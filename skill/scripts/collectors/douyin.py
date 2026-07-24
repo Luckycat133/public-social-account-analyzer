@@ -476,6 +476,15 @@ class DouyinCollector(BaseCollector):
                 f"浏览器采集中止: {result.restriction}",
                 raw=result.diagnostics,
                 partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if result.diagnostic_code:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器采集完成，但资源清理失败",
+                raw=result.diagnostics,
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
             )
         if not posts:
             raise DouyinError(
@@ -740,7 +749,7 @@ class DouyinCollector(BaseCollector):
     @staticmethod
     def _build_post_raw(url: str, aweme: dict, source: str) -> dict:
         from ._douyin_browser_transport import (
-            canonical_post_url,
+            canonical_post_url_for_item,
             sanitize_response_url,
         )
 
@@ -758,7 +767,7 @@ class DouyinCollector(BaseCollector):
         collection_name = (collection or {}).get("mix_name") if isinstance(collection, dict) else None
         single_text = (desc or "").split("\n")[0] if isinstance(desc, str) else None
         post_id = str(aweme.get("aweme_id") or aweme.get("aweme_id_str") or "")
-        post_url = canonical_post_url(post_id) or sanitize_response_url(url)
+        post_url = canonical_post_url_for_item(aweme, post_id) or sanitize_response_url(url)
         collection_source = str(
             aweme.get("_collection_source") or source or "unknown"
         )

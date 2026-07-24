@@ -12,17 +12,22 @@ import json
 import re
 import time
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from ._constants import DOUYIN_PAGE_STATE_PATTERNS
-from .browser_backend import BrowserError, BrowserSession
+from .browser_backend import (
+    BrowserError,
+    BrowserSession,
+    _sanitize_cleanup_diagnostics,
+)
 
 
 _ITEM_LIST_KEYS = {"aweme_list", "awemeList", "post_list"}
 _ITEM_DETAIL_KEYS = {"aweme_detail", "awemeDetail"}
-_POST_PATH = re.compile(r"/(?:video|note)/(\d+)")
+_POST_PATH = re.compile(r"/(?P<kind>video|note)/(?P<post_id>\d+)")
 _POST_ID = re.compile(r"\d+")
 _VISIBLE_METRIC_NUMBER = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?\s*[万亿]?")
 _KNOWN_STATISTICS = {
@@ -71,6 +76,7 @@ class DouyinBrowserResult:
     aweme_items: list[dict[str, Any]] = field(default_factory=list)
     source: str = "network"
     restriction: Optional[str] = None
+    diagnostic_code: Optional[str] = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
@@ -102,12 +108,12 @@ def sanitize_response_url(url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
 
 
-def canonical_post_url(post_id: Any) -> str:
+def canonical_post_url(post_id: Any, kind: str = "video") -> str:
     """Build a query-free public evidence URL from a validated Douyin post ID."""
     value = str(post_id or "")
-    if not _POST_ID.fullmatch(value):
+    if not _POST_ID.fullmatch(value) or kind not in {"video", "note"}:
         return ""
-    return f"https://www.douyin.com/video/{value}"
+    return f"https://www.douyin.com/{kind}/{value}"
 
 
 def _item_id(item: dict[str, Any]) -> Optional[str]:
@@ -200,7 +206,8 @@ def _is_allowed_host(host: str) -> bool:
     )
 
 
-def _post_id_from_public_url(url: str) -> Optional[str]:
+def _post_reference_from_public_url(url: str) -> Optional[tuple[str, str]]:
+    """Return a validated public post kind and ID without retaining URL secrets."""
     try:
         parsed = urllib.parse.urlsplit(url)
     except ValueError:
@@ -213,7 +220,22 @@ def _post_id_from_public_url(url: str) -> Optional[str]:
     ):
         return None
     match = _POST_PATH.fullmatch(parsed.path)
-    return match.group(1) if match else None
+    if match is None:
+        return None
+    return match.group("kind"), match.group("post_id")
+
+
+def canonical_post_url_for_item(item: dict[str, Any], post_id: Any) -> str:
+    """Prefer an ID-matching safe share path, then infer image notes."""
+    value = str(post_id or "")
+    if not _POST_ID.fullmatch(value):
+        return ""
+    reference = _post_reference_from_public_url(str(item.get("share_url") or ""))
+    if reference is not None and reference[1] == value:
+        return canonical_post_url(value, reference[0])
+    note_media = item.get("images") or item.get("image_post_info")
+    kind = "note" if isinstance(note_media, (dict, list)) and bool(note_media) else "video"
+    return canonical_post_url(value, kind)
 
 
 def _visible_metric_value(value: Any) -> Any:
@@ -231,8 +253,11 @@ def extract_dom_items(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for card in cards:
-        post_id = _post_id_from_public_url(str(card.get("href") or ""))
-        if post_id is None or post_id in seen:
+        reference = _post_reference_from_public_url(str(card.get("href") or ""))
+        if reference is None:
+            continue
+        kind, post_id = reference
+        if post_id in seen:
             continue
         seen.add(post_id)
         visible_stats: dict[str, Any] = {}
@@ -246,7 +271,7 @@ def extract_dom_items(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "aweme_id": post_id,
                 "desc": str(card.get("text") or "").strip(),
-                "share_url": canonical_post_url(post_id),
+                "share_url": canonical_post_url(post_id, kind),
                 "statistics": visible_stats,
                 "is_top": True if card.get("is_pinned") is True else None,
                 "_collection_source": "dom",
@@ -345,6 +370,23 @@ def _date_relation(item: dict[str, Any], lower_bound: Optional[float]) -> str:
     return "past_lower_bound"
 
 
+@contextmanager
+def _collection_session(session_factory, cleanup_state: dict[str, Any]):
+    """Retain collection state when a normal context exit reports cleanup failure."""
+    try:
+        with session_factory() as session:
+            yield session
+    except BrowserError as exc:
+        if not getattr(exc, "is_cleanup_failure", False):
+            raise
+        cleanup_state["diagnostic_code"] = "BROWSER_CLEANUP_FAILED"
+        cleanup_state["cleanup_codes"] = list(
+            _sanitize_cleanup_diagnostics(
+                getattr(exc, "cleanup_diagnostics", ())
+            )
+        )
+
+
 def collect_account_page(
     url: str,
     *,
@@ -362,6 +404,8 @@ def collect_account_page(
     items: dict[str, dict[str, Any]] = {}
     pending: dict[str, dict[str, Any]] = {}
     safe_paths: list[str] = []
+    candidate_response_count = 0
+    cleanup_state: dict[str, Any] = {}
     restriction: Optional[str] = None
     scrolls = 0
     idle = 0
@@ -433,7 +477,7 @@ def collect_account_page(
             if len(items) >= requested or remaining() <= 0:
                 break
 
-    with session_factory() as session:
+    with _collection_session(session_factory, cleanup_state) as session:
         budget = remaining()
         if budget <= 0:
             deadline_expired = True
@@ -459,7 +503,10 @@ def collect_account_page(
 
             candidate = _allowed_response(event or {})
             if candidate:
+                candidate_response_count += 1
                 request_id, safe_url = candidate
+                if safe_url not in safe_paths:
+                    safe_paths.append(safe_url)
                 pending[request_id] = {
                     "safe_url": safe_url,
                     "ready": False,
@@ -572,11 +619,17 @@ def collect_account_page(
         aweme_items=final,
         source=source,
         restriction=restriction,
+        diagnostic_code=cleanup_state.get("diagnostic_code"),
         diagnostics={
             "scroll_rounds": scrolls,
-            "candidate_response_count": len(safe_paths),
+            "candidate_response_count": candidate_response_count,
             "response_paths": safe_paths,
             "pending_response_count": len(pending),
             "stop_condition": stop_condition,
+            **(
+                {"cleanup_codes": cleanup_state["cleanup_codes"]}
+                if cleanup_state.get("cleanup_codes")
+                else {}
+            ),
         },
     )

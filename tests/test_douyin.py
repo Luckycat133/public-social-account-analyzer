@@ -207,12 +207,22 @@ def test_collect_post_list_keeps_ssr_fast_path_without_browser(monkeypatch):
     monkeypatch.setattr(
         collector,
         "_fetch",
-        lambda url: _ssr_html({"user": {"post": {"data": [AWEME]}}}),
+        lambda url: _ssr_html({
+            "user": {
+                "post": {
+                    "data": [dict(
+                        AWEME,
+                        share_url="https://www.douyin.com/note/7001?secret=x",
+                    )]
+                }
+            }
+        }),
     )
 
     posts = collector.collect_post_list(ACCOUNT_URL, limit=1)
 
     assert [post["post_id"] for post in posts] == ["7001"]
+    assert posts[0]["post_url"] == "https://www.douyin.com/note/7001"
     assert browser_calls == []
 
 
@@ -225,7 +235,13 @@ def test_collect_post_list_uses_browser_when_ssr_is_missing(monkeypatch):
 
     def browser_collect(**kwargs):
         browser_calls.append(kwargs)
-        return DouyinBrowserResult(aweme_items=[AWEME], source="network")
+        return DouyinBrowserResult(
+            aweme_items=[dict(
+                AWEME,
+                share_url="https://www.douyin.com/note/7001?secret=x",
+            )],
+            source="network",
+        )
 
     collector = DouyinCollector(browser_collect=browser_collect)
     monkeypatch.setattr(collector, "_fetch", lambda url: "<html>shell</html>")
@@ -234,6 +250,7 @@ def test_collect_post_list_uses_browser_when_ssr_is_missing(monkeypatch):
 
     assert browser_calls == [{"url": ACCOUNT_URL, "limit": 1, "date_range": None}]
     assert posts[0]["post_id"] == "7001"
+    assert posts[0]["post_url"] == "https://www.douyin.com/note/7001"
     assert posts[0]["likes"] == 12
 
 
@@ -450,7 +467,7 @@ def test_extract_dom_items_requires_exact_post_path():
     result = extract_dom_items(cards)
 
     assert [item["aweme_id"] for item in result] == ["7003"]
-    assert result[0]["share_url"] == "https://www.douyin.com/video/7003"
+    assert result[0]["share_url"] == "https://www.douyin.com/note/7003"
 
 
 def test_extract_dom_items_rejects_non_https_and_non_douyin_hosts():
@@ -466,7 +483,7 @@ def test_extract_dom_items_rejects_non_https_and_non_douyin_hosts():
     result = extract_dom_items(cards)
 
     assert [item["aweme_id"] for item in result] == ["7003"]
-    assert result[0]["share_url"] == "https://www.douyin.com/video/7003"
+    assert result[0]["share_url"] == "https://www.douyin.com/note/7003"
 
 
 def test_extract_dom_items_keeps_only_explicit_visible_metrics_and_pin():
@@ -664,7 +681,33 @@ def test_collect_account_page_continues_after_response_body_is_unavailable():
     assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
     assert result.aweme_items[0]["_collection_source"] == "network"
     assert result.diagnostics["response_paths"] == [
+        "https://www.douyin.com/aweme/v1/web/aweme/post/",
         "https://www.iesdouyin.com/aweme/v1/web/aweme/post/"
+    ]
+    assert result.diagnostics["candidate_response_count"] == 2
+
+
+def test_collect_account_page_counts_duplicate_path_candidates_independently():
+    """Each eligible response is counted even when safe paths de-duplicate."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    browser = FakeBrowser(events=[
+        _response_event("r1"),
+        _loading_event("Network.loadingFailed", "r1"),
+        _response_event("r2"),
+        _loading_event("Network.loadingFailed", "r2"),
+    ])
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: browser,
+        sleep=lambda _: None,
+    )
+
+    assert result.diagnostics["candidate_response_count"] == 2
+    assert result.diagnostics["response_paths"] == [
+        "https://www.douyin.com/aweme/v1/web/aweme/post/"
     ]
 
 
@@ -942,3 +985,120 @@ def test_network_share_url_is_replaced_by_canonical_public_url():
 
     assert post["post_url"] == "https://www.douyin.com/video/7001"
     assert post["source_url"] == "https://www.douyin.com/video/7001"
+
+
+@pytest.mark.parametrize("source", ["ssr", "network"])
+def test_safe_note_share_url_is_preserved_for_ssr_and_network(source):
+    """A matching public note URL keeps its kind while dropping query data."""
+    from collectors.douyin import DouyinCollector
+
+    aweme = dict(
+        AWEME,
+        share_url="https://www.douyin.com/note/7001?signed=secret#fragment",
+    )
+
+    post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(ACCOUNT_URL, aweme, source=source)
+    )
+
+    assert post["post_url"] == "https://www.douyin.com/note/7001"
+    assert "secret" not in post["source_url"]
+
+
+def test_note_kind_is_inferred_from_image_media_without_safe_share_url():
+    from collectors.douyin import DouyinCollector
+
+    aweme = dict(AWEME, images=[{"url_list": ["https://example.test/image"]}])
+    aweme.pop("video")
+
+    post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(ACCOUNT_URL, aweme, source="network")
+    )
+
+    assert post["post_url"] == "https://www.douyin.com/note/7001"
+
+
+@pytest.mark.parametrize(
+    "share_url",
+    [
+        "https://www.douyin.com/note/9999?signed=secret",
+        "https://name:password@www.douyin.com/note/7001?signed=secret",
+        "http://www.douyin.com/note/7001?signed=secret",
+        "https://evil.example/note/7001?signed=secret",
+    ],
+)
+def test_unsafe_or_mismatched_note_share_url_cannot_change_video_kind(share_url):
+    from collectors.douyin import DouyinCollector
+
+    aweme = dict(AWEME, share_url=share_url)
+
+    post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(ACCOUNT_URL, aweme, source="network")
+    )
+
+    assert post["post_url"] == "https://www.douyin.com/video/7001"
+    assert "secret" not in post["source_url"]
+
+
+def test_collect_account_page_returns_items_with_cleanup_diagnostic():
+    """A normal-exit cleanup failure retains already-observed network items."""
+    from collectors._douyin_browser_transport import collect_account_page
+    from collectors.browser_backend import BrowserError
+
+    class CleanupFailBrowser(FakeBrowser):
+        def __exit__(self, exc_type, exc, traceback):
+            raise BrowserError(
+                "浏览器清理失败: PROFILE_REMOVE_FAILED",
+                diagnostic_code="BROWSER_CLEANUP_FAILED",
+                cleanup_diagnostics=(
+                    "PROFILE_REMOVE_FAILED",
+                    "/tmp/private-profile?cookie=secret",
+                ),
+                is_cleanup_failure=True,
+            )
+
+    browser = CleanupFailBrowser(
+        events=[RESPONSE_EVENT],
+        bodies={"r1": json.dumps({"aweme_list": [AWEME]})},
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: browser,
+        sleep=lambda _: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
+    assert result.diagnostic_code == "BROWSER_CLEANUP_FAILED"
+    assert result.diagnostics["cleanup_codes"] == ["PROFILE_REMOVE_FAILED"]
+
+
+@pytest.mark.parametrize("items", [[AWEME], []])
+def test_collector_maps_cleanup_diagnostic_to_parser_failure_with_partial_posts(
+    monkeypatch,
+    items,
+):
+    """Cleanup failure is a parser failure and retains any normalized evidence."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=items,
+            source="network",
+            diagnostic_code="BROWSER_CLEANUP_FAILED",
+            diagnostics={"cleanup_codes": ["PROFILE_REMOVE_FAILED"]},
+        )
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_list(ACCOUNT_URL)
+
+    error = exc_info.value
+    assert error.stop_reason == STOP_PARSER_FAILED
+    assert error.diagnostic_code == "BROWSER_CLEANUP_FAILED"
+    assert [post["post_id"] for post in error.partial_posts] == (
+        ["7001"] if items else []
+    )

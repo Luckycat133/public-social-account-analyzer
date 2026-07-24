@@ -227,6 +227,7 @@ def test_ws_client_fragmented_text():
 class QueueWS:
     def __init__(self, messages):
         self.messages, self.sent, self.timeout = list(messages), [], None
+        self.timeouts = []
 
     def send_text(self, text):
         self.sent.append(json.loads(text))
@@ -236,6 +237,7 @@ class QueueWS:
 
     def set_timeout(self, timeout):
         self.timeout = timeout
+        self.timeouts.append(timeout)
 
 
 def test_send_cdp_preserves_async_events():
@@ -249,6 +251,50 @@ def test_send_cdp_preserves_async_events():
     session._cmd_id, session._events = 0, deque()
     assert session._send_cdp("Network.enable", {}) == {"ok": True}
     assert session.drain_events("Network.responseReceived")[0]["params"]["requestId"] == "r1"
+
+
+def test_send_cdp_timeout_is_one_absolute_budget_across_unmatched_messages(monkeypatch):
+    """Async and wrong-ID traffic cannot restart a bounded command timeout."""
+
+    class BusyWS(QueueWS):
+        def __init__(self):
+            super().__init__([])
+            self.recv_count = 0
+
+        def recv_message(self):
+            self.recv_count += 1
+            if self.recv_count == 1:
+                return {
+                    "method": "Network.responseReceived",
+                    "params": {"requestId": "async"},
+                }
+            if self.recv_count == 2:
+                return {"id": 999, "result": {}}
+            pytest.fail("absolute deadline should expire before another receive")
+
+    ticks = iter([10.0, 10.4, 10.8, 11.01])
+    monkeypatch.setattr(
+        "collectors.browser_backend.time.monotonic",
+        lambda: next(ticks),
+    )
+    session = BrowserSession.__new__(BrowserSession)
+    session._ws = BusyWS()
+    session._cmd_id = 0
+    session._events = deque()
+    session._startup_timeout = 20.0
+
+    with pytest.raises(BrowserError, match="超时") as exc_info:
+        session._send_cdp(
+            "Runtime.evaluate",
+            {"expression": "https://www.douyin.com/private?secret=1"},
+            timeout=1.0,
+        )
+
+    assert session._ws.recv_count == 2
+    assert session._ws.timeouts[:-1] == pytest.approx([0.6, 0.2])
+    assert session._ws.timeouts[-1] == 20.0
+    assert "secret" not in str(exc_info.value)
+    assert session.drain_events()[0]["params"]["requestId"] == "async"
 
 
 def test_get_response_body_decodes_base64():
@@ -523,6 +569,70 @@ def test_close_never_replaces_an_error_when_profile_state_is_unreadable(monkeypa
     real_rmtree(profile_dir)
 
 
+def test_context_exit_raises_sanitized_cleanup_error_without_active_exception(monkeypatch):
+    """A failed cleanup is observable to production callers on a normal exit."""
+    session = BrowserSession(port=9222)
+    profile_dir = session._user_data_dir
+    real_rmtree = shutil.rmtree
+    monkeypatch.setattr(
+        "collectors.browser_backend.shutil.rmtree",
+        lambda path: (_ for _ in ()).throw(PermissionError(path)),
+    )
+    monkeypatch.setattr("collectors.browser_backend.time.sleep", lambda _: None)
+
+    with pytest.raises(BrowserError) as exc_info:
+        session.__exit__(None, None, None)
+
+    error = exc_info.value
+    assert error.diagnostic_code == "BROWSER_CLEANUP_FAILED"
+    assert error.cleanup_diagnostics == ("PROFILE_REMOVE_FAILED",)
+    assert profile_dir not in str(error)
+    assert profile_dir not in repr(error.cleanup_diagnostics)
+    real_rmtree(profile_dir)
+
+
+def test_context_exit_attaches_cleanup_codes_without_replacing_active_error(monkeypatch):
+    """Cleanup diagnostics augment, but never override, the original exception."""
+    session = BrowserSession(port=9222)
+    profile_dir = session._user_data_dir
+    real_rmtree = shutil.rmtree
+    monkeypatch.setattr(
+        "collectors.browser_backend.shutil.rmtree",
+        lambda path: (_ for _ in ()).throw(PermissionError(path)),
+    )
+    monkeypatch.setattr("collectors.browser_backend.time.sleep", lambda _: None)
+    original = RuntimeError("collection failed")
+
+    assert session.__exit__(RuntimeError, original, None) is None
+
+    assert original.diagnostic_code == "BROWSER_CLEANUP_FAILED"
+    assert original.cleanup_diagnostics == ("PROFILE_REMOVE_FAILED",)
+    assert profile_dir not in repr(original.cleanup_diagnostics)
+    real_rmtree(profile_dir)
+
+
+def test_context_exit_preserves_an_active_error_diagnostic_code(monkeypatch):
+    """The cleanup code remains secondary when the active error has a diagnosis."""
+    session = BrowserSession(port=9222)
+    profile_dir = session._user_data_dir
+    real_rmtree = shutil.rmtree
+    monkeypatch.setattr(
+        "collectors.browser_backend.shutil.rmtree",
+        lambda path: (_ for _ in ()).throw(PermissionError(path)),
+    )
+    monkeypatch.setattr("collectors.browser_backend.time.sleep", lambda _: None)
+    original = BrowserError(
+        "command failed",
+        diagnostic_code="BROWSER_CDP_TIMEOUT",
+    )
+
+    assert session.__exit__(BrowserError, original, None) is None
+
+    assert original.diagnostic_code == "BROWSER_CDP_TIMEOUT"
+    assert original.cleanup_diagnostics == ("PROFILE_REMOVE_FAILED",)
+    real_rmtree(profile_dir)
+
+
 # --------------------------------------------------------------------------
 # 浏览器降级接线（不联网、不启动浏览器，纯 mock）
 # --------------------------------------------------------------------------
@@ -562,6 +672,36 @@ def test_get_json_no_fallback_raises_on_waf(monkeypatch):
         raise AssertionError("expected BilibiliError")
     except BilibiliError as e:
         assert e.stop_reason == STOP_ACCESS_RESTRICTED
+
+
+def test_bilibili_browser_fetch_propagates_cleanup_error(monkeypatch):
+    """Bilibili must receive a cleanup error raised by BrowserSession.__exit__."""
+    from collectors import browser_backend
+    from collectors.bilibili import Session
+
+    class CleanupFailSession:
+        def __init__(self, browser_bin):
+            assert browser_bin == "/fake/browser"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            error = BrowserError("浏览器清理失败: PROFILE_REMOVE_FAILED")
+            error.diagnostic_code = "BROWSER_CLEANUP_FAILED"
+            error.cleanup_diagnostics = ("PROFILE_REMOVE_FAILED",)
+            raise error
+
+        def fetch_text(self, full, headers):
+            return '{"code": 0}'
+
+    monkeypatch.setattr(browser_backend, "find_browser", lambda: "/fake/browser")
+    monkeypatch.setattr(browser_backend, "BrowserSession", CleanupFailSession)
+
+    with pytest.raises(BrowserError) as exc_info:
+        Session()._fetch_via_browser("https://api.bilibili.com/x", "https://bilibili.com")
+
+    assert exc_info.value.diagnostic_code == "BROWSER_CLEANUP_FAILED"
 
 
 if __name__ == "__main__":

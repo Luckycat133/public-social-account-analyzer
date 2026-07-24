@@ -255,8 +255,46 @@ class _WSClient:
         self._sock = None
 
 
+_CLEANUP_DIAGNOSTIC_CODES = frozenset({
+    "WEBSOCKET_CLOSE_FAILED",
+    "PROCESS_KILL_FAILED",
+    "PROCESS_REAP_FAILED",
+    "PROFILE_REMOVE_FAILED",
+})
+
+
+def _sanitize_cleanup_diagnostics(values: Any) -> tuple[str, ...]:
+    """Keep only fixed lifecycle codes; never carry paths or external text."""
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return ()
+    safe: list[str] = []
+    for code in values:
+        if (
+            isinstance(code, str)
+            and code in _CLEANUP_DIAGNOSTIC_CODES
+            and code not in safe
+        ):
+            safe.append(code)
+    return tuple(safe)
+
+
 class BrowserError(Exception):
     """浏览器后端自身的错误（区别于平台返回的业务码）。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic_code: Optional[str] = None,
+        cleanup_diagnostics: tuple[str, ...] = (),
+        is_cleanup_failure: bool = False,
+    ):
+        super().__init__(message)
+        self.diagnostic_code = diagnostic_code
+        self.cleanup_diagnostics = _sanitize_cleanup_diagnostics(
+            cleanup_diagnostics
+        )
+        self.is_cleanup_failure = is_cleanup_failure
 
 
 # --------------------------------------------------------------------------
@@ -380,9 +418,10 @@ class BrowserSession:
     ) -> dict:
         assert self._ws is not None
         bounded_timeout = None
+        deadline = None
         if timeout is not None:
             bounded_timeout = max(0.001, float(timeout))
-            self._ws.set_timeout(bounded_timeout)
+            deadline = time.monotonic() + bounded_timeout
         self._cmd_id += 1
         cid = self._cmd_id
         self._ws.send_text(
@@ -390,6 +429,14 @@ class BrowserSession:
         )
         try:
             while True:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise BrowserError(
+                            f"CDP {method} 超时",
+                            diagnostic_code="BROWSER_CDP_TIMEOUT",
+                        )
+                    self._ws.set_timeout(remaining)
                 msg = self._ws.recv_message()
                 if msg is None:
                     raise BrowserError("浏览器连接在处理 CDP 指令时关闭")
@@ -402,7 +449,10 @@ class BrowserSession:
                     raise BrowserError(f"CDP {method} 失败: {msg['error']}")
                 return msg.get("result", {})
         except socket.timeout as exc:
-            raise BrowserError(f"CDP {method} 超时") from exc
+            raise BrowserError(
+                f"CDP {method} 超时",
+                diagnostic_code="BROWSER_CDP_TIMEOUT",
+            ) from exc
         finally:
             if bounded_timeout is not None:
                 self._ws.set_timeout(self._startup_timeout)
@@ -557,7 +607,10 @@ class BrowserSession:
         return tuple(self._cleanup_diagnostics)
 
     def _record_cleanup_diagnostic(self, code: str) -> None:
-        if code not in self._cleanup_diagnostics:
+        if (
+            code in _CLEANUP_DIAGNOSTIC_CODES
+            and code not in self._cleanup_diagnostics
+        ):
             self._cleanup_diagnostics.append(code)
 
     def close(self) -> None:
@@ -615,3 +668,20 @@ class BrowserSession:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+        diagnostics = self.cleanup_diagnostics
+        if not diagnostics:
+            return None
+        if exc is not None:
+            try:
+                exc.cleanup_diagnostics = diagnostics
+                if getattr(exc, "diagnostic_code", None) is None:
+                    exc.diagnostic_code = "BROWSER_CLEANUP_FAILED"
+            except (AttributeError, TypeError):
+                pass
+            return None
+        raise BrowserError(
+            "浏览器清理失败: " + ",".join(diagnostics),
+            diagnostic_code="BROWSER_CLEANUP_FAILED",
+            cleanup_diagnostics=diagnostics,
+            is_cleanup_failure=True,
+        )
