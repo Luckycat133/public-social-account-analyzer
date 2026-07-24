@@ -494,8 +494,9 @@ class Session:
         )
         if data.get("code") != 0:
             raise BilibiliError(STOP_ACCESS_RESTRICTED, "search/type 降级失败")
+        res_data = data.get("data") or {}
         target = next(
-            (r for r in data["data"].get("result", [])
+            (r for r in res_data.get("result", [])
              if str(r.get("mid")) == str(mid)),
             None,
         )
@@ -585,7 +586,10 @@ def _to_iso(ts: Any) -> str | None:
     if not ts:
         return None
     try:
-        return datetime.fromtimestamp(int(ts), tz=_BEIJING).isoformat()
+        val = int(ts)
+        if val > 10000000000:
+            val //= 1000
+        return datetime.fromtimestamp(val, tz=_BEIJING).isoformat()
     except (ValueError, OverflowError, OSError):
         return None
 
@@ -835,7 +839,10 @@ class BilibiliCollector(BaseCollector):
                 f"view 失败: {data.get('message')}",
                 data,
             )
-        return self.normalize_post(_build_post_raw_from_view(data["data"], post_url))
+        view_data = data.get("data")
+        if not view_data:
+            raise BilibiliError(STOP_ACCESS_RESTRICTED, "view 响应数据为空")
+        return self.normalize_post(_build_post_raw_from_view(view_data, post_url))
 
     # -- 评论采集（best-effort，urllib-only，免登录） --
     def collect_comments(self, post_url: str, limit: int = 20) -> list[dict]:

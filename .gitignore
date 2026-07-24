@@ -3,6 +3,9 @@ workspace/
 .worktrees/
 worktrees/
 
+# --- 构建打包产物（由 skill/ 源目录再生，不入库） ---
+dist/
+
 # --- Python ---
 __pycache__/
 *.py[cod]

@@ -28,7 +28,7 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-from base import BaseCollector  # 适配 scripts/collectors 作为 sys.path 入口
+from .base import BaseCollector  # 适配 scripts/collectors 作为 sys.path 入口
 
 # P2 可选平台：默认关闭，经环境变量开启真实采集，不阻塞 MVP。
 ENABLED = os.environ.get("WEIBO_COLLECTOR_ENABLED", "0") == "1"

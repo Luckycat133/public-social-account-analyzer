@@ -197,6 +197,7 @@ def split_samples(all_posts: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dic
     flagged = [
         p for p in all_posts
         if (p["is_pinned"] or p["is_repost"] or p["is_promoted"])
+        and p["collection_status"] not in ("FAILED", "DELETED", "RESTRICTED")
     ]
     missing = [p for p in all_posts if p["collection_status"] in ("FAILED", "DELETED")]
     restricted = [p for p in all_posts if p["collection_status"] == "RESTRICTED"]
@@ -263,9 +264,18 @@ def compute_cadence(valid: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # 月度分布与季节性/学期检测（§3 扩展，确定性启发式，非因果）
     monthly: Dict[str, int] = {}
-    for d in dates:
-        key = f"{d.year}-{d.month:02d}"
-        monthly[key] = monthly.get(key, 0) + 1
+    if dates:
+        curr_y, curr_m = min_d.year, min_d.month
+        end_y, end_m = max_d.year, max_d.month
+        while (curr_y < end_y) or (curr_y == end_y and curr_m <= end_m):
+            monthly[f"{curr_y}-{curr_m:02d}"] = 0
+            curr_m += 1
+            if curr_m > 12:
+                curr_m = 1
+                curr_y += 1
+        for d in dates:
+            key = f"{d.year}-{d.month:02d}"
+            monthly[key] = monthly.get(key, 0) + 1
     monthly_distribution = dict(sorted(monthly.items()))
 
     month_counts = list(monthly_distribution.values())
@@ -279,7 +289,8 @@ def compute_cadence(valid: List[Dict[str, Any]]) -> Dict[str, Any]:
     break_months = (1, 2, 7, 8)
     break_count = sum(v for k, v in monthly_distribution.items()
                      if int(k.split("-")[1]) in break_months)
-    break_month_share = rnd(break_count / total, 4) if total else None
+    valid_dates_count = len(dates)
+    break_month_share = rnd(break_count / valid_dates_count, 4) if valid_dates_count else None
     if seasonal_intensity is None:
         seasonal_note = None
     elif seasonal_intensity >= 1.0:
@@ -512,23 +523,18 @@ def choose_main_metric(analysis_goal: Optional[str], valid: List[Dict[str, Any]]
 
 
 def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[Dict[str, Any]]:
-    n = len(valid)
-    if n < MIN_SAMPLE_FOR_HIGH_LOW:
+    measured_items = [(p, v) for p, v in ((p, post_metric_value(p, main_metric)) for p in valid) if v is not None]
+    n_meas = len(measured_items)
+    if n_meas < MIN_SAMPLE_FOR_HIGH_LOW:
         return None  # 标记 INSUFFICIENT_SAMPLE
 
-    items = [(p, post_metric_value(p, main_metric)) for p in valid]
+    items_sorted = sorted(measured_items, key=lambda t: t[1], reverse=True)
 
-    def keyf(t: Tuple[Dict, Optional[float]]):
-        v = t[1]
-        return (v is not None, v if v is not None else 0.0)
-
-    items_sorted = sorted(items, key=keyf, reverse=True)
-
-    k = math.ceil(n * 0.2)
+    k = math.ceil(n_meas * 0.2)
     if k < 3:
         k = 3  # 每组至少 3 条(§6.2)
-    if k > n // 2:
-        k = n // 2
+    if k > n_meas // 2:
+        k = n_meas // 2
 
     high = items_sorted[:k]
     low = items_sorted[-k:]
@@ -544,7 +550,7 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
         }
 
     high_items = [to_item(t, i + 1) for i, t in enumerate(high)]
-    low_items = [to_item(t, n - k + i + 1) for i, t in enumerate(low)]
+    low_items = [to_item(t, n_meas - k + i + 1) for i, t in enumerate(low)]
     return {
         "high": high_items,
         "low": low_items,
@@ -1014,7 +1020,7 @@ def main() -> None:
         "low_performance": low_performance,
         "performance_meta": performance_meta,
         "posts": post_records,
-        "classification_status": "pending-model",
+        "classification_status": meta["classification_status"],
     }
 
     out_json = os.path.join(task_dir, "analysis.json")

@@ -33,7 +33,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 
-from base import BaseCollector
+from .base import BaseCollector
 
 
 # --------------------------------------------------------------------------
@@ -138,38 +138,46 @@ def _extract_hashtags(desc: Any, text_extra: Any) -> list[str]:
 
 
 def _extract_render_data(html: str) -> dict | None:
-    """从页面提取内嵌 RENDER_DATA（URL 编码 JSON）并解码为 dict。
+    """从页面提取内嵌 RENDER_DATA（URL 编码 JSON）及多变体 SSR 数据。
 
-    Douyin 的 SSR 数据常放在 `<script id="RENDER_DATA" type="application/json">`
-    中，内容为 URL 编码的 JSON。解析失败（无该节点 / 非 JSON）返回 None，由调用方
-    据实判定为 PARSER_FAILED。
+    支持节点：<script id="RENDER_DATA">、_ROUTER_DATA、_SSR_DATA、__INIT_DATA、__INITIAL_STATE__。
+    解析失败（无节点 / 需风控验证 / JS虚拟机渲染）返回 None，由调用方据实判定为 PARSER_FAILED。
     """
     if not html:
         return None
+
+    # 1. 经典 RENDER_DATA 节点
     m = re.search(
-        r'<script[^>]*id=["\']RENDER_DATA["\'][^>]*>(.*?)</script>',
+        r'<script[^>]*id=["\'](?:RENDER_DATA|_SSR_DATA|__INIT_DATA)["\'][^>]*>(.*?)</script>',
         html,
         re.DOTALL | re.I,
     )
     raw = m.group(1) if m else None
-    if not raw:
-        # 个别变体：window._ROUTER_DATA = {...}
-        m2 = re.search(r"window\._ROUTER_DATA\s*=\s*(\{.*?\});?\s*</script>", html, re.DOTALL)
-        raw = m2.group(1) if m2 else None
-        if not raw:
-            return None
+    if raw:
         try:
-            return json.loads(raw)
+            decoded = urllib.parse.unquote(raw)
+            return json.loads(decoded)
         except (json.JSONDecodeError, ValueError):
-            return None
-    try:
-        decoded = urllib.parse.unquote(raw)
-        return json.loads(decoded)
-    except (json.JSONDecodeError, ValueError):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return None
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    # 2. window 全局变量挂载变体 (window._ROUTER_DATA / window.__INITIAL_STATE__)
+    patterns = [
+        r"window\._ROUTER_DATA\s*=\s*(\{.*?\});?\s*</script>",
+        r"window\._SSR_DATA\s*=\s*(\{.*?\});?\s*</script>",
+        r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});?\s*</script>",
+    ]
+    for p in patterns:
+        m2 = re.search(p, html, re.DOTALL)
+        if m2:
+            try:
+                return json.loads(m2.group(1))
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    return None
 
 
 def _detect_restriction(html: str) -> str | None:
@@ -328,12 +336,60 @@ class DouyinCollector(BaseCollector):
             "stop_reason": None,
         }
 
+    @staticmethod
+    def _extract_sec_uid(url: str) -> str | None:
+        m = re.search(r"/(?:user|share/user)/([A-Za-z0-9_\-]+)", url)
+        return m.group(1) if m else None
+
+    def _fetch_profile_via_iesdouyin_api(self, sec_uid: str, url: str) -> dict[str, Any] | None:
+        """fallback 降级调用 iesdouyin 公开 API 提取公开资料。"""
+        if not sec_uid:
+            return None
+        api_url = f"https://www.iesdouyin.com/web/api/v2/user/info/?sec_uid={sec_uid}"
+        try:
+            req = urllib.request.Request(
+                api_url,
+                headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"}
+            )
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                res_text = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(res_text)
+                ui = data.get("user_info")
+                if not ui:
+                    return None
+                raw = {
+                    "platform": "douyin",
+                    "account_id": ui.get("unique_id") or ui.get("short_id") or sec_uid,
+                    "account_name": ui.get("nickname"),
+                    "profile_url": url,
+                    "bio": ui.get("signature") or None,
+                    "verified": bool(ui.get("custom_verify") or ui.get("enterprise_verify_reason") or ui.get("verification_type")),
+                    "followers": _int(ui.get("follower_count") or ui.get("mplatform_followers_count")),
+                    "post_count": _int(ui.get("aweme_count")),
+                    "platform_metrics": {
+                        "total_likes": _int(ui.get("total_favorited")),
+                        "sec_uid": sec_uid,
+                        "unique_id": ui.get("unique_id"),
+                        "enterprise_verify_reason": ui.get("enterprise_verify_reason"),
+                    },
+                    "collected_at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
+                    "field_visibility": {
+                        "account_name": "visible" if ui.get("nickname") else "hidden",
+                        "bio": "visible" if ui.get("signature") else "hidden",
+                        "followers": "visible" if (ui.get("follower_count") or ui.get("mplatform_followers_count")) is not None else "hidden",
+                        "post_count": "visible" if ui.get("aweme_count") is not None else "hidden",
+                    }
+                }
+                return self.normalize_profile(raw)
+        except Exception:
+            return None
+
     # -- 资料 ---------------------------------------------------------------
     def collect_profile(self, url: str) -> dict[str, Any]:
         """采集公开账号信息并归一化为统一 Profile。
 
         命中任务级限制时抛 DouyinError(stop_reason)；页面可访问但无法解析用户结构
-        抛 PARSER_FAILED。获赞总量写入 platform_metrics.total_likes。
+        时自动触发 iesdouyin 公开 API 降级；全不可用时抛 PARSER_FAILED。
         """
         if not self.supports(url):
             raise DouyinError(STOP_UNSUPPORTED, f"不支持的账号主页 URL: {url}")
@@ -344,11 +400,13 @@ class DouyinCollector(BaseCollector):
             raise DouyinError(restriction, f"采集资料时命中访问限制: {restriction}")
 
         data = _extract_render_data(html)
-        if data is None:
-            raise DouyinError(STOP_PARSER_FAILED, "账号主页可访问但无 RENDER_DATA，无法解析")
-
-        user = self._find_user(data)
+        user = self._find_user(data) if data else None
         if not user:
+            sec_uid = self._extract_sec_uid(url)
+            if sec_uid:
+                fallback = self._fetch_profile_via_iesdouyin_api(sec_uid, url)
+                if fallback:
+                    return fallback
             raise DouyinError(
                 STOP_PARSER_FAILED, "RENDER_DATA 中未识别到用户结构（可能为 JS 外壳页）"
             )
@@ -635,7 +693,7 @@ class DouyinCollector(BaseCollector):
             "content_type": content_type,
             "title": single_text,
             "text": desc,
-            "duration_seconds": _int(video.get("duration")),
+            "duration_seconds": (_int(video.get("duration")) // 1000) if video.get("duration") is not None else None,
             "hashtags": _extract_hashtags(desc, text_extra),
             "is_pinned": is_top,
             "is_repost": False,

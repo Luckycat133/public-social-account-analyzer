@@ -133,14 +133,18 @@
 | 验证页 / 滑块 | "滑动验证"、"人机验证"、"请完成安全验证"、"Verify you are human" | `VERIFICATION_REQUIRED` |
 | 访问频控 | "访问过于频繁"、"操作过于频繁"、"请求频率过高"、"网络异常，请稍后再试" | `ACCESS_RESTRICTED` |
 | 账号不可用 | "账号不存在"、"用户不存在"、"该账号已被封禁"、"账号已注销" | `ACCOUNT_UNAVAILABLE` |
-| 解析失败 | 页面可访问（HTTP 200）但 `RENDER_DATA` 缺失/无法识别用户结构 | `PARSER_FAILED` |
+| 解析失败 | 页面可访问（HTTP 200）但缺少 SSR 数据（抖音升级为 JS 虚拟机 `_$jsvmprt` 动态渲染，未嵌入静态 `RENDER_DATA` / `_SSR_DATA`） | `PARSER_FAILED` |
 | 无公开内容 | 账号存在但作品列表为空且非受限 | `NO_PUBLIC_CONTENT` |
 
-行为约束：
+行为约束与解决决策树：
 - 命中上述任一**任务级**限制时，**立即停止**对应请求；`check_access` 返回
   `{"accessible": False, "reason": <说明>, "stop_reason": <上表值>}`；
   `collect_*` 抛 `DouyinError(stop_reason)` 由上层按 `exceptions.md` 决策表降级。
-- **绝不**刷新、重试破解、伪造签名或模拟浏览器绕过；`urllib` 直连拿到的风控页即如实认定。
+- **抖音 JS 虚拟机/动态渲染排查与传输层降级**：
+  1. 当直连 HTTP 仅获取到 `_$jsvmprt` 打桩页抛出 `PARSER_FAILED` 时，此为抖音前端架构向客户端动态渲染演进的正常表现。
+  2. 可使用 `--browser-fallback` 参数开启传输层降级，利用环境中的 Headless Chrome 加载完整 DOM 树再试。
+  3. 后续 `normalize.py` / `analyze.py` / `render_report.py` 即使在 0 条数据时亦会完成无缝降级，输出完整的标准产物与 Dashboard，绝不中断崩溃。
+- **绝不**刷新、重试破解、伪造签名或模拟浏览器绕过；`urllib` 直连或浏览器传输层拿到的风控页即如实认定。
 - 单条内容级问题（`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE`）只下钻到内容级，
   **不**写入任务级 `stop_reason`（见 `exceptions.md` §1.1）。
 

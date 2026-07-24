@@ -144,11 +144,13 @@ def fmt_metric(v) -> str:
         return "—"
     try:
         f = float(v)
-    except (ValueError, TypeError):
+        if math.isnan(f) or math.isinf(f):
+            return "—"
+        if f == int(f):
+            return f"{int(f):,}"
+        return f"{f:,.2f}"
+    except (ValueError, TypeError, OverflowError):
         return str(v)
-    if f == int(f):
-        return f"{int(f):,}"
-    return f"{f:,.2f}"
 
 
 # 链接 ---------------------------------------------------------------------
@@ -211,7 +213,10 @@ def svg_timeline_scatter(posts: list, width: int = 600, height: int = 240) -> st
         if not pa or v is None:
             continue
         try:
-            dt = datetime.fromisoformat(str(pa))
+            s_pa = str(pa)
+            if s_pa.endswith("Z"):
+                s_pa = s_pa[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s_pa)
         except (ValueError, TypeError):
             continue
         pts.append((dt, float(v), p.get("post_id") or "?"))
@@ -691,12 +696,8 @@ def build_metrics_dashboard(analysis) -> tuple[str, str]:
     return md, html
 
 
-def _render_perf_group(group) -> tuple[str, str]:
-    """高/低表现组渲染。group 可能是 'INSUFFICIENT_SAMPLE' 或 post 列表。"""
-    if isinstance(group, str):
-        return (f"样本不足（{group}），本模块不输出高低表现组，不补造结论。",
-                f'<p class="note warn">样本不足（{h_esc(group)}），本模块不输出高低表现组，不补造结论。</p>')
-    if not group:
+def _render_perf_group(group, main_metric: str | None = None) -> tuple[str, str]:
+    if not isinstance(group, list) or not group:
         return EMPTY_MD, EMPTY_HTML
 
     headers = ["内容", "发布时间", "主指标值", "相对中位表现", "播放互动率"]

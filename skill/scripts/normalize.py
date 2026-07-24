@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import math
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
@@ -114,7 +115,7 @@ def parse_metric(raw: Any) -> tuple[Optional[int], str]:
     if isinstance(raw, int):
         return (raw, "visible")
     if isinstance(raw, float):
-        if raw != raw:  # NaN
+        if math.isnan(raw) or math.isinf(raw):
             return (None, "hidden")
         return (int(raw), "visible")
 
@@ -128,8 +129,8 @@ def parse_metric(raw: Any) -> tuple[Optional[int], str]:
     elif "万" in s:
         mult = 10_000
 
-    # 仅保留数字与小数点，去掉 "赞" / "播放" / 逗号 / 空格等噪声。
-    cleaned = re.sub(r"[^0-9.]", "", s)
+    # 仅保留数字、小数点与负号，去掉 "赞" / "播放" / 逗号 / 空格等噪声。
+    cleaned = re.sub(r"[^0-9.-]", "", s)
     if cleaned in ("", "."):
         # 字段出现但无可用数字 → 部分可见。
         return (None, "partial")
@@ -213,8 +214,9 @@ def parse_time(raw: Any) -> Optional[datetime]:
     m = re.match(r"^(\d{1,2})月(\d{1,2})日", s)
     if m:
         try:
+            ref_year = datetime.now(CST).year
             return datetime(
-                datetime.now().year, int(m.group(1)), int(m.group(2)), tzinfo=CST
+                ref_year, int(m.group(1)), int(m.group(2)), tzinfo=CST
             )
         except ValueError:
             pass
@@ -462,7 +464,11 @@ def write_csv(rows: list[dict], path: str) -> None:
                 elif value is None:
                     out[col] = ""
                 elif col == "duration_seconds":
-                    out[col] = int(value)
+                    try:
+                        fval = float(value)
+                        out[col] = "" if math.isnan(fval) or math.isinf(fval) else int(fval)
+                    except (ValueError, TypeError, OverflowError):
+                        out[col] = ""
                 else:
                     out[col] = value
             writer.writerow(out)
