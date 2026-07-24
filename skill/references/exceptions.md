@@ -21,6 +21,7 @@
 | 单条内容失效 | PARTIAL | POST_UNAVAILABLE | 是 | 是 |
 | 字段缺失 | 状态不变 | null | 是 | 是 |
 | 页面解析失败 | PARTIAL/FAILED | PARSER_FAILED | 是 | 视情况 |
+| 授权 OpenAPI 返回错误 | PARTIAL/FAILED | OPENAPI_ERROR | 是 | 否 |
 | 评论不可见 | 状态不变 | COMMENTS_UNAVAILABLE | 是 | 是 |
 
 ### 1.1 内容级原因与任务级原因的区分
@@ -46,6 +47,21 @@
 4. **错误指标不得写入正常数据。** 失败、受限或缺失的字段一律写 `null` 或记录于错误日志，禁止用 `0`、占位值或猜测值污染正常数据行。
 5. **报告必须说明停止位置、成功数量和失败数量。** 采集质量报告（`collection-report.md`）须明确写出：任务在哪一步/哪一条停止、成功采集多少条、失败或受限多少条。
 6. **不向用户提供规避平台保护措施的方法。** 分析报告仅呈现公开数据与客观结论，不得包含任何绕过登录、验证、频控或访问限制的指引。
+
+### 2.1 抖音授权 OpenAPI 的边界与失败语义
+
+- 独立授权命令只读取环境变量 `DOUYIN_OPENAPI_ACCESS_TOKEN`，且只采集该令牌所有者；缺少
+  令牌或输出目录已经存在时，在任何网络请求和目录写入前以参数错误退出。
+- OpenAPI 在第一页前失败时写标准空内容产物并标记 `FAILED / OPENAPI_ERROR`；已完成至少
+  一页后失败时保留既有作品并标记 `PARTIAL / OPENAPI_ERROR`。
+- `--all` 遇游标不前进或连续两页没有新增作品时，以 `PARSER_FAILED` 停止；有既有作品为
+  `PARTIAL`，否则为 `FAILED`。只有官方 `/video/list/` 明确返回 `has_more=false` 才能
+  `COMPLETED`。
+- 错误描述只写固定的清洗后分类，不写服务端描述、请求头、查询字符串、响应正文或底层
+  transport 异常。令牌不得进入 URL、文件、stdout/stderr、异常链或诊断字段。
+- 不实现 OAuth 登录、授权码交换、token refresh 或第三方账号查询。由于当前官方参数表
+  未给出可在本仓库无凭据验证的完整样例，在线令牌验证保持 **pending**；仅集中构造已确认
+  的 `cursor` / `count` 查询参数，不推测其他接口或参数。
 
 ---
 

@@ -41,7 +41,7 @@ workspace/<platform>-<account>-<date>/
 | task_id | string | 否 | 是 | bilibili-123-20260723-a1b2 | 任务唯一标识；现有 CLI 未生成时可省略或为 `null` |
 | platform | enum | 是 | 否 | bilibili | bilibili / douyin / weibo |
 | profile_url | string | 是 | 否 | https://space.bilibili.com/123 | 账号主页 URL |
-| requested_limit | integer | 是 | 否 | 30 | 默认 30，最大 100 |
+| requested_limit | integer | 是 | 是 | 30 | 默认 30，最大 100；授权 OpenAPI `--all` 为 `null` |
 | date_from | datetime | 否 | 是 | 2026-06-01T00:00:00+08:00 | 采集起始时间 |
 | date_to | datetime | 否 | 是 | 2026-07-23T23:59:59+08:00 | 采集结束时间 |
 | analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | 用户填写的分析目的 |
@@ -61,7 +61,7 @@ workspace/<platform>-<account>-<date>/
 | snapshot_crawled_at_precision | enum | 否 | 是 | datetime | `datetime` / `date` / `unknown` |
 | snapshot_age_label | string | 否 | 是 | 约 6 个月前 | 仅保存来源明确显示的相对年龄，不反推精确日期 |
 | evidence_is_exhaustive | boolean | 否 | 是 | false | 索引降级固定为 `false` |
-| collection_coverage | object | 否 | 否 | 见 §3.1 | 公开列表采集的覆盖与完备性账本；普通限量采集可为 `{}` |
+| collection_coverage | object | 否 | 否 | 见 §3.1 / §3.2 | 公开页面或授权 OpenAPI 列表采集的覆盖与完备性账本；普通限量采集可为 `{}` |
 
 约束：
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
@@ -97,6 +97,26 @@ workspace/<platform>-<account>-<date>/
 `COMPLETED`；此时 `observed_post_count>0`、`range_filter_applied=true`、
 `range_match_count=0`、`range_no_match=true`，不得与账号原始公开作品列表为空混淆。
 
+### 3.2 授权账号 OpenAPI 覆盖账本
+
+独立命令 `collect_douyin_authorized.py` 只采集 `DOUYIN_OPENAPI_ACCESS_TOKEN` 所有者：
+`POST https://open.douyin.com/oauth/userinfo/` 确认该授权账号，随后
+`GET https://open.douyin.com/video/list/` 仅以集中构造的 `cursor` / `count` 查询分页。
+它不是任意公开账号主页采集的降级路径，也不支持按第三方账号查找。
+
+授权账本复用 `requested_all`、`is_exhaustive`、`terminal_page_observed`、
+`observed_page_count`、`observed_post_count`、`repeated_cursor_count` 和
+`stop_condition`，并可记录 `zero_new_page_count`。`stop_condition` 还可为
+`repeated_zero_new_page`、`limit` 或 `api_error`。仅官方列表响应明确返回
+`has_more=false` 时允许 `is_exhaustive=true`；请求数量上限、游标不前进、连续两页没有
+新增作品或 API 错误均非穷尽停止。`--all` 只有在上述官方末页证据存在时才能
+`COMPLETED`；中途失败必须保留此前已经验证并映射的作品。
+
+访问令牌只允许从 `DOUYIN_OPENAPI_ACCESS_TOKEN` 读取并放入 `access-token` 请求头，禁止
+出现在 URL、产物、标准输出/错误、异常或诊断信息中。账本同样不得保存请求头、原始游标、
+查询字符串、响应正文或令牌。当前官方在线令牌的端到端验证仍为 **pending**；在完成该
+验证前，不增加 OAuth 登录、授权码交换、刷新令牌或未文档化内部接口。
+
 ## 4. Profile 数据结构
 
 账号层公开信息。只保存页面公开字段及采集快照，不可见字段为 `null`。
@@ -121,6 +141,11 @@ workspace/<platform>-<account>-<date>/
   索引降级还可保存 `collection_source`、`source_url`、`snapshot_crawled_at`
 - 微博：`following`（关注数）
 - B站：一般为空对象 `{}`
+
+授权 OpenAPI 例外：接口只确认令牌所有者的 `open_id`，不得把 `open_id` 猜测成公开主页
+路径。此模式的 `profile_url` 使用固定的官方 userinfo 端点作为来源证据，
+`platform_metrics.authorization_source=douyin_openapi_token_owner`；它不表示可访问的公众
+主页 URL。
 
 全局账号字段映射：
 
@@ -155,6 +180,7 @@ workspace/<platform>-<account>-<date>/
 约束：
 - `is_pinned` / `is_repost` / `is_promoted` 仅保留明确公开的 `true` / `false`；未知时为 `null`，不得把缺失证据断言为 `false` 或 `true`。
 - 默认分析排除置顶、转载、投放内容（见 `analysis-rules.md`），但须在数据中保留标记。
+- 授权 OpenAPI 作品必须使用响应提供的、经校验属于抖音的 HTTPS `share_url`；持久化前移除查询参数与片段。缺失或非法 `video_id` / `share_url` 视为响应错误，不得合成证据 URL。
 
 ### 5.1 抖音搜索索引降级的显式例外
 
@@ -279,6 +305,7 @@ workspace/<platform>-<account>-<date>/
 - `UNSUPPORTED_PLATFORM`：URL 不属于支持平台
 - `ADAPTER_UNAVAILABLE`：平台适配器未实现或未启用（如微博 P1 未启用）
 - `INTERNAL_ERROR`：脚本 / 内部错误
+- `OPENAPI_ERROR`：授权抖音 OpenAPI 请求或响应错误；令牌与服务端原始描述不得进入产物
 - 单条内容级中止原因（用于错误日志，不写入 `task_status`）：`POST_UNAVAILABLE`、`COMMENTS_UNAVAILABLE`
 
 ### 9.3 collection_status（单条内容采集状态）
