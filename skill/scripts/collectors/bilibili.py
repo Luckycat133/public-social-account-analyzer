@@ -949,8 +949,8 @@ def _build_profile_raw(mid, card, stat, acc) -> dict:
         "platform_metrics": {},
         "collected_at": _now_iso(),
         "field_visibility": {
-            "followers": "public" if followers is not None else "hidden",
-            "post_count": "public" if post_count is not None else "hidden",
+            "followers": "visible" if followers is not None else "hidden",
+            "post_count": "visible" if post_count is not None else "hidden",
         },
     }
 

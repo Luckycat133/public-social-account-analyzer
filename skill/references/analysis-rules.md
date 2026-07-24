@@ -69,6 +69,18 @@
 
 > 注意：发布间隔、最长断更时间应使用统一时间单位（建议小时或天，并在报告中标注单位）。
 
+### 季节性 / 学期检测
+
+在发布节奏基础上，额外输出按自然月聚合的分布与两项强度指标，用于识别"寒暑假 / 学期"型更新模式（不推断因果）：
+
+| 指标 | 定义 / 公式 |
+|---|---|
+| 月度分布 `monthly_distribution` | 按 `published_at` 的年份-月份（`YYYY-MM`）分组计数，输出全量键值对 |
+| 季节性强度 `seasonal_intensity` | 月发布量的变异系数 = `std(月发布量) / mean(月发布量)`（无偏标准差）；仅 1 个月样本时为 `null`；`≥1.0` 强波动、`≥0.5` 中等、`<0.5` 弱 |
+| 假期月份占比 `break_month_share` | 寒暑假月份（1/2/7/8 月）发布量 ÷ 总发布量；用于提示"假期驱动"内容节奏 |
+
+> 说明：`seasonal_intensity` 与 `break_month_share` 仅作描述性统计；样本月份过少（如 <3 个月）时结论置信度有限，报告需标注。
+
 ---
 
 ## 4. 公开表现指标
@@ -128,6 +140,33 @@ PRD 明确要求互动率必须分别命名、分母透明，**禁止统一称�
 - 分子固定为 `likes + comments + favorites + shares`（微博 `favorites` 为 `null` 时按 `0` 计入分子，但须在分母透明说明中标注）；
 - `coins`、`danmaku` 不计入上述互动率分子（B站特有，可单列分析，但不得并入统一互动率）；
 - 对这两个比率同样计算 §4 开头规定的 `count / median / p25 / p75 / minimum / maximum / missing_rate`。
+
+### 互动率扩展（深度认可率 / 社群讨论率）
+
+为刻画"B站式"深度互动，在二分法基础上扩展两项独立指标，**分母同样透明、独立命名、禁止混用**（混合口径）：
+
+- **深度认可率** `deep_approval_rate`：
+  ```
+  deep_approval_rate = (coins + favorites) / views
+  ```
+  - 仅在 `views` 非 `null` 且非 `0` 时计算；分母固定为 `views`（投币 / 收藏相对播放的深度认可强度）。
+
+- **社群讨论率** `community_discussion_rate`：
+  ```
+  community_discussion_rate = (comments + danmaku) / views
+  ```
+  - 仅在 `views` 非 `null` 且非 `0` 时计算；分母固定为 `views`（评论 + 弹幕相对播放的讨论密度）。
+
+两项均独立计算 `count / median / p25 / p75 / minimum / maximum / missing_rate`，并在报告中与二分法互动率并列、分列呈现（分母透明说明见 `analysis.json` 的 `engagement.denominator_note`）。
+
+### IQR 散布比（指标离散度）
+
+对每项可见指标，除 §4 开头统计量外，额外输出分位离散度：
+
+- `iqr`：`p75 - p25`（四分位距）；
+- `dispersion_ratio`：散布比 = `iqr / median`；当 `median` 为 `0` 或 `null` 时该值置 `null`（不得以 0 为分母）。
+
+> 用途：`dispersion_ratio` 用于区分"稳定输出型"与"爆款波动型"账号，仅作描述性对比，不构成因果。
 
 ---
 

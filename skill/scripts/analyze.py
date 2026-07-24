@@ -358,8 +358,8 @@ def compute_metric_summary(valid: List[Dict[str, Any]], profile: Dict[str, Any])
     for m in METRIC_FIELDS:
         vals = [float(p[m]) for p in valid if p[m] is not None]
         st = metric_stats(vals, valid_count)
-        # visible:field_visibility 标注 visible/partial,或实际存在非 null 值
-        st["visible"] = bool(fv.get(m) in ("visible", "partial") or len(vals) > 0)
+        # visible:field_visibility 标注 visible/partial/public(向下兼容),或实际存在非 null 值
+        st["visible"] = bool(fv.get(m) in ("visible", "partial", "public") or len(vals) > 0)
         summary[m] = st
     return summary
 
@@ -396,21 +396,21 @@ def follower_based_ratio(p: Dict[str, Any], followers: Optional[int]) -> Optiona
 
 
 def deep_approval_rate(p: Dict[str, Any]) -> Optional[float]:
-    """三分法·深度认可率 = (coins + favorites) / likes（§4 扩展）。
+    """四分法·深度认可率 = (coins + favorites) / views（§4 扩展，混合口径）。
 
-    分母 likes 为 null/0 时该条置 null（禁止用 0 做分母）。
+    分母 views 为 null/0 时该条置 null（分母透明，禁止用 0 做分母）。
     coins/favorites 为 null 时按 0 计入分子（单条互动指标，非统一互动率分子）。
     """
-    likes = p["likes"]
-    if likes is None or likes == 0:
+    views = p["views"]
+    if views is None or views == 0:
         return None
     coins = p["coins"] or 0
     favorites = p["favorites"] or 0
-    return (coins + favorites) / likes
+    return (coins + favorites) / views
 
 
 def community_discussion_rate(p: Dict[str, Any]) -> Optional[float]:
-    """三分法·社群讨论率 = (comments + danmaku) / views（§4 扩展）。
+    """四分法·社群讨论率 = (comments + danmaku) / views（§4 扩展）。
 
     分母 views 为 null/0 时该条置 null（分母透明）。
     comments/danmaku 为 null 时按 0 计入分子。
@@ -453,7 +453,7 @@ def compute_engagement(valid: List[Dict[str, Any]], profile: Dict[str, Any]) -> 
             "四分法互动率，分母各自透明、禁止混用(§4):"
             "view_based 以 views 为分母=(likes+comments+favorites+shares)/views;"
             "follower_based 以 followers 为分母=(likes+comments+favorites+shares)/followers;"
-            "deep_approval_rate 以 likes 为分母=(coins+favorites)/likes;"
+            "deep_approval_rate 以 views 为分母=(coins+favorites)/views;"
             "community_discussion_rate 以 views 为分母=(comments+danmaku)/views。"
             "统一互动率分子 = likes+comments+favorites+shares;coins/danmaku 不并入统一互动率。"
         ),
@@ -807,11 +807,11 @@ def generate_report(
     L.append(f"- followers={engagement['followers']}")
     L.append(f"- count={fb['count']}, median={fb['median']}, p25={fb['p25']}, p75={fb['p75']},"
              f" min={fb['minimum']}, max={fb['maximum']}, missing_rate={fb['missing_rate']}")
-    # 三分法扩展（§4）
+    # 四分法扩展（§4）
     deep = engagement.get("deep_approval_rate") or {}
     disc = engagement.get("community_discussion_rate") or {}
     if deep:
-        L.append("### 深度认可率 (coins+favorites)/likes")
+        L.append("### 深度认可率 (coins+favorites)/views")
         L.append(f"- count={deep['count']}, median={deep['median']}, p25={deep['p25']}, p75={deep['p75']},"
                  f" min={deep['minimum']}, max={deep['maximum']}, missing_rate={deep['missing_rate']}")
     if disc:
@@ -959,11 +959,13 @@ def main() -> None:
     post_records = build_post_records(valid, medians, followers)
 
     # §5 LLM 协同分类（确定性 + 语义标注 标准接口）
+    taxonomy_applied = False
     if args.llm_tax_results:
         try:
             with open(args.llm_tax_results, encoding="utf-8") as fh:
                 tax_results = json.load(fh)
             post_records = apply_taxonomy(post_records, tax_results)
+            taxonomy_applied = True
             print(f"OK: 已回填 LLM 分类结果 -> {args.llm_tax_results}", file=sys.stderr)
         except (OSError, json.JSONDecodeError) as e:
             print(f"WARN: 应用 LLM 分类结果失败({e})，保留 pending-model 占位", file=sys.stderr)
@@ -993,8 +995,14 @@ def main() -> None:
         ),
     }
 
-    if args.with_llm_tax:
-        meta["llm_taxonomy"] = {"enabled": True, "prompt_file": "taxonomy-prompt.md"}
+    if args.with_llm_tax or taxonomy_applied:
+        meta["llm_taxonomy"] = {
+            "enabled": True,
+            "prompt_file": "taxonomy-prompt.md" if args.with_llm_tax else None,
+            "backfilled": taxonomy_applied,
+        }
+        if taxonomy_applied:
+            meta["classification_status"] = "llm-1"
 
     analysis = {
         "meta": meta,

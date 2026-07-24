@@ -5,7 +5,10 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
+    if os.path.isdir(_d) and _d not in sys.path:
+        sys.path.insert(0, _d)
 
 from collectors.browser_backend import (  # noqa: E402
     BrowserError,

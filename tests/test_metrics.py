@@ -128,3 +128,84 @@ def test_relative_performance_skips_when_median_null():
     medians["views"] = None  # 中位数缺失
     recs = analyze.build_post_records(posts, medians, followers=1000)
     assert recs[0]["relative_performance"]["views"] is None
+
+
+# ---------------------------------------------------------------------------
+# P0 深度互动率拆分（混合口径）：深度认可率=(投币+收藏)/播放，社群讨论率=(评论+弹幕)/播放
+# ---------------------------------------------------------------------------
+def test_deep_approval_rate_normal():
+    # (coins + favorites) / views = (10 + 5) / 100 = 0.15
+    post = {"views": 100, "coins": 10, "favorites": 5, "likes": 50}
+    assert analyze.deep_approval_rate(post) == 0.15
+
+
+def test_deep_approval_rate_uses_views_denominator_not_likes():
+    # 混合口径：分母应为 views，而非 likes
+    post = {"views": 100, "coins": 10, "favorites": 5, "likes": 1000}
+    assert analyze.deep_approval_rate(post) == 0.15
+
+
+def test_deep_approval_rate_zero_views_is_null():
+    post = {"views": 0, "coins": 10, "favorites": 5, "likes": 50}
+    assert analyze.deep_approval_rate(post) is None
+
+
+def test_deep_approval_rate_null_views_is_null():
+    post = {"views": None, "coins": 10, "favorites": 5, "likes": 50}
+    assert analyze.deep_approval_rate(post) is None
+
+
+def test_deep_approval_rate_null_components_treated_as_zero():
+    # coins/favorites 为 null 时按 0 计入分子
+    post = {"views": 100, "coins": None, "favorites": None, "likes": 50}
+    assert analyze.deep_approval_rate(post) == 0.0
+
+
+def test_community_discussion_rate_normal():
+    # (comments + danmaku) / views = (5 + 3) / 100 = 0.08
+    post = {"views": 100, "comments": 5, "danmaku": 3}
+    assert analyze.community_discussion_rate(post) == 0.08
+
+
+def test_community_discussion_rate_no_danmaku():
+    post = {"views": 100, "comments": 5, "danmaku": 0}
+    assert analyze.community_discussion_rate(post) == 0.05
+
+
+def test_community_discussion_rate_zero_views_is_null():
+    post = {"views": 0, "comments": 5, "danmaku": 3}
+    assert analyze.community_discussion_rate(post) is None
+
+
+def test_community_discussion_rate_null_components_treated_as_zero():
+    post = {"views": 100, "comments": None, "danmaku": None}
+    assert analyze.community_discussion_rate(post) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# P0 四分位距散布比（IQR Ratio）：metric_stats 计算 iqr 与 dispersion_ratio
+# ---------------------------------------------------------------------------
+def test_metric_stats_iqr_and_dispersion():
+    vals = [1, 2, 3, 4, 5]
+    st = analyze.metric_stats(vals, valid_count=5)
+    assert st["median"] == 3.0
+    assert st["p25"] == 2.0
+    assert st["p75"] == 4.0
+    assert st["iqr"] == 2.0
+    # dispersion_ratio = iqr / median = 2/3，保留 4 位小数
+    assert st["dispersion_ratio"] == round(2 / 3, 4)
+
+
+def test_metric_stats_iqr_zero_median_dispersion_null():
+    # median 为 0 时 dispersion_ratio 置 null（禁止用 0 做分母）
+    vals = [0, 0, 0, 0, 0]
+    st = analyze.metric_stats(vals, valid_count=5)
+    assert st["median"] == 0.0
+    assert st["iqr"] == 0.0
+    assert st["dispersion_ratio"] is None
+
+
+def test_metric_stats_empty_dispersion_null():
+    st = analyze.metric_stats([], valid_count=5)
+    assert st["iqr"] is None
+    assert st["dispersion_ratio"] is None

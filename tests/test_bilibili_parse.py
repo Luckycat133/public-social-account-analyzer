@@ -7,7 +7,10 @@ import os
 import sys
 import json
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
+    if os.path.isdir(_d) and _d not in sys.path:
+        sys.path.insert(0, _d)
 
 from collectors.bilibili import (  # noqa: E402
     BilibiliCollector,
@@ -107,7 +110,7 @@ def test_profile():
     check("verified=False(官方type=-1)", prof["verified"] is False)
     check("level=6(acc.level 优先)", prof["level"] == 6)
     check("platform_metrics 为 {} (B站不进 total_likes)", prof["platform_metrics"] == {})
-    check("field_visibility followers public", prof["field_visibility"]["followers"] == "public")
+    check("field_visibility followers visible", prof["field_visibility"]["followers"] == "visible")
     # 兜底路径：stat=None 且 acc=None 时 level 取 card.level_info.current_level
     raw2 = _build_profile_raw("411581408", CARD, None, None)
     prof2 = c.normalize_profile(raw2)

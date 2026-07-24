@@ -224,3 +224,74 @@ def test_single_post_failure_continues():
     assert [p["post_id"] for p in missing] == ["2"]
     # 内容级原因不出现在任务级——此处仅验证被隔离，不抛异常中断
     assert len(valid) + len(missing) == len(collected)
+
+
+def test_vis_count_field_visibility():
+    from collect import _vis_count
+
+    # visible & partial
+    prof1 = {"field_visibility": {"followers": "visible", "post_count": "partial", "bio": "hidden"}}
+    assert _vis_count(prof1) == 2
+
+    # public (downward compatibility)
+    prof2 = {"field_visibility": {"followers": "public", "post_count": "hidden"}}
+    assert _vis_count(prof2) == 1
+
+    # empty
+    assert _vis_count({}) == 0
+
+
+# ---------------------------------------------------------------------------
+# P0 B站标签接口接线：collect_tags 已接入 collect_post_list 全量流程，
+# API 标签合并进 base.hashtags（离线 FakeSession 验证真实调用路径）。
+# ---------------------------------------------------------------------------
+def test_collect_tags_wired_into_full_flow(monkeypatch):
+    from collectors import bilibili as B
+
+    calls: dict = {}
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        def ensure_buvid(self):
+            pass
+
+        def collect_pinned(self, mid):
+            return None
+
+        def discover_medialist(self, mid, limit):
+            return [{
+                "bv_id": "BVtags",
+                "title": "标题 #t1",
+                "intro": "简介 #t2 #t3",
+                "pubtime": 1700000000,
+                "duration": "03:20",
+                "copy_right": 1,
+                "tid": 17,
+                "upper": {"mid": "1", "name": "up"},
+                "cnt_info": {"play": 100, "thumb_up": 10, "coin": 5,
+                             "collect": 3, "reply": 2, "danmaku": 4, "share": 1},
+            }]
+
+        def get_json(self, path, params=None, wbi=False, retry=0):
+            raise B.BilibiliError("ACCESS_RESTRICTED", "unexpected network call")
+
+        def collect_tags(self, bvid):
+            calls["bvid"] = bvid
+            calls["count"] = calls.get("count", 0) + 1
+            return ["apiTagA", "apiTagB"]
+
+    monkeypatch.setattr(B, "Session", FakeSession)
+    c = B.BilibiliCollector()
+    posts = c.collect_post_list("https://space.bilibili.com/1", limit=1)
+    assert len(posts) == 1
+    # collect_tags 被实际调用，且针对该 bvid
+    assert calls.get("bvid") == "BVtags"
+    assert calls.get("count") == 1
+    tags = posts[0].get("hashtags") or []
+    # API 标签已合并进 hashtags
+    assert "apiTagA" in tags and "apiTagB" in tags
+    # 文本提取标签也保留
+    assert "t1" in tags and "t2" in tags and "t3" in tags
+

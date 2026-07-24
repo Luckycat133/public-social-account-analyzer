@@ -38,6 +38,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 3. **数据采集**
    - 调用平台适配器（`scripts/collect.py`），采集账号资料与内容列表。
    - 记录 `source_url` 与 `collected_at`。置顶内容单独标记，不混入近期原创列表。
+   - **增量续采**：加 `--resume --out <既有任务目录>` 时，读取既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧），避免重复打满配额；`--since` 可显式指定续采起点。必须配合 `--out`。
    - 平台降级逻辑与数据映射详见 [references/platform-bilibili.md](references/platform-bilibili.md) / [platform-douyin.md](references/platform-douyin.md) / [platform-weibo.md](references/platform-weibo.md)。
 
 4. **数据归一化**
@@ -46,6 +47,11 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 5. **指标计算与模型分类**
    - 调用 `scripts/analyze.py`，使用确定性算法计算中位数/分位数分布（详见 [references/analysis-rules.md](references/analysis-rules.md)）。
+   - **互动率四分法（分母透明、独立命名）**：`view_based_engagement_rate`（互动/播放）、`follower_based_engagement_ratio`（互动/粉丝）、`deep_approval_rate`（(投币+收藏)/播放）、`community_discussion_rate`（(评论+弹幕)/播放），均独立计算 `count/median/p25/p75/min/max/missing_rate`。
+   - **IQR 散布比**：对每项可见指标额外输出 `iqr = p75-p25` 与 `dispersion_ratio = iqr/median`（`median` 为 0/`null` 时置 `null`）。
+   - **季节性 / 学期检测**：输出 `monthly_distribution`、`seasonal_intensity`（月变异系数）、`break_month_share`（寒暑假月份 1/2/7/8 占比）。
+   - **内联可视化**：报告含发布时间-播放量散点图、高低表现雷达图、字段覆盖率徽章、发布时段分布（24 小时）柱状图（零依赖 SVG/HTML）。
+   - **LLM 协同分类（可选）**：`--with-llm-tax` 生成分类 Prompt 模版（`taxonomy-prompt.md`），交给外部 LLM 打标后用 `--llm-tax-results` 回填；回填内容经枚举校验后写入 `analysis.json`，`classification_version = llm-1`。不得在无 `--llm-tax-results` 时臆造分类。
    - 标注主题、形式、钩子类型等策略维度，提取高低表现对比特征。
 
 6. **报告渲染**
@@ -85,9 +91,9 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 必须通过项目脚本执行真实采集与分析，严禁虚构或推测数据：
 
-1. `python scripts/collect.py "<url>" --limit <N>`
+1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--browser-fallback] [--resume --out <dir> [--since ...]]`
 2. `python scripts/normalize.py --input <workspace_path>`
-3. `python scripts/analyze.py --input <workspace_path> ...`
+3. `python scripts/analyze.py --input <workspace_path> [--with-llm-tax | --llm-tax-results <file>]`
 4. `python scripts/render_report.py --input <workspace_path>`
 
 在数据有效样本少于 15 条时，标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现归纳。

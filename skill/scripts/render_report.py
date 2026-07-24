@@ -255,6 +255,52 @@ def svg_timeline_scatter(posts: list, width: int = 600, height: int = 240) -> st
     )
 
 
+def svg_post_hour_distribution(hour_distribution: dict, width: int = 600, height: int = 200) -> str:
+    """发布时段分布（24 小时柱状图）。hour_distribution: {str(hour): count}。
+
+    仅含任意计数的小时；零依赖内联 SVG。
+    """
+    hours = []
+    for h in range(24):
+        try:
+            hours.append(int(hour_distribution.get(str(h), 0)))
+        except (TypeError, ValueError):
+            hours.append(0)
+    total = sum(hours)
+    if total == 0:
+        return ""
+    maxv = max(hours) or 1
+    pad_l, pad_r, pad_top, pad_bottom = 28, 10, 10, 22
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_top - pad_bottom
+    slot = plot_w / 24
+    bar_gap = 2
+    bar_w = slot - bar_gap
+    bars = []
+    for h in range(24):
+        c = hours[h]
+        bh = (c / maxv) * plot_h if maxv else 0
+        x = pad_l + h * slot + bar_gap / 2
+        y = pad_top + (plot_h - bh)
+        bars.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{bh:.1f}" '
+            f'rx="1" fill="#3b82f6" fill-opacity="0.85">'
+            f'<title>{h:02d}:00 — {c} 条</title></rect>'
+        )
+    axis = (f'<line x1="{pad_l}" y1="{pad_top + plot_h}" x2="{width - pad_r}" '
+            f'y2="{pad_top + plot_h}" stroke="#cbd5e1"/>')
+    ticks = []
+    for h in range(0, 25, 3):
+        x = pad_l + h * slot
+        ticks.append(f'<text x="{x:.1f}" y="{height - 8}" font-size="9" fill="#64748b" '
+                     f'text-anchor="middle">{h}</text>')
+    return (
+        f'<svg viewBox="0 0 {width} {height}" width="100%" preserveAspectRatio="xMidYMid meet" '
+        f'role="img" aria-label="发布时段分布（24 小时柱状图，共 {total} 条）">'
+        f'{axis}{"".join(bars)}{"".join(ticks)}</svg>'
+    )
+
+
 def svg_high_low_radar(high, low, metrics: list, width: int = 340, height: int = 300) -> str:
     """高低表现雷达图：高/低组在各指标上的中位数对比（按列最大值归一化）。"""
     def _collect(group):
@@ -448,6 +494,8 @@ def build_quality_summary(analysis) -> tuple[str, str]:
         fc_html = [[Raw(h_esc(METRIC_LABELS.get(k, k))), Raw(h_esc(fmt_pct(v)))]
                    for k, v in fc.items()]
         cov_html = '<p class="note">指标字段覆盖率</p>' + html_table(["指标", "覆盖率"], fc_html)
+        # 字段覆盖率徽章（阈值着色，零依赖）
+        cov_html += svg_coverage_badges(fc)
     else:
         cov_html = ""
 
@@ -558,6 +606,24 @@ def build_publish_cadence(analysis) -> tuple[str, str]:
                         f'<span style="width:28px;text-align:right;">{cnt}</span></div>')
         html += '<p class="note">星期分布</p>' + "".join(bars)
 
+    # 发布时段分布（24 小时柱状图，内联 SVG，零依赖）
+    hr = cad.get("hour_distribution", {}) or {}
+    if hr:
+        hour_svg = svg_post_hour_distribution(hr)
+        if hour_svg:
+            html += '<p class="note">发布时段分布（24 小时）</p>' + hour_svg
+        total_hr = sum(int(v) for v in hr.values())
+        if total_hr:
+            ranked = sorted(((int(k), int(v)) for k, v in hr.items()), key=lambda x: -x[1])
+            top = ranked[:3]
+            # 白天(6-22) / 深夜(22-6) 占比，作为可解释提示
+            daytime = sum(int(v) for k, v in hr.items() if 6 <= int(k) < 22)
+            nighttime = total_hr - daytime
+            md += "\n\n**发布时段分布（24 小时）**\n\n" + \
+                  "峰值时段：" + "、".join(f"{h:02d}:00（{c} 条）" for h, c in top) + "\n\n" + \
+                  f"- 白天(06:00–22:00)占比：{fmt_pct(daytime / total_hr)}，" + \
+                  f"深夜(22:00–06:00)占比：{fmt_pct(nighttime / total_hr)}"
+
     # 时间轴散点图（内联 SVG，零依赖）
     scatter = svg_timeline_scatter(analysis.get("posts") or [])
     if scatter:
@@ -591,41 +657,34 @@ def build_metrics_dashboard(analysis) -> tuple[str, str]:
     html = html_table(headers, [[Raw(h_esc(c)) if i == 0 else Raw(h_esc(c))
                                  for i, c in enumerate(r)] for r in rows]) if rows else EMPTY_HTML
 
-    # 互动率（分母透明，分开展示）
-    vber = eng.get("view_based_engagement_rate", {}) or {}
-    fber = eng.get("follower_based_engagement_ratio", {}) or {}
-    if vber or fber:
-        md += "\n\n**互动率（分母透明，分列呈现）**\n\n"
-        er_rows = []
-        if vber:
-            er_rows.append(["基于播放的互动率 (view_based)",
-                            fmt_int(vber.get("count")), fmt_pct(vber.get("median")),
-                            fmt_pct(vber.get("p25")), fmt_pct(vber.get("p75")),
-                            fmt_pct(vber.get("minimum")), fmt_pct(vber.get("maximum")),
-                            fmt_pct(vber.get("missing_rate"))])
-        if fber:
-            er_rows.append(["基于粉丝的互动比 (follower_based)",
-                            fmt_int(fber.get("count")), fmt_pct(fber.get("median")),
-                            fmt_pct(fber.get("p25")), fmt_pct(fber.get("p75")),
-                            fmt_pct(fber.get("minimum")), fmt_pct(fber.get("maximum")),
-                            fmt_pct(fber.get("missing_rate"))])
-        md += md_table(["互动指标", "count", "median", "p25", "p75", "min", "max", "缺失率"], er_rows)
+    # 互动率（分母透明，四分法分列呈现）
+    er_defs = [
+        ("view_based_engagement_rate", "基于播放的互动率 (view_based)"),
+        ("follower_based_engagement_ratio", "基于粉丝的互动比 (follower_based)"),
+        ("deep_approval_rate", "深度认可率 (coins+favorites)/views"),
+        ("community_discussion_rate", "社群讨论率 (comments+danmaku)/views"),
+    ]
+    er_rows, er_html = [], []
+    for key, label in er_defs:
+        d = eng.get(key, {}) or {}
+        if not isinstance(d, dict) or not d.get("count"):
+            continue
+        er_rows.append([label, fmt_int(d.get("count")), fmt_pct(d.get("median")),
+                        fmt_pct(d.get("p25")), fmt_pct(d.get("p75")),
+                        fmt_pct(d.get("minimum")), fmt_pct(d.get("maximum")),
+                        fmt_pct(d.get("missing_rate"))])
+        er_html.append([Raw(h_esc(label)), Raw(h_esc(fmt_int(d.get("count")))),
+                        Raw(h_esc(fmt_pct(d.get("median")))), Raw(h_esc(fmt_pct(d.get("p25")))),
+                        Raw(h_esc(fmt_pct(d.get("p75")))), Raw(h_esc(fmt_pct(d.get("minimum")))),
+                        Raw(h_esc(fmt_pct(d.get("maximum")))), Raw(h_esc(fmt_pct(d.get("missing_rate"))))])
+    if er_rows:
+        md += "\n\n**互动率（分母透明，四分法分列呈现）**\n\n" + md_table(
+            ["互动指标", "count", "median", "p25", "p75", "min", "max", "缺失率"], er_rows)
         note = eng.get("denominator_note")
         if note:
             md += f"\n\n> 说明：{note}"
 
-        er_html = []
-        if vber:
-            er_html.append([Raw("基于播放的互动率"), Raw(h_esc(fmt_int(vber.get("count")))),
-                            Raw(h_esc(fmt_pct(vber.get("median")))), Raw(h_esc(fmt_pct(vber.get("p25")))),
-                            Raw(h_esc(fmt_pct(vber.get("p75")))), Raw(h_esc(fmt_pct(vber.get("minimum")))),
-                            Raw(h_esc(fmt_pct(vber.get("maximum")))), Raw(h_esc(fmt_pct(vber.get("missing_rate"))))])
-        if fber:
-            er_html.append([Raw("基于粉丝的互动比"), Raw(h_esc(fmt_int(fber.get("count")))),
-                            Raw(h_esc(fmt_pct(fber.get("median")))), Raw(h_esc(fmt_pct(fber.get("p25")))),
-                            Raw(h_esc(fmt_pct(fber.get("p75")))), Raw(h_esc(fmt_pct(fber.get("minimum")))),
-                            Raw(h_esc(fmt_pct(fber.get("maximum")))), Raw(h_esc(fmt_pct(fber.get("missing_rate"))))])
-        html += '<p class="note">互动率（分母透明，分列呈现）</p>' + html_table(
+        html += '<p class="note">互动率（分母透明，四分法分列呈现）</p>' + html_table(
             ["互动指标", "count", "median", "p25", "p75", "min", "max", "缺失率"], er_html)
         if note:
             html += f'<p class="note">{h_esc(note)}</p>'
@@ -676,8 +735,16 @@ _PERF_MAIN_METRIC = None  # 由 build_high/low 设置
 def build_high_performance(analysis) -> tuple[str, str]:
     global _PERF_MAIN_METRIC
     _PERF_MAIN_METRIC = (analysis.get("meta", {}) or {}).get("main_sort_metric")
-    group = analysis.get("high_performance")
-    return _render_perf_group(group)
+    high = analysis.get("high_performance")
+    low = analysis.get("low_performance")
+    md, html = _render_perf_group(high)
+    # 高低表现雷达图：对比两组在各指标上的均值形态（仅作形态对比，不构成因果）
+    radar = svg_high_low_radar(high, low, METRIC_FIELDS)
+    if radar:
+        md += ("\n\n**高低表现指标对比（雷达图）**\n\n"
+               "> 说明：以各组在各指标上的均值按列最大值归一化，仅作形态对比，不构成因果结论。")
+        html += '<p class="note">高低表现指标对比（雷达图）</p>' + radar
+    return md, html
 
 
 def build_low_performance(analysis) -> tuple[str, str]:

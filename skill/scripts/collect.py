@@ -111,8 +111,8 @@ def _pick(adapters: list[BaseCollector], url: str) -> BaseCollector | None:
 
 def _vis_count(profile: dict) -> int:
     vis = profile.get("field_visibility") or {}
-    # field_visibility 取值严格为 visible/hidden/partial(见 data-schema.md §8)
-    return sum(1 for v in vis.values() if v == "visible")
+    # field_visibility 取值规范为 visible/hidden/partial(见 data-schema.md §8)，做对 "public" 的向下兼容兜底
+    return sum(1 for v in vis.values() if v in ("visible", "partial", "public"))
 
 
 def _write_csv(posts: list[dict], path: str) -> None:
@@ -205,6 +205,79 @@ def _filter_by_date(
     return out
 
 
+def _post_key(p: dict) -> str:
+    """增量去重主键:post_id > bvid > post_url。"""
+    return str(p.get("post_id") or p.get("bvid") or p.get("post_url") or "")
+
+
+def _load_existing_posts(ws: str) -> list[dict]:
+    """读取既有采集产物中的帖子,用于增量续采去重。
+
+    优先 source/posts.jsonl(无损 JSONL),回退 normalized-posts.csv(字段可能经 CSV 字符串化)。
+    """
+    src = os.path.join(ws, "source", "posts.jsonl")
+    posts: list[dict] = []
+    if os.path.isfile(src):
+        with open(src, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    posts.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    if not posts:
+        csvp = os.path.join(ws, "normalized-posts.csv")
+        if os.path.isfile(csvp):
+            with open(csvp, encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f):
+                    posts.append({k: v for k, v in row.items()})
+    return posts
+
+
+def _latest_published_at(posts: list[dict]) -> str | None:
+    """返回既有帖子中最新(published_at 最大)的 ISO 字符串;无法解析则 None。"""
+
+    def parse(iso):
+        if not iso:
+            return None
+        try:
+            return datetime.fromisoformat(iso)
+        except (ValueError, TypeError):
+            return None
+
+    best, best_dt = None, None
+    for p in posts:
+        dt = parse(p.get("published_at"))
+        if dt is not None and (best_dt is None or dt > best_dt):
+            best_dt, best = dt, p.get("published_at")
+    return best
+
+
+def _merge_incremental(existing: list[dict], new: list[dict]) -> tuple[list[dict], int]:
+    """合并既有与新抓取的帖子,按 post_id/bvid 去重(新抓取覆盖旧)。
+
+    返回 (合并后列表, 新增条数)。无主键的帖子直接追加,不参与去重。
+    """
+    merged_map: dict[str, dict] = {}
+    for p in existing:
+        k = _post_key(p)
+        if k:
+            merged_map[k] = p
+    kept_no_key: list[dict] = []
+    new_count = 0
+    for p in new:
+        k = _post_key(p)
+        if not k:
+            kept_no_key.append(p)
+            continue
+        if k not in merged_map:
+            new_count += 1
+        merged_map[k] = p  # 新覆盖旧(指标可能更新)
+    return list(merged_map.values()) + kept_no_key, new_count
+
+
 def _write_task_json(
     ws: str,
     *,
@@ -218,6 +291,9 @@ def _write_task_json(
     stop_reason: str | None,
     collected_count: int,
     collected_at: str,
+    incremental: bool = False,
+    existing_count: int = 0,
+    new_count: int = 0,
 ) -> None:
     """落盘 task.json(任务状态与停止原因,见 SKILL.md「任务状态与停止原因」)。"""
     payload = {
@@ -231,6 +307,9 @@ def _write_task_json(
         "stop_reason": stop_reason,
         "collected_count": collected_count,
         "collected_at": collected_at,
+        "incremental": incremental,
+        "existing_count": existing_count,
+        "new_count": new_count,
     }
     with open(os.path.join(ws, "task.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -246,6 +325,9 @@ def _write_report(
     task_status: str,
     stop_reason: str | None,
     error_log: list[dict],
+    incremental: bool = False,
+    existing_count: int = 0,
+    new_count: int = 0,
 ) -> None:
     """生成采集质量报告(含停止位置、成功/失败数量、字段覆盖率、错误日志)。"""
     lines = [
@@ -258,8 +340,10 @@ def _write_report(
         f"- 停止原因 stop_reason: {stop_reason if stop_reason else 'null'}",
         f"- 资料 field_visibility: {profile.get('field_visibility')}",
         f"- 内容条数: {len(posts)}",
-        "",
     ]
+    if incremental:
+        lines.append(f"- 增量续采: 是(既有 {existing_count} 条 + 新增 {new_count} 条)")
+    lines.append("")
     if posts:
         for fld in ("views", "likes", "comments", "favorites", "shares", "coins", "danmaku"):
             visible = sum(1 for p in posts if p.get(fld) is not None)
@@ -284,6 +368,8 @@ def run(
     include_comments: bool = False,
     date_from: str | None = None,
     date_to: str | None = None,
+    resume: bool = False,
+    since: str | None = None,
 ) -> int:
     adapters = _load_adapters()
     if not adapters:
@@ -296,12 +382,6 @@ def run(
         return 2
 
     platform = adapter.platform
-    # 规范化日期范围(中国平台默认 +08:00)
-    date_from_iso = _parse_date(date_from)
-    date_to_iso = _default_date_to(date_to)
-    date_range = None
-    if date_from_iso or date_to_iso:
-        date_range = (date_from_iso, date_to_iso)
 
     m = re.search(r"(\d+)", url)
     account = m.group(1) if m else "account"
@@ -312,6 +392,32 @@ def run(
     src = os.path.join(ws, "source")
     os.makedirs(src, exist_ok=True)
 
+    # 增量续采:基于既有 posts 的 published_at / bvid 去重续采,避免重复打满配额
+    existing_posts: list[dict] = []
+    resume_mode = bool(resume)
+    if resume_mode:
+        if not out_dir:
+            print("[FAILED] 增量续采(--resume)必须配合 --out 指定既有任务目录", file=sys.stderr)
+            return 2
+        existing_posts = _load_existing_posts(ws)
+        if not existing_posts:
+            print(f"[warn] --resume 指定目录无既有帖子数据,退化为全量采集: {ws}", file=sys.stderr)
+            resume_mode = False
+
+    # 规范化日期范围(中国平台默认 +08:00);增量续采时起点取既有最新发布时间
+    user_from = _parse_date(date_from)
+    user_to = _default_date_to(date_to)
+    if resume_mode:
+        latest = _latest_published_at(existing_posts)
+        since_iso = _parse_date(since) if since else _parse_date(latest)
+        if since_iso and (user_from is None or since_iso > user_from):
+            user_from = since_iso
+    date_from_iso = user_from
+    date_to_iso = user_to
+    date_range = None
+    if date_from_iso or date_to_iso:
+        date_range = (date_from_iso, date_to_iso)
+
     # 执行前回显:平台、采集范围、最大数量、评论开关(见 SKILL.md §1「任务创建」)
     echo_parts = [
         f"platform={platform}",
@@ -319,6 +425,8 @@ def run(
         f"date_range={date_range if date_range else 'unset'}",
         f"include_comments={include_comments}",
     ]
+    if resume_mode:
+        echo_parts.append(f"resume=on existing={len(existing_posts)} since={date_from_iso}")
     print(f"[echo] " + " ".join(echo_parts))
 
     collected_at = datetime.now(_BEIJING).isoformat()
@@ -393,8 +501,13 @@ def run(
     # (见 SKILL.md §1「采集数量和日期范围同时存在时,取两者共同限定的结果」)
     if posts and (date_from_iso or date_to_iso):
         posts = _filter_by_date(posts, date_from_iso, date_to_iso)
-    if posts:
+    if posts and not resume_mode:
         posts = posts[:limit]
+
+    # 增量续采:合并既有帖子,按 post_id/bvid 去重(新抓取的覆盖旧的)
+    new_count = 0
+    if resume_mode and existing_posts:
+        posts, new_count = _merge_incremental(existing_posts, posts)
 
     # 3) 资料(失败不阻塞已采内容)
     try:
@@ -444,10 +557,12 @@ def run(
         date_from=date_from_iso, date_to=date_to_iso,
         include_comments=include_comments, task_status=task_status,
         stop_reason=stop_reason, collected_count=len(posts), collected_at=collected_at,
+        incremental=resume_mode, existing_count=len(existing_posts), new_count=new_count,
     )
     _write_report(
         adapter, url, profile, posts, ws,
         task_status=task_status, stop_reason=stop_reason, error_log=error_log,
+        incremental=resume_mode, existing_count=len(existing_posts), new_count=new_count,
     )
 
     print(
@@ -470,6 +585,15 @@ def main() -> None:
     ap.add_argument("--date-from", default=None, help="起始日期 YYYY-MM-DD 或 ISO 8601(北京时间)")
     ap.add_argument("--date-to", default=None, help="结束日期 YYYY-MM-DD 或 ISO 8601(北京时间)")
     ap.add_argument(
+        "--resume", action="store_true",
+        help="增量续采:读取 --out 目录既有 source/posts.jsonl,以其最新 published_at 为起点续采,"
+             "按 post_id/bvid 去重合并(新覆盖旧)。必须配合 --out 指定既有任务目录。",
+    )
+    ap.add_argument(
+        "--since", default=None,
+        help="增量续采起点(YYYY-MM-DD 或 ISO 8601,北京时间);覆盖从既有数据推导的起始时间。仅与 --resume 联用。",
+    )
+    ap.add_argument(
         "--browser-fallback", action="store_true",
         help="当主路径(直连)因出口 IP 被平台 WAF 封禁而失败时，启用浏览器降级"
              "(经运行环境的真实网络出口再试一次)。需本机/运行环境装有 Chrome/Chromium/Edge。"
@@ -490,6 +614,7 @@ def main() -> None:
         raise SystemExit(2)
     raise SystemExit(run(
         args.url, limit, args.out, args.comments, date_from_iso, date_to_iso,
+        resume=args.resume, since=args.since,
     ))
 
 

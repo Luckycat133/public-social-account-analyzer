@@ -40,6 +40,9 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 - `--limit INT`：最大采集条数。默认值：`30`，上限：`100`。
 - `--out PATH`：指定输出目录路径。默认自动生成为 `workspace/<platform>-<account>-<date>/`。
 - `--comments`：开启评论采样（默认关闭）。
+- `--date-from / --date-to`：采集时间范围（YYYY-MM-DD 或 ISO 8601，北京时间）。两者与 `--limit` 共同限定结果。
+- `--resume`：增量续采。读取 `--out` 指定目录既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧）。**必须配合 `--out`**，否则直接报错退出。
+- `--since`：增量续采起点（YYYY-MM-DD 或 ISO 8601），覆盖由既有数据推导的起始时间；仅与 `--resume` 联用。
 - `--browser-fallback`：当主机出口 IP 被目标平台 WAF 拦截时，开启传输层浏览器重试机制。
 
 ---
@@ -72,6 +75,10 @@ python skill/scripts/analyze.py --input <WORKSPACE_DIR> --platform <PLATFORM> [O
 #### 可选选项：
 - `--analysis-goal STRING`：分析目标描述（如："分析选题与发布节奏"）。
 - `--requested-limit INT`：请求的采集条数限制。
+- `--with-llm-tax`：生成分类 Prompt 模版 `taxonomy-prompt.md`（主题/形式/漏斗/钩子四维度），交给外部 LLM 对 `normalized-posts.csv` 打标。
+- `--llm-tax-results PATH`：回填经外部 LLM 打标的结果文件（JSON/CSV），经枚举校验后写入 `analysis.json`，`classification_version = llm-1`。未提供时不臆造分类。
+
+> 分析脚本默认输出四分法互动率（含 `deep_approval_rate`、`community_discussion_rate`）、IQR 散布比与季节性/学期检测指标，详见 `skill/references/analysis-rules.md`。
 
 ---
 

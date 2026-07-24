@@ -383,7 +383,7 @@ def compute_metric_coverage(rows: list[dict]) -> dict:
         missing = 0
         for row in rows:
             status = row.get("_visibility", {}).get(field, "hidden")
-            if status == "visible":
+            if status in ("visible", "public"):
                 present += 1
             elif status == "partial":
                 partial += 1
