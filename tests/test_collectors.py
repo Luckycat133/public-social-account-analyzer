@@ -245,6 +245,10 @@ def test_vis_count_field_visibility():
     assert _vis_count({}) == 0
 
 
+def test_base_collector_collection_coverage_defaults_to_empty():
+    assert FakeLoginWallCollector().get_collection_coverage() == {}
+
+
 # ---------------------------------------------------------------------------
 # P0 B站标签接口接线：collect_tags 已接入 collect_post_list 全量流程，
 # API 标签合并进 base.hashtags（离线 FakeSession 验证真实调用路径）。

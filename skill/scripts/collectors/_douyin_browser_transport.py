@@ -8,6 +8,7 @@ DOM-card fields.  It never constructs signed requests or handles challenges.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import time
@@ -25,7 +26,7 @@ from .browser_backend import (
 )
 
 
-_ITEM_LIST_KEYS = {"aweme_list", "awemeList", "post_list"}
+_ITEM_LIST_KEYS = ("aweme_list", "awemeList", "post_list")
 _ITEM_DETAIL_KEYS = {"aweme_detail", "awemeDetail"}
 _POST_PATH = re.compile(r"/(?P<kind>video|note)/(?P<post_id>\d+)")
 _POST_ID = re.compile(r"\d+")
@@ -78,6 +79,16 @@ class DouyinBrowserResult:
     restriction: Optional[str] = None
     diagnostic_code: Optional[str] = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    coverage: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PostPageObservation:
+    """Ephemeral metadata from a dictionary that owns a recognized post list."""
+
+    items: list[dict[str, Any]] = field(default_factory=list)
+    has_more: Optional[bool] = None
+    cursor: Any = None
 
 
 def detect_restriction(text: str) -> Optional[str]:
@@ -196,6 +207,77 @@ def extract_aweme_items(data: Any) -> list[dict[str, Any]]:
         else:
             _merge_missing(unique[item_id], item)
     return list(unique.values())
+
+
+def extract_post_page_observations(data: Any) -> list[PostPageObservation]:
+    """Extract list-scoped pagination facts without treating nested flags as proof."""
+    observations: list[PostPageObservation] = []
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 10:
+            return
+        if isinstance(value, dict):
+            owned_lists = [
+                value[key]
+                for key in _ITEM_LIST_KEYS
+                if key in value and isinstance(value[key], list)
+            ]
+            for raw_items in owned_lists:
+                unique: dict[str, dict[str, Any]] = {}
+                for raw_item in raw_items:
+                    if not isinstance(raw_item, dict) or not _is_trustworthy_aweme(raw_item):
+                        continue
+                    item_id = _item_id(raw_item)
+                    if item_id is None:
+                        continue
+                    if item_id not in unique:
+                        unique[item_id] = copy.deepcopy(raw_item)
+                    else:
+                        _merge_missing(unique[item_id], raw_item)
+                if raw_items and not unique:
+                    continue
+                has_more = value.get("has_more")
+                if not isinstance(has_more, bool):
+                    has_more = None
+                cursor = next(
+                    (
+                        value[key]
+                        for key in ("max_cursor", "cursor", "min_cursor")
+                        if key in value and value[key] is not None
+                    ),
+                    None,
+                )
+                observations.append(
+                    PostPageObservation(
+                        items=list(unique.values()),
+                        has_more=has_more,
+                        cursor=cursor,
+                    )
+                )
+            for child in value.values():
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, depth + 1)
+
+    walk(data)
+    return observations
+
+
+def _cursor_fingerprint(cursor: Any) -> Optional[str]:
+    """Return an irreversible correlation token for an in-memory cursor value."""
+    if cursor is None:
+        return None
+    try:
+        encoded = json.dumps(
+            cursor,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        encoded = repr(type(cursor).__name__).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def _is_allowed_host(host: str) -> bool:
@@ -392,14 +474,19 @@ def collect_account_page(
     *,
     limit: int,
     date_range: Any = None,
+    all_posts: bool = False,
+    max_seconds: Optional[float] = None,
+    max_scrolls: Optional[int] = None,
     session_factory=BrowserSession,
     monotonic=time.monotonic,
     sleep=time.sleep,
 ) -> DouyinBrowserResult:
     """Observe public response bodies within hard time/scroll/idle boundaries."""
-    requested = max(1, min(int(limit), 100))
+    requested = max(1, min(int(limit), 10_000 if all_posts else 100))
+    seconds_budget = float(max_seconds) if max_seconds is not None else MAX_SECONDS
+    scroll_budget = int(max_scrolls) if max_scrolls is not None else MAX_SCROLLS
     started = monotonic()
-    deadline = started + MAX_SECONDS
+    deadline = started + seconds_budget
     lower_bound = _date_lower_bound(date_range)
     items: dict[str, dict[str, Any]] = {}
     pending: dict[str, dict[str, Any]] = {}
@@ -416,6 +503,10 @@ def collect_account_page(
     in_range_since_boundary = False
     past_lower_bound_since_boundary = False
     date_confirmation_pending = False
+    observed_page_count = 0
+    terminal_page_observed = False
+    cursor_fingerprints: set[str] = set()
+    repeated_cursor_count = 0
 
     def remaining() -> float:
         return max(0.0, deadline - monotonic())
@@ -439,6 +530,8 @@ def collect_account_page(
 
     def read_pending(request_id: str, session: BrowserSession) -> bool:
         """Try once; temporary body errors leave the candidate retryable."""
+        nonlocal observed_page_count, terminal_page_observed
+        nonlocal repeated_cursor_count, stop_condition
         candidate = pending.get(request_id)
         if candidate is None:
             return False
@@ -464,6 +557,22 @@ def collect_account_page(
         if safe_url not in safe_paths:
             safe_paths.append(safe_url)
         before = len(items)
+        observations = extract_post_page_observations(decoded)
+        if observations:
+            for observation in observations:
+                observed_page_count += 1
+                fingerprint = _cursor_fingerprint(observation.cursor)
+                if fingerprint is not None:
+                    if fingerprint in cursor_fingerprints:
+                        repeated_cursor_count += 1
+                        if all_posts and observation.has_more is not False:
+                            stop_condition = "repeated_cursor"
+                    else:
+                        cursor_fingerprints.add(fingerprint)
+                if observation.has_more is False:
+                    terminal_page_observed = True
+                    if all_posts:
+                        stop_condition = "terminal_page"
         for item in extract_aweme_items(decoded):
             store_network_item(item)
         return len(items) > before
@@ -489,7 +598,11 @@ def collect_account_page(
                 timeout=min(30.0, budget),
             )
 
-        while not deadline_expired and len(items) < requested:
+        while (
+            not deadline_expired
+            and len(items) < requested
+            and not (all_posts and stop_condition in {"terminal_page", "repeated_cursor"})
+        ):
             budget = remaining()
             if budget <= 0:
                 deadline_expired = True
@@ -525,6 +638,9 @@ def collect_account_page(
             if event is None:
                 flush_pending(session)
 
+            if all_posts and stop_condition in {"terminal_page", "repeated_cursor"}:
+                break
+
             budget = remaining()
             if budget <= 0:
                 deadline_expired = True
@@ -558,7 +674,7 @@ def collect_account_page(
             elif past_lower_bound_since_boundary:
                 date_confirmation_pending = True
 
-            if scrolls >= MAX_SCROLLS:
+            if scrolls >= scroll_budget:
                 stop_condition = "max_scrolls"
                 break
 
@@ -609,12 +725,22 @@ def collect_account_page(
         if dom_count
         else "network"
     )
+    item_budget_truncated = len(items) > requested
     if restriction:
         stop_condition = restriction
+    elif all_posts and terminal_page_observed and not item_budget_truncated:
+        stop_condition = "terminal_page"
     elif len(final) >= requested:
-        stop_condition = "limit"
+        stop_condition = "max_items" if all_posts else "limit"
     elif stop_condition is None:
         stop_condition = "timeout" if deadline_expired else "idle"
+    is_exhaustive = bool(
+        all_posts
+        and terminal_page_observed
+        and not item_budget_truncated
+        and not restriction
+        and stop_condition == "terminal_page"
+    )
     return DouyinBrowserResult(
         aweme_items=final,
         source=source,
@@ -631,5 +757,15 @@ def collect_account_page(
                 if cleanup_state.get("cleanup_codes")
                 else {}
             ),
+        },
+        coverage={
+            "requested_all": bool(all_posts),
+            "is_exhaustive": is_exhaustive,
+            "terminal_page_observed": terminal_page_observed,
+            "observed_page_count": observed_page_count,
+            "observed_post_count": len(final),
+            "cursor_fingerprint_count": len(cursor_fingerprints),
+            "repeated_cursor_count": repeated_cursor_count,
+            "stop_condition": stop_condition,
         },
     )

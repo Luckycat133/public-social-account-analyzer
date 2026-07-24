@@ -41,6 +41,10 @@ class BaseCollector(ABC):
         """Optional public comment sampling."""
         return []
 
+    def get_collection_coverage(self) -> dict[str, Any]:
+        """Return sanitized task-level coverage metadata, when available."""
+        return {}
+
     def _canon_status(self, cs) -> str:
         """Canonicalize a raw collection_status string to the unified enum.
 

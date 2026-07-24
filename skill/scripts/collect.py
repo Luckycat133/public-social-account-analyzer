@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -286,6 +287,38 @@ def _merge_incremental(existing: list[dict], new: list[dict]) -> tuple[list[dict
     return list(merged_map.values()) + kept_no_key, new_count
 
 
+def _sanitize_collection_coverage(value) -> dict:
+    """Enforce the persisted coverage allowlist at the workspace boundary."""
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for key in ("requested_all", "is_exhaustive", "terminal_page_observed"):
+        if isinstance(value.get(key), bool):
+            clean[key] = value[key]
+    for key in (
+        "observed_page_count",
+        "observed_post_count",
+        "cursor_fingerprint_count",
+        "repeated_cursor_count",
+    ):
+        field_value = value.get(key)
+        if isinstance(field_value, int) and not isinstance(field_value, bool):
+            clean[key] = max(0, field_value)
+    stop_condition = value.get("stop_condition")
+    if stop_condition in {
+        "terminal_page",
+        "idle",
+        "timeout",
+        "repeated_cursor",
+        "max_items",
+        "max_scrolls",
+        "date_lower_bound",
+        "limit",
+    }:
+        clean["stop_condition"] = stop_condition
+    return clean
+
+
 def _write_task_json(
     ws: str,
     *,
@@ -302,6 +335,7 @@ def _write_task_json(
     incremental: bool = False,
     existing_count: int = 0,
     new_count: int = 0,
+    collection_coverage: dict | None = None,
 ) -> None:
     """落盘 task.json(任务状态与停止原因,见 SKILL.md「任务状态与停止原因」)。"""
     payload = {
@@ -318,6 +352,7 @@ def _write_task_json(
         "incremental": incremental,
         "existing_count": existing_count,
         "new_count": new_count,
+        "collection_coverage": _sanitize_collection_coverage(collection_coverage),
     }
     with open(os.path.join(ws, "task.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -336,6 +371,7 @@ def _write_report(
     incremental: bool = False,
     existing_count: int = 0,
     new_count: int = 0,
+    collection_coverage: dict | None = None,
 ) -> None:
     """生成采集质量报告(含停止位置、成功/失败数量、字段覆盖率、错误日志)。"""
     lines = [
@@ -351,6 +387,16 @@ def _write_report(
     ]
     if incremental:
         lines.append(f"- 增量续采: 是(既有 {existing_count} 条 + 新增 {new_count} 条)")
+    lines.append("")
+    lines.append("## 覆盖与完备性")
+    lines.append("")
+    coverage = _sanitize_collection_coverage(collection_coverage)
+    if coverage:
+        for key, value in coverage.items():
+            rendered = json.dumps(value, ensure_ascii=False)
+            lines.append(f"- {key}: {rendered}")
+    else:
+        lines.append("- collection_coverage: {}")
     lines.append("")
     if posts:
         for fld in ("views", "likes", "comments", "favorites", "shares", "coins", "danmaku"):
@@ -386,6 +432,10 @@ def run(
     resume: bool = False,
     since: str | None = None,
     browser_fallback: bool | None = None,
+    collect_all: bool = False,
+    max_items: int = 10_000,
+    max_seconds: float = 1800.0,
+    max_scrolls: int = 2000,
 ) -> int:
     env_value = os.environ.get("SOCIAL_BROWSER_FALLBACK")
     douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
@@ -412,6 +462,19 @@ def run(
         return 2
 
     platform = adapter.platform
+    if collect_all and platform != "douyin":
+        print("[FAILED] --all 目前仅支持抖音账号主页", file=sys.stderr)
+        return 2
+    if collect_all and (
+        max_items <= 0
+        or not math.isfinite(max_seconds)
+        or max_seconds <= 0
+        or max_scrolls <= 0
+    ):
+        print("[FAILED] --all 安全预算必须为正数", file=sys.stderr)
+        return 2
+
+    requested_count = max_items if collect_all else limit
 
     m = re.search(r"(\d+)", url)
     account = m.group(1) if m else "account"
@@ -451,10 +514,16 @@ def run(
     # 执行前回显:平台、采集范围、最大数量、评论开关(见 SKILL.md §1「任务创建」)
     echo_parts = [
         f"platform={platform}",
-        f"limit={limit}",
+        f"limit={requested_count}",
         f"date_range={date_range if date_range else 'unset'}",
         f"include_comments={include_comments}",
     ]
+    if collect_all:
+        echo_parts.extend([
+            "all=on",
+            f"max_seconds={max_seconds}",
+            f"max_scrolls={max_scrolls}",
+        ])
     if resume_mode:
         echo_parts.append(f"resume=on existing={len(existing_posts)} since={date_from_iso}")
     print(f"[echo] " + " ".join(echo_parts))
@@ -465,6 +534,7 @@ def run(
     error_log: list[dict] = []
     posts: list = []
     profile: dict = {}
+    collection_coverage: dict = {}
 
     # 1) check_access:不绕过任何保护(见 base.py / exceptions.md §2)
     try:
@@ -474,15 +544,16 @@ def run(
             # check_access 阶段尚无已采数据,所有受阻场景统一 FAILED(见 exceptions.md §1)
             task_status = "FAILED"
             _write_task_json(
-                ws, platform=platform, profile_url=url, requested_limit=limit,
+                ws, platform=platform, profile_url=url, requested_limit=requested_count,
                 date_from=date_from_iso, date_to=date_to_iso,
                 include_comments=include_comments, task_status=task_status,
                 stop_reason=stop_reason, collected_count=0, collected_at=collected_at,
+                collection_coverage=collection_coverage,
             )
             _write_report(
                 adapter, url, profile or {}, posts, ws,
                 task_status=task_status, stop_reason=stop_reason,
-                error_log=[{
+                collection_coverage=collection_coverage, error_log=[{
                     "url": url, "stage": "check_access",
                     "error_code": stop_reason,
                     "message": access.get("reason", "访问受限"),
@@ -496,15 +567,16 @@ def run(
         stop_reason = _stop_reason_from_exc(e)
         task_status = "FAILED"
         _write_task_json(
-            ws, platform=platform, profile_url=url, requested_limit=limit,
+            ws, platform=platform, profile_url=url, requested_limit=requested_count,
             date_from=date_from_iso, date_to=date_to_iso,
             include_comments=include_comments, task_status=task_status,
             stop_reason=stop_reason, collected_count=0, collected_at=collected_at,
+            collection_coverage=collection_coverage,
         )
         _write_report(
             adapter, url, profile, posts, ws,
             task_status=task_status, stop_reason=stop_reason,
-            error_log=[{
+            collection_coverage=collection_coverage, error_log=[{
                 "url": url, "stage": "check_access",
                 "error_code": stop_reason, "message": str(e),
                 "occurred_at": collected_at, "retryable": False,
@@ -515,11 +587,20 @@ def run(
 
     # 2) 内容列表(先于资料,便于回填;失败不阻断资料写入)
     try:
-        posts = adapter.collect_post_list(url, limit=limit, date_range=date_range)
+        if collect_all:
+            posts = adapter.collect_all_post_list(
+                url,
+                date_range=date_range,
+                max_items=max_items,
+                max_seconds=max_seconds,
+                max_scrolls=max_scrolls,
+            )
+        else:
+            posts = adapter.collect_post_list(url, limit=limit, date_range=date_range)
     except Exception as e:
         partial_posts = getattr(e, "partial_posts", None)
         if isinstance(partial_posts, list):
-            posts = partial_posts[:limit]
+            posts = partial_posts[:requested_count]
         diagnostic_code = getattr(e, "diagnostic_code", None)
         stop_reason = _stop_reason_from_exc(e)
         # 登录/验证/频控/解析失败 → PARTIAL(已有数据保留)或 FAILED(无已采数据)
@@ -533,13 +614,19 @@ def run(
             entry["diagnostic_code"] = diagnostic_code
         error_log.append(entry)
         print(f"[warn] 内容列表采集异常 stop_reason={stop_reason}: {e}", file=sys.stderr)
+    try:
+        collection_coverage = _sanitize_collection_coverage(
+            adapter.get_collection_coverage()
+        )
+    except Exception:
+        collection_coverage = {}
 
     # limit 与 date_range 的交集:适配器可能仅应用其一,此处再做一次本地交集过滤
     # (见 SKILL.md §1「采集数量和日期范围同时存在时,取两者共同限定的结果」)
     if posts and (date_from_iso or date_to_iso):
         posts = _filter_by_date(posts, date_from_iso, date_to_iso)
     if posts and not resume_mode:
-        posts = posts[:limit]
+        posts = posts[:requested_count]
 
     # 增量续采:合并既有帖子,按 post_id/bvid 去重(新抓取的覆盖旧的)
     new_count = 0
@@ -590,16 +677,18 @@ def run(
         task_status = "PARTIAL" if posts else "FAILED"
 
     _write_task_json(
-        ws, platform=platform, profile_url=url, requested_limit=limit,
+        ws, platform=platform, profile_url=url, requested_limit=requested_count,
         date_from=date_from_iso, date_to=date_to_iso,
         include_comments=include_comments, task_status=task_status,
         stop_reason=stop_reason, collected_count=len(posts), collected_at=collected_at,
         incremental=resume_mode, existing_count=len(existing_posts), new_count=new_count,
+        collection_coverage=collection_coverage,
     )
     _write_report(
         adapter, url, profile, posts, ws,
         task_status=task_status, stop_reason=stop_reason, error_log=error_log,
         incremental=resume_mode, existing_count=len(existing_posts), new_count=new_count,
+        collection_coverage=collection_coverage,
     )
 
     print(
@@ -615,6 +704,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="公开社交媒体账号采集")
     ap.add_argument("url", help="账号主页 URL,如 https://space.bilibili.com/123")
     ap.add_argument("--limit", type=int, default=30, help="采集条数(默认30,最大100)")
+    ap.add_argument("--all", dest="collect_all", action="store_true", help="采集抖音公开作品直到明确末页")
+    ap.add_argument("--max-items", type=int, default=10_000, help="--all 最大保留作品数(默认10000)")
+    ap.add_argument("--max-seconds", type=float, default=1800.0, help="--all 最长秒数(默认1800)")
+    ap.add_argument("--max-scrolls", type=int, default=2000, help="--all 最大滚动次数(默认2000)")
     ap.add_argument(
         "--out", default=None, help="输出目录(默认 workspace/<platform>-<account>-<date>/)"
     )
@@ -650,9 +743,17 @@ def main() -> None:
     if args.date_to and not date_to_iso:
         print(f"[FAILED] --date-to 无法解析: {args.date_to}", file=sys.stderr)
         raise SystemExit(2)
+    if args.max_items <= 0:
+        ap.error("--max-items 必须为正数")
+    if not math.isfinite(args.max_seconds) or args.max_seconds <= 0:
+        ap.error("--max-seconds 必须为正数")
+    if args.max_scrolls <= 0:
+        ap.error("--max-scrolls 必须为正数")
     raise SystemExit(run(
         args.url, limit, args.out, args.comments, date_from_iso, date_to_iso,
         resume=args.resume, since=args.since, browser_fallback=args.browser_fallback,
+        collect_all=args.collect_all, max_items=args.max_items,
+        max_seconds=args.max_seconds, max_scrolls=args.max_scrolls,
     ))
 
 

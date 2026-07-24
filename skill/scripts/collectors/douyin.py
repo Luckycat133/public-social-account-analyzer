@@ -25,6 +25,7 @@ CDP 客户端驱动独立临时浏览器，观察页面公开响应并读取可�
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 import urllib.error
@@ -214,6 +215,7 @@ class DouyinCollector(BaseCollector):
             browser_collect = collect_account_page
         self.browser_fallback = bool(browser_fallback)
         self._browser_collect = browser_collect
+        self._collection_coverage: dict[str, Any] = {}
 
     # -- 路由 ---------------------------------------------------------------
     def supports(self, url: str) -> bool:
@@ -494,6 +496,133 @@ class DouyinCollector(BaseCollector):
             )
         return posts
 
+    @staticmethod
+    def _sanitize_collection_coverage(value: Any) -> dict[str, Any]:
+        """Keep only the bounded coverage ledger; never retain transport secrets."""
+        if not isinstance(value, dict):
+            return {}
+        boolean_fields = (
+            "requested_all",
+            "is_exhaustive",
+            "terminal_page_observed",
+        )
+        count_fields = (
+            "observed_page_count",
+            "observed_post_count",
+            "cursor_fingerprint_count",
+            "repeated_cursor_count",
+        )
+        allowed_stops = {
+            "terminal_page",
+            "idle",
+            "timeout",
+            "repeated_cursor",
+            "max_items",
+            "max_scrolls",
+            "date_lower_bound",
+            "limit",
+        }
+        clean: dict[str, Any] = {}
+        for key in boolean_fields:
+            if isinstance(value.get(key), bool):
+                clean[key] = value[key]
+        for key in count_fields:
+            field_value = value.get(key)
+            if isinstance(field_value, int) and not isinstance(field_value, bool):
+                clean[key] = max(0, field_value)
+        stop_condition = value.get("stop_condition")
+        if stop_condition in allowed_stops:
+            clean["stop_condition"] = stop_condition
+        return clean
+
+    def get_collection_coverage(self) -> dict[str, Any]:
+        """Return a detached copy of the current sanitized coverage ledger."""
+        return dict(self._collection_coverage)
+
+    def collect_all_post_list(
+        self,
+        url: str,
+        date_range: tuple[str | None, str | None] | None = None,
+        max_items: int = 10_000,
+        max_seconds: float = 1800.0,
+        max_scrolls: int = 2000,
+    ) -> list[dict[str, Any]]:
+        """Passively observe public post-list pages until a verified terminal page."""
+        self._collection_coverage = {}
+        if not self.supports(url):
+            raise DouyinError(STOP_UNSUPPORTED, f"不支持的账号主页 URL: {url}")
+        if (
+            max_items <= 0
+            or not math.isfinite(max_seconds)
+            or max_seconds <= 0
+            or max_scrolls <= 0
+        ):
+            raise ValueError("全量采集安全预算必须为正数")
+        if not self.browser_fallback:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "全量作品采集需要启用公开浏览器传输层",
+                diagnostic_code="BROWSER_DISABLED",
+            )
+        try:
+            result = self._browser_collect(
+                url=url,
+                limit=max_items,
+                date_range=date_range,
+                all_posts=True,
+                max_seconds=max_seconds,
+                max_scrolls=max_scrolls,
+            )
+        except Exception as exc:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "抖音全量浏览器采集失败",
+                diagnostic_code="BROWSER_TRANSPORT_FAILED",
+            ) from exc
+
+        self._collection_coverage = self._sanitize_collection_coverage(
+            getattr(result, "coverage", {})
+        )
+        posts = [
+            self.normalize_post(
+                self._build_post_raw(
+                    url,
+                    item,
+                    source=str(
+                        item.get("_collection_source") or result.source or "network"
+                    ),
+                )
+            )
+            for item in result.aweme_items
+            if isinstance(item, dict)
+        ]
+        if date_range:
+            posts = self._filter_by_date(posts, date_range)
+        posts = posts[:max_items]
+
+        if result.restriction:
+            raise DouyinError(
+                result.restriction,
+                f"浏览器全量采集中止: {result.restriction}",
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if result.diagnostic_code:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "全量作品采集完成，但资源清理失败",
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if not self._collection_coverage.get("is_exhaustive", False):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "全量作品采集在安全边界停止，结果不具完备性",
+                partial_posts=posts,
+                diagnostic_code="ALL_POSTS_INCOMPLETE",
+            )
+        return posts
+
     def collect_post_list(
         self,
         url: str,
@@ -505,6 +634,7 @@ class DouyinCollector(BaseCollector):
         Best-effort：从 RENDER_DATA 抽取作品数组。尊重 limit 与 date_range。
         命中任务级限制抛 DouyinError；单条缺失不影响整体（保持 null，不臆造）。
         """
+        self._collection_coverage = {}
         if not self.supports(url):
             raise DouyinError(STOP_UNSUPPORTED, f"不支持的账号主页 URL: {url}")
         html = self._fetch(url)

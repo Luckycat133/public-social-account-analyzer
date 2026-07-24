@@ -196,6 +196,146 @@ def test_run_persists_partial_douyin_posts_before_marking_task_partial(monkeypat
     assert "must not be written" not in report
 
 
+class _AllDouyinAdapter(_PartialDouyinAdapter):
+    def __init__(self, stop_condition="terminal_page"):
+        self.stop_condition = stop_condition
+        self.standard_calls = []
+
+    def collect_post_list(self, url, limit=30, date_range=None):
+        self.standard_calls.append((url, limit, date_range))
+        return [{
+            "platform": "douyin",
+            "post_id": "7001",
+            "post_url": "https://www.douyin.com/video/7001",
+            "collection_status": "SUCCESS",
+        }]
+
+    def collect_all_post_list(
+        self,
+        url,
+        date_range=None,
+        max_items=10000,
+        max_seconds=1800.0,
+        max_scrolls=2000,
+    ):
+        from collectors.douyin import DouyinError
+
+        posts = self.collect_post_list(url, limit=max_items, date_range=date_range)
+        if self.stop_condition != "terminal_page":
+            raise DouyinError(
+                "PARSER_FAILED",
+                "全量作品采集在安全边界停止",
+                partial_posts=posts,
+                diagnostic_code="ALL_POSTS_INCOMPLETE",
+            )
+        return posts
+
+    def get_collection_coverage(self):
+        terminal = self.stop_condition == "terminal_page"
+        return {
+            "requested_all": True,
+            "is_exhaustive": terminal,
+            "terminal_page_observed": terminal,
+            "observed_page_count": 2,
+            "observed_post_count": 1,
+            "cursor_fingerprint_count": 1,
+            "repeated_cursor_count": 0,
+            "stop_condition": self.stop_condition,
+            "raw_cursor": "must-not-persist",
+        }
+
+
+def test_all_rejects_non_douyin_urls_before_writing(monkeypatch, tmp_path):
+    import collect
+
+    class OtherAdapter(_AllDouyinAdapter):
+        platform = "bilibili"
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [OtherAdapter()])
+
+    rc = collect.run(
+        "https://space.bilibili.com/1",
+        out_dir=str(tmp_path),
+        collect_all=True,
+    )
+
+    assert rc == 2
+    assert not (tmp_path / "task.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--max-items", "0"),
+        ("--max-seconds", "0"),
+        ("--max-seconds", "nan"),
+        ("--max-scrolls", "-1"),
+    ],
+)
+def test_all_cli_budgets_must_be_positive(monkeypatch, flag, value):
+    import collect
+
+    monkeypatch.setattr(collect, "run", lambda *args, **kwargs: pytest.fail("must reject"))
+    monkeypatch.setattr("sys.argv", ["collect.py", ACCOUNT_URL, "--all", flag, value])
+
+    with pytest.raises(SystemExit) as exc_info:
+        collect.main()
+
+    assert exc_info.value.code == 2
+
+
+def test_all_terminal_page_writes_exhaustive_coverage(monkeypatch, tmp_path):
+    import collect
+
+    adapter = _AllDouyinAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    rc = collect.run(ACCOUNT_URL, out_dir=str(tmp_path), collect_all=True)
+
+    assert rc == 0
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "COMPLETED"
+    assert task["collection_coverage"]["is_exhaustive"] is True
+    assert "raw_cursor" not in task["collection_coverage"]
+    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    assert "## 覆盖与完备性" in report
+    assert "is_exhaustive: true" in report
+    assert "must-not-persist" not in report
+
+
+@pytest.mark.parametrize(
+    "stop_condition",
+    ["idle", "timeout", "repeated_cursor", "max_items", "max_scrolls"],
+)
+def test_all_safety_stops_keep_posts_and_mark_task_partial(
+    monkeypatch, tmp_path, stop_condition
+):
+    import collect
+
+    adapter = _AllDouyinAdapter(stop_condition)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    rc = collect.run(ACCOUNT_URL, out_dir=str(tmp_path), collect_all=True)
+
+    assert rc == 0
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "PARTIAL"
+    assert task["collection_coverage"]["is_exhaustive"] is False
+    assert task["collection_coverage"]["stop_condition"] == stop_condition
+    rows = (tmp_path / "source" / "posts.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+
+
+def test_standard_limit_thirty_keeps_existing_collection_path(monkeypatch, tmp_path):
+    import collect
+
+    adapter = _AllDouyinAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(ACCOUNT_URL, limit=30, out_dir=str(tmp_path)) == 0
+    assert adapter.standard_calls == [(ACCOUNT_URL, 30, None)]
+
+
 def test_collect_post_list_keeps_ssr_fast_path_without_browser(monkeypatch):
     """A valid SSR document must not start the optional browser fallback."""
     from collectors.douyin import DouyinCollector
@@ -406,6 +546,64 @@ def test_extract_aweme_items_deduplicates_nested_lists():
 
     data = {"data": {"aweme_list": [AWEME, dict(AWEME)]}}
     assert [item["aweme_id"] for item in extract_aweme_items(data)] == ["7001"]
+
+
+def test_page_observation_accepts_metadata_only_from_post_list_owner():
+    from collectors._douyin_browser_transport import extract_post_page_observations
+
+    payload = {
+        "data": {
+            "aweme_list": [AWEME],
+            "has_more": False,
+            "max_cursor": "secret-cursor",
+        }
+    }
+
+    pages = extract_post_page_observations(payload)
+
+    assert [item["aweme_id"] for item in pages[0].items] == ["7001"]
+    assert pages[0].has_more is False
+    assert pages[0].cursor == "secret-cursor"
+    assert extract_post_page_observations({"feed": {"has_more": False}}) == []
+
+
+def test_page_observation_merges_duplicate_items_without_persisting_cursor():
+    from collectors._douyin_browser_transport import (
+        collect_account_page,
+        extract_post_page_observations,
+    )
+
+    listed = dict(AWEME, desc="列表文案", video={})
+    enriched = dict(AWEME, desc="不同文案", video={"duration": 9000})
+    payload = {
+        "first": {"aweme_list": [listed], "has_more": True, "cursor": "alpha"},
+        "second": {
+            "post_list": [enriched],
+            "has_more": False,
+            "max_cursor": "secret-cursor",
+        },
+    }
+
+    pages = extract_post_page_observations(payload)
+    assert len(pages) == 2
+    assert pages[1].items[0]["video"] == {"duration": 9000}
+
+    browser = FakeBrowser(
+        events=[_response_event("r1")],
+        bodies={"r1": json.dumps(payload)},
+    )
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
+    assert result.coverage["is_exhaustive"] is True
+    assert "cursor" not in result.coverage
+    assert "secret-cursor" not in json.dumps(result.coverage)
 
 
 def test_extract_aweme_items_rejects_id_only_objects():

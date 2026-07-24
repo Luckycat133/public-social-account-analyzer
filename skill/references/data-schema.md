@@ -61,6 +61,7 @@ workspace/<platform>-<account>-<date>/
 | snapshot_crawled_at_precision | enum | 否 | 是 | datetime | `datetime` / `date` / `unknown` |
 | snapshot_age_label | string | 否 | 是 | 约 6 个月前 | 仅保存来源明确显示的相对年龄，不反推精确日期 |
 | evidence_is_exhaustive | boolean | 否 | 是 | false | 索引降级固定为 `false` |
+| collection_coverage | object | 否 | 否 | 见 §3.1 | 公开列表采集的覆盖与完备性账本；普通限量采集可为 `{}` |
 
 约束：
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
@@ -69,6 +70,26 @@ workspace/<platform>-<account>-<date>/
   快照字段；未知快照时间保持 `null`，可单独保存来源显示的 `snapshot_age_label`。
 - `source/index-evidence.json` 不是搜索引擎 HTML 或连接器原始转储。Agent 先核验公开来源，
   导入脚本再只持久化白名单字段；Cookie、请求头、内部引用、签名参数和原始页面正文不得落盘。
+
+### 3.1 collection_coverage 覆盖与完备性账本
+
+抖音 `--all` 使用公开页面自身发起的 XHR/Fetch 响应与正常滚动来观察作品列表分页，不重建、
+重放或补签请求。账本仅保留下列白名单字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `requested_all` | boolean | 本次是否请求公开作品全量观察 |
+| `is_exhaustive` | boolean | 是否观察到经验证的作品列表末页 |
+| `terminal_page_observed` | boolean | 是否在拥有已知作品列表键的对象上明确观察到 `has_more=false` |
+| `observed_page_count` | integer | 已验证作品列表载荷数量 |
+| `observed_post_count` | integer | 去重后保留作品数量 |
+| `cursor_fingerprint_count` | integer | 仅在内存中计算后得到的不同游标指纹数量 |
+| `repeated_cursor_count` | integer | 观察到重复游标指纹的次数 |
+| `stop_condition` | enum | `terminal_page` / `idle` / `timeout` / `repeated_cursor` / `max_items` / `max_scrolls` / `date_lower_bound` |
+
+只有已验证作品列表载荷上的显式 `has_more=false` 可以令 `is_exhaustive=true`。空闲、超时、
+重复游标、数量/滚动预算或日期边界停止都属于非穷尽结果；若已保留作品，任务状态为
+`PARTIAL`。原始游标、请求头、查询字符串、响应正文和请求体不得写入账本或其他任务产物。
 
 ## 4. Profile 数据结构
 
