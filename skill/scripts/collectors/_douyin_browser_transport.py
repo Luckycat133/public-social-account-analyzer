@@ -6,12 +6,15 @@ normalizes already-observed public response data and visible DOM card data.
 
 from __future__ import annotations
 
+import json
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ._constants import STOP_LOGIN, STOP_VERIFICATION
+from .browser_backend import BrowserSession
 
 
 _RESTRICTIONS = [
@@ -28,6 +31,15 @@ _RESTRICTIONS = [
 _ITEM_LIST_KEYS = {"aweme_list", "awemeList", "post_list"}
 _ITEM_DETAIL_KEYS = {"aweme_detail", "awemeDetail"}
 _POST_PATH = re.compile(r"/(?:video|note)/(\d+)")
+MAX_SECONDS = 90.0
+MAX_SCROLLS = 20
+MAX_IDLE_ROUNDS = 3
+
+_ALLOWED_RESPONSE_HOSTS = ("douyin.com", "iesdouyin.com")
+_DOM_CARDS_EXPRESSION = """Array.from(document.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')).map(a => ({
+  href: a.href,
+  text: (a.getAttribute('aria-label') || a.getAttribute('title') || a.innerText || '').trim()
+}))"""
 
 
 @dataclass
@@ -119,3 +131,118 @@ def extract_dom_items(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _is_allowed_host(host: str) -> bool:
+    """Return whether an observed response belongs to a public Douyin host."""
+    host = host.lower().rstrip(".")
+    return any(host == suffix or host.endswith("." + suffix) for suffix in _ALLOWED_RESPONSE_HOSTS)
+
+
+def _allowed_response(event: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """Return a request id and query-free URL for eligible public responses."""
+    if event.get("method") != "Network.responseReceived":
+        return None
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return None
+    response = params.get("response")
+    if not isinstance(response, dict):
+        return None
+    request_id = params.get("requestId")
+    url = response.get("url")
+    if not isinstance(request_id, str) or not request_id or not isinstance(url, str):
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    if not _is_allowed_host(parsed.hostname or ""):
+        return None
+    resource_type = str(params.get("type") or "").lower()
+    mime_type = str(response.get("mimeType") or "").lower()
+    if resource_type not in {"xhr", "fetch"} and "json" not in mime_type:
+        return None
+    return request_id, sanitize_response_url(url)
+
+
+def _dom_cards(session: BrowserSession) -> list[dict[str, Any]]:
+    """Read visible candidate post cards without retaining page HTML."""
+    cards = session.evaluate(_DOM_CARDS_EXPRESSION)
+    if not isinstance(cards, list):
+        return []
+    return [card for card in cards if isinstance(card, dict)]
+
+
+def collect_account_page(
+    url: str,
+    *,
+    limit: int,
+    date_range: Any = None,
+    session_factory=BrowserSession,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> DouyinBrowserResult:
+    """Observe bounded public Douyin post responses and visible DOM cards.
+
+    Response bodies exist only long enough to parse a known public post shape;
+    diagnostics contain counts and query-free paths only.
+    """
+    del date_range  # Date normalization/filtering belongs to the collector layer.
+    requested = max(1, min(int(limit), 100))
+    started = monotonic()
+    items: dict[str, dict[str, Any]] = {}
+    safe_paths: list[str] = []
+    restriction: Optional[str] = None
+    scrolls = 0
+    idle = 0
+
+    with session_factory() as session:
+        session.navigate(url, timeout=30.0)
+        while len(items) < requested:
+            if monotonic() - started >= MAX_SECONDS:
+                break
+            before = len(items)
+            event = session.poll_event(timeout=1.0)
+            candidate = _allowed_response(event or {})
+            if candidate:
+                request_id, safe_url = candidate
+                try:
+                    decoded = json.loads(session.get_response_body(request_id))
+                except (ValueError, TypeError, UnicodeError, RuntimeError):
+                    decoded = None
+                if decoded is not None:
+                    for item in extract_aweme_items(decoded):
+                        item_id = _item_id(item)
+                        if item_id is not None:
+                            items.setdefault(item_id, item)
+                    if safe_url not in safe_paths:
+                        safe_paths.append(safe_url)
+            restriction = detect_restriction(session.page_text())
+            if restriction or len(items) >= requested:
+                break
+            if event is None:
+                idle = idle + 1 if len(items) == before else 0
+                if idle >= MAX_IDLE_ROUNDS or scrolls >= MAX_SCROLLS:
+                    break
+                session.scroll_by(1)
+                scrolls += 1
+                sleep(1.0)
+
+        network_count = len(items)
+        if not restriction and len(items) < requested:
+            for item in extract_dom_items(_dom_cards(session)):
+                items.setdefault(str(item["aweme_id"]), item)
+
+    final = list(items.values())[:requested]
+    dom_count = sum(item.get("_collection_source") == "dom" for item in final)
+    source = "network+dom" if network_count and dom_count else "dom" if dom_count else "network"
+    return DouyinBrowserResult(
+        aweme_items=final,
+        source=source,
+        restriction=restriction,
+        diagnostics={
+            "scroll_rounds": scrolls,
+            "candidate_response_count": len(safe_paths),
+            "response_paths": safe_paths,
+            "stop_condition": restriction
+            or ("limit" if len(final) >= requested else "idle_or_timeout"),
+        },
+    )
