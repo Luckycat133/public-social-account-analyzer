@@ -59,3 +59,138 @@ def test_build_publish_cadence_includes_hour_distribution():
     # HTML 含内联 SVG 图表
     assert "发布时段分布（24 小时）" in html
     assert "<svg" in html
+
+
+def test_high_performance_renders_analyzer_value_field():
+    analysis = {
+        "meta": {"main_sort_metric": "likes"},
+        "high_performance": [
+            {
+                "post_id": "idx-example",
+                "title": "财政贴息政策解读",
+                "post_url": None,
+                "evidence_url": "https://www.douyin.com/user/example",
+                "item_url_known": False,
+                "value": 3791,
+                "rank": 1,
+                "reason": "主指标 likes = 3791",
+            }
+        ],
+        "low_performance": [],
+    }
+
+    md, html = render_report.build_high_performance(analysis)
+
+    assert "点赞: 3,791" in md
+    assert "点赞: 3,791" in html
+    assert "财政贴息政策解读" in md
+    assert "财政贴息政策解读" in html
+    assert "href=" not in html
+
+
+def test_radar_is_suppressed_when_only_one_metric_is_visible():
+    high = [{"metrics": {"likes": 10, "views": None, "comments": None}}]
+    low = [{"metrics": {"likes": 2, "views": None, "comments": None}}]
+
+    assert render_report.svg_high_low_radar(
+        high, low, ["views", "likes", "comments"]
+    ) == ""
+
+
+def test_markdown_table_escapes_untrusted_markup_but_keeps_trusted_links():
+    hostile = (
+        "账号|越界 ![pixel](https://tracker.example/pixel.png) "
+        "[点击](javascript:alert(1)) <img src=https://tracker.example/x>"
+    )
+
+    table = render_report.md_table(
+        ["字段", "值"],
+        [
+            ["账号名称", hostile],
+            [
+                "账号主页",
+                render_report.link_md(
+                    "https://www.douyin.com/user/example",
+                    "https://www.douyin.com/user/example",
+                ),
+            ],
+        ],
+    )
+
+    assert "账号\\|越界" in table
+    assert "![pixel](" not in table
+    assert "[点击](javascript:" not in table
+    assert "<img" not in table
+    assert (
+        "[https://www.douyin.com/user/example]"
+        "(https://www.douyin.com/user/example)"
+    ) in table
+
+
+def test_high_and_low_performance_render_index_metric_note():
+    analysis = {
+        "meta": {
+            "main_sort_metric": "likes",
+            "collection_source": "douyin_search_index",
+        },
+        "performance_meta": {
+            "metric_note": (
+                "搜索索引只确认了卡片可见点赞数；"
+                "不把缺失的评论、收藏、分享推算为总互动。"
+            )
+        },
+        "high_performance": [
+            {
+                "post_id": "idx-example",
+                "title": "索引标题",
+                "post_url": None,
+                "item_url_known": False,
+                "value": 3791,
+            }
+        ],
+        "low_performance": [],
+    }
+
+    high_md, high_html = render_report.build_high_performance(analysis)
+    low_md, low_html = render_report.build_low_performance(analysis)
+
+    for rendered in (high_md, high_html, low_md, low_html):
+        assert "搜索索引只确认了卡片可见点赞数" in rendered
+    assert "索引可见点赞: 3,791" in high_md
+    assert "索引可见点赞: 3,791" in high_html
+
+
+def test_non_exhaustive_index_cadence_is_labeled_as_sample_distribution():
+    analysis = _sample_analysis()
+    analysis["meta"] = {
+        "collection_source": "douyin_jingxuan",
+        "evidence_is_exhaustive": False,
+    }
+    analysis["publish_cadence"]["cadence_inference_allowed"] = False
+    analysis["publish_cadence"]["weekly_avg"] = None
+    analysis["publish_cadence"]["median_interval_hours"] = None
+    analysis["publish_cadence"]["longest_gap_hours"] = None
+
+    md, html = render_report.build_publish_cadence(analysis)
+
+    for rendered in (md, html):
+        assert "可见样本数量" in rendered
+        assert "仅描述可见样本的日期分布" in rendered
+        assert "总发布数量" not in rendered
+
+
+def test_non_exhaustive_index_skips_cadence_based_scheduling_advice():
+    analysis = _sample_analysis()
+    analysis["meta"] = {
+        "collection_source": "douyin_jingxuan",
+        "evidence_is_exhaustive": False,
+    }
+    analysis["publish_cadence"]["cadence_inference_allowed"] = False
+    analysis["sample_boundary"] = {"valid": 20}
+
+    md, html = render_report.build_strategy(analysis, {})
+
+    assert md == render_report.EMPTY_MD
+    assert html == render_report.EMPTY_HTML
+    assert "优先排播" not in md
+    assert "稳定更新锚点" not in md

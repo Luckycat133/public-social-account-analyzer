@@ -19,8 +19,10 @@
 
 ```
 workspace/<platform>-<account>-<date>/
+  task.json                  # 任务参数、状态与来源元数据
   source/profile.json        # 账号原始快照
   source/posts.jsonl         # 内容原始快照（每行一条）
+  source/index-evidence.json # 仅 Web 索引降级；经过白名单规范化的证据副本
   normalized-posts.csv       # 归一化内容表
   collection-report.md       # 采集质量报告
   account-analysis-report.md # 分析报告（Markdown）
@@ -36,7 +38,7 @@ workspace/<platform>-<account>-<date>/
 
 | 字段 | 类型 | 必填 | 可空 | 示例 | 说明 |
 |---|---|---:|---:|---|---|
-| task_id | string | 是 | 否 | bilibili-123-20260723-a1b2 | 任务唯一标识 |
+| task_id | string | 否 | 是 | bilibili-123-20260723-a1b2 | 任务唯一标识；现有 CLI 未生成时可省略或为 `null` |
 | platform | enum | 是 | 否 | bilibili | bilibili / douyin / weibo |
 | profile_url | string | 是 | 否 | https://space.bilibili.com/123 | 账号主页 URL |
 | requested_limit | integer | 是 | 否 | 30 | 默认 30，最大 100 |
@@ -46,10 +48,27 @@ workspace/<platform>-<account>-<date>/
 | include_comments | boolean | 是 | 否 | false | 评论采样开关，默认关闭 |
 | task_status | enum | 是 | 否 | COMPLETED | 生命周期状态（§9.1） |
 | stop_reason | enum | 否 | 是 | VERIFICATION_REQUIRED | 停止原因（§9.2），未中止时为 `null` |
+| collected_count | integer | 是 | 否 | 20 | 本次任务已保留的内容条数 |
+| collected_at | datetime | 是 | 否 | 2026-07-24T18:07:51+08:00 | 本次采集或证据观察时间 |
+| incremental | boolean | 否 | 否 | false | 是否为增量续采 |
+| existing_count | integer | 否 | 否 | 0 | 增量前已有条数 |
+| new_count | integer | 否 | 否 | 20 | 本次新增条数 |
+| diagnostic_code | string | 否 | 是 | SANDBOX_INDEX_FALLBACK | 安全诊断码；不是 `stop_reason` |
+| collection_source | string | 否 | 是 | douyin_search_index | 实际采集/证据来源 |
+| source_kind | string | 否 | 是 | douyin_search_index | 索引证据类型；当前与 `collection_source` 同值 |
+| source_url | string | 否 | 是 | https://www.douyin.com/user/... | 任务级证据 URL |
+| snapshot_crawled_at | datetime | 否 | 是 | 2026-07-24T18:00:00+08:00 | 连接器明确提供的索引快照时间；未知为 `null` |
+| snapshot_crawled_at_precision | enum | 否 | 是 | datetime | `datetime` / `date` / `unknown` |
+| snapshot_age_label | string | 否 | 是 | 约 6 个月前 | 仅保存来源明确显示的相对年龄，不反推精确日期 |
+| evidence_is_exhaustive | boolean | 否 | 是 | false | 索引降级固定为 `false` |
 
 约束：
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
 - 执行前向用户回显 `platform`、`requested_limit`、`date_from`/`date_to`、`include_comments`。
+- Web 索引降级必须设置 `task_status=PARTIAL`、保留真实上游 `stop_reason`，并填写来源与
+  快照字段；未知快照时间保持 `null`，可单独保存来源显示的 `snapshot_age_label`。
+- `source/index-evidence.json` 不是搜索引擎 HTML 或连接器原始转储。Agent 先核验公开来源，
+  导入脚本再只持久化白名单字段；Cookie、请求头、内部引用、签名参数和原始页面正文不得落盘。
 
 ## 4. Profile 数据结构
 
@@ -71,7 +90,8 @@ workspace/<platform>-<account>-<date>/
 | field_visibility | object | 是 | 否 | — | 字段可见性（§8） |
 
 `platform_metrics` 账号层常见键：
-- 抖音：`total_likes`（获赞总量）
+- 抖音：`total_likes`（获赞总量）、`douyin_id`（页面显示抖音号）、`latest_post_at`；
+  索引降级还可保存 `collection_source`、`source_url`、`snapshot_crawled_at`
 - 微博：`following`（关注数）
 - B站：一般为空对象 `{}`
 
@@ -79,7 +99,7 @@ workspace/<platform>-<account>-<date>/
 
 | 统一字段 | B站 | 抖音 | 微博 |
 |---|---|---|---|
-| account_id | UID | 抖音号 | UID |
+| account_id | UID | 抖音号；Web 索引降级使用主页路径 `sec_uid`，可见抖音号另存 `platform_metrics.douyin_id` | UID |
 | followers | 粉丝 | 粉丝 | 粉丝 |
 | post_count | 视频数 | 作品数 | 微博数 |
 
@@ -90,8 +110,8 @@ workspace/<platform>-<account>-<date>/
 | 字段 | 类型 | 必填 | 可空 | 说明 |
 |---|---|---:|---:|---|
 | platform | string | 是 | 否 | 平台标识 |
-| post_id | string | 是 | 否 | 平台内容 ID（BV号 / 作品ID / 博文ID） |
-| post_url | string | 是 | 否 | 内容详情页 URL（证据锚点） |
+| post_id | string | 是 | 否 | 平台内容 ID（BV号 / 作品ID / 博文ID）；索引降级例外见 §5.1 |
+| post_url | string | 是 | 否 | 内容详情页 URL（证据锚点）；索引降级例外见 §5.1 |
 | published_at | datetime | 否 | 是 | 发布时间（ISO 8601） |
 | content_type | enum | 是 | 否 | 内容形态（§9.4） |
 | title | string | 否 | 是 | 标题 / 文案首行 |
@@ -108,6 +128,33 @@ workspace/<platform>-<account>-<date>/
 约束：
 - `is_pinned` / `is_repost` / `is_promoted` 默认为 `false`；未知时不得臆测为 `true`。
 - 默认分析排除置顶、转载、投放内容（见 `analysis-rules.md`），但须在数据中保留标记。
+
+### 5.1 抖音搜索索引降级的显式例外
+
+当抖音直连 SSR/CDP 已因登录墙、验证或解析失败停止，且 Web 搜索连接器只返回精确账号
+主页的公开索引卡片时，可能没有真实平台作品 ID 和单条详情 URL。为了让标题快照进入既有
+确定性分析，同时不伪造平台标识，允许以下**唯一例外**：
+
+- `post_id` 使用 `idx-<20 hex>` 确定性本地记录键；它不是抖音作品 ID。
+- `post_url` 与 `source_url` 使用精确账号主页作为证据锚点；它不是单条作品详情页。
+- 原始记录的 `platform_metrics` 及归一化 CSV 必须携带下列证据语义字段；任何一项缺失都
+  不得把搜索索引记录描述成平台作品。
+
+| 字段 | 类型 | 搜索索引固定值 / 说明 |
+|---|---|---|
+| `collection_source` | string | `douyin_search_index`（精选真实作品页为 `douyin_jingxuan`） |
+| `platform_post_id_known` | boolean | `false` |
+| `local_record_key` | boolean | `true` |
+| `item_url_known` | boolean | `false` |
+| `source_rank` | integer | 在该索引快照中的 1 基顺序 |
+| `published_at_precision` | enum | `datetime` / `date` / `unknown` |
+
+下游必须传播这些字段：最终报告显著显示 `PARTIAL`、来源、快照时间/年龄和非穷尽声明；
+`item_url_known=false` 时不得把账号主页渲染为单条作品链接。`published_at_precision=date`
+只能用于日期、星期和月份统计，不进入小时分布或精确小时级发布间隔；`unknown` 不得计算
+发布频率。当前搜索索引契约只接受卡片标题与明确显示的点赞数；`published_at`、
+`duration_seconds`、`views`、`comments`、`favorites`、`shares`、`coins`、`danmaku` 必须为
+`null`。报告可以比较“索引可见点赞”，但不得将缺失字段按零补齐后称为总互动。
 
 ## 6. Metrics 数据结构
 

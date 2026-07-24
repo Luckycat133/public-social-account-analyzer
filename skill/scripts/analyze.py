@@ -103,6 +103,16 @@ def parse_dt(v: Any) -> Optional[datetime]:
     return dt
 
 
+def format_published_at_for_boundary(post: Dict[str, Any]) -> Optional[str]:
+    """Format a sample-boundary timestamp without inventing midnight precision."""
+    published_at = post.get("published_at")
+    if not isinstance(published_at, datetime):
+        return None
+    if post.get("published_at_precision") == "date":
+        return published_at.date().isoformat()
+    return published_at.isoformat()
+
+
 def percentile(sorted_vals: List[float], p: float) -> Optional[float]:
     """线性插值分位数(numpy 默认行为),确定性强,兼容 Python 3.9+。"""
     if not sorted_vals:
@@ -177,6 +187,20 @@ def build_posts(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "collection_status": (row.get("collection_status") or "SUCCESS").strip().upper(),
             "collected_at": row.get("collected_at"),
             "source_url": row.get("source_url") or row.get("post_url"),
+            "collection_source": row.get("collection_source") or None,
+            "platform_post_id_known": parse_bool(
+                row.get("platform_post_id_known"), default=bool(row.get("post_id"))
+            ),
+            "local_record_key": parse_bool(row.get("local_record_key")),
+            "item_url_known": parse_bool(
+                row.get("item_url_known"), default=bool(row.get("post_url"))
+            ),
+            "source_rank": parse_int(row.get("source_rank")),
+            "published_at_precision": (
+                row.get("published_at_precision")
+                if row.get("published_at_precision") in ("datetime", "date", "unknown")
+                else ("datetime" if parse_dt(row.get("published_at")) else "unknown")
+            ),
         }
         for m in METRIC_FIELDS:
             post[m] = parse_int(row.get(m))
@@ -211,13 +235,21 @@ def split_samples(all_posts: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dic
 def compute_cadence(valid: List[Dict[str, Any]]) -> Dict[str, Any]:
     dates = [p["published_at"] for p in valid if p["published_at"] is not None]
     total = len(valid)
+    date_only_count = sum(
+        1 for p in valid
+        if p.get("published_at") is not None and p.get("published_at_precision") == "date"
+    )
+    datetime_count = sum(
+        1 for p in valid
+        if p.get("published_at") is not None and p.get("published_at_precision") == "datetime"
+    )
 
     if not dates:
         return {
             "total_posts": total,
             "coverage_days": 0,
-            "coverage_weeks": 1,
-            "weekly_avg": (rnd(float(total), 4) if total else None),
+            "coverage_weeks": 0,
+            "weekly_avg": None,
             "median_interval_hours": None,
             "longest_gap_hours": None,
             "weekday_distribution": {str(i): 0 for i in range(7)},
@@ -233,15 +265,19 @@ def compute_cadence(valid: List[Dict[str, Any]]) -> Dict[str, Any]:
             "break_month_share": None,
             "seasonal_note": "有效内容均无 published_at,无法计算季节性/学期指标",
             "interval_unit": "hours",
+            "time_precision": {
+                "datetime": 0,
+                "date_only": 0,
+                "unknown": total,
+            },
             "note": "有效内容均无 published_at,无法计算基于时间的节奏指标",
         }
 
-    dts_utc = [d.astimezone(timezone.utc) for d in dates]
-    min_d, max_d = min(dts_utc), max(dts_utc)
+    min_d, max_d = min(dates), max(dates)
     span_days = (max_d - min_d).days
     coverage_weeks = max(math.ceil(span_days / 7), 1)  # 覆盖周数不小于 1
     coverage_days = len({(d.year, d.month, d.day) for d in dates})
-    weekly_avg = total / coverage_weeks if coverage_weeks else None
+    weekly_avg = len(dates) / coverage_weeks if coverage_weeks else None
 
     sorted_dates = sorted(dates)
     gaps: List[float] = []
@@ -249,14 +285,20 @@ def compute_cadence(valid: List[Dict[str, Any]]) -> Dict[str, Any]:
         gaps.append((sorted_dates[i] - sorted_dates[i - 1]).total_seconds() / 3600.0)
     median_gap = percentile(sorted(gaps), 0.5) if gaps else None
     longest_gap = max(gaps) if gaps else None
+    if date_only_count:
+        # 日期级证据只能支持日期/星期/月度节奏，不能声称精确到小时的发布间隔。
+        median_gap = None
+        longest_gap = None
 
     # 星期 / 小时分布:使用帖子自身时区的墙上时间(无时区按 +08:00,见 parse_dt)
     wd = {str(i): 0 for i in range(7)}
     for d in dates:
         wd[str(d.weekday())] += 1
     hr = {str(i): 0 for i in range(24)}
-    for d in dates:
-        hr[str(d.hour)] += 1
+    for p in valid:
+        d = p.get("published_at")
+        if d is not None and p.get("published_at_precision") == "datetime":
+            hr[str(d.hour)] += 1
 
     wd_count = sum(v for k, v in wd.items() if int(k) < 5)
     we_count = sum(v for k, v in wd.items() if int(k) >= 5)
@@ -320,7 +362,41 @@ def compute_cadence(valid: List[Dict[str, Any]]) -> Dict[str, Any]:
         "break_month_share": break_month_share,
         "seasonal_note": seasonal_note,
         "interval_unit": "hours",
+        "time_precision": {
+            "datetime": datetime_count,
+            "date_only": date_only_count,
+            "unknown": total - len(dates),
+        },
+        "note": (
+            f"{date_only_count} 条仅有日期精度，未计入具体时段分布。"
+            if date_only_count
+            else None
+        ),
     }
+
+
+def restrict_nonexhaustive_index_cadence(cadence: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep sample date counts while suppressing account-level cadence claims."""
+    restricted = dict(cadence)
+    for field in (
+        "weekly_avg",
+        "median_interval_hours",
+        "longest_gap_hours",
+        "seasonal_intensity",
+        "break_month_share",
+        "seasonal_note",
+    ):
+        restricted[field] = None
+    restricted["cadence_inference_allowed"] = False
+    boundary_note = (
+        "当前为非穷尽索引样本，仅展示可见作品的日期分布；不计算账号周均发布量、"
+        "发布间隔、断更、季节性或排播建议。"
+    )
+    previous_note = restricted.get("note")
+    restricted["note"] = (
+        f"{previous_note} {boundary_note}" if previous_note else boundary_note
+    )
+    return restricted
 
 
 # ---------------------------------------------------------------------------
@@ -387,23 +463,37 @@ def compute_medians(valid: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
 # 互动率(§4 分母透明)
 # ---------------------------------------------------------------------------
 
-def engagement_numerator(p: Dict[str, Any]) -> float:
+def _is_search_index_post(p: Dict[str, Any]) -> bool:
+    return p.get("collection_source") == "douyin_search_index"
+
+
+def engagement_numerator(p: Dict[str, Any]) -> Optional[float]:
     # 分子固定 = likes + comments + favorites + shares;
-    # null 组件按 0 计入(§4:微博 favorites 为 null 时按 0)。
-    return (p["likes"] or 0) + (p["comments"] or 0) + (p["favorites"] or 0) + (p["shares"] or 0)
+    # 至少一个组件可见时，其他 null 组件按 0 计入（如微博 favorites 不提供）；
+    # 四个组件全未知时必须保持 null，不能把“完全不可见”伪装成真实 0。
+    values = [p.get("likes"), p.get("comments"), p.get("favorites"), p.get("shares")]
+    if all(value is None for value in values):
+        return None
+    return sum(value or 0 for value in values)
 
 
 def view_based_rate(p: Dict[str, Any]) -> Optional[float]:
+    if _is_search_index_post(p):
+        return None
     v = p["views"]
     if v is None or v == 0:
         return None
-    return engagement_numerator(p) / v
+    numerator = engagement_numerator(p)
+    return None if numerator is None else numerator / v
 
 
 def follower_based_ratio(p: Dict[str, Any], followers: Optional[int]) -> Optional[float]:
+    if _is_search_index_post(p):
+        return None
     if followers is None or followers == 0:
         return None
-    return engagement_numerator(p) / followers
+    numerator = engagement_numerator(p)
+    return None if numerator is None else numerator / followers
 
 
 def deep_approval_rate(p: Dict[str, Any]) -> Optional[float]:
@@ -412,6 +502,8 @@ def deep_approval_rate(p: Dict[str, Any]) -> Optional[float]:
     分母 views 为 null/0 时该条置 null（分母透明，禁止用 0 做分母）。
     coins/favorites 为 null 时按 0 计入分子（单条互动指标，非统一互动率分子）。
     """
+    if _is_search_index_post(p):
+        return None
     views = p["views"]
     if views is None or views == 0:
         return None
@@ -426,6 +518,8 @@ def community_discussion_rate(p: Dict[str, Any]) -> Optional[float]:
     分母 views 为 null/0 时该条置 null（分母透明）。
     comments/danmaku 为 null 时按 0 计入分子。
     """
+    if _is_search_index_post(p):
+        return None
     views = p["views"]
     if views is None or views == 0:
         return None
@@ -479,6 +573,8 @@ def post_metric_value(p: Dict[str, Any], metric: str) -> Optional[float]:
     if metric == "views":
         return p["views"]
     if metric == "engagement_sum":
+        if _is_search_index_post(p):
+            return None
         return engagement_numerator(p)
     if metric == "view_based_engagement_rate":
         return view_based_rate(p)
@@ -500,6 +596,17 @@ def choose_main_metric(analysis_goal: Optional[str], valid: List[Dict[str, Any]]
 
     返回: (主排序指标, 回退/跳过说明 note 或 None)
     """
+    if valid and all(_is_search_index_post(p) for p in valid):
+        if any(p.get("likes") is not None for p in valid):
+            return (
+                "likes",
+                "搜索索引只确认了卡片可见点赞数；不把缺失的评论/收藏/分享推算为总互动。",
+            )
+        return (
+            "likes",
+            "搜索索引没有可用于高低表现比较的公开指标，保持 likes 为空并跳过该模块。",
+        )
+
     goal = (analysis_goal or "").lower()
     if any(k in goal for k in ["互动", "engagement", "interact"]):
         metric = "engagement_sum"
@@ -541,9 +648,14 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
 
     def to_item(t: Tuple[Dict, Optional[float]], rank: int) -> Dict[str, Any]:
         p, v = t
+        item_url_known = p.get("item_url_known", bool(p.get("post_url")))
         return {
             "post_id": p["post_id"],
-            "post_url": p["post_url"],
+            "title": p.get("title"),
+            "post_url": p["post_url"] if item_url_known else None,
+            "evidence_url": p.get("source_url") or p.get("post_url"),
+            "item_url_known": item_url_known,
+            "metrics": {metric: p.get(metric) for metric in METRIC_FIELDS},
             "value": rnd(v, 6) if v is not None else None,
             "rank": rank,
             "reason": f"主指标 {main_metric} = {rnd(v, 6) if v is not None else 'null'}",
@@ -578,10 +690,22 @@ def build_post_records(
                 rel[m] = None  # 禁止用 0 做分母(§4)
             else:
                 rel[m] = rnd(p[m] / med, 4) if p[m] is not None else None
+        item_url_known = p.get("item_url_known", bool(p.get("post_url")))
         recs.append({
             "post_id": p["post_id"],
-            "post_url": p["post_url"],
+            "post_url": p["post_url"] if item_url_known else None,
+            "evidence_url": p.get("source_url") or p.get("post_url"),
+            "title": p.get("title"),
+            "text": p.get("text"),
             "published_at": p["published_at"].isoformat() if p["published_at"] else None,
+            "published_at_precision": p.get("published_at_precision", "unknown"),
+            "collection_source": p.get("collection_source"),
+            "platform_post_id_known": p.get(
+                "platform_post_id_known", bool(p.get("post_id"))
+            ),
+            "local_record_key": p.get("local_record_key", False),
+            "item_url_known": item_url_known,
+            "source_rank": p.get("source_rank"),
             "metrics": {m: p[m] for m in METRIC_FIELDS},
             "relative_performance": rel,
             "view_based_engagement_rate": rnd(view_based_rate(p), 6),
@@ -734,6 +858,15 @@ def generate_report(
     L.append("> **不代表账号后台真实曝光、触达、完播或转化**。")
     L.append("> 分类字段(topic/format/funnel_stage/hook_type 等)由模型在运行时填充,")
     L.append("> 当前状态:分类待模型填充(classification_version = pending-model)。")
+    if meta.get("collection_source"):
+        L.append(
+            f"> 采集状态:{meta.get('task_status') or '未知'};停止原因:"
+            f"{meta.get('stop_reason') or 'null'};来源:{meta.get('collection_source')}。"
+        )
+        L.append(
+            "> 本批数据是非穷尽的公开索引快照，不是实时完整作品列表；"
+            "搜索索引的 idx-* 为本地记录键。"
+        )
     L.append("")
     L.append("## 样本边界(报告必填,见 §2)")
     L.append("")
@@ -780,6 +913,9 @@ def generate_report(
         note = cadence.get("seasonal_note")
         if note:
             L.append(f"- 季节性提示:{note}")
+    cadence_note = cadence.get("note")
+    if cadence_note:
+        L.append(f"- 节奏边界:{cadence_note}")
     L.append("")
 
     L.append("## 公开表现指标(§4)")
@@ -837,10 +973,14 @@ def generate_report(
     else:
         L.append(f"- 高表现组(每组 {len(high_performance)} 条):")
         for it in high_performance:
-            L.append(f"  - #{it['rank']} {it['post_id']} — {it['reason']} ({it['post_url']})")
+            target = it.get("post_url") or it.get("evidence_url") or "无单条作品链接"
+            label = "作品链接" if it.get("item_url_known") else "证据锚点"
+            L.append(f"  - #{it['rank']} {it['post_id']} — {it['reason']} ({label}: {target})")
         L.append(f"- 低表现组:")
         for it in low_performance:
-            L.append(f"  - #{it['rank']} {it['post_id']} — {it['reason']} ({it['post_url']})")
+            target = it.get("post_url") or it.get("evidence_url") or "无单条作品链接"
+            label = "作品链接" if it.get("item_url_known") else "证据锚点"
+            L.append(f"  - #{it['rank']} {it['post_id']} — {it['reason']} ({label}: {target})")
         L.append("> 高低表现仅描述样本中事实性差异,不宣称因果关系(§6.4)。")
     L.append("")
 
@@ -886,14 +1026,19 @@ def main() -> None:
     _, valid, flagged, missing, restricted = split_samples(all_posts)
     valid_count = len(valid)
 
+    task_params = load_task_params(task_dir, args)
     cadence = compute_cadence(valid)
+    if (
+        task_params.get("collection_source") in ("douyin_jingxuan", "douyin_search_index")
+        and task_params.get("evidence_is_exhaustive") is False
+    ):
+        cadence = restrict_nonexhaustive_index_cadence(cadence)
     metric_summary = compute_metric_summary(valid, profile)
     medians = compute_medians(valid)
     followers = parse_int(profile.get("followers"))
     engagement = compute_engagement(valid, profile)
 
     # §6 主排序指标 + 高低表现
-    task_params = load_task_params(task_dir, args)
     main_metric, metric_note = choose_main_metric(task_params.get("analysis_goal"), valid)
     if metric_note:
         print(f"NOTE: 主排序指标回退/跳过 -> {metric_note}", file=sys.stderr)
@@ -935,9 +1080,11 @@ def main() -> None:
     if requested is None:
         requested = collected
         requested_is_derived = True
-    valid_dates = [p["published_at"] for p in valid if p["published_at"]]
-    content_min = min(valid_dates).isoformat() if valid_dates else None
-    content_max = max(valid_dates).isoformat() if valid_dates else None
+    dated_posts = [p for p in valid if p["published_at"]]
+    min_post = min(dated_posts, key=lambda p: p["published_at"]) if dated_posts else None
+    max_post = max(dated_posts, key=lambda p: p["published_at"]) if dated_posts else None
+    content_min = format_published_at_for_boundary(min_post) if min_post else None
+    content_max = format_published_at_for_boundary(max_post) if max_post else None
     field_coverage = {}
     for m in METRIC_FIELDS:
         nn = sum(1 for p in valid if p[m] is not None)
@@ -992,6 +1139,15 @@ def main() -> None:
         "date_to": task_params.get("date_to"),
         "analysis_goal": task_params.get("analysis_goal"),
         "include_comments": task_params.get("include_comments"),
+        "task_status": task_params.get("task_status"),
+        "stop_reason": task_params.get("stop_reason"),
+        "diagnostic_code": task_params.get("diagnostic_code"),
+        "collection_source": task_params.get("collection_source"),
+        "source_kind": task_params.get("source_kind"),
+        "source_url": task_params.get("source_url"),
+        "snapshot_crawled_at": task_params.get("snapshot_crawled_at"),
+        "snapshot_age_label": task_params.get("snapshot_age_label"),
+        "evidence_is_exhaustive": task_params.get("evidence_is_exhaustive"),
         "main_sort_metric": main_metric,
         "classification_status": "pending-model",
         "note": (

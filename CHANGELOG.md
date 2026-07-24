@@ -10,13 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added an experimental Douyin browser fallback when SSR is absent or its post-list structure is unrecognized. It observes eligible public CDP network responses and falls back to visible post cards when needed; a recognized empty list remains `NO_PUBLIC_CONTENT`, and no Python runtime package is added.
 - Added offline Douyin tests for browser-response parsing, bounded collection, CLI policy, retained partial posts, and documentation coverage.
+- Added a zero-runtime-dependency `import_index_snapshot.py` path for public Douyin Web-index evidence after direct collection is blocked. The Agent verifies source/item ownership, while the importer validates official URLs and field consistency; it supports official Jingxuan item URLs and explicitly disclosed profile-index records.
 
 ### Changed
 - Douyin collection now defaults to the experimental fallback. `SOCIAL_BROWSER_FALLBACK=0` disables its default, while explicit `--no-browser-fallback` globally overrides both Douyin and Bilibili browser paths. Each browser run uses a temporary profile and does not reuse login state.
 - When browser collection is stopped by a public access restriction, normalized posts already collected are preserved as partial results. Diagnostics are limited to safe codes and sanitized response paths.
+- Index provenance, platform-ID/link availability, source rank, and timestamp precision now survive normalization and analysis. Reports disclose partial/stale/non-exhaustive index data, suppress profile anchors as item links, and do not infer total engagement from index-visible likes.
+- Cadence analysis no longer fabricates a weekly average when all publication dates are unknown, and date-only evidence is excluded from hour-of-day and exact-hour interval claims.
 
 ### Security
 - The fallback does not reproduce signatures or bypass login, CAPTCHA, slider, rate-limit, or other access protections. It does not persist cookies, request headers, signed URLs, response bodies, or media.
+- The Web-index importer rejects non-Douyin/lookalike hosts, credentials, ports, query strings, author mismatches, ID/URL mismatches, and non-integer metrics; persisted evidence is field-whitelisted.
 
 ## [1.0.0] - 2026-07-24
 

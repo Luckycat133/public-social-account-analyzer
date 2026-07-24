@@ -55,6 +55,17 @@ POST_FIELDS = [
     "source_url",
 ]
 
+# 证据来源与标识语义。普通平台适配器可留空；索引降级必须完整填写，确保
+# `idx-*` 本地记录键和账号主页证据锚点不会在下游被误称为平台作品 ID/详情页。
+PROVENANCE_FIELDS = [
+    "collection_source",
+    "platform_post_id_known",
+    "local_record_key",
+    "item_url_known",
+    "source_rank",
+    "published_at_precision",
+]
+
 # 分析阶段占位的空列（data-schema.md §7），交由 analyze 阶段填充。
 ANALYSIS_FIELDS = [
     "topic",
@@ -68,7 +79,7 @@ ANALYSIS_FIELDS = [
     "classification_version",
 ]
 
-CSV_COLUMNS = POST_FIELDS + METRIC_FIELDS + ANALYSIS_FIELDS
+CSV_COLUMNS = POST_FIELDS + PROVENANCE_FIELDS + METRIC_FIELDS + ANALYSIS_FIELDS
 
 # content_type 有效枚举（data-schema.md §9.4）。
 CONTENT_TYPES = {
@@ -336,6 +347,24 @@ def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
         if status == "partial":
             log_parse_error(field, raw_val)
 
+    platform_metrics = raw.get("platform_metrics")
+    if not isinstance(platform_metrics, dict):
+        platform_metrics = {}
+    precision = platform_metrics.get("published_at_precision")
+    if precision not in ("datetime", "date", "unknown"):
+        if isinstance(raw_published, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_published.strip()):
+            precision = "date"
+        else:
+            precision = "datetime" if published is not None else "unknown"
+
+    def optional_bool(key: str, default: bool) -> bool:
+        value = platform_metrics.get(key)
+        return value if isinstance(value, bool) else default
+
+    source_rank = platform_metrics.get("source_rank")
+    if isinstance(source_rank, bool) or not isinstance(source_rank, int) or source_rank < 1:
+        source_rank = None
+
     row = {
         "platform": platform,
         "post_id": post_id,
@@ -357,6 +386,16 @@ def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
         ),
         "collected_at": collected.isoformat() if collected else None,
         "source_url": raw.get("source_url") or raw.get("post_url"),
+        "collection_source": platform_metrics.get("collection_source")
+        if isinstance(platform_metrics.get("collection_source"), str)
+        else None,
+        "platform_post_id_known": optional_bool(
+            "platform_post_id_known", bool(post_id)
+        ),
+        "local_record_key": optional_bool("local_record_key", False),
+        "item_url_known": optional_bool("item_url_known", bool(raw.get("post_url"))),
+        "source_rank": source_rank,
+        "published_at_precision": precision,
     }
     row.update(metric_values)
     # 分析占位列留空，交由 analyze 阶段填充。
@@ -459,7 +498,14 @@ def write_csv(rows: list[dict], path: str) -> None:
             out = {}
             for col in CSV_COLUMNS:
                 value = row.get(col)
-                if col in ("is_pinned", "is_repost", "is_promoted"):
+                if col in (
+                    "is_pinned",
+                    "is_repost",
+                    "is_promoted",
+                    "platform_post_id_known",
+                    "local_record_key",
+                    "item_url_known",
+                ):
                     out[col] = "true" if value else "false"
                 elif value is None:
                     out[col] = ""

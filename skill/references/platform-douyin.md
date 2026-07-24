@@ -150,6 +150,32 @@
 - 单条内容级问题（`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE`）只下钻到内容级，
   **不**写入任务级 `stop_reason`（见 `exceptions.md` §1.1）。
 
+## 无登录 Web 索引证据降级（Skill/Agent 层）
+
+当 HTTP/SSR 与临时浏览器路径已经以 `LOGIN_REQUIRED`、`VERIFICATION_REQUIRED`、
+`ACCESS_RESTRICTED` 或 `PARSER_FAILED` 停止时，若 Agent 环境有 Web 搜索/打开连接器，可
+继续取得公开索引证据。该能力不属于 `DouyinCollector` 网络适配器：Agent 通过连接器负责
+核验精确来源、作者和作品区边界，`scripts/import_index_snapshot.py` 只做离线结构、域名与
+字段一致性校验并导入，不能独立证明 JSON 中自报的作者归属。
+
+- A 级 `douyin_jingxuan`：官方精选页给出真实数字作品 ID、官方 URL、同作者标题等，可进入
+  统一流水线；未展示指标保持 `null`。
+- B 级 `douyin_search_index`：仅精确账号主页索引快照；没有作品 ID/详情 URL 时使用明确披露
+  的本地 `idx-*` 记录键和主页证据锚点，不能冒充平台作品。当前只接受卡片标题与明确显示的
+  点赞数，其余作品时间、时长和互动字段固定为 `null`。
+- 两级都要求 Agent 先逐条核对连接器页面中的目标主页/作者归属；脚本再检查将导入条目的
+  主页 ID、官方域名、`author_name`/账号名和作品 ID/URL 是否自洽。
+- 通用推荐区、热门区、页脚作品卡片、标题反搜命中和作者不一致内容必须在 Agent 取证阶段
+  排除，不能靠填写相同 `author_name` 送入导入器。
+- 两级始终为 `PARTIAL`、非穷尽、可能陈旧；无法确认页面区域或作者归属时不得导入。
+- 两级只能描述可见子集的日期分布，不计算账号周均、发布间隔、断更、季节性或排播建议。
+- 搜索索引的账号 `account_id` 使用主页路径 `sec_uid`，可见抖音号另存
+  `platform_metrics.douyin_id`；这与直连适配器从页面结构拿到 `unique_id` 时的优先规则不同。
+
+完整取证顺序、JSON 格式、命令和报告语义见
+[douyin-index-evidence.md](douyin-index-evidence.md)。没有 Web 连接器且沙箱不能联网时不可用，
+不得声称完成新数据采集。
+
 ## 平台特有测试样例
 
 > 以下为**适配层路由与字段映射**的验证样例（断言 URL 是否被支持、期望映射字段）。

@@ -153,10 +153,14 @@ def test_high_low_ok_when_sufficient():
     posts = [
         _post(str(i), views=100 + i * 10, likes=10 + i) for i in range(20)
     ]
+    for i, post in enumerate(posts):
+        post["title"] = f"标题 {i}"
     result = analyze.compute_high_low(posts, "views")
     assert result is not None
     assert result["group_size"] >= 3
     assert len(result["high"]) >= 3 and len(result["low"]) >= 3
+    assert result["high"][0]["title"].startswith("标题 ")
+    assert result["high"][0]["metrics"]["views"] == 290
 
 
 # ---------------------------------------------------------------------------
@@ -294,4 +298,3 @@ def test_collect_tags_wired_into_full_flow(monkeypatch):
     assert "apiTagA" in tags and "apiTagB" in tags
     # 文本提取标签也保留
     assert "t1" in tags and "t2" in tags and "t3" in tags
-

@@ -10,12 +10,12 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 本 Skill 仅基于**无需登录即可查看的公开页面**采集账号资料与近期内容，完成归一化、指标计算、内容分类与策略归类，输出可复核的账号内容分析报告。
 
 - **正式支持（P0）**：B站（bilibili）
-- **实验性支持（P0）**：抖音（douyin，浏览器降级尚待在线验收）
+- **实验性支持（P0）**：抖音（douyin，直连浏览器路径受平台登录墙影响；可用 Web 索引证据做诚实的 `PARTIAL` 降级）
 - **条件支持（P1）**：微博（weibo，仅在适配器已实现并启用时）
 - **不支持**：小红书、视频号及任意其他平台
 
 ### 环境与兼容性
-需要 Python 3.9+ 环境，能访问目标平台公开页面。不保存密码、登录凭证或私人 Cookie；公开指纹 cookie（如 B站 buvid3/buvid4）仅在内存中临时使用，不落盘、不跨任务复用。不下载完整媒体文件。
+需要 Python 3.9+ 环境，能访问目标平台公开页面。不保存密码、登录凭证或私人 Cookie；公开指纹 cookie（如 B站 buvid3/buvid4）仅在内存中临时使用，不落盘、不跨任务复用。不下载完整媒体文件。抖音索引降级还需要 Agent 环境已有的 Web 搜索/打开连接器；Python 脚本本身不联网。
 
 ### 合规边界（任何情况下不得违反）
 1. **不登录/不接管**：不登录、不接管、不运营被分析账号。
@@ -24,6 +24,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 4. **不修改数据**：不自动发布、修改、删除内容，不自动回复评论或私信。
 5. **严禁推测**：未公开显示的字段写 `null`，禁止用 `0` 代替未知，禁止强行推测。
 6. **抖音实验性浏览器降级**：仅在 SSR 缺失或作品列表结构无法识别时使用；已识别的空列表直接报告 `NO_PUBLIC_CONTENT`。绝不用于规避验证码、登录墙或其他保护。
+7. **索引证据不冒充实时采集**：直连受限后可读取公开 Web 索引，但 Agent 必须核验账号、作者与作品区，离线脚本只做结构/字段一致性校验；任务标为 `PARTIAL`，不把推荐卡片、标题搜索命中、本地 `idx-*` 或账号主页冒充真实作品 ID/详情页。
 
 ## 核心流程
 
@@ -41,6 +42,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
    - 记录 `source_url` 与 `collected_at`。置顶内容单独标记，不混入近期原创列表。
    - **增量续采**：加 `--resume --out <既有任务目录>` 时，读取既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧），避免重复打满配额；`--since` 可显式指定续采起点。必须配合 `--out`。
    - 平台降级逻辑与数据映射详见 [references/platform-bilibili.md](references/platform-bilibili.md) / [platform-douyin.md](references/platform-douyin.md) / [platform-weibo.md](references/platform-weibo.md)。
+   - 抖音直连以既有受限原因停止且 Web 连接器可用时，按 [references/douyin-index-evidence.md](references/douyin-index-evidence.md) 由 Agent 核验公开来源/作品区，再用离线脚本校验结构与字段一致性并导入；无连接器则保留原失败结果。
 
 4. **数据归一化**
    - 调用 `scripts/normalize.py`，去重并映射至统一结构（详见 [references/data-schema.md](references/data-schema.md)）。
@@ -77,8 +79,9 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - **互动率分母明确**：仅在播放数已知时使用“互动数/播放数”，仅有粉丝数时标为“粉丝基准比”，不同分母严禁混用。
 - **不跨平台打总分**：不同平台指标可见度不同，不构造统一总分。
 - **中位数优先**：聚合指标优先采用中位数与四分位数，避免极值拉偏平均数。
-- **证据 100% 覆盖**：报告中每项核心洞察必须至少附带一个具体帖子 URL 作为证据。
+- **证据 100% 覆盖**：报告中每项核心洞察必须有可复核证据；正常/A 级数据使用具体作品 URL，B 级搜索索引只能使用精确账号主页并明确“无单条详情链接”。
 - **抖音动态 JS 虚拟机渲染与降级（实验性）**：SSR 缺失或作品列表结构无法识别时默认自动降级：使用新的临时用户目录启动可选系统浏览器，先观察公开 CDP 网络响应，再从可见作品卡片提取最小字段；不附着或复用登录状态。已识别的空列表返回 `NO_PUBLIC_CONTENT`。可用 `SOCIAL_BROWSER_FALLBACK=0` 仅禁用抖音默认降级，或用 `--no-browser-fallback` 同时禁止 B站和抖音启动浏览器。未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外仍为 `PARSER_FAILED`。不复现签名或绕过登录、验证码、滑块、频控。
+- **抖音 Web 索引降级（实验性）**：仅在直连已经诚实停止后由 Agent 编排；优先官方精选真实作品页，其次精确主页搜索索引。Agent 核验来源/作品区，离线脚本全批校验结构与字段一致性；零 Python 第三方依赖，始终 `PARTIAL`。搜索索引不计算精确发布时段或衍生互动率，详见专门参考。
 
 ## 任务状态与停止原因
 
@@ -98,6 +101,9 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 3. `python scripts/analyze.py --input <workspace_path> [--with-llm-tax | --llm-tax-results <file>]`
 4. `python scripts/render_report.py --input <workspace_path>`
 
+抖音 Web 索引替代入口：先按专门参考生成 evidence JSON，再运行
+`python scripts/import_index_snapshot.py --evidence <json> --out <new_workspace> --limit <N>`，随后执行上述第 2–4 步。
+
 在数据有效样本少于 15 条时，标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现归纳。
 
 ## 输出验证清单
@@ -108,6 +114,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - [ ] 核心洞察证据 URL 覆盖率达 100%
 - [ ] 附带“公开页面快照”免责声明
 - [ ] `task_status` 与 `stop_reason` 设置准确
+- [ ] 索引降级的来源、快照年龄、ID/链接语义与非穷尽限制已进入最终报告
 
 ## 参考文件索引
 
@@ -115,6 +122,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - [references/analysis-rules.md](references/analysis-rules.md) — 指标计算与分析规则
 - [references/platform-bilibili.md](references/platform-bilibili.md) — B站特定处理与接口降级
 - [references/platform-douyin.md](references/platform-douyin.md) — 抖音特定处理与风控说明
+- [references/douyin-index-evidence.md](references/douyin-index-evidence.md) — 抖音无登录 Web 索引证据降级与导入格式
 - [references/platform-weibo.md](references/platform-weibo.md) — 微博适配说明
 - [references/exceptions.md](references/exceptions.md) — 异常状态码与处理策略
 - [assets/report-template.html](assets/report-template.html) — HTML 仪表盘模版

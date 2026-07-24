@@ -153,6 +153,23 @@ SOCIAL_BROWSER_FALLBACK=0 python skill/scripts/collect.py "https://www.douyin.co
 
 设置 `SOCIAL_BROWSER_FALLBACK=1` 可显式保持默认启用状态。命令行开关优先于环境变量。
 
+如果上述直连任务已经以登录、验证、访问限制或解析失败停止，而 Agent 环境有 Web
+搜索/打开连接器，可按 `skill/references/douyin-index-evidence.md` 整理公开证据，然后执行：
+
+```bash
+python skill/scripts/import_index_snapshot.py \
+  --evidence /path/to/douyin-evidence.json \
+  --out workspace/douyin-index-<account>-<date> \
+  --limit 30
+python skill/scripts/normalize.py --input workspace/douyin-index-<account>-<date>
+python skill/scripts/analyze.py --input workspace/douyin-index-<account>-<date>
+python skill/scripts/render_report.py --input workspace/douyin-index-<account>-<date>
+```
+
+这不是匿名抖音 API：Python 导入器不联网。官方精选页可保留真实作品 ID/URL；搜索索引
+没有单条 ID/URL 时只生成已披露的 `idx-*` 本地键并以账号主页作为证据锚点。两者始终
+`PARTIAL`、非实时、非穷尽；没有 Web 连接器的离线沙箱无法取得新数据。
+
 ---
 
 ## 任务状态与错误码说明

@@ -74,6 +74,30 @@ def test_view_based_rate_normal():
     assert analyze.view_based_rate(post) == 0.2
 
 
+def test_all_unknown_engagement_components_stay_null():
+    post = {
+        "views": 100,
+        "likes": None,
+        "comments": None,
+        "favorites": None,
+        "shares": None,
+    }
+    assert analyze.engagement_numerator(post) is None
+    assert analyze.view_based_rate(post) is None
+
+
+def test_partially_visible_engagement_sums_only_known_components():
+    post = {
+        "views": 100,
+        "likes": 7,
+        "comments": None,
+        "favorites": None,
+        "shares": None,
+    }
+    assert analyze.engagement_numerator(post) == 7
+    assert analyze.view_based_rate(post) == 0.07
+
+
 # ---------------------------------------------------------------------------
 # 相对中位数表现：median 为 0 / null 时该指标置 null（禁止用 0 做分母）
 # ---------------------------------------------------------------------------

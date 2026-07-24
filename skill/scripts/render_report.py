@@ -109,6 +109,16 @@ class Raw:
         return self.s
 
 
+class MdRaw:
+    """包装由本渲染器生成的可信 Markdown，避免表格层再次转义。"""
+
+    def __init__(self, s: str):
+        self.s = s
+
+    def __str__(self) -> str:
+        return self.s
+
+
 # 数值格式化 ----------------------------------------------------------------
 
 def fmt_int(v) -> str:
@@ -155,8 +165,34 @@ def fmt_metric(v) -> str:
 
 # 链接 ---------------------------------------------------------------------
 
-def link_md(url: str, text: str) -> str:
-    return f"[{text}]({url})"
+def md_escape_text(value) -> str:
+    """把外部文本变成 Markdown 纯文本，阻断表格、链接、图片和 HTML 注入。"""
+    s = "" if value is None else str(value)
+    s = " ".join(s.replace("\r\n", "\n").replace("\r", "\n").splitlines())
+    s = s.replace("\\", "\\\\")
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for char in ("|", "!", "[", "]", "`", "*"):
+        s = s.replace(char, "\\" + char)
+    return s
+
+
+def _md_link_destination(url: str) -> str:
+    """转义可信 URL 中会提前结束 Markdown link destination 的字符。"""
+    return (
+        str(url)
+        .replace("\\", "%5C")
+        .replace(" ", "%20")
+        .replace("(", "%28")
+        .replace(")", "%29")
+        .replace("<", "%3C")
+        .replace(">", "%3E")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+
+
+def link_md(url: str, text: str) -> MdRaw:
+    return MdRaw(f"[{md_escape_text(text)}]({_md_link_destination(url)})")
 
 
 def link_html(url: str, text: str) -> Raw:
@@ -190,10 +226,17 @@ def html_table(headers, rows) -> str:
 def md_table(headers, rows) -> str:
     if not rows:
         return EMPTY_MD
-    lines = ["| " + " | ".join(str(h) for h in headers) + " |",
+    def cell(value) -> str:
+        if isinstance(value, MdRaw):
+            return value.s
+        if value is None or value == "":
+            return "—"
+        return md_escape_text(value)
+
+    lines = ["| " + " | ".join(cell(h) for h in headers) + " |",
              "| " + " | ".join("---" for _ in headers) + " |"]
     for r in rows:
-        cells = [("—" if c is None or c == "" else str(c)) for c in r]
+        cells = [cell(c) for c in r]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -308,13 +351,37 @@ def svg_post_hour_distribution(hour_distribution: dict, width: int = 600, height
 
 def svg_high_low_radar(high, low, metrics: list, width: int = 340, height: int = 300) -> str:
     """高低表现雷达图：高/低组在各指标上的中位数对比（按列最大值归一化）。"""
+    def _metric_values(group, metric):
+        if not isinstance(group, list):
+            return []
+        values = []
+        for post in group:
+            if not isinstance(post, dict):
+                continue
+            value = (post.get("metrics") or {}).get(metric)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and not (isinstance(value, float) and (math.isnan(value) or math.isinf(value)))
+            ):
+                values.append(float(value))
+        return values
+
+    # 雷达图需要至少三个在高低两组都真实可见的维度。缺失值不能用 0 补画。
+    metrics = [
+        metric for metric in metrics
+        if _metric_values(high, metric) and _metric_values(low, metric)
+    ]
+    if len(metrics) < 3:
+        return ""
+
     def _collect(group):
         if not isinstance(group, list):
             return None
         vals = []
         for m in metrics:
-            col = [((p.get("metrics") or {}).get(m) or 0) for p in group if isinstance(p, dict)]
-            vals.append((sum(col) / len(col)) if col else 0.0)
+            col = _metric_values(group, m)
+            vals.append(sum(col) / len(col))
         return vals
 
     series = []
@@ -456,6 +523,15 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         ["请求采集数量", fmt_int(meta.get("requested_limit"))],
         ["采集时间范围", f"{meta.get('date_from') or '—'} ~ {meta.get('date_to') or '—'}"],
         ["分析目的", meta.get("analysis_goal") or "—"],
+        ["任务状态", meta.get("task_status") or "—"],
+        ["停止原因", meta.get("stop_reason") or "—"],
+        ["采集来源", meta.get("collection_source") or "—"],
+        ["索引快照时间", meta.get("snapshot_crawled_at") or "—"],
+        ["索引年龄标注", meta.get("snapshot_age_label") or "—"],
+        ["证据是否穷尽", (
+            "否" if meta.get("evidence_is_exhaustive") is False
+            else ("是" if meta.get("evidence_is_exhaustive") is True else "—")
+        )],
         ["主排序指标", meta.get("main_sort_metric") or "—"],
         ["分类状态", meta.get("classification_status") or "—"],
     ]
@@ -562,14 +638,23 @@ def build_content_structure(analysis, posts_csv) -> tuple[str, str]:
     return md, html
 
 
+def _cadence_inference_allowed(analysis, cadence) -> bool:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    return not (
+        meta.get("evidence_is_exhaustive") is False
+        or cadence.get("cadence_inference_allowed") is False
+    )
+
+
 def build_publish_cadence(analysis) -> tuple[str, str]:
     cad = _safe_get(analysis, "publish_cadence", default={}) or {}
     if not cad:
         return EMPTY_MD, EMPTY_HTML
 
+    inference_allowed = _cadence_inference_allowed(analysis, cad)
     unit = cad.get("interval_unit", "hours")
     rows = [
-        ["总发布数量", fmt_int(cad.get("total_posts"))],
+        ["总发布数量" if inference_allowed else "可见样本数量", fmt_int(cad.get("total_posts"))],
         ["覆盖天数", fmt_int(cad.get("coverage_days"))],
         ["覆盖周数", fmt_int(cad.get("coverage_weeks"))],
         ["周均发布量", fmt_float(cad.get("weekly_avg"))],
@@ -588,6 +673,17 @@ def build_publish_cadence(analysis) -> tuple[str, str]:
 
     html = html_table(["节奏指标", "数值"],
                       [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
+    if not inference_allowed:
+        sample_note = (
+            "索引证据并非穷尽作品列表；以下仅描述可见样本的日期分布，"
+            "不用于推断账号发布频率、发布间隔或排播规律。"
+        )
+        md += f"\n\n> {sample_note}"
+        html += f'<p class="note">{h_esc(sample_note)}</p>'
+    cadence_note = cad.get("note")
+    if cadence_note:
+        md += f"\n\n> {md_escape_text(cadence_note)}"
+        html += f'<p class="note">{h_esc(cadence_note)}</p>'
     if ww:
         html += '<p class="note">工作日 / 周末分布</p>' + html_table(
             ["类别", "数量", "占比"],
@@ -696,7 +792,11 @@ def build_metrics_dashboard(analysis) -> tuple[str, str]:
     return md, html
 
 
-def _render_perf_group(group, main_metric: str | None = None) -> tuple[str, str]:
+def _render_perf_group(
+    group,
+    main_metric: str | None = None,
+    metric_label: str | None = None,
+) -> tuple[str, str]:
     if not isinstance(group, list) or not group:
         return EMPTY_MD, EMPTY_HTML
 
@@ -706,22 +806,24 @@ def _render_perf_group(group, main_metric: str | None = None) -> tuple[str, str]
         if not isinstance(p, dict):
             continue
         pid = p.get("post_id") or "—"
+        display = p.get("title") or pid
         url = p.get("post_url") or ""
         pub = p.get("published_at") or "—"
         metrics = p.get("metrics", {}) or {}
         rp = p.get("relative_performance", {}) or {}
         # 主指标：优先使用调用方给定的 main_metric
-        mm = _PERF_MAIN_METRIC
-        mm_label = METRIC_LABELS.get(mm, mm) if mm else "—"
-        mm_val = fmt_metric(metrics.get(mm)) if mm else "—"
+        mm = main_metric or _PERF_MAIN_METRIC
+        mm_label = metric_label or (METRIC_LABELS.get(mm, mm) if mm else "—")
+        raw_mm_value = p.get("value") if "value" in p else metrics.get(mm)
+        mm_val = fmt_metric(raw_mm_value) if mm else "—"
         rp_val = fmt_float(rp.get(mm)) if (mm and mm in rp and rp.get(mm) is not None) else "—"
         vber = fmt_pct(p.get("view_based_engagement_rate"))
         if url:
             ref_post(url)
-            md_link = link_md(url, pid)
-            html_link = link_html(url, pid)
+            md_link = link_md(url, display)
+            html_link = link_html(url, display)
         else:
-            md_link, html_link = pid, Raw(h_esc(pid))
+            md_link, html_link = display, Raw(h_esc(display))
         rows_md.append([md_link, pub, f"{mm_label}: {mm_val}", rp_val, vber])
         rows_html.append([html_link, Raw(h_esc(pub)),
                           Raw(h_esc(f"{mm_label}: {mm_val}")), Raw(h_esc(rp_val)), Raw(h_esc(vber))])
@@ -733,26 +835,53 @@ def _render_perf_group(group, main_metric: str | None = None) -> tuple[str, str]
 _PERF_MAIN_METRIC = None  # 由 build_high/low 设置
 
 
+def _performance_metric_context(analysis) -> tuple[str | None, str | None, str | None]:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    performance_meta = (
+        analysis.get("performance_meta", {}) if isinstance(analysis, dict) else {}
+    )
+    main_metric = meta.get("main_sort_metric")
+    metric_label = None
+    if meta.get("collection_source") == "douyin_search_index" and main_metric == "likes":
+        metric_label = "索引可见点赞"
+    metric_note = performance_meta.get("metric_note")
+    if not isinstance(metric_note, str) or not metric_note.strip():
+        metric_note = None
+    return main_metric, metric_label, metric_note
+
+
+def _append_performance_note(md: str, html: str, note: str | None) -> tuple[str, str]:
+    if note is None:
+        return md, html
+    return (
+        md + f"\n\n> 指标口径：{md_escape_text(note)}",
+        html + f'<p class="note">指标口径：{h_esc(note)}</p>',
+    )
+
+
 def build_high_performance(analysis) -> tuple[str, str]:
     global _PERF_MAIN_METRIC
-    _PERF_MAIN_METRIC = (analysis.get("meta", {}) or {}).get("main_sort_metric")
+    main_metric, metric_label, metric_note = _performance_metric_context(analysis)
+    _PERF_MAIN_METRIC = main_metric
     high = analysis.get("high_performance")
     low = analysis.get("low_performance")
-    md, html = _render_perf_group(high)
+    md, html = _render_perf_group(high, main_metric, metric_label)
     # 高低表现雷达图：对比两组在各指标上的均值形态（仅作形态对比，不构成因果）
     radar = svg_high_low_radar(high, low, METRIC_FIELDS)
     if radar:
         md += ("\n\n**高低表现指标对比（雷达图）**\n\n"
                "> 说明：以各组在各指标上的均值按列最大值归一化，仅作形态对比，不构成因果结论。")
         html += '<p class="note">高低表现指标对比（雷达图）</p>' + radar
-    return md, html
+    return _append_performance_note(md, html, metric_note)
 
 
 def build_low_performance(analysis) -> tuple[str, str]:
     global _PERF_MAIN_METRIC
-    _PERF_MAIN_METRIC = (analysis.get("meta", {}) or {}).get("main_sort_metric")
+    main_metric, metric_label, metric_note = _performance_metric_context(analysis)
+    _PERF_MAIN_METRIC = main_metric
     group = analysis.get("low_performance")
-    return _render_perf_group(group)
+    md, html = _render_perf_group(group, main_metric, metric_label)
+    return _append_performance_note(md, html, metric_note)
 
 
 def _dist_table(posts, key, label) -> tuple[str, str]:
@@ -807,19 +936,20 @@ def build_strategy(analysis, profile) -> tuple[str, str]:
     tips = []
 
     cad = _safe_get(analysis, "publish_cadence", default={}) or {}
-    ww = cad.get("weekday_weekend", {}) or {}
-    if ww:
-        wc, ec = int(ww.get("weekday_count") or 0), int(ww.get("weekend_count") or 0)
-        if ec and wc:
-            dom = "周末" if ec > wc else "工作日"
-            tips.append(f"有效样本中 {dom}发布占比更高（周末 {fmt_pct(ww.get('weekend_pct'))} / "
-                        f"工作日 {fmt_pct(ww.get('weekday_pct'))}），可在该时段优先排播，但需注意样本量是否足以支撑结论。")
-    wd = cad.get("weekday_distribution", {}) or {}
-    if wd:
-        top_day = max(((int(wd.get(str(i), 0)), i) for i in range(7)), default=(0, 0))
-        if top_day[0] > 0:
-            tips.append(f"发布最密集的星期为 {WEEKDAY_NAMES[top_day[1]]}（{top_day[0]} 条），"
-                        f"可作为稳定更新锚点，但仍应结合表现数据验证。")
+    if _cadence_inference_allowed(analysis, cad):
+        ww = cad.get("weekday_weekend", {}) or {}
+        if ww:
+            wc, ec = int(ww.get("weekday_count") or 0), int(ww.get("weekend_count") or 0)
+            if ec and wc:
+                dom = "周末" if ec > wc else "工作日"
+                tips.append(f"有效样本中 {dom}发布占比更高（周末 {fmt_pct(ww.get('weekend_pct'))} / "
+                            f"工作日 {fmt_pct(ww.get('weekday_pct'))}），可在该时段优先排播，但需注意样本量是否足以支撑结论。")
+        wd = cad.get("weekday_distribution", {}) or {}
+        if wd:
+            top_day = max(((int(wd.get(str(i), 0)), i) for i in range(7)), default=(0, 0))
+            if top_day[0] > 0:
+                tips.append(f"发布最密集的星期为 {WEEKDAY_NAMES[top_day[1]]}（{top_day[0]} 条），"
+                            f"可作为稳定更新锚点，但仍应结合表现数据验证。")
 
     eng = _safe_get(analysis, "engagement", default={}) or {}
     vber = eng.get("view_based_engagement_rate", {}) or {}
@@ -857,7 +987,7 @@ def build_strategy(analysis, profile) -> tuple[str, str]:
     if not tips:
         return EMPTY_MD, EMPTY_HTML
 
-    md = "\n".join(f"{i}. {t}" for i, t in enumerate(tips, 1))
+    md = "\n".join(f"{i}. {md_escape_text(t)}" for i, t in enumerate(tips, 1))
     html = "<ul class='tight'>" + "".join(f"<li>{h_esc(t)}</li>" for t in tips) + "</ul>"
     return md, html
 
@@ -881,6 +1011,18 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
 
     md = md_table(["样本边界", "数值"], rows)
     md += "\n\n> " + DISCLAIMER
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    collection_source = meta.get("collection_source")
+    if collection_source:
+        md += (
+            f"\n\n> 当前数据来自 `{collection_source}` 公开索引快照，属于非实时、非穷尽样本；"
+            "不能据此推断账号完整发布量或后台表现。"
+        )
+        if collection_source == "douyin_search_index":
+            md += (
+                "\n\n> `idx-*` 是本地记录键；账号主页仅为证据锚点，"
+                "不是单条作品详情链接。"
+            )
     if hidden:
         md += f"\n\n> 受限/不可见字段：{', '.join(hidden)}（相关指标覆盖率相应下调）。"
     md += ("\n\n> 默认排除置顶/转载/投放内容；统计仅基于有效样本，"
@@ -889,6 +1031,13 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
     html = html_table(["样本边界", "数值"],
                       [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
     notes = [DISCLAIMER]
+    if collection_source:
+        notes.append(
+            f"当前数据来自 {collection_source} 公开索引快照，属于非实时、非穷尽样本；"
+            "不能据此推断账号完整发布量或后台表现。"
+        )
+        if collection_source == "douyin_search_index":
+            notes.append("idx-* 是本地记录键；账号主页仅为证据锚点，不是单条作品详情链接。")
     if hidden:
         notes.append("受限/不可见字段：" + ", ".join(hidden) + "（相关指标覆盖率相应下调）。")
     notes.append("默认排除置顶/转载/投放内容；统计仅基于有效样本，确定性数字由脚本计算，"
@@ -904,7 +1053,11 @@ def build_sources(analysis, profile) -> tuple[str, str]:
         urls.append(("账号主页", prof_url))
     posts = analysis.get("posts", []) if isinstance(analysis, dict) else []
     for p in posts:
-        if isinstance(p, dict) and p.get("post_url"):
+        if (
+            isinstance(p, dict)
+            and p.get("post_url")
+            and p.get("item_url_known") is not False
+        ):
             ref_post(p["post_url"])
             urls.append((p.get("post_id") or p["post_url"], p["post_url"]))
 
@@ -1003,8 +1156,10 @@ def main(argv=None) -> int:
                     or (profile or {}).get("account_name") or "未知账号")
     platform = ((analysis.get("meta", {}) or {}).get("platform")
                 or (profile or {}).get("platform") or "")
-    title = f"公开社媒账号分析报告：{account_name}（{platform}）" if platform else \
-        f"公开社媒账号分析报告：{account_name}"
+    safe_account_name = md_escape_text(account_name)
+    safe_platform = md_escape_text(platform)
+    title = f"公开社媒账号分析报告：{safe_account_name}（{safe_platform}）" if platform else \
+        f"公开社媒账号分析报告：{safe_account_name}"
     md_parts = [f"# {title}", "", DISCLAIMER, ""]
     for idx, (name, sec_title) in enumerate(SECTION_DEFS, 1):
         md_parts.append(f"## {idx}. {sec_title}")
