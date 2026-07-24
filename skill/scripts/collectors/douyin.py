@@ -1,14 +1,15 @@
-"""抖音公开账号采集适配器（P0，urllib-only）。
+"""抖音公开账号采集适配器（标准库 HTTP + 可选系统浏览器 CDP）。
 
-仅用标准库 `urllib` 访问 douyin.com / iesdouyin.com / v.douyin.com 的**公开**
-账号主页，把可解析到的字段映射到统一 `Profile` / `Post` 结构（见
-`data-schema.md`），并如实上抛访问限制 `stop_reason`（见 `exceptions.md`）。
+HTTP/SSR 是快速路径；SSR 缺失或作品结构无法识别时，可用项目自带的标准库
+CDP 客户端驱动独立临时浏览器，观察页面公开响应并读取可见作品卡片。两条路径
+都映射到统一 `Profile` / `Post` 结构，并如实上抛访问限制 `stop_reason`。
 
 现实约束（务必遵守）：
 - 抖音站点是重度 JS 渲染 + 风控（WAF / 滑块 / 签名）站点。标准库 `urllib` 直连
   通常只能拿到 JS 外壳或风控页，拿不到完整 SSR 数据。这是**预期且诚实**的结果：
   解析不到即 `PARSER_FAILED`，触发登录/验证/频控即对应 `stop_reason`。
-- **绝不绕过**登录、验证码、滑块或频控；不伪造签名、不模拟浏览器、不重试破解。
+- **绝不绕过**登录、验证码、滑块或频控；不伪造签名、不重试破解，也不复用
+  用户日常浏览器登录态。
 - 字段不可见写 `None`（绝不以 `0` 代替未知，见 `data-schema.md` §7/§8）。
 - 本适配器只采集、只映射，不分析、不存储（由上层脚本落盘）。
 
@@ -33,20 +34,19 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 
+from ._constants import (
+    DOUYIN_PAGE_STATE_PATTERNS,
+    STOP_ACCESS_RESTRICTED,
+    STOP_ACCOUNT_UNAVAILABLE,
+    STOP_INTERNAL,
+    STOP_LOGIN,
+    STOP_NO_PUBLIC_CONTENT,
+    STOP_PARSER_FAILED,
+    STOP_UNSUPPORTED,
+    STOP_VERIFICATION,
+)
 from .base import BaseCollector
 
-
-# --------------------------------------------------------------------------
-# stop_reason 常量（取值严格对齐 exceptions.md §9.2，不得新增）
-# --------------------------------------------------------------------------
-STOP_LOGIN = "LOGIN_REQUIRED"
-STOP_VERIFICATION = "VERIFICATION_REQUIRED"
-STOP_ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
-STOP_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
-STOP_PARSER_FAILED = "PARSER_FAILED"
-STOP_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
-STOP_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
-STOP_INTERNAL = "INTERNAL_ERROR"
 
 # 抖音公开接口 / 主页均使用北京时间（+08:00）
 _BEIJING = timezone(timedelta(hours=8))
@@ -58,17 +58,8 @@ _UA = (
 
 _TIMEOUT = 12
 
-# 访问限制识别：语句片段 → stop_reason（按优先级从上到下匹配）
-_RESTRICTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"滑动验证|人机验证|安全验证|verify you are human|please verify", re.I),
-     STOP_VERIFICATION),
-    (re.compile(r"登录后查看|请先登录|登录抖音|需登录|登录后访问|扫码登录", re.I),
-     STOP_LOGIN),
-    (re.compile(r"访问过于频繁|操作过于频繁|请求频率过高|网络异常[，, ]?请稍后|频繁"),
-     STOP_ACCESS_RESTRICTED),
-    (re.compile(r"账号不存在|用户不存在|该账号已被封禁|账号已注销|帐号不存在", re.I),
-     STOP_ACCOUNT_UNAVAILABLE),
-]
+# Shared with the browser transport so both paths use identical priority.
+_RESTRICTION_PATTERNS = DOUYIN_PAGE_STATE_PATTERNS
 
 
 class DouyinError(Exception):
@@ -433,6 +424,67 @@ class DouyinCollector(BaseCollector):
         return self.normalize_profile(raw)
 
     # -- 作品列表 -----------------------------------------------------------
+    def _collect_posts_via_browser(
+        self,
+        url: str,
+        limit: int,
+        date_range: tuple[str | None, str | None] | None,
+    ) -> list[dict[str, Any]]:
+        """Run the optional browser path and preserve its status semantics."""
+        if not self.browser_fallback:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "账号主页 SSR 缺失或作品列表结构无法识别，且浏览器降级已禁用",
+            )
+        try:
+            result = self._browser_collect(
+                url=url,
+                limit=limit,
+                date_range=date_range,
+            )
+        except Exception as exc:
+            code = (
+                "BROWSER_UNAVAILABLE"
+                if "未找到可用的浏览器" in str(exc)
+                else "BROWSER_TRANSPORT_FAILED"
+            )
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                f"抖音浏览器降级失败: {exc}",
+                diagnostic_code=code,
+            ) from exc
+
+        posts = [
+            self.normalize_post(
+                self._build_post_raw(
+                    url,
+                    item,
+                    source=str(
+                        item.get("_collection_source") or result.source or "network"
+                    ),
+                )
+            )
+            for item in result.aweme_items
+            if isinstance(item, dict)
+        ]
+        if date_range:
+            posts = self._filter_by_date(posts, date_range)
+        posts = posts[:limit]
+        if result.restriction:
+            raise DouyinError(
+                result.restriction,
+                f"浏览器采集中止: {result.restriction}",
+                raw=result.diagnostics,
+                partial_posts=posts,
+            )
+        if not posts:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器未识别到可验证的作品结构",
+                raw=result.diagnostics,
+            )
+        return posts
+
     def collect_post_list(
         self,
         url: str,
@@ -452,57 +504,14 @@ class DouyinCollector(BaseCollector):
             raise DouyinError(restriction, f"采集列表时命中访问限制: {restriction}")
 
         data = _extract_render_data(html)
-        if data is None:
-            if not self.browser_fallback:
-                raise DouyinError(
-                    STOP_PARSER_FAILED,
-                    "账号主页无 RENDER_DATA，且浏览器降级已禁用",
-                )
-            try:
-                result = self._browser_collect(
-                    url=url, limit=limit, date_range=date_range
-                )
-            except Exception as exc:
-                code = (
-                    "BROWSER_UNAVAILABLE"
-                    if "未找到可用的浏览器" in str(exc)
-                    else "BROWSER_TRANSPORT_FAILED"
-                )
-                raise DouyinError(
-                    STOP_PARSER_FAILED,
-                    f"抖音浏览器降级失败: {exc}",
-                    diagnostic_code=code,
-                ) from exc
+        aweme_list = self._find_aweme_list(data) if data is not None else None
+        if data is None or aweme_list is None:
+            return self._collect_posts_via_browser(url, limit, date_range)
 
-            posts = [
-                self.normalize_post(
-                    self._build_post_raw(url, item, source=result.source)
-                )
-                for item in result.aweme_items
-                if isinstance(item, dict)
-            ]
-            if date_range:
-                posts = self._filter_by_date(posts, date_range)
-            posts = posts[:limit]
-            if result.restriction:
-                raise DouyinError(
-                    result.restriction,
-                    f"浏览器采集中止: {result.restriction}",
-                    raw=result.diagnostics,
-                    partial_posts=posts,
-                )
-            if not posts:
-                raise DouyinError(
-                    STOP_PARSER_FAILED,
-                    "浏览器未识别到可验证的作品结构",
-                    raw=result.diagnostics,
-                )
-            return posts
-
-        aweme_list = self._find_aweme_list(data)
-        if aweme_list is None:
+        if len(aweme_list) == 0:
             raise DouyinError(
-                STOP_PARSER_FAILED, "RENDER_DATA 中未识别到作品列表结构"
+                STOP_NO_PUBLIC_CONTENT,
+                "账号主页明确显示没有公开作品",
             )
 
         posts: list[dict[str, Any]] = []
@@ -513,10 +522,6 @@ class DouyinCollector(BaseCollector):
                 break
             raw = self._build_post_raw(url, item, source="list")
             posts.append(self.normalize_post(raw))
-
-        if not posts and len(aweme_list) == 0:
-            # 账号存在但确无作品（且非受限）→ 如实返回空列表（上层可判 NO_PUBLIC_CONTENT）。
-            return []
 
         if date_range:
             posts = self._filter_by_date(posts, date_range)
@@ -734,6 +739,11 @@ class DouyinCollector(BaseCollector):
 
     @staticmethod
     def _build_post_raw(url: str, aweme: dict, source: str) -> dict:
+        from ._douyin_browser_transport import (
+            canonical_post_url,
+            sanitize_response_url,
+        )
+
         desc = aweme.get("desc") or ""
         text_extra = aweme.get("text_extra")
         statistics = aweme.get("statistics") or {}
@@ -747,10 +757,15 @@ class DouyinCollector(BaseCollector):
         collection = aweme.get("mix_info") or aweme.get("collection")
         collection_name = (collection or {}).get("mix_name") if isinstance(collection, dict) else None
         single_text = (desc or "").split("\n")[0] if isinstance(desc, str) else None
+        post_id = str(aweme.get("aweme_id") or aweme.get("aweme_id_str") or "")
+        post_url = canonical_post_url(post_id) or sanitize_response_url(url)
+        collection_source = str(
+            aweme.get("_collection_source") or source or "unknown"
+        )
         return {
             "platform": "douyin",
-            "post_id": str(aweme.get("aweme_id") or aweme.get("aweme_id_str")),
-            "post_url": aweme.get("share_url") or url,
+            "post_id": post_id,
+            "post_url": post_url,
             "published_at": _ts_to_iso(aweme.get("create_time")),
             "content_type": content_type,
             "title": single_text,
@@ -770,10 +785,18 @@ class DouyinCollector(BaseCollector):
             "danmaku": None,
             "collection_status": "SUCCESS",
             "collected_at": _now_iso(),
-            "source_url": aweme.get("share_url") or url,
+            "source_url": post_url,
             "platform_metrics": {
                 "collection_name": collection_name,
                 "aweme_type": aweme.get("aweme_type"),
+                "collection_source": collection_source,
+                "visible_is_pinned": (
+                    True
+                    if collection_source == "dom" and aweme.get("is_top") is True
+                    else None
+                    if collection_source == "dom"
+                    else is_top
+                ),
             },
         }
 

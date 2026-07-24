@@ -75,14 +75,19 @@ def _stop_reason_from_exc(e: Exception) -> str:
     return SR_INTERNAL
 
 
-def _load_adapters(douyin_browser_fallback: bool = True) -> list[BaseCollector]:
+def _load_adapters(
+    douyin_browser_fallback: bool = True,
+    bilibili_browser_fallback: bool | None = None,
+) -> list[BaseCollector]:
     """加载已实现(非桩)的采集器,返回实例列表。"""
     adapters: list[BaseCollector] = []
     # B站(P0):平级导入
     try:
         from collectors.bilibili import BilibiliCollector
 
-        adapters.append(BilibiliCollector())
+        adapters.append(
+            BilibiliCollector(browser_fallback=bilibili_browser_fallback)
+        )
     except Exception as e:  # pragma: no cover
         print(f"[warn] 加载 bilibili 适配器失败: {e}", file=sys.stderr)
     # 抖音(P0)/微博(P1):若实现则加载
@@ -386,11 +391,17 @@ def run(
     douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
     # Keep the default zero-argument loader call compatible with integrations
     # that replace it, while passing the policy only when it disables Douyin.
-    adapters = (
-        _load_adapters()
-        if douyin_enabled
-        else _load_adapters(douyin_browser_fallback=False)
-    )
+    if browser_fallback is not None:
+        # An explicit CLI policy is global: False overrides even the legacy
+        # BILIBILI_BROWSER_FALLBACK=1 environment setting.
+        adapters = _load_adapters(
+            douyin_browser_fallback=browser_fallback,
+            bilibili_browser_fallback=browser_fallback,
+        )
+    elif douyin_enabled:
+        adapters = _load_adapters()
+    else:
+        adapters = _load_adapters(douyin_browser_fallback=False)
     if not adapters:
         print("[FAILED] 没有可用适配器(采集器均未实现)", file=sys.stderr)
         return 2
@@ -630,9 +641,6 @@ def main() -> None:
     )
     ap.set_defaults(browser_fallback=None)
     args = ap.parse_args()
-    if args.browser_fallback is True:
-        # 透传给采集适配器(Session 构造时读取此环境变量)
-        os.environ["BILIBILI_BROWSER_FALLBACK"] = "1"
     limit = max(1, min(args.limit, 100))
     date_from_iso = _parse_date(args.date_from)
     date_to_iso = _default_date_to(args.date_to)

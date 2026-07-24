@@ -476,7 +476,11 @@ class BrowserSession:
     def navigate(self, url: str, timeout: float = 30.0) -> None:
         self.drain_events("Page.loadEventFired")
         started = time.monotonic()
-        result = self._send_cdp("Page.navigate", {"url": url})
+        result = self._send_cdp(
+            "Page.navigate",
+            {"url": url},
+            timeout=max(0.001, float(timeout)),
+        )
         if result.get("errorText"):
             raise BrowserError(f"页面导航失败: {result['errorText']}")
         deadline = started + timeout
@@ -579,18 +583,32 @@ class BrowserSession:
                         proc.wait(timeout=5)
                     except Exception:  # noqa: BLE001
                         self._record_cleanup_diagnostic("PROCESS_REAP_FAILED")
-        if os.path.isdir(self._user_data_dir):
-            for attempt in range(3):
+        try:
+            profile_is_dir = os.path.isdir(self._user_data_dir)
+        except Exception:  # noqa: BLE001 - never replace an active exception
+            self._record_cleanup_diagnostic("PROFILE_REMOVE_FAILED")
+            return
+        if not profile_is_dir:
+            return
+        for attempt in range(3):
+            try:
+                shutil.rmtree(self._user_data_dir)
+                break
+            except Exception:  # noqa: BLE001 - bounded cleanup retry
                 try:
-                    shutil.rmtree(self._user_data_dir)
+                    profile_remains = os.path.exists(self._user_data_dir)
+                except Exception:  # noqa: BLE001
+                    profile_remains = True
+                if not profile_remains:
                     break
-                except Exception:  # noqa: BLE001 - bounded cleanup retry
-                    if not os.path.exists(self._user_data_dir):
-                        break
-                    if attempt < 2:
-                        time.sleep(0.05)
-            if os.path.exists(self._user_data_dir):
-                self._record_cleanup_diagnostic("PROFILE_REMOVE_FAILED")
+                if attempt < 2:
+                    time.sleep(0.05)
+        try:
+            profile_remains = os.path.exists(self._user_data_dir)
+        except Exception:  # noqa: BLE001
+            profile_remains = True
+        if profile_remains:
+            self._record_cleanup_diagnostic("PROFILE_REMOVE_FAILED")
 
     def __enter__(self) -> "BrowserSession":
         return self.start()

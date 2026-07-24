@@ -8,11 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Added an experimental Douyin browser fallback when a profile homepage has no parseable `RENDER_DATA`. It observes eligible public CDP network responses and falls back to visible post cards when needed; no Python runtime package is added.
+- Added an experimental Douyin browser fallback when SSR is absent or its post-list structure is unrecognized. It observes eligible public CDP network responses and falls back to visible post cards when needed; a recognized empty list remains `NO_PUBLIC_CONTENT`, and no Python runtime package is added.
 - Added offline Douyin tests for browser-response parsing, bounded collection, CLI policy, retained partial posts, and documentation coverage.
 
 ### Changed
-- Douyin collection now defaults to the experimental fallback, while `--no-browser-fallback` and `SOCIAL_BROWSER_FALLBACK=0` disable it. Each browser run uses a temporary profile and does not reuse login state.
+- Douyin collection now defaults to the experimental fallback. `SOCIAL_BROWSER_FALLBACK=0` disables its default, while explicit `--no-browser-fallback` globally overrides both Douyin and Bilibili browser paths. Each browser run uses a temporary profile and does not reuse login state.
 - When browser collection is stopped by a public access restriction, normalized posts already collected are preserved as partial results. Diagnostics are limited to safe codes and sanitized response paths.
 
 ### Security

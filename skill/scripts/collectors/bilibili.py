@@ -152,7 +152,12 @@ def _backoff(attempt: int) -> float:
 # HTTP 会话（curl 传输层）
 # --------------------------------------------------------------------------
 class Session:
-    def __init__(self, timeout: int = 10, min_interval: float = 1.2, browser_fallback: bool = False):
+    def __init__(
+        self,
+        timeout: int = 10,
+        min_interval: float = 1.2,
+        browser_fallback: bool | None = None,
+    ):
         self.cookies: dict[str, str] = {}
         self.timeout = timeout
         self.min_interval = min_interval
@@ -160,9 +165,11 @@ class Session:
         self._wbi: tuple[str, str] | None = None
         # 浏览器降级（可选、默认关闭）：仅当 HTTP 主路径因出口 IP 被 WAF 封禁而全部重试失败时，
         # 改由运行环境的浏览器进程经真实网络出口再试一次。绝不用于绕过验证码/登录墙/频控。
-        # 优先级：构造参数 > 环境变量 BILIBILI_BROWSER_FALLBACK=1。
-        self._browser_fallback = bool(browser_fallback) or (
+        # 显式三态策略优先于兼容环境变量；False 必须能压过 env=1。
+        self._browser_fallback = (
             os.environ.get("BILIBILI_BROWSER_FALLBACK") == "1"
+            if browser_fallback is None
+            else bool(browser_fallback)
         )
 
     def _throttle(self) -> None:
@@ -634,6 +641,13 @@ def _mid_from_url(url: str) -> str:
 class BilibiliCollector(BaseCollector):
     platform = "bilibili"
 
+    def __init__(self, browser_fallback: bool | None = None):
+        self.browser_fallback = browser_fallback
+
+    def _new_session(self) -> Session:
+        """Create a task session with the caller's explicit browser policy."""
+        return Session(browser_fallback=self.browser_fallback)
+
     # -- 路由 --
     def supports(self, url: str) -> bool:
         # 仅接受账号主页：https://space.bilibili.com/<digits>
@@ -648,7 +662,7 @@ class BilibiliCollector(BaseCollector):
     # -- 访问检查（不绕过） --
     def check_access(self, url: str) -> dict:
         mid = _mid_from_url(url)
-        s = Session()
+        s = self._new_session()
         s.ensure_buvid()
         # 免 wbi 端点优先：card 稳定，relation/stat 偶发被风控(-400/-412)。
         # 任一成功即视为可访问；仅两端点都失败才报受限。
@@ -677,7 +691,7 @@ class BilibiliCollector(BaseCollector):
     # -- 资料 --
     def collect_profile(self, url: str) -> dict:
         mid = _mid_from_url(url)
-        s = Session()
+        s = self._new_session()
         s.ensure_buvid()
 
         # card(免wbi) 稳定保底；关注数优先 relation/stat，失败用 card.fans 兜底
@@ -708,7 +722,7 @@ class BilibiliCollector(BaseCollector):
     # -- 视频列表 --
     def collect_post_list(self, url: str, limit: int = 30, date_range=None) -> list:
         mid = _mid_from_url(url)
-        s = Session()
+        s = self._new_session()
         s.ensure_buvid()
 
         # 置顶视频检测（top/arc，免 wbi、稳定）——用于标记 is_pinned
@@ -830,7 +844,7 @@ class BilibiliCollector(BaseCollector):
         if not m:
             raise BilibiliError(STOP_UNSUPPORTED, f"无法解析 BV: {post_url}")
         bv = m.group(0)
-        s = Session()
+        s = self._new_session()
         s.ensure_buvid()
         data = s.get_json("/x/web-interface/view", {"bvid": bv})
         if data.get("code") != 0:
@@ -897,7 +911,7 @@ class BilibiliCollector(BaseCollector):
         （返回空），由上层判定 PARTIAL/停止，绝不伪装成功。
         """
         mid = _mid_from_url(url)
-        s = Session()
+        s = self._new_session()
         s.ensure_buvid()
         try:
             cards = s.discover_dynamics(mid, limit)

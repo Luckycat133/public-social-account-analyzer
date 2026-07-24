@@ -39,10 +39,10 @@
 
 已完成离线实现与单元测试的功能如下；抖音浏览器降级尚待在线验收，不将其标为已验证或生产可用：
 
-- **测试**：`tests/` 共 129 项离线 pytest 通过，涵盖 `test_incremental.py`、`test_weibo.py`、`test_render_report.py`、`test_metrics.py` 与抖音浏览器降级的解析、边界和 CLI 策略用例。
+- **测试**：`tests/` 共 162 项离线 pytest 通过，涵盖 `test_incremental.py`、`test_weibo.py`、`test_render_report.py`、`test_metrics.py` 与抖音浏览器降级的解析、边界和 CLI 策略用例。
 - **仓库 restructure**：原 `scripts/` 已迁移至 `skill/scripts/`，`references/`、`assets/`、`evals/`、`SKILL.md` 同处 `skill/`；`tests/conftest.py` 与 `test_bilibili_parse.py`/`test_browser_backend.py` 的 `sys.path` 已改为兼容 `skill/scripts`（同时回退兼容旧 `scripts` 布局），确保离线测试可导入。
 - **文档**：`skill/SKILL.md`、`USAGE.md`、`skill/references/analysis-rules.md` 已补齐四分法互动率、IQR 散布比、季节性检测、内联可视化、LLM 协同分类、增量续采的说明。
 - **render 验证**：在 `workspace/bilibili-518388027-20260723` 样例上渲染无告警，四类产物（MD/HTML/CSV/JSON）均含新增章节（深度认可率、社群讨论率、IQR 表、覆盖率徽章、高低表现雷达图、发布时段分布图）。
 - **LLM 回填验证**：`--with-llm-tax` → 生成 prompt；`--llm-tax-results` 回填后 `meta.llm_taxonomy` 与 `meta.classification_status=llm-1` 正确写入。
 - **深度互动率口径（混合口径）**：经确认，`deep_approval_rate` 采用 `(投币+收藏)/播放` 分母（与「播放」维度一致），`community_discussion_rate` 采用 `(评论+弹幕)/播放` 并保留弹幕（贴合 B站讨论形态）。两者分母均透明、禁止用 0 做分母。
-- **抖音浏览器降级（实验性）**：主页没有可解析的 `RENDER_DATA` 时可按 CDP 网络响应观察、可见 DOM 卡片顺序降级；默认启用且可禁用。若 `RENDER_DATA` 存在但无法识别作品列表，仍返回 `PARSER_FAILED`。它使用临时用户目录，不复用登录状态，不新增 Python 运行时依赖；在线账号验收仍待完成。
+- **抖音浏览器降级（实验性）**：SSR 缺失或作品列表结构无法识别时可按 CDP 网络响应观察、可见 DOM 卡片顺序降级；已识别的空列表返回 `NO_PUBLIC_CONTENT`。它默认启用且可全局禁用，使用临时用户目录，不复用登录状态，不新增 Python 运行时依赖；在线账号验收仍待完成。

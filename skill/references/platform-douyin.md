@@ -141,7 +141,7 @@
   `{"accessible": False, "reason": <说明>, "stop_reason": <上表值>}`；
   `collect_*` 抛 `DouyinError(stop_reason)` 由上层按 `exceptions.md` 决策表降级。
 - **抖音 JS 虚拟机/动态渲染与浏览器降级（实验性）**：
-  1. 当主页没有可解析的 `RENDER_DATA`（例如直连 HTTP 仅获取到 `_$jsvmprt` 打桩页）时，默认自动启动浏览器降级；`--no-browser-fallback` 或 `SOCIAL_BROWSER_FALLBACK=0` 可禁用，命令行开关优先于环境变量。若 `RENDER_DATA` 存在但无法识别作品列表，仍返回 `PARSER_FAILED`。
+  1. 当 SSR 缺失或作品列表结构无法识别（例如直连 HTTP 仅获取到 `_$jsvmprt` 打桩页）时，默认自动启动浏览器降级；真正识别到空作品列表时不启动浏览器，返回 `NO_PUBLIC_CONTENT`。`SOCIAL_BROWSER_FALLBACK=0` 可禁用抖音默认降级；`--no-browser-fallback` 优先级最高，同时禁止 B站和抖音启动浏览器。
   2. 降级不会声称加载“完整 DOM”。实现会先观察来自公开 Douyin/iesdouyin 域名的 CDP XHR/Fetch JSON 响应并提取已验证的作品结构；不足时才从可见的 `/video/<id>` 或 `/note/<id>` 卡片提取最小字段。浏览器不参与签名生成或保护绕过。
   3. 系统 Chrome、Chromium、Edge 或 Brave 是可选前置条件，可通过 `BROWSER_BIN` / `CHROME_BIN` 指定。未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外 `stop_reason` 仍为 `PARSER_FAILED`。
   4. 浏览器运行不新增 pip 或其他 Python 运行时依赖。每次启动均创建并删除临时用户目录，不附着或复用本机浏览器的登录状态、Cookie 或用户配置；不持久化 Cookie、请求头、带签名 URL、完整响应或媒体。

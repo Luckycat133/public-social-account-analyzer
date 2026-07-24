@@ -319,7 +319,9 @@ def test_navigate_waits_for_load_event():
     session = BrowserSession.__new__(BrowserSession)
     calls = []
     session._events = deque()
-    session._send_cdp = lambda method, params: calls.append((method, params)) or {}
+    session._send_cdp = (
+        lambda method, params, timeout=None: calls.append((method, params)) or {}
+    )
     session.poll_event = lambda timeout: {"method": "Page.loadEventFired"}
 
     assert session.navigate("https://example.test") is None
@@ -332,7 +334,7 @@ def test_navigate_ignores_stale_load_event_but_observes_fresh_one():
         {"method": "Page.loadEventFired", "params": {"marker": "fresh"}},
         {"id": 1, "result": {}},
     ])
-    session._cmd_id = 0
+    session._cmd_id, session._startup_timeout = 0, 20.0
     session._events = deque([
         {"method": "Page.loadEventFired", "params": {"marker": "stale"}},
     ])
@@ -364,7 +366,7 @@ def test_navigate_restores_non_load_events_in_original_order():
     }
     session._events = deque()
 
-    def navigate_command(method, params):
+    def navigate_command(method, params, timeout=None):
         session._events.extend([
             network,
             {"method": "Page.loadEventFired", "params": {}},
@@ -377,6 +379,24 @@ def test_navigate_restores_non_load_events_in_original_order():
     session.navigate("https://www.douyin.com/user/example")
 
     assert list(session._events) == [network, after_load]
+
+
+def test_navigate_bounds_the_page_command_with_its_deadline():
+    """The Page.navigate command itself cannot outlive the public timeout."""
+    session = BrowserSession.__new__(BrowserSession)
+    session._events = deque()
+    command_timeouts = []
+
+    def navigate_command(method, params, timeout=None):
+        command_timeouts.append(timeout)
+        session._events.append({"method": "Page.loadEventFired", "params": {}})
+        return {}
+
+    session._send_cdp = navigate_command
+
+    session.navigate("https://www.douyin.com/user/example", timeout=0.5)
+
+    assert command_timeouts == [pytest.approx(0.5, abs=0.05)]
 
 
 def test_page_apis_forward_bounded_command_timeouts():
@@ -483,6 +503,23 @@ def test_close_reports_sanitized_cleanup_failure_without_raising(monkeypatch):
 
     # The method remains idempotent and never replaces an active exception.
     session.close()
+    real_rmtree(profile_dir)
+
+
+def test_close_never_replaces_an_error_when_profile_state_is_unreadable(monkeypatch):
+    """Even filesystem inspection failure becomes only a sanitized diagnostic."""
+    session = BrowserSession(port=9222)
+    profile_dir = session._user_data_dir
+    real_rmtree = shutil.rmtree
+    monkeypatch.setattr(
+        "collectors.browser_backend.os.path.isdir",
+        lambda path: (_ for _ in ()).throw(PermissionError(path)),
+    )
+
+    session.close()
+
+    assert session.cleanup_diagnostics == ("PROFILE_REMOVE_FAILED",)
+    assert profile_dir not in repr(session.cleanup_diagnostics)
     real_rmtree(profile_dir)
 
 

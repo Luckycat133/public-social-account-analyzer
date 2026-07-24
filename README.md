@@ -58,10 +58,10 @@ public-social-account-analyzer/             # 项目根目录
 | 平台 | 成熟度 | 适配器路径 | 核心能力 |
 |:---|:---|:---|:---|
 | **B站 (Bilibili)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/bilibili.py` | 三级接口降级链、WBI 签名、置顶/合集标识、传输层降级重试 |
-| **抖音 (Douyin)** | 🟡 P0（实验性支持） | `skill/scripts/collectors/douyin.py` | SSR 快速路径；主页没有可解析的 `RENDER_DATA` 时按 CDP 网络响应观察、可见 DOM 卡片的顺序降级；公开指标提取与风控模式识别 |
+| **抖音 (Douyin)** | 🟡 P0（实验性支持） | `skill/scripts/collectors/douyin.py` | SSR 快速路径；SSR 缺失或作品列表结构无法识别时按 CDP 网络响应观察、可见 DOM 卡片的顺序降级；公开指标提取与风控模式识别 |
 | **微博 (Weibo)** | 🟡 P1 (条件支持) | `skill/scripts/collectors/weibo.py` | 需显式启用适配器；未启用时返回 `ADAPTER_UNAVAILABLE` |
 
-抖音浏览器降级默认自动尝试，但只在主页没有可解析的 `RENDER_DATA` 时启动，并依次使用公开的 CDP 网络响应和可见 DOM 卡片。若 `RENDER_DATA` 存在但无法识别作品列表，仍如实返回 `PARSER_FAILED`。该路径仍需在线验收；可通过 `--no-browser-fallback` 禁用，详见 [USAGE.md](USAGE.md)。
+抖音浏览器降级默认自动尝试：当 SSR 缺失或作品列表结构无法识别时，依次使用公开的 CDP 网络响应和可见 DOM 卡片；已识别的空列表不会启动浏览器，而是返回 `NO_PUBLIC_CONTENT`。该路径仍需在线验收；`--no-browser-fallback` 会同时禁止 B站和抖音启动系统浏览器，详见 [USAGE.md](USAGE.md)。
 
 ---
 
@@ -146,7 +146,7 @@ python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 pytest tests/
 ```
 
-当前包含 129 项离线单元测试，覆盖适配器解析、日期时间计算、去重映射、指标统计算法与抖音浏览器降级策略。
+当前包含 162 项离线单元测试，覆盖适配器解析、日期时间计算、去重映射、指标统计算法与抖音浏览器降级策略。
 
 ---
 
