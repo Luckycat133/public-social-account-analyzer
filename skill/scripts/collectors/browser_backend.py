@@ -25,6 +25,7 @@ import struct
 import subprocess
 import tempfile
 import time
+from collections import deque
 from typing import Any, Dict, Optional
 
 
@@ -155,6 +156,11 @@ class _WSClient:
             raise RuntimeError(f"WebSocket 握手失败: {status_line}")
         self._sock = raw
 
+    def set_timeout(self, timeout: float) -> None:
+        self._timeout = timeout
+        if self._sock is not None:
+            self._sock.settimeout(timeout)
+
     # -- 帧收发 --
     def _read_exact(self, n: int) -> bytes:
         assert self._sock is not None
@@ -282,37 +288,48 @@ class BrowserSession:
         self._ws: Optional[_WSClient] = None
         self._ws_url: Optional[str] = None
         self._cmd_id = 0
+        self._events: deque = deque()
         self._startup_timeout = startup_timeout
 
     # -- 生命周期 --
     def start(self) -> "BrowserSession":
         if self._proc is not None:
             return self
-        bin_path = self.browser_bin or find_browser()
-        if not bin_path or not os.path.exists(bin_path):
-            raise BrowserError(
-                "未找到可用的浏览器二进制；请安装 Chrome/Chromium/Edge，"
-                "或通过 BROWSER_BIN 环境变量指定路径。"
-            )
-        args = [
-            bin_path,
-            f"--remote-debugging-port={self.port}",
-            "--no-proxy-server",  # 关键：强制走本机/运行环境的真实网络出口，而非沙箱代理
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            f"--user-data-dir={self._user_data_dir}",
-        ]
-        if self.headless:
-            args.append("--headless=new")
         try:
+            bin_path = self.browser_bin or find_browser()
+            if not bin_path or not os.path.exists(bin_path):
+                raise BrowserError(
+                    "未找到可用的浏览器二进制；请安装 Chrome/Chromium/Edge，"
+                    "或通过 BROWSER_BIN 环境变量指定路径。"
+                )
+            args = [
+                bin_path,
+                f"--remote-debugging-port={self.port}",
+                "--no-proxy-server",  # 关键：强制走本机/运行环境的真实网络出口，而非沙箱代理
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                f"--user-data-dir={self._user_data_dir}",
+            ]
+            if self.headless:
+                args.append("--headless=new")
             self._proc = subprocess.Popen(
                 args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            self._wait_for_devtools()
+            self._connect()
+            return self
         except OSError as e:
+            try:
+                self.close()
+            except Exception:
+                pass
             raise BrowserError(f"启动浏览器失败: {e}")
-        self._wait_for_devtools()
-        self._connect()
-        return self
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def _wait_for_devtools(self) -> None:
         import urllib.request
@@ -354,6 +371,7 @@ class BrowserSession:
         self._ws.connect()
         self._send_cdp("Runtime.enable", {})
         self._send_cdp("Network.enable", {})
+        self._send_cdp("Page.enable", {})
 
     def _send_cdp(self, method: str, params: dict) -> dict:
         assert self._ws is not None
@@ -366,11 +384,39 @@ class BrowserSession:
             msg = self._ws.recv_message()
             if msg is None:
                 raise BrowserError("浏览器连接在处理 CDP 指令时关闭")
-            if msg.get("id") == cid:
-                if "error" in msg:
-                    raise BrowserError(f"CDP {method} 失败: {msg['error']}")
-                return msg.get("result", {})
-            # 其余为事件帧，忽略
+            if msg.get("method"):
+                self._events.append(msg)
+                continue
+            if msg.get("id") != cid:
+                continue
+            if "error" in msg:
+                raise BrowserError(f"CDP {method} 失败: {msg['error']}")
+            return msg.get("result", {})
+
+    def drain_events(self, method: Optional[str] = None) -> list[dict]:
+        matched, remaining = [], deque()
+        while self._events:
+            event = self._events.popleft()
+            (matched if method is None or event.get("method") == method else remaining).append(event)
+        self._events = remaining
+        return matched
+
+    def poll_event(self, timeout: float = 1.0) -> Optional[dict]:
+        if self._events:
+            return self._events.popleft()
+        assert self._ws is not None
+        self._ws.set_timeout(timeout)
+        try:
+            while True:
+                msg = self._ws.recv_message()
+                if msg is None:
+                    raise BrowserError("浏览器连接在等待 CDP 事件时关闭")
+                if msg.get("method"):
+                    return msg
+        except socket.timeout:
+            return None
+        finally:
+            self._ws.set_timeout(self._startup_timeout)
 
     # -- 公共 API --
     def set_cookies(self, cookies: Dict[str, str], domain: str = ".bilibili.com") -> None:
@@ -390,6 +436,39 @@ class BrowserSession:
                 },
             )
 
+    def evaluate(self, expression: str, await_promise: bool = False) -> Any:
+        result = self._send_cdp("Runtime.evaluate", {
+            "expression": expression,
+            "awaitPromise": await_promise,
+            "returnByValue": True,
+            "userGesture": False,
+        })
+        if "exceptionDetails" in result:
+            raise BrowserError(
+                f"浏览器脚本执行失败: {result['exceptionDetails'].get('text')}"
+            )
+        return result.get("result", {}).get("value")
+
+    def navigate(self, url: str, timeout: float = 30.0) -> None:
+        result = self._send_cdp("Page.navigate", {"url": url})
+        if result.get("errorText"):
+            raise BrowserError(f"页面导航失败: {result['errorText']}")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            event = self.poll_event(min(1.0, deadline - time.monotonic()))
+            if event and event.get("method") == "Page.loadEventFired":
+                return
+        raise BrowserError(f"页面加载超时: {url}")
+
+    def scroll_by(self, viewports: int = 1) -> None:
+        self.evaluate(
+            f"window.scrollBy(0, window.innerHeight * {max(1, int(viewports))}); true"
+        )
+
+    def page_text(self) -> str:
+        value = self.evaluate("document.body ? document.body.innerText : ''")
+        return value if isinstance(value, str) else ""
+
     def fetch_text(self, url: str, headers: Optional[Dict[str, str]] = None) -> str:
         """经浏览器 fetch 取响应体文本。由调用方负责后续 JSON 解析与业务码判断。"""
         hdrs = {k: v for k, v in (headers or {}).items() if v}
@@ -401,19 +480,15 @@ class BrowserSession:
             "  return await resp.text();"
             "})()"
         ) % (json.dumps(url), json.dumps(hdrs))
-        result = self._send_cdp(
-            "Runtime.evaluate",
-            {
-                "expression": expr,
-                "awaitPromise": True,
-                "returnByValue": True,
-                "userGesture": False,
-            },
-        )
-        if "exceptionDetails" in result:
-            exc = result["exceptionDetails"]
-            raise BrowserError(f"浏览器内 fetch 抛出异常: {exc.get('text')}")
-        return result.get("result", {}).get("value", "") or ""
+        value = self.evaluate(expr, await_promise=True)
+        return value if isinstance(value, str) else ""
+
+    def get_response_body(self, request_id: str) -> str:
+        result = self._send_cdp("Network.getResponseBody", {"requestId": request_id})
+        body = result.get("body", "")
+        if result.get("base64Encoded"):
+            return base64.b64decode(body).decode("utf-8", errors="replace")
+        return body
 
     def close(self) -> None:
         if self._ws is not None:

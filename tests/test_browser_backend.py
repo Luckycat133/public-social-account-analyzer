@@ -2,8 +2,13 @@
 
 运行：python tests/test_browser_backend.py
 """
+import json
 import os
+import socket
 import sys
+from collections import deque
+
+import pytest
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
@@ -115,6 +120,47 @@ def test_session_start_no_binary_raises():
         assert "未找到" in str(e) or "浏览器" in str(e)
 
 
+def test_start_connect_failure_cleans_owned_resources(monkeypatch):
+    class FakeProc:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout):
+            return 0
+
+    proc = FakeProc()
+    session = BrowserSession(browser_bin="/fake/browser", port=9222)
+    profile_dir = session._user_data_dir
+    real_exists = os.path.exists
+    monkeypatch.setattr("collectors.browser_backend.os.path.exists", lambda _: True)
+    monkeypatch.setattr("collectors.browser_backend.subprocess.Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(session, "_wait_for_devtools", lambda: None)
+    monkeypatch.setattr(session, "_connect", lambda: (_ for _ in ()).throw(BrowserError("connect failed")))
+
+    with pytest.raises(BrowserError, match="connect failed"):
+        session.start()
+
+    assert proc.terminated is True
+    assert not real_exists(profile_dir)
+
+
+def test_start_preserves_browser_error_when_cleanup_fails(monkeypatch, tmp_path):
+    session = BrowserSession(
+        browser_bin="/fake/browser", port=9222, user_data_dir=str(tmp_path)
+    )
+    monkeypatch.setattr("collectors.browser_backend.os.path.exists", lambda _: True)
+    monkeypatch.setattr("collectors.browser_backend.subprocess.Popen", lambda *args, **kwargs: object())
+    monkeypatch.setattr(session, "_wait_for_devtools", lambda: None)
+    monkeypatch.setattr(session, "_connect", lambda: (_ for _ in ()).throw(BrowserError("connect failed")))
+    monkeypatch.setattr(session, "close", lambda: (_ for _ in ()).throw(OSError("cleanup failed")))
+
+    with pytest.raises(BrowserError, match="connect failed"):
+        session.start()
+
+
 # --------------------------------------------------------------------------
 # WebSocket 帧编解码（纯函数式，使用 FakeSocket，不联网）
 # --------------------------------------------------------------------------
@@ -168,6 +214,124 @@ def test_ws_client_fragmented_text():
     assert fin1 is False and op1 == 0x1 and bytes(p1) == b"hel"
     fin2, op2, p2 = ws._read_frame()
     assert fin2 is True and op2 == 0x0 and bytes(p2) == b"lo"
+
+
+class QueueWS:
+    def __init__(self, messages):
+        self.messages, self.sent, self.timeout = list(messages), [], None
+
+    def send_text(self, text):
+        self.sent.append(json.loads(text))
+
+    def recv_message(self):
+        return self.messages.pop(0) if self.messages else None
+
+    def set_timeout(self, timeout):
+        self.timeout = timeout
+
+
+def test_send_cdp_preserves_async_events():
+    from collectors.browser_backend import BrowserSession
+
+    session = BrowserSession.__new__(BrowserSession)
+    session._ws = QueueWS([
+        {"method": "Network.responseReceived", "params": {"requestId": "r1"}},
+        {"id": 1, "result": {"ok": True}},
+    ])
+    session._cmd_id, session._events = 0, deque()
+    assert session._send_cdp("Network.enable", {}) == {"ok": True}
+    assert session.drain_events("Network.responseReceived")[0]["params"]["requestId"] == "r1"
+
+
+def test_get_response_body_decodes_base64():
+    from collectors.browser_backend import BrowserSession
+
+    session = BrowserSession.__new__(BrowserSession)
+    session._send_cdp = lambda method, params: {
+        "body": "eyJhd2VtZV9saXN0IjpbXX0=", "base64Encoded": True
+    }
+    assert session.get_response_body("r1") == '{"aweme_list":[]}'
+
+
+def test_poll_event_reads_event_and_restores_timeout():
+    session = BrowserSession.__new__(BrowserSession)
+    session._ws = QueueWS([{"method": "Page.loadEventFired", "params": {}}])
+    session._events, session._startup_timeout = deque(), 20.0
+
+    assert session.poll_event(0.5)["method"] == "Page.loadEventFired"
+    assert session._ws.timeout == 20.0
+
+
+def test_connect_enables_page_domain(monkeypatch):
+    class FakeWS:
+        def __init__(self, url, timeout):
+            self.url, self.timeout = url, timeout
+
+        def connect(self):
+            pass
+
+    session = BrowserSession.__new__(BrowserSession)
+    session._ws_url, session._startup_timeout = "ws://example.test", 20.0
+    enabled = []
+    session._send_cdp = lambda method, params: enabled.append(method) or {}
+    monkeypatch.setattr("collectors.browser_backend._WSClient", FakeWS)
+
+    session._connect()
+
+    assert enabled == ["Runtime.enable", "Network.enable", "Page.enable"]
+
+
+def test_evaluate_returns_cdp_value():
+    session = BrowserSession.__new__(BrowserSession)
+    calls = []
+    session._send_cdp = lambda method, params: calls.append((method, params)) or {
+        "result": {"value": "ok"}
+    }
+
+    assert session.evaluate("1 + 1", await_promise=True) == "ok"
+    assert calls == [("Runtime.evaluate", {
+        "expression": "1 + 1", "awaitPromise": True,
+        "returnByValue": True, "userGesture": False,
+    })]
+
+
+def test_fetch_text_uses_evaluate():
+    session = BrowserSession.__new__(BrowserSession)
+    calls = []
+    session.evaluate = lambda expression, await_promise=False: calls.append(
+        (expression, await_promise)
+    ) or "response body"
+
+    assert session.fetch_text("https://example.test/api", {"Referer": "https://example.test"}) == "response body"
+    assert calls[0][1] is True
+    assert "fetch(\"https://example.test/api\"" in calls[0][0]
+
+
+def test_navigate_waits_for_load_event():
+    session = BrowserSession.__new__(BrowserSession)
+    calls = []
+    session._send_cdp = lambda method, params: calls.append((method, params)) or {}
+    session.poll_event = lambda timeout: {"method": "Page.loadEventFired"}
+
+    assert session.navigate("https://example.test") is None
+    assert calls == [("Page.navigate", {"url": "https://example.test"})]
+
+
+def test_scroll_by_evaluates_at_least_one_viewport():
+    session = BrowserSession.__new__(BrowserSession)
+    calls = []
+    session.evaluate = lambda expression: calls.append(expression)
+
+    session.scroll_by(0)
+
+    assert calls == ["window.scrollBy(0, window.innerHeight * 1); true"]
+
+
+def test_page_text_returns_only_string_values():
+    session = BrowserSession.__new__(BrowserSession)
+    session.evaluate = lambda expression: 42
+
+    assert session.page_text() == ""
 
 
 # --------------------------------------------------------------------------
