@@ -1,0 +1,288 @@
+# 统一数据模型
+
+> 本文件是 **字段字典（field dictionary）**，冻结所有采集、归一化、分析与报告层共享的数据结构。
+> 在字段定义变更前，不得正式实现平台采集器；任何字段增删都须同步更新本文件、归一化脚本、分析脚本和报告模板。
+> 配套规范：`references/exceptions.md`（异常与状态机）、`references/analysis-rules.md`（指标与分类）、各 `references/platform-*.md`（平台字段映射）。
+
+## 1. 设计原则
+
+- **原始数据与归一化数据分开保存**：`source/` 下保留平台原始快照，`normalized-posts.csv` / `analysis.json` 为派生数据，可被重新生成。
+- **未公开字段写 `null`，不写 `0`**：页面没有显示该字段即为 `null`；`0` 仅用于页面明确显示为零的情况（见 §7）。
+- **所有时间统一为 ISO 8601**：带时区偏移，如 `2026-07-23T09:00:00+08:00`；无法获取时区时以平台默认时区（中国为 `+08:00`）标注。
+- **`platform` + `post_id` 构成内容唯一键**：跨平台允许相同 `post_id` 共存，不能因此去重。
+- **每条记录必须包含来源和采集状态**：`source_url` / `collected_at` / `collection_status` 为必填证据字段。
+- **模型分析字段不得覆盖原始字段**：`analysis_*` 与 `platform_metrics` 分层保存，原始值只读。
+
+## 2. 存储与文件命名约定
+
+每个账号 + 分析周期创建独立任务目录，避免不同账号或采集批次混写：
+
+```
+workspace/<platform>-<account>-<date>/
+  source/profile.json        # 账号原始快照
+  source/posts.jsonl         # 内容原始快照（每行一条）
+  normalized-posts.csv       # 归一化内容表
+  collection-report.md       # 采集质量报告
+  account-analysis-report.md # 分析报告（Markdown）
+  dashboard.html             # 可视化报告（HTML）
+  analysis.json              # 结构化分析结果
+```
+
+同目录已存在时**不得覆盖**，追加任务 ID 或序号创建新目录（见 `SKILL.md` 任务创建步骤）。
+
+## 3. Task 数据结构
+
+任务级参数与状态。对应 `SKILL.md` 任务创建步骤与状态机。
+
+| 字段 | 类型 | 必填 | 可空 | 示例 | 说明 |
+|---|---|---:|---:|---|---|
+| task_id | string | 是 | 否 | bilibili-123-20260723-a1b2 | 任务唯一标识 |
+| platform | enum | 是 | 否 | bilibili | bilibili / douyin / weibo |
+| profile_url | string | 是 | 否 | https://space.bilibili.com/123 | 账号主页 URL |
+| requested_limit | integer | 是 | 否 | 30 | 默认 30，最大 100 |
+| date_from | datetime | 否 | 是 | 2026-06-01T00:00:00+08:00 | 采集起始时间 |
+| date_to | datetime | 否 | 是 | 2026-07-23T23:59:59+08:00 | 采集结束时间 |
+| analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | 用户填写的分析目的 |
+| include_comments | boolean | 是 | 否 | false | 评论采样开关，默认关闭 |
+| task_status | enum | 是 | 否 | COMPLETED | 生命周期状态（§9.1） |
+| stop_reason | enum | 否 | 是 | VERIFICATION_REQUIRED | 停止原因（§9.2），未中止时为 `null` |
+
+约束：
+- `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
+- 执行前向用户回显 `platform`、`requested_limit`、`date_from`/`date_to`、`include_comments`。
+
+## 4. Profile 数据结构
+
+账号层公开信息。只保存页面公开字段及采集快照，不可见字段为 `null`。
+
+| 字段 | 类型 | 必填 | 可空 | 平台来源 | 说明 |
+|---|---|---:|---:|---|---|
+| platform | string | 是 | 否 | — | 平台标识 |
+| account_id | string | 是 | 否 | UID / 抖音号 / UID | 平台账号 ID |
+| account_name | string | 是 | 否 | 名称 | 页面显示名称 |
+| profile_url | string | 是 | 否 | — | 主页 URL（证据锚点） |
+| bio | string | 否 | 是 | 简介 | 账号简介 |
+| verified | boolean \| string | 否 | 是 | 认证 | `true`/`false` 或认证文案 |
+| followers | integer | 否 | 是 | 粉丝 | 粉丝数量 |
+| post_count | integer | 否 | 是 | 视频数 / 作品数 / 微博数 | 作品数量 |
+| level | integer | 否 | 是 | 等级 | 账号等级（B站等），不可见为 `null` |
+| platform_metrics | object | 是 | 否 | 见下 | 平台特有账号字段 |
+| collected_at | datetime | 是 | 否 | — | 采集时间（ISO 8601） |
+| field_visibility | object | 是 | 否 | — | 字段可见性（§8） |
+
+`platform_metrics` 账号层常见键：
+- 抖音：`total_likes`（获赞总量）
+- 微博：`following`（关注数）
+- B站：一般为空对象 `{}`
+
+全局账号字段映射：
+
+| 统一字段 | B站 | 抖音 | 微博 |
+|---|---|---|---|
+| account_id | UID | 抖音号 | UID |
+| followers | 粉丝 | 粉丝 | 粉丝 |
+| post_count | 视频数 | 作品数 | 微博数 |
+
+## 5. Post 数据结构
+
+单条内容基础信息。`platform` + `post_id` 唯一；时间统一为 ISO 8601。
+
+| 字段 | 类型 | 必填 | 可空 | 说明 |
+|---|---|---:|---:|---|
+| platform | string | 是 | 否 | 平台标识 |
+| post_id | string | 是 | 否 | 平台内容 ID（BV号 / 作品ID / 博文ID） |
+| post_url | string | 是 | 否 | 内容详情页 URL（证据锚点） |
+| published_at | datetime | 否 | 是 | 发布时间（ISO 8601） |
+| content_type | enum | 是 | 否 | 内容形态（§9.4） |
+| title | string | 否 | 是 | 标题 / 文案首行 |
+| text | string | 否 | 是 | 正文 / 文案全文 |
+| duration_seconds | integer | 否 | 是 | 视频时长（秒） |
+| hashtags | array[string] | 否 | 是 | 话题 / 标签 |
+| is_pinned | boolean | 是 | 否 | 是否置顶 |
+| is_repost | boolean | 是 | 否 | 是否转载 / 转发 |
+| is_promoted | boolean | 是 | 否 | 是否投放 / 推广标记 |
+| collection_status | enum | 是 | 否 | 采集状态（§9.3） |
+| collected_at | datetime | 是 | 否 | 采集时间（ISO 8601） |
+| source_url | string | 是 | 否 | 来源 URL（证据锚点） |
+
+约束：
+- `is_pinned` / `is_repost` / `is_promoted` 默认为 `false`；未知时不得臆测为 `true`。
+- 默认分析排除置顶、转载、投放内容（见 `analysis-rules.md`），但须在数据中保留标记。
+
+## 6. Metrics 数据结构
+
+单条内容的公开表现指标。未展示即为 `null`；禁止用 `0` 代替未知（见 §7）。
+
+| 字段 | 类型 | 必填 | 可空 | 说明 |
+|---|---|---:|---:|---|
+| views | integer | 否 | 是 | 播放 / 浏览（公开时） |
+| likes | integer | 否 | 是 | 点赞 |
+| comments | integer | 否 | 是 | 评论 |
+| favorites | integer | 否 | 是 | 收藏 |
+| shares | integer | 否 | 是 | 分享 / 转发 |
+| coins | integer | 否 | 是 | 投币（B站） |
+| danmaku | integer | 否 | 是 | 弹幕（B站） |
+| platform_metrics | object | 是 | 否 | 平台特有指标（如微博无 favorites 时记此） |
+
+全局内容指标映射：
+
+| 统一字段 | B站 | 抖音 | 微博 |
+|---|---|---|---|
+| views | 播放 | 播放（公开时） | 浏览（公开时） |
+| likes | 点赞 | 点赞 | 点赞 |
+| comments | 评论 | 评论 | 评论 |
+| favorites | 收藏 | 收藏 | null |
+| shares | 分享 | 分享 | 转发 |
+| coins | 投币 | null | null |
+| danmaku | 弹幕 | null | null |
+
+## 7. Analysis 数据结构
+
+模型输出，分层保存，不覆盖原始字段。
+
+| 字段 | 类型 | 必填 | 可空 | 说明 |
+|---|---|---:|---:|---|
+| topic | string | 否 | 是 | 主题标签（2–10 汉字，未知为 `unknown`） |
+| format | enum | 否 | 是 | 内容形式（§9.5） |
+| funnel_stage | enum | 否 | 是 | 内容目的 / 漏斗阶段（§9.6） |
+| hook_type | enum | 否 | 是 | 开头钩子类型（§9.7） |
+| series_name | string | 否 | 是 | 所属栏目 / 合集名 |
+| is_original | boolean | 否 | 是 | 是否原创 |
+| has_product_placement | boolean | 否 | 是 | 是否有产品露出 |
+| analysis_labels | array[string] | 否 | 是 | 额外模型标签 |
+| classification_confidence | float | 否 | 是 | 分类置信度（0–1） |
+| classification_version | string | 否 | 是 | 分类器 / 模型版本 |
+
+约束：
+- 分类结果可重新分类；每次重新分类须更新 `classification_version`。
+- 确定性数字（排名、中位数、分位数）由脚本计算，不写入本结构。
+
+## 8. 空值规则（field_visibility）
+
+`field_visibility` 记录每个顶层字段是否对当前采集可见，便于计算字段覆盖率与诚实报告。示例：
+
+```json
+{
+  "followers": "visible",
+  "post_count": "visible",
+  "bio": "hidden",
+  "views": "visible",
+  "favorites": "hidden"
+}
+```
+
+取值：`visible` / `hidden` / `partial`（字段出现但数值不完整）。
+
+数值空值规则：
+- 页面**明确显示 0** → 保存为 `0`（真实零值）。
+- 页面**没有显示**该字段 → 保存为 `null`。
+- **解析失败** → 保存为 `null`，并在错误日志记录字段错误（`PARSER_FAILED` 或字段级错误）。
+- **禁止**通过其他指标推算不可见字段（如用互动数反推播放数）。
+- 禁止用 `0` 代替未知；`null` 与 `0` 在统计与报告中必须区分对待。
+
+## 9. 枚举定义
+
+> 行为语义（在何种场景设置哪个值）的权威来源是 `exceptions.md`（状态机）与 `analysis-rules.md`（分类）；此处汇总便于字段实现查阅。
+
+### 9.1 task_status（生命周期状态）
+
+- `CREATED`：任务目录已创建
+- `COLLECTING`：正在采集
+- `NORMALIZING`：正在归一化
+- `ANALYZING`：正在分析
+- `COMPLETED`：输出验证全部通过
+- `PARTIAL`：部分数据成功，部分失败 / 中止
+- `FAILED`：不可恢复错误，无可用结果
+
+### 9.2 stop_reason（停止原因，默认 `null`）
+
+- `LOGIN_REQUIRED`：页面要求登录
+- `VERIFICATION_REQUIRED`：出现验证码 / 滑块
+- `ACCOUNT_UNAVAILABLE`：账号不存在、封禁或无法访问
+- `ACCESS_RESTRICTED`：其他访问限制（含频控）
+- `PARSER_FAILED`：页面可访问但解析失败
+- `NO_PUBLIC_CONTENT`：账号确实没有公开内容
+- `UNSUPPORTED_PLATFORM`：URL 不属于支持平台
+- `ADAPTER_UNAVAILABLE`：平台适配器未实现或未启用（如微博 P1 未启用）
+- `INTERNAL_ERROR`：脚本 / 内部错误
+- 单条内容级中止原因（用于错误日志，不写入 `task_status`）：`POST_UNAVAILABLE`、`COMMENTS_UNAVAILABLE`
+
+### 9.3 collection_status（单条内容采集状态）
+
+- `SUCCESS`：内容与指标完整采集
+- `PARTIAL`：内容已采集但部分指标缺失 / 受限
+- `FAILED`：内容采集失败
+- `DELETED`：内容已删除或不可公开访问
+- `RESTRICTED`：内容存在访问限制（如仅粉丝可见）
+
+### 9.4 content_type（内容形态）
+
+- `video`：视频（B站 / 抖音）
+- `image_text`：图文（微博图文 / 动态）
+- `text`：纯文字 / 长文（微博长文）
+- `live_clip`：直播切片
+- `dynamic`：动态视频 / 图文动态（B站动态）
+- `other`：无法归入上述类型
+
+### 9.5 format（内容形式，模型分类，有限枚举）
+
+`talking_head` / `tutorial` / `commentary` / `interview` / `vlog` / `news` / `review` / `compilation` / `image_text` / `live_clip` / `other`
+
+### 9.6 funnel_stage（内容目的 / 漏斗阶段，模型分类）
+
+`awareness` / `education` / `engagement` / `conversion` / `retention` / `unknown`
+
+### 9.7 hook_type（开头钩子类型，模型分类）
+
+`question` / `contradiction` / `result_first` / `pain_point` / `controversy` / `list` / `curiosity` / `authority` / `story` / `none` / `unknown`
+
+## 10. 平台字段映射总表
+
+综合 §4 / §6 与 PRD 平台字段矩阵。适配器须将平台原始字段映射到下列统一字段；无法映射的平台特有字段放入 `platform_metrics`。
+
+### 账号层
+
+| 统一字段 | B站 | 抖音 | 微博 |
+|---|---|---|---|
+| account_id | UID | 抖音号 | UID |
+| account_name | 名称 | 名称 | 名称 |
+| bio | 简介 | 简介 | 简介 |
+| verified | 认证 | 认证 | 认证 |
+| followers | 粉丝 | 粉丝 | 粉丝 |
+| post_count | 视频数 | 作品数 | 微博数 |
+| level | 等级 | 等级 | 等级 |
+| platform_metrics | {} | {total_likes} | {following} |
+
+### 内容层
+
+| 统一字段 | B站 | 抖音 | 微博 |
+|---|---|---|---|
+| post_id | BV号 | 作品ID | 博文ID |
+| title | 标题 | 文案首行 | 正文首行 |
+| text | 简介 | 文案全文 | 正文全文 |
+| published_at | 发布时间 | 发布时间 | 发布时间 |
+| duration_seconds | 时长 | 时长 | null |
+| hashtags | 标签 | 话题 | 话题 |
+| content_type | video / dynamic | video | text / image_text / video |
+
+### 指标层
+
+| 统一字段 | B站 | 抖音 | 微博 |
+|---|---|---|---|
+| views | 播放 | 播放（公开时） | 浏览（公开时） |
+| likes | 点赞 | 点赞 | 点赞 |
+| comments | 评论 | 评论 | 评论 |
+| favorites | 收藏 | 收藏 | null |
+| shares | 分享 | 分享 | 转发 |
+| coins | 投币 | null | null |
+| danmaku | 弹幕 | null | null |
+
+### 特殊处理标记
+
+| 平台 | 需标记的特殊内容 |
+|---|---|
+| B站 | 合集、动态视频、置顶、转载 |
+| 抖音 | 合集、置顶、公开视频、登录 / 验证提示 |
+| 微博 | 置顶、转发微博、长文、图文 / 视频 |
+
+所有 `is_pinned` / `is_repost` / `is_promoted` 标记须在 `Post` 结构中显式记录，供分析层按规则排除或单独成组。

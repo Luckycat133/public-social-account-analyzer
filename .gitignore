@@ -1,0 +1,36 @@
+# --- 任务产物与 Worktrees（每次分析生成/隔离，不入库） ---
+workspace/
+.worktrees/
+worktrees/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+  venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- 本地环境与密钥 ---
+.env
+.env.*
+
+# --- WorkBuddy / Superpowers Agent 本地会话与上下文数据 ---
+.workbuddy/
+.superpowers/
+
+# --- 评估运行产物（evals 定义入库，运行结果不入库） ---
+evals/files/output/
+*-workspace/
+
+# --- macOS / 编辑器 ---
+.DS_Store
+.idea/
+.vscode/
+
+# --- 临时文件 ---
+*.log
+*.tmp
+~$*.docx

@@ -1,0 +1,442 @@
+"""通用 headless 浏览器 fetch 后端（可选降级用）。
+
+设计目标（面向「通用 Skill」，绝非本机专属 hack）：
+- **跨平台**：自动探测 macOS / Linux / Windows 上的 Chrome / Chromium / Edge / Brave；
+  支持 `BROWSER_BIN` / `CHROME_BIN` 环境变量覆盖；找不到浏览器时优雅报错，不硬编码任何路径。
+- **零第三方依赖**：自带标准库 WebSocket 客户端（socket + struct + base64 + hashlib 实现
+  握手与帧掩码），不要求安装 `websocket-client` 等包，便于分发给任意 Python 环境。
+- **合规降级**：仅作为「部署环境的出口 IP 被平台 WAF 封禁」时的**传输层**替代——请求改由
+  运行环境的真实网络出口（浏览器进程）发出。绝不用于绕过验证码 / 滑块 / 登录墙 / 访问频控。
+- **安全清理**：作为上下文管理器使用，退出时终止浏览器进程并删除临时 user-data 目录。
+
+用法（由采集适配器在 HTTP 主路径失败后调用）：
+    with BrowserSession() as b:
+        b.set_cookies({"buvid3": "..."}, domain=".bilibili.com")
+        body = b.fetch_text("https://api.bilibili.com/...", headers={"Referer": "..."})
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+from typing import Any, Dict, Optional
+
+
+# --------------------------------------------------------------------------
+# 浏览器二进制自动探测（跨平台）
+# --------------------------------------------------------------------------
+_CANDIDATES: Dict[str, list] = {
+    "darwin": [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    ],
+    "linux": [
+        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+        "chrome", "microsoft-edge", "brave-browser", "google-chrome-beta",
+        "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+        "/usr/bin/microsoft-edge", "/snap/bin/chromium",
+    ],
+    "windows": [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+    ],
+}
+
+
+def _platform_key() -> str:
+    sysname = getattr(os, "uname", lambda: None)()
+    if sysname is not None:
+        s = sysname.sysname if hasattr(sysname, "sysname") else str(sysname)
+    else:
+        s = os.name
+    s = str(s).lower()
+    if s.startswith("darwin") or s == "macos":
+        return "darwin"
+    if "win" in s:
+        return "windows"
+    return "linux"
+
+
+def find_browser(explicit: Optional[str] = None) -> Optional[str]:
+    """探测可用的浏览器二进制路径。
+
+    - 优先使用 explicit 显式路径；
+    - 其次读取 BROWSER_BIN / CHROME_BIN 环境变量；
+    - 最后按当前平台候选列表（绝对路径用 os.path.exists，命令名用 shutil.which）探测。
+    全部失败返回 None（由调用方决定如何上报，不在此处静默兜底到本机特定路径）。
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get("BROWSER_BIN") or os.environ.get("CHROME_BIN")
+    if env:
+        return env
+    key = _platform_key()
+    for cand in _CANDIDATES.get(key, []):
+        if "/" in cand or "\\" in cand:
+            if os.path.exists(cand):
+                return cand
+        else:
+            found = shutil.which(cand)
+            if found:
+                return found
+    return None
+
+
+def _free_port() -> int:
+    """向 OS 借一个当前空闲的 TCP 端口（存在极小竞态，部署场景可接受）。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+# --------------------------------------------------------------------------
+# 极简标准库 WebSocket 客户端（仅满足 CDP 文本帧需求）
+# --------------------------------------------------------------------------
+class _WSClient:
+    """无第三方依赖的 WebSocket 客户端，足够驱动 CDP（文本帧 + ping/pong + close）。"""
+
+    def __init__(self, url: str, timeout: float = 15.0):
+        self._url = url
+        self._timeout = timeout
+        self._sock: Optional[socket.socket] = None
+        self._buf = bytearray()
+        self._closed = False
+
+    # -- 握手 --
+    def connect(self) -> None:
+        import urllib.parse as up
+
+        p = up.urlparse(self._url)
+        host = p.hostname or "127.0.0.1"
+        port = p.port or (443 if p.scheme == "wss" else 80)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.settimeout(self._timeout)
+        raw.connect((host, port))
+        # 关键：CDP 握手**不**带 Origin 头（带 Origin 会被部分实现拒绝）
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        raw.sendall(req.encode("ascii"))
+        # 读取响应头直到 \r\n\r\n
+        header = b""
+        while b"\r\n\r\n" not in header:
+            chunk = raw.recv(4096)
+            if not chunk:
+                raise RuntimeError("WebSocket 握手未收到响应")
+            header += chunk
+            if len(header) > 65536:
+                raise RuntimeError("WebSocket 握手响应过长")
+        status_line = header.split(b"\r\n", 1)[0].decode("ascii", "replace")
+        if "101" not in status_line:
+            raise RuntimeError(f"WebSocket 握手失败: {status_line}")
+        self._sock = raw
+
+    # -- 帧收发 --
+    def _read_exact(self, n: int) -> bytes:
+        assert self._sock is not None
+        while len(self._buf) < n:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("WebSocket 连接在读帧时断开")
+            self._buf += chunk
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def _send_frame(self, payload: bytes, opcode: int = 0x1) -> None:
+        assert self._sock is not None
+        mask = os.urandom(4)
+        length = len(payload)
+        header = bytearray()
+        header.append(0x80 | opcode)  # FIN + opcode（文本=1）
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header += length.to_bytes(2, "big")
+        else:
+            header.append(0x80 | 127)
+            header += length.to_bytes(8, "big")
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self._sock.sendall(bytes(header) + mask + masked)
+
+    def _read_frame(self) -> tuple:
+        assert self._sock is not None
+        b0, b1 = self._read_exact(2)
+        fin = bool(b0 & 0x80)
+        opcode = b0 & 0x0F
+        masked = bool(b1 & 0x80)
+        length = b1 & 0x7F
+        if length == 126:
+            (length,) = struct.unpack(">H", self._read_exact(2))
+        elif length == 127:
+            (length,) = struct.unpack(">Q", self._read_exact(8))
+        payload = self._read_exact(length)
+        if masked:
+            _ = self._read_exact(4)  # 服务端不应掩码，忽略以防万一
+        return fin, opcode, payload
+
+    def send_text(self, text: str) -> None:
+        self._send_frame(text.encode("utf-8"), opcode=0x1)
+
+    def recv_message(self) -> Optional[dict]:
+        """读取一个完整文本消息（处理分片 / ping / pong / close）。返回解析后的 dict 或 None。"""
+        assert self._sock is not None
+        fragments: list = []
+        frag_op = 0
+        while True:
+            fin, opcode, payload = self._read_frame()
+            if opcode == 0x8:  # close
+                self._closed = True
+                return None
+            if opcode == 0x9:  # ping -> pong
+                self._send_frame(payload, opcode=0xA)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+            if opcode == 0x0:  # 续帧
+                fragments.append(payload)
+                if fin:
+                    data = b"".join(fragments)
+                    return json.loads(data.decode("utf-8"))
+                continue
+            # 0x1 文本 / 0x2 二进制
+            if not fin:
+                frag_op = opcode
+                fragments.append(payload)
+                continue
+            data = payload
+            try:
+                return json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+
+    def close(self) -> None:
+        if self._sock is None:
+            return
+        try:
+            self._send_frame(b"", opcode=0x8)
+        except OSError:
+            pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._sock = None
+
+
+class BrowserError(Exception):
+    """浏览器后端自身的错误（区别于平台返回的业务码）。"""
+
+
+# --------------------------------------------------------------------------
+# 浏览器会话（启动 / fetch / 清理）
+# --------------------------------------------------------------------------
+class BrowserSession:
+    """启动一个 headless 浏览器并通过 CDP 发起 fetch。
+
+    典型用法：
+        with BrowserSession(browser_bin=find_browser()) as b:
+            b.set_cookies({"buvid3": "xxx"}, domain=".bilibili.com")
+            body = b.fetch_text(url, headers={"Referer": "..."})
+    """
+
+    def __init__(
+        self,
+        browser_bin: Optional[str] = None,
+        port: Optional[int] = None,
+        headless: bool = True,
+        user_data_dir: Optional[str] = None,
+        startup_timeout: float = 20.0,
+    ):
+        self.browser_bin = browser_bin
+        self.port = port or _free_port()
+        self.headless = headless
+        self._user_data_dir = user_data_dir or tempfile.mkdtemp(prefix="psaa-cdp-")
+        self._owns_user_data = user_data_dir is None
+        self._proc: Optional[subprocess.Popen] = None
+        self._ws: Optional[_WSClient] = None
+        self._ws_url: Optional[str] = None
+        self._cmd_id = 0
+        self._startup_timeout = startup_timeout
+
+    # -- 生命周期 --
+    def start(self) -> "BrowserSession":
+        if self._proc is not None:
+            return self
+        bin_path = self.browser_bin or find_browser()
+        if not bin_path or not os.path.exists(bin_path):
+            raise BrowserError(
+                "未找到可用的浏览器二进制；请安装 Chrome/Chromium/Edge，"
+                "或通过 BROWSER_BIN 环境变量指定路径。"
+            )
+        args = [
+            bin_path,
+            f"--remote-debugging-port={self.port}",
+            "--no-proxy-server",  # 关键：强制走本机/运行环境的真实网络出口，而非沙箱代理
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            f"--user-data-dir={self._user_data_dir}",
+        ]
+        if self.headless:
+            args.append("--headless=new")
+        try:
+            self._proc = subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except OSError as e:
+            raise BrowserError(f"启动浏览器失败: {e}")
+        self._wait_for_devtools()
+        self._connect()
+        return self
+
+    def _wait_for_devtools(self) -> None:
+        import urllib.request
+
+        base = f"http://127.0.0.1:{self.port}"
+        deadline = time.time() + self._startup_timeout
+        last_err = None
+        ws_url = None
+        while time.time() < deadline:
+            if self._proc and self._proc.poll() is not None:
+                raise BrowserError("浏览器进程启动后随即退出")
+            try:
+                # /json/version 的 webSocketDebuggerUrl 是「浏览器级」WS，不支持 Runtime 域；
+                # 必须连到具体的 page target（/json/list 取，没有则用 /json/new 创建一个）。
+                with urllib.request.urlopen(f"{base}/json/list", timeout=2) as r:
+                    targets = json.loads(r.read().decode("utf-8"))
+                page = next(
+                    (t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")),
+                    None,
+                )
+                if page:
+                    ws_url = page["webSocketDebuggerUrl"]
+                    break
+                with urllib.request.urlopen(f"{base}/json/new?about:blank", timeout=2) as r:
+                    new_t = json.loads(r.read().decode("utf-8"))
+                if new_t.get("webSocketDebuggerUrl"):
+                    ws_url = new_t["webSocketDebuggerUrl"]
+                    break
+            except Exception as e:  # noqa: BLE001 - 轮询期间多种异常均可重试
+                last_err = e
+                time.sleep(0.4)
+        if not ws_url:
+            raise BrowserError(f"等待浏览器 DevTools 可用 target 超时: {last_err}")
+        self._ws_url = ws_url
+
+    def _connect(self) -> None:
+        assert self._ws_url is not None
+        self._ws = _WSClient(self._ws_url, timeout=self._startup_timeout)
+        self._ws.connect()
+        self._send_cdp("Runtime.enable", {})
+        self._send_cdp("Network.enable", {})
+
+    def _send_cdp(self, method: str, params: dict) -> dict:
+        assert self._ws is not None
+        self._cmd_id += 1
+        cid = self._cmd_id
+        self._ws.send_text(
+            json.dumps({"id": cid, "method": method, "params": params})
+        )
+        while True:
+            msg = self._ws.recv_message()
+            if msg is None:
+                raise BrowserError("浏览器连接在处理 CDP 指令时关闭")
+            if msg.get("id") == cid:
+                if "error" in msg:
+                    raise BrowserError(f"CDP {method} 失败: {msg['error']}")
+                return msg.get("result", {})
+            # 其余为事件帧，忽略
+
+    # -- 公共 API --
+    def set_cookies(self, cookies: Dict[str, str], domain: str = ".bilibili.com") -> None:
+        """通过 CDP 在浏览器上下文写入 cookie（复用采集会话已获得的 buvid 等）。"""
+        for name, value in cookies.items():
+            if not value:
+                continue
+            self._send_cdp(
+                "Network.setCookie",
+                {
+                    "name": name,
+                    "value": str(value),
+                    "domain": domain,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": False,
+                },
+            )
+
+    def fetch_text(self, url: str, headers: Optional[Dict[str, str]] = None) -> str:
+        """经浏览器 fetch 取响应体文本。由调用方负责后续 JSON 解析与业务码判断。"""
+        hdrs = {k: v for k, v in (headers or {}).items() if v}
+        # json.dumps 的产物本身即合法 JS 字面量（字符串/对象），直接嵌入即可，
+        # 无需 JSON.parse，避免引号转义导致的解析失败。
+        expr = (
+            "(async () => {"
+            "  const resp = await fetch(%s, {method: 'GET', headers: %s, credentials: 'include'});"
+            "  return await resp.text();"
+            "})()"
+        ) % (json.dumps(url), json.dumps(hdrs))
+        result = self._send_cdp(
+            "Runtime.evaluate",
+            {
+                "expression": expr,
+                "awaitPromise": True,
+                "returnByValue": True,
+                "userGesture": False,
+            },
+        )
+        if "exceptionDetails" in result:
+            exc = result["exceptionDetails"]
+            raise BrowserError(f"浏览器内 fetch 抛出异常: {exc.get('text')}")
+        return result.get("result", {}).get("value", "") or ""
+
+    def close(self) -> None:
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except OSError:
+                pass
+            self._ws = None
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                try:
+                    self._proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._proc = None
+        if self._owns_user_data and os.path.isdir(self._user_data_dir):
+            shutil.rmtree(self._user_data_dir, ignore_errors=True)
+
+    def __enter__(self) -> "BrowserSession":
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

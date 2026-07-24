@@ -1,0 +1,13 @@
+[project]
+name = "public-social-account-analyzer"
+version = "1.0.0"
+description = "采集公开社交媒体账号主页并输出带来源证据的账号内容分析报告（Agent Skills 规范）"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["skill/scripts", "skill/scripts/collectors"]
