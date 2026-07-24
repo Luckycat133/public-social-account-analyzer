@@ -276,14 +276,12 @@ class BrowserSession:
         browser_bin: Optional[str] = None,
         port: Optional[int] = None,
         headless: bool = True,
-        user_data_dir: Optional[str] = None,
         startup_timeout: float = 20.0,
     ):
         self.browser_bin = browser_bin
         self.port = port or _free_port()
         self.headless = headless
-        self._user_data_dir = user_data_dir or tempfile.mkdtemp(prefix="psaa-cdp-")
-        self._owns_user_data = user_data_dir is None
+        self._user_data_dir = tempfile.mkdtemp(prefix="psaa-cdp-")
         self._proc: Optional[subprocess.Popen] = None
         self._ws: Optional[_WSClient] = None
         self._ws_url: Optional[str] = None
@@ -450,6 +448,7 @@ class BrowserSession:
         return result.get("result", {}).get("value")
 
     def navigate(self, url: str, timeout: float = 30.0) -> None:
+        self.drain_events("Page.loadEventFired")
         result = self._send_cdp("Page.navigate", {"url": url})
         if result.get("errorText"):
             raise BrowserError(f"页面导航失败: {result['errorText']}")
@@ -507,7 +506,7 @@ class BrowserSession:
                 except Exception:  # noqa: BLE001
                     pass
             self._proc = None
-        if self._owns_user_data and os.path.isdir(self._user_data_dir):
+        if os.path.isdir(self._user_data_dir):
             shutil.rmtree(self._user_data_dir, ignore_errors=True)
 
     def __enter__(self) -> "BrowserSession":

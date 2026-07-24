@@ -120,6 +120,11 @@ def test_session_start_no_binary_raises():
         assert "未找到" in str(e) or "浏览器" in str(e)
 
 
+def test_session_rejects_user_data_dir_override(tmp_path):
+    with pytest.raises(TypeError):
+        BrowserSession(port=9222, user_data_dir=str(tmp_path))
+
+
 def test_start_connect_failure_cleans_owned_resources(monkeypatch):
     class FakeProc:
         def __init__(self):
@@ -147,10 +152,9 @@ def test_start_connect_failure_cleans_owned_resources(monkeypatch):
     assert not real_exists(profile_dir)
 
 
-def test_start_preserves_browser_error_when_cleanup_fails(monkeypatch, tmp_path):
-    session = BrowserSession(
-        browser_bin="/fake/browser", port=9222, user_data_dir=str(tmp_path)
-    )
+def test_start_preserves_browser_error_when_cleanup_fails(monkeypatch):
+    session = BrowserSession(browser_bin="/fake/browser", port=9222)
+    real_close = session.close
     monkeypatch.setattr("collectors.browser_backend.os.path.exists", lambda _: True)
     monkeypatch.setattr("collectors.browser_backend.subprocess.Popen", lambda *args, **kwargs: object())
     monkeypatch.setattr(session, "_wait_for_devtools", lambda: None)
@@ -159,6 +163,8 @@ def test_start_preserves_browser_error_when_cleanup_fails(monkeypatch, tmp_path)
 
     with pytest.raises(BrowserError, match="connect failed"):
         session.start()
+
+    real_close()
 
 
 # --------------------------------------------------------------------------
@@ -310,11 +316,37 @@ def test_fetch_text_uses_evaluate():
 def test_navigate_waits_for_load_event():
     session = BrowserSession.__new__(BrowserSession)
     calls = []
+    session._events = deque()
     session._send_cdp = lambda method, params: calls.append((method, params)) or {}
     session.poll_event = lambda timeout: {"method": "Page.loadEventFired"}
 
     assert session.navigate("https://example.test") is None
     assert calls == [("Page.navigate", {"url": "https://example.test"})]
+
+
+def test_navigate_ignores_stale_load_event_but_observes_fresh_one():
+    session = BrowserSession.__new__(BrowserSession)
+    session._ws = QueueWS([
+        {"method": "Page.loadEventFired", "params": {"marker": "fresh"}},
+        {"id": 1, "result": {}},
+    ])
+    session._cmd_id = 0
+    session._events = deque([
+        {"method": "Page.loadEventFired", "params": {"marker": "stale"}},
+    ])
+    seen = []
+    poll_event = BrowserSession.poll_event
+
+    def record_poll_event(timeout):
+        event = poll_event(session, timeout)
+        seen.append(event["params"]["marker"])
+        return event
+
+    session.poll_event = record_poll_event
+
+    session.navigate("https://example.test")
+
+    assert seen == ["fresh"]
 
 
 def test_scroll_by_evaluates_at_least_one_viewport():
