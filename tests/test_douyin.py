@@ -5,6 +5,7 @@ import json
 import pytest
 
 from collectors._constants import STOP_LOGIN, STOP_VERIFICATION
+from collectors.base import BaseCollector
 
 
 AWEME = {
@@ -21,6 +22,76 @@ ACCOUNT_URL = "https://www.douyin.com/user/example"
 
 def _ssr_html(data):
     return '<script id="RENDER_DATA">' + json.dumps(data) + "</script>"
+
+
+def test_load_adapters_can_disable_only_douyin_browser_fallback():
+    """Adapter policy controls the Douyin instance without changing others."""
+    import collect
+
+    adapters = collect._load_adapters(douyin_browser_fallback=False)
+
+    douyin = next(adapter for adapter in adapters if adapter.platform == "douyin")
+    assert douyin.browser_fallback is False
+
+
+class _PartialDouyinAdapter(BaseCollector):
+    platform = "douyin"
+
+    def supports(self, url):
+        return True
+
+    def check_access(self, url):
+        return {"accessible": True}
+
+    def collect_profile(self, url):
+        return {
+            "platform": "douyin",
+            "account_name": "公开账号",
+            "field_visibility": {},
+        }
+
+    def collect_post_list(self, url, limit=30, date_range=None):
+        from collectors.douyin import DouyinError
+
+        raise DouyinError(
+            STOP_VERIFICATION,
+            "验证",
+            raw={"secret": "must not be written"},
+            partial_posts=[{
+                "platform": "douyin",
+                "post_id": "7001",
+                "post_url": "https://www.douyin.com/video/7001",
+                "collection_status": "SUCCESS",
+            }],
+            diagnostic_code="BROWSER_RESTRICTION",
+        )
+
+    def collect_post_detail(self, post_url):
+        return {}
+
+
+def test_run_persists_partial_douyin_posts_before_marking_task_partial(monkeypatch, tmp_path):
+    """A restricted browser collection retains its safe normalized posts."""
+    import collect
+
+    monkeypatch.setattr(
+        collect,
+        "_load_adapters",
+        lambda douyin_browser_fallback=True: [_PartialDouyinAdapter()],
+    )
+
+    rc = collect.run(ACCOUNT_URL, limit=30, out_dir=str(tmp_path))
+
+    assert rc == 0
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] == "VERIFICATION_REQUIRED"
+    rows = (tmp_path / "source" / "posts.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert json.loads(rows[0])["post_id"] == "7001"
+    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    assert "BROWSER_RESTRICTION" in report
+    assert "must not be written" not in report
 
 
 def test_collect_post_list_keeps_ssr_fast_path_without_browser(monkeypatch):

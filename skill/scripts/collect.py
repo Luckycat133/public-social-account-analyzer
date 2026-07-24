@@ -75,7 +75,7 @@ def _stop_reason_from_exc(e: Exception) -> str:
     return SR_INTERNAL
 
 
-def _load_adapters() -> list[BaseCollector]:
+def _load_adapters(douyin_browser_fallback: bool = True) -> list[BaseCollector]:
     """加载已实现(非桩)的采集器,返回实例列表。"""
     adapters: list[BaseCollector] = []
     # B站(P0):平级导入
@@ -93,7 +93,10 @@ def _load_adapters() -> list[BaseCollector]:
             m = importlib.import_module(mod)
             c = getattr(m, cls, None)
             if c:
-                adapters.append(c())
+                if mod == "collectors.douyin":
+                    adapters.append(c(browser_fallback=douyin_browser_fallback))
+                else:
+                    adapters.append(c())
         except Exception:
             pass
     return adapters
@@ -353,9 +356,16 @@ def _write_report(
         lines.append("## 错误日志")
         lines.append("")
         for e in error_log:
+            diagnostic_code = e.get("diagnostic_code")
+            diagnostic = (
+                f" diagnostic_code={diagnostic_code}"
+                if isinstance(diagnostic_code, str) and diagnostic_code
+                else ""
+            )
             lines.append(
                 f"- stage={e.get('stage')} error_code={e.get('error_code')} "
                 f"url={e.get('url')} message={e.get('message')} occurred_at={e.get('occurred_at')}"
+                f"{diagnostic}"
             )
     with open(os.path.join(ws, "collection-report.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -370,8 +380,17 @@ def run(
     date_to: str | None = None,
     resume: bool = False,
     since: str | None = None,
+    browser_fallback: bool | None = None,
 ) -> int:
-    adapters = _load_adapters()
+    env_value = os.environ.get("SOCIAL_BROWSER_FALLBACK")
+    douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
+    # Keep the default zero-argument loader call compatible with integrations
+    # that replace it, while passing the policy only when it disables Douyin.
+    adapters = (
+        _load_adapters()
+        if douyin_enabled
+        else _load_adapters(douyin_browser_fallback=False)
+    )
     if not adapters:
         print("[FAILED] 没有可用适配器(采集器均未实现)", file=sys.stderr)
         return 2
@@ -487,14 +506,21 @@ def run(
     try:
         posts = adapter.collect_post_list(url, limit=limit, date_range=date_range)
     except Exception as e:
+        partial_posts = getattr(e, "partial_posts", None)
+        if isinstance(partial_posts, list):
+            posts = partial_posts[:limit]
+        diagnostic_code = getattr(e, "diagnostic_code", None)
         stop_reason = _stop_reason_from_exc(e)
         # 登录/验证/频控/解析失败 → PARTIAL(已有数据保留)或 FAILED(无已采数据)
         task_status = "PARTIAL" if posts else "FAILED"
-        error_log.append({
+        entry = {
             "url": url, "stage": "collect_post_list",
             "error_code": stop_reason, "message": str(e),
             "occurred_at": collected_at, "retryable": False,
-        })
+        }
+        if isinstance(diagnostic_code, str) and diagnostic_code:
+            entry["diagnostic_code"] = diagnostic_code
+        error_log.append(entry)
         print(f"[warn] 内容列表采集异常 stop_reason={stop_reason}: {e}", file=sys.stderr)
 
     # limit 与 date_range 的交集:适配器可能仅应用其一,此处再做一次本地交集过滤
@@ -593,14 +619,18 @@ def main() -> None:
         "--since", default=None,
         help="增量续采起点(YYYY-MM-DD 或 ISO 8601,北京时间);覆盖从既有数据推导的起始时间。仅与 --resume 联用。",
     )
-    ap.add_argument(
-        "--browser-fallback", action="store_true",
-        help="当主路径(直连)因出口 IP 被平台 WAF 封禁而失败时，启用浏览器降级"
-             "(经运行环境的真实网络出口再试一次)。需本机/运行环境装有 Chrome/Chromium/Edge。"
-             "等价环境变量: BILIBILI_BROWSER_FALLBACK=1。仅作传输层降级，不绕过验证/登录墙/频控。",
+    browser_group = ap.add_mutually_exclusive_group()
+    browser_group.add_argument(
+        "--browser-fallback", dest="browser_fallback", action="store_true",
+        help="显式启用系统浏览器传输层降级。",
     )
+    browser_group.add_argument(
+        "--no-browser-fallback", dest="browser_fallback", action="store_false",
+        help="禁止启动系统浏览器；仅使用 HTTP/SSR 快速路径。",
+    )
+    ap.set_defaults(browser_fallback=None)
     args = ap.parse_args()
-    if args.browser_fallback:
+    if args.browser_fallback is True:
         # 透传给采集适配器(Session 构造时读取此环境变量)
         os.environ["BILIBILI_BROWSER_FALLBACK"] = "1"
     limit = max(1, min(args.limit, 100))
@@ -614,7 +644,7 @@ def main() -> None:
         raise SystemExit(2)
     raise SystemExit(run(
         args.url, limit, args.out, args.comments, date_from_iso, date_to_iso,
-        resume=args.resume, since=args.since,
+        resume=args.resume, since=args.since, browser_fallback=args.browser_fallback,
     ))
 
 
