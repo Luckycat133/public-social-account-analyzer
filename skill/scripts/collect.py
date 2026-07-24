@@ -23,6 +23,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 
@@ -218,7 +219,7 @@ def _filter_by_date(
 
 
 def _missing_detail_value(value) -> bool:
-    return value is None or value == "" or value == []
+    return value is None or value == "" or value == [] or value == {}
 
 
 def _douyin_item_url(post: dict) -> str | None:
@@ -248,6 +249,142 @@ def _set_detail_status(post: dict, status: str) -> None:
     metrics = post.get("platform_metrics")
     post["platform_metrics"] = dict(metrics) if isinstance(metrics, dict) else {}
     post["platform_metrics"]["detail_status"] = status
+
+
+def _valid_comment_parent(platform: str, post: dict) -> tuple[str, str] | None:
+    post_id = str(post.get("post_id") or "").strip()
+    post_url = post.get("post_url")
+    if not post_id or not isinstance(post_url, str):
+        return None
+    if platform == "douyin":
+        return (post_id, post_url) if _douyin_item_url(post) else None
+    try:
+        parsed = urllib.parse.urlparse(post_url)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    if platform == "bilibili":
+        if parsed.hostname not in {"bilibili.com", "www.bilibili.com"}:
+            return None
+        match = re.fullmatch(r"/video/(BV[0-9A-Za-z]+)/?", parsed.path)
+        if match is None or match.group(1) != post_id:
+            return None
+    return post_id, post_url
+
+
+def _normalize_comment_record(
+    value,
+    parent_post_id: str,
+    parent_post_url: str,
+    occurred_at: str,
+) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ("parent_post_id", "post_id"):
+        supplied = value.get(key)
+        if supplied is not None and str(supplied).strip() != parent_post_id:
+            return None
+    for key in ("parent_post_url", "post_url"):
+        supplied = value.get(key)
+        if supplied is not None and supplied != parent_post_url:
+            return None
+    comment_id = value.get("comment_id")
+    if (
+        isinstance(comment_id, bool)
+        or not isinstance(comment_id, (str, int))
+    ):
+        return None
+    comment_id = str(comment_id).strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", comment_id) is None:
+        return None
+
+    def optional_text(key: str) -> str | None:
+        item = value.get(key)
+        if item is None:
+            return None
+        if not isinstance(item, str):
+            raise ValueError(key)
+        return item.strip() or None
+
+    try:
+        author = optional_text("author")
+        text = optional_text("text")
+        published_at = optional_text("published_at")
+        collected_at = optional_text("collected_at") or occurred_at
+    except ValueError:
+        return None
+    for timestamp in (published_at, collected_at):
+        if timestamp is None:
+            continue
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+    likes = value.get("likes")
+    if likes is not None and (
+        isinstance(likes, bool) or not isinstance(likes, int) or likes < 0
+    ):
+        return None
+    return {
+        "comment_id": comment_id,
+        "parent_post_id": parent_post_id,
+        "parent_post_url": parent_post_url,
+        "author": author,
+        "text": text,
+        "likes": likes,
+        "published_at": published_at,
+        "collected_at": collected_at,
+    }
+
+
+def _workspace_paths_safe(ws: str) -> bool:
+    if os.path.lexists(ws) and (os.path.islink(ws) or not os.path.isdir(ws)):
+        return False
+    source = os.path.join(ws, "source")
+    if os.path.lexists(source) and (
+        os.path.islink(source) or not os.path.isdir(source)
+    ):
+        return False
+    return True
+
+
+def _write_comments_atomic(path: str, records: list[dict]) -> bool:
+    descriptor = -1
+    temporary: str | None = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            dir=os.path.dirname(path),
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+        )
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(temporary, path)
+        temporary = None
+        return True
+    except Exception:
+        return False
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def _enrich_douyin_details(
@@ -282,6 +419,8 @@ def _enrich_douyin_details(
             detail = adapter.collect_post_detail(item_url)
             if not isinstance(detail, dict):
                 raise ValueError("invalid detail result")
+            if str(detail.get("post_id") or "") != str(post.get("post_id") or ""):
+                raise ValueError("mismatched detail post id")
         except Exception:
             unavailable_count += 1
             _set_detail_status(post, "UNAVAILABLE")
@@ -320,9 +459,22 @@ def _collect_and_persist_comments(
         "failures": 0,
         "per_post_limit": per_post_limit,
     }
+    seen: set[tuple[str, str]] = set()
+    failed_parents: set[str] = set()
     for post in posts:
-        post_id = str(post.get("post_id") or "")
-        post_url = str(post.get("post_url") or "")
+        parent = _valid_comment_parent(str(adapter.platform), post)
+        if parent is None:
+            outcome["failures"] += 1
+            error_log.append({
+                "url": None,
+                "stage": "collect_comments",
+                "error_code": "COMMENTS_UNAVAILABLE",
+                "message": "公开评论采样不可用",
+                "occurred_at": occurred_at,
+                "retryable": False,
+            })
+            continue
+        post_id, post_url = parent
         outcome["attempted_posts"] += 1
         try:
             returned = adapter.collect_comments(post_url, limit=per_post_limit)
@@ -330,6 +482,7 @@ def _collect_and_persist_comments(
                 raise ValueError("invalid comments result")
         except Exception:
             outcome["failures"] += 1
+            failed_parents.add(post_id)
             error_log.append({
                 "url": post_url or None,
                 "stage": "collect_comments",
@@ -339,21 +492,47 @@ def _collect_and_persist_comments(
                 "retryable": False,
             })
             continue
-        valid = [comment for comment in returned[:per_post_limit] if isinstance(comment, dict)]
-        if not valid:
+        if not returned:
             outcome["empty_results"] += 1
             continue
-        for comment in valid:
-            record = dict(comment)
-            record["parent_post_id"] = post_id
-            record["parent_post_url"] = post_url
+        malformed = False
+        for comment in returned[:per_post_limit]:
+            record = _normalize_comment_record(
+                comment, post_id, post_url, occurred_at
+            )
+            if record is None:
+                malformed = True
+                continue
+            key = (post_id, record["comment_id"])
+            if key in seen:
+                continue
+            seen.add(key)
             records.append(record)
-    outcome["comments_collected"] = len(records)
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    os.replace(temporary, path)
+        if malformed:
+            outcome["failures"] += 1
+            failed_parents.add(post_id)
+            error_log.append({
+                "url": post_url,
+                "stage": "collect_comments",
+                "error_code": "COMMENTS_UNAVAILABLE",
+                "message": "公开评论响应包含无效记录",
+                "occurred_at": occurred_at,
+                "retryable": False,
+            })
+    if _write_comments_atomic(path, records):
+        outcome["comments_collected"] = len(records)
+    else:
+        affected = {record["parent_post_id"] for record in records}
+        outcome["failures"] += len(affected - failed_parents)
+        outcome["comments_collected"] = 0
+        error_log.append({
+            "url": None,
+            "stage": "persist_comments",
+            "error_code": "COMMENTS_UNAVAILABLE",
+            "message": "评论产物写入失败",
+            "occurred_at": occurred_at,
+            "retryable": False,
+        })
     return outcome
 
 
@@ -609,6 +788,32 @@ def run(
     max_scrolls: int = 2000,
     enrich_details: bool = False,
 ) -> int:
+    if resume and not out_dir:
+        print("[FAILED] 增量续采(--resume)必须配合 --out 指定既有任务目录", file=sys.stderr)
+        return 2
+    if out_dir and not _workspace_paths_safe(out_dir):
+        print("[FAILED] 输出目录或 source 不能是符号链接", file=sys.stderr)
+        return 2
+
+    user_from = _parse_date(date_from)
+    user_to = _default_date_to(date_to)
+    existing_posts: list[dict] = []
+    resume_mode = bool(resume)
+    if resume_mode:
+        existing_posts = _load_existing_posts(str(out_dir))
+        if not existing_posts:
+            print(f"[warn] --resume 指定目录无既有帖子数据,退化为全量采集: {out_dir}", file=sys.stderr)
+            resume_mode = False
+        else:
+            latest = _latest_published_at(existing_posts)
+            since_iso = _parse_date(since) if since else _parse_date(latest)
+            if since_iso and (user_from is None or since_iso > user_from):
+                user_from = since_iso
+    if user_from and user_to:
+        if datetime.fromisoformat(user_from) > datetime.fromisoformat(user_to):
+            print("[FAILED] --date-from 不能晚于 --date-to", file=sys.stderr)
+            return 2
+
     env_value = os.environ.get("SOCIAL_BROWSER_FALLBACK")
     douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
     # Keep the default zero-argument loader call compatible with integrations
@@ -648,13 +853,6 @@ def run(
 
     requested_count = max_items if collect_all else limit
 
-    user_from = _parse_date(date_from)
-    user_to = _default_date_to(date_to)
-    if user_from and user_to:
-        if datetime.fromisoformat(user_from) > datetime.fromisoformat(user_to):
-            print("[FAILED] --date-from 不能晚于 --date-to", file=sys.stderr)
-            return 2
-
     m = re.search(r"(\d+)", url)
     account = m.group(1) if m else "account"
     date = datetime.now(_BEIJING).strftime("%Y%m%d")
@@ -662,26 +860,13 @@ def run(
         os.path.dirname(_HERE), "workspace", f"{platform}-{account}-{date}"
     )
     src = os.path.join(ws, "source")
+    if not _workspace_paths_safe(ws):
+        print("[FAILED] 输出目录或 source 不能是符号链接", file=sys.stderr)
+        return 2
     os.makedirs(src, exist_ok=True)
 
     # 增量续采:基于既有 posts 的 published_at / bvid 去重续采,避免重复打满配额
-    existing_posts: list[dict] = []
-    resume_mode = bool(resume)
-    if resume_mode:
-        if not out_dir:
-            print("[FAILED] 增量续采(--resume)必须配合 --out 指定既有任务目录", file=sys.stderr)
-            return 2
-        existing_posts = _load_existing_posts(ws)
-        if not existing_posts:
-            print(f"[warn] --resume 指定目录无既有帖子数据,退化为全量采集: {ws}", file=sys.stderr)
-            resume_mode = False
-
     # 规范化日期范围(中国平台默认 +08:00);增量续采时起点取既有最新发布时间
-    if resume_mode:
-        latest = _latest_published_at(existing_posts)
-        since_iso = _parse_date(since) if since else _parse_date(latest)
-        if since_iso and (user_from is None or since_iso > user_from):
-            user_from = since_iso
     date_from_iso = user_from
     date_to_iso = user_to
     date_range = None

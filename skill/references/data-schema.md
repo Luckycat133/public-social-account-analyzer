@@ -68,6 +68,9 @@ workspace/<platform>-<account>-<date>/
 
 约束：
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
+- `--resume` 必须先校验 `--out`、只读加载既有作品并结合 `--since` / 最新作品时间计算有效
+  `date_from`；有效 `date_from > date_to` 时以参数错误退出。以上步骤必须发生在创建或修改
+  任务目录、`source/` 和任何任务产物之前。
 - 执行前向用户回显 `platform`、`requested_limit`、`date_from`/`date_to`、`include_comments`。
 - Web 索引降级必须设置 `task_status=PARTIAL`、保留真实上游 `stop_reason`，并填写来源与
   快照字段；未知快照时间保持 `null`，可单独保存来源显示的 `snapshot_age_label`。
@@ -134,7 +137,9 @@ workspace/<platform>-<account>-<date>/
 | `per_post_limit` | integer | 固定为 20 |
 
 空结果与失败必须分开计数。评论失败只写清洗后的 `COMMENTS_UNAVAILABLE` 内容级错误，不能
-改变账号任务状态或写入任务级 `stop_reason`。
+改变账号任务状态或写入任务级 `stop_reason`。只有适配器确认上游请求成功且明确返回空评论
+数组时才能增加 `empty_results`；受限、网络错误、非 JSON、字段缺失或非空畸形响应都增加
+`failures`。持久化失败时 `comments_collected` 必须按最终文件中的实际行数（通常为 0）记录。
 
 ## 4. Profile 数据结构
 
@@ -206,6 +211,9 @@ workspace/<platform>-<account>-<date>/
   且 `title`、`published_at`、`duration_seconds`、`hashtags` 至少一项缺失，才允许请求详情。
   详情只能补空值，不能覆盖列表值。`platform_metrics.detail_status` 固定为 `SUCCESS`
   （详情请求成功）、`UNAVAILABLE`（详情不可用）或 `NOT_NEEDED`（所需字段完整）。
+  详情结果的 `post_id` 还必须与列表父作品 ID 完全一致；缺失或不一致均按 `UNAVAILABLE`
+  处理，不能合并任何详情证据。详情 SSR 解析只能检查已知作品详情路径，不能从任意嵌套
+  对象中搜索 ID 后当成作品。
 
 ### 5.1 抖音搜索索引降级的显式例外
 
@@ -267,7 +275,7 @@ workspace/<platform>-<account>-<date>/
 
 | 字段 | 类型 | 必填 | 可空 | 说明 |
 |---|---|---:|---:|---|
-| `comment_id` | string | 否 | 是 | 平台评论 ID；适配器未提供时保持 `null` |
+| `comment_id` | string | 是 | 否 | 平台评论 ID；仅限 1–128 位字母、数字、`_`、`-` |
 | `parent_post_id` | string | 是 | 否 | 父作品平台 ID |
 | `parent_post_url` | string | 是 | 否 | 父作品真实详情 URL |
 | `author` | string | 否 | 是 | 页面公开的评论作者名 |
@@ -276,7 +284,15 @@ workspace/<platform>-<account>-<date>/
 | `published_at` | datetime | 否 | 是 | 评论发布时间 |
 | `collected_at` | datetime | 否 | 是 | 适配器采集时间 |
 
-除父作品锚点外，编排层不得改写适配器实际返回字段；每个父作品最多持久化 20 条。
+持久化边界只允许上表字段，禁止保存适配器返回的 Cookie、请求头、token、原始响应或其他
+任意键。编排层必须校验适配器自带的 `post_id` / `post_url` / 父锚点与当前作品一致，按
+`parent_post_id + comment_id` 稳定保留第一条并去重；非空响应中的畸形记录按失败记录，不能
+伪装为空结果。每个父作品最多持久化 20 条，`comments_collected` 等于最终有效唯一行数。
+
+评论文件使用与目标同目录的不可预测、排他创建临时文件并原子替换；无论序列化或替换成功
+与否都清理临时文件。任务目录或 `source/` 为符号链接时必须在读取/写入前拒绝；不得使用
+可预测临时文件名或跟随预置临时符号链接。写入失败只落固定清洗错误，随后仍须生成
+`task.json` 与 `collection-report.md`。
 
 ## 7. Analysis 数据结构
 

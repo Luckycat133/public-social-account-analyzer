@@ -498,6 +498,13 @@ class DouyinCollector(BaseCollector):
                 partial_posts=posts,
                 diagnostic_code=result.diagnostic_code,
             )
+        if result.aweme_items and not valid_items:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器作品载荷未包含有效的数字平台作品 ID",
+                partial_posts=[],
+                diagnostic_code="INVALID_PLATFORM_POST_ID",
+            )
         if not posts:
             raise DouyinError(
                 STOP_PARSER_FAILED,
@@ -696,8 +703,16 @@ class DouyinCollector(BaseCollector):
                 "账号主页明确显示没有公开作品",
             )
 
+        valid_items = self._validated_aweme_items(aweme_list)
+        if aweme_list and not valid_items:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "SSR 作品载荷未包含有效的数字平台作品 ID",
+                partial_posts=[],
+                diagnostic_code="INVALID_PLATFORM_POST_ID",
+            )
         posts: list[dict[str, Any]] = []
-        for item in self._validated_aweme_items(aweme_list):
+        for item in valid_items:
             if len(posts) >= limit:
                 break
             raw = self._build_post_raw(url, item, source="list")
@@ -731,14 +746,32 @@ class DouyinCollector(BaseCollector):
             current = target.get(key)
             if isinstance(current, dict) and isinstance(value, dict):
                 cls._merge_missing_values(current, value)
-            elif current in (None, "") and value not in (None, ""):
+            elif cls._missing_value(current) and not cls._missing_value(value):
                 target[key] = value
+
+    @staticmethod
+    def _missing_value(value: Any) -> bool:
+        return value is None or value == "" or value == [] or value == {}
 
     # -- 单条详情 -----------------------------------------------------------
     def collect_post_detail(self, post_url: str) -> dict[str, Any]:
         """采集单条作品详情并归一化。播放数可能不公开 → views=None。"""
         if not isinstance(post_url, str) or not post_url.strip():
             raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL")
+        try:
+            parsed = urllib.parse.urlparse(post_url)
+        except ValueError:
+            raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL") from None
+        match = re.fullmatch(r"/(?:video|note)/(\d+)/?", parsed.path)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {"douyin.com", "www.douyin.com", "iesdouyin.com"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or match is None
+        ):
+            raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL")
+        expected_post_id = match.group(1)
         html = self._fetch(post_url)
         restriction = _detect_restriction(html)
         if restriction:
@@ -747,7 +780,7 @@ class DouyinCollector(BaseCollector):
         data = _extract_render_data(html)
         if data is None:
             raise DouyinError(STOP_PARSER_FAILED, "作品页可访问但无 RENDER_DATA，无法解析")
-        aweme = self._find_aweme_detail(data)
+        aweme = self._find_aweme_detail(data, expected_post_id)
         if not aweme:
             raise DouyinError(
                 STOP_PARSER_FAILED, "RENDER_DATA 中未识别到单条作品结构"
@@ -823,19 +856,17 @@ class DouyinCollector(BaseCollector):
         found = self._search_list_of_key(data, "aweme_id")
         return found
 
-    def _find_aweme_detail(self, data: dict) -> dict | None:
+    def _find_aweme_detail(self, data: dict, expected_post_id: str) -> dict | None:
         """在 RENDER_DATA 中定位单条作品结构。"""
         candidates = [
             _dig(data, "aweme", "detail"),
             _dig(data, "video", "aweme"),
             _dig(data, "app", "aweme", "detail"),
+            _dig(data, "aweme_detail"),
         ]
         for c in candidates:
-            if isinstance(c, dict) and c.get("aweme_id"):
+            if isinstance(c, dict) and str(c.get("aweme_id") or "") == expected_post_id:
                 return c
-        found = self._search_key(data, "aweme_id")
-        if isinstance(found, dict) and found.get("aweme_id"):
-            return found
         return None
 
     def _find_comments(self, data: dict) -> list | None:

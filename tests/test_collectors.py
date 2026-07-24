@@ -13,6 +13,7 @@
 import json
 
 import analyze
+import pytest
 from collectors.bilibili import (
     BilibiliCollector,
     BilibiliError,
@@ -20,6 +21,20 @@ from collectors.bilibili import (
     STOP_VERIFICATION,
 )
 from collectors.weibo import WeiboCollector, ADAPTER_UNAVAILABLE
+
+
+class _CommentResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self.body
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +64,61 @@ def test_bilibili_supports_rejects_bare_domain_and_non_numeric():
     assert c.supports("https://space.bilibili.com") is False
     assert c.supports("https://space.bilibili.com/abc") is False
     assert c.supports("https://bilibili.com/946974") is False
+
+
+def test_bilibili_comments_return_empty_only_for_explicit_valid_empty(
+    monkeypatch
+):
+    collector = BilibiliCollector()
+    monkeypatch.setattr(collector, "_bv_to_aid_urllib", lambda _bvid: 123)
+    monkeypatch.setattr(
+        "collectors.bilibili.urllib.request.urlopen",
+        lambda *_args, **_kwargs: _CommentResponse(
+            json.dumps({"code": 0, "data": {"replies": []}}).encode()
+        ),
+    )
+
+    assert collector.collect_comments("https://www.bilibili.com/video/BV1abc") == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps({"code": -101, "message": "secret restricted body"}).encode(),
+        json.dumps({"code": 0, "data": {"cursor": "missing replies"}}).encode(),
+        b"not-json secret response",
+    ],
+)
+def test_bilibili_comments_raise_sanitized_unavailable_for_nonempty_failures(
+    monkeypatch, body
+):
+    collector = BilibiliCollector()
+    monkeypatch.setattr(collector, "_bv_to_aid_urllib", lambda _bvid: 123)
+    monkeypatch.setattr(
+        "collectors.bilibili.urllib.request.urlopen",
+        lambda *_args, **_kwargs: _CommentResponse(body),
+    )
+
+    with pytest.raises(BilibiliError) as exc_info:
+        collector.collect_comments("https://www.bilibili.com/video/BV1abc")
+
+    assert exc_info.value.stop_reason == "COMMENTS_UNAVAILABLE"
+    assert "secret" not in str(exc_info.value)
+
+
+def test_bilibili_comments_sanitize_aid_resolution_failure(monkeypatch):
+    collector = BilibiliCollector()
+    monkeypatch.setattr(
+        collector,
+        "_bv_to_aid_urllib",
+        lambda _bvid: (_ for _ in ()).throw(RuntimeError("secret aid failure")),
+    )
+
+    with pytest.raises(BilibiliError) as exc_info:
+        collector.collect_comments("https://www.bilibili.com/video/BV1abc")
+
+    assert exc_info.value.stop_reason == "COMMENTS_UNAVAILABLE"
+    assert "secret" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +419,258 @@ def test_all_comments_persist_returns_parents_and_honest_outcomes(
     assert "empty_results: 1" in report
     assert "failures: 1" in report
     assert "upstream response must not persist" not in report
+
+
+def test_comment_artifact_normalizes_allowlist_dedupes_and_rejects_malformed(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class BoundaryAdapter:
+        platform = "douyin"
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_profile(self, url):
+            return {"platform": "douyin", "field_visibility": {}}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            return [
+                {
+                    "platform": "douyin",
+                    "post_id": post_id,
+                    "post_url": f"https://www.douyin.com/video/{post_id}",
+                    "collection_status": "SUCCESS",
+                }
+                for post_id in ("7001", "7002")
+            ]
+
+        def collect_comments(self, post_url, limit=20):
+            post_id = post_url.rsplit("/", 1)[-1]
+            if post_id == "7002":
+                return [{"text": "missing comment id", "raw_token": "secret-two"}]
+            return [
+                {
+                    "comment_id": 123,
+                    "post_id": "7001",
+                    "post_url": post_url,
+                    "author": " Alice ",
+                    "text": " first ",
+                    "likes": 4,
+                    "published_at": "2026-07-20T10:00:00+08:00",
+                    "collected_at": "2026-07-24T10:00:00+08:00",
+                    "raw_token": "secret-one",
+                    "headers": {"Cookie": "must-not-persist"},
+                },
+                {"comment_id": "123", "text": "duplicate must lose"},
+                {
+                    "comment_id": "124",
+                    "parent_post_id": "9999",
+                    "text": "mismatched parent",
+                },
+                {
+                    "comment_id": {"token": "secret-id"},
+                    "text": "invalid identifier type",
+                },
+                {
+                    "comment_id": "125",
+                    "text": "invalid timestamp",
+                    "published_at": "secret raw timestamp",
+                },
+                "raw response fragment",
+            ]
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [BoundaryAdapter()])
+
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(tmp_path),
+        include_comments=True,
+    ) == 0
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "source" / "comments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert rows == [{
+        "comment_id": "123",
+        "parent_post_id": "7001",
+        "parent_post_url": "https://www.douyin.com/video/7001",
+        "author": "Alice",
+        "text": "first",
+        "likes": 4,
+        "published_at": "2026-07-20T10:00:00+08:00",
+        "collected_at": "2026-07-24T10:00:00+08:00",
+    }]
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["comment_collection"] == {
+        "attempted_posts": 2,
+        "comments_collected": 1,
+        "empty_results": 0,
+        "failures": 2,
+        "per_post_limit": 20,
+    }
+    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    assert "secret-one" not in report
+    assert "secret-two" not in report
+    assert "secret-id" not in (tmp_path / "source" / "comments.jsonl").read_text()
+    assert "secret raw timestamp" not in (tmp_path / "source" / "comments.jsonl").read_text()
+    assert "must-not-persist" not in (tmp_path / "source" / "comments.jsonl").read_text()
+
+
+class _SafeCommentAdapter:
+    platform = "douyin"
+
+    def supports(self, url):
+        return True
+
+    def check_access(self, url):
+        return {"accessible": True}
+
+    def collect_profile(self, url):
+        return {"platform": "douyin", "field_visibility": {}}
+
+    def collect_post_list(self, url, limit=30, date_range=None):
+        return [{
+            "platform": "douyin",
+            "post_id": "7001",
+            "post_url": "https://www.douyin.com/video/7001",
+            "collection_status": "SUCCESS",
+        }]
+
+    def collect_comments(self, post_url, limit=20):
+        return [{"comment_id": "c1", "text": "safe comment"}]
+
+
+@pytest.mark.parametrize("link_kind", ["workspace", "source"])
+def test_comments_reject_workspace_or_source_symlink_before_writes(
+    monkeypatch, tmp_path, link_kind
+):
+    import collect
+
+    target = tmp_path / "target"
+    target.mkdir()
+    if link_kind == "workspace":
+        out = tmp_path / "out"
+        out.symlink_to(target, target_is_directory=True)
+    else:
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "source").symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
+
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(out),
+        include_comments=True,
+    ) == 2
+    assert list(target.iterdir()) == []
+
+
+def test_invalid_comment_parent_is_failure_without_adapter_attempt(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class InvalidParentAdapter(_SafeCommentAdapter):
+        def __init__(self):
+            self.comment_calls = 0
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            return [{
+                "platform": "douyin",
+                "post_id": "7001",
+                "post_url": "https://www.douyin.com/user/example",
+                "collection_status": "SUCCESS",
+            }]
+
+        def collect_comments(self, post_url, limit=20):
+            self.comment_calls += 1
+            return []
+
+    adapter = InvalidParentAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(tmp_path),
+        include_comments=True,
+    ) == 0
+
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert adapter.comment_calls == 0
+    assert task["comment_collection"]["attempted_posts"] == 0
+    assert task["comment_collection"]["failures"] == 1
+
+
+def test_comments_ignore_predictable_temp_symlink(monkeypatch, tmp_path):
+    import collect
+
+    out = tmp_path / "out"
+    source = out / "source"
+    source.mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do-not-touch", encoding="utf-8")
+    predictable = source / "comments.jsonl.tmp"
+    predictable.symlink_to(victim)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
+
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(out),
+        include_comments=True,
+    ) == 0
+    assert victim.read_text(encoding="utf-8") == "do-not-touch"
+    assert predictable.is_symlink()
+    assert (source / "comments.jsonl").is_file()
+
+
+@pytest.mark.parametrize("failure_kind", ["serialize", "replace"])
+def test_comment_persistence_failure_is_sanitized_and_finalizes_task(
+    monkeypatch, tmp_path, failure_kind
+):
+    import collect
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
+    if failure_kind == "serialize":
+        original_dumps = collect.json.dumps
+
+        def fail_comment_only(value, *args, **kwargs):
+            if isinstance(value, dict) and value.get("comment_id") == "c1":
+                raise TypeError("secret serialization failure")
+            return original_dumps(value, *args, **kwargs)
+
+        monkeypatch.setattr(collect.json, "dumps", fail_comment_only)
+    else:
+        original_replace = collect.os.replace
+
+        def fail_comment_only(source, destination):
+            if str(destination).endswith("comments.jsonl"):
+                raise OSError("secret replace failure")
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(collect.os, "replace", fail_comment_only)
+
+    out = tmp_path / "out"
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(out),
+        include_comments=True,
+    ) == 0
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["comment_collection"]["comments_collected"] == 0
+    assert task["comment_collection"]["failures"] == 1
+    assert (out / "collection-report.md").is_file()
+    assert "secret" not in (out / "collection-report.md").read_text(encoding="utf-8")
+    assert not (out / "source" / "comments.jsonl").exists()
+    assert list((out / "source").glob(".comments.jsonl.*.tmp")) == []
 
 
 def test_normalize_post_preserves_explicit_public_booleans():

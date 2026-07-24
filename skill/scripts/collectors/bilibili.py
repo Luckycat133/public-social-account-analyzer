@@ -55,6 +55,7 @@ STOP_PARSER_FAILED = "PARSER_FAILED"
 STOP_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
 STOP_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
 STOP_INTERNAL = "INTERNAL_ERROR"
+STOP_COMMENTS_UNAVAILABLE = "COMMENTS_UNAVAILABLE"
 
 # WBI 置换表（bilibili-api-collect 项目权威值，长度 64，元素 0-63）
 MIXIN_KEY_ENC_TAB = [
@@ -860,15 +861,19 @@ class BilibiliCollector(BaseCollector):
 
     # -- 评论采集（best-effort，urllib-only，免登录） --
     def collect_comments(self, post_url: str, limit: int = 20) -> list[dict]:
-        """取公开评论（best-effort）。任何限制/错误/空结果一律返回 []。"""
+        """取公开评论；仅明确成功的空 replies 可返回空列表。"""
+        m = re.search(r"BV[0-9A-Za-z]+", post_url)
+        if not m:
+            raise BilibiliError(
+                STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
+            )
+        bvid = m.group(0)
         try:
-            m = re.search(r"BV[0-9A-Za-z]+", post_url)
-            if not m:
-                return []
-            bvid = m.group(0)
             aid = self._bv_to_aid_urllib(bvid)
             if aid is None:
-                return []
+                raise BilibiliError(
+                    STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
+                )
             api = (
                 "https://api.bilibili.com/x/v2/reply"
                 f"?type=1&oid={aid}&mode=3&next=0"
@@ -879,9 +884,20 @@ class BilibiliCollector(BaseCollector):
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            if data.get("code") != 0:
-                return []
-            replies = (data.get("data") or {}).get("replies") or []
+            if not isinstance(data, dict) or data.get("code") != 0:
+                raise BilibiliError(
+                    STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
+                )
+            payload = data.get("data")
+            if not isinstance(payload, dict) or "replies" not in payload:
+                raise BilibiliError(
+                    STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
+                )
+            replies = payload.get("replies")
+            if not isinstance(replies, list):
+                raise BilibiliError(
+                    STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
+                )
             out: list[dict] = []
             for r in replies[:limit]:
                 member = r.get("member") or {}
@@ -898,8 +914,12 @@ class BilibiliCollector(BaseCollector):
                     }
                 )
             return out
+        except BilibiliError:
+            raise
         except Exception:
-            return []
+            raise BilibiliError(
+                STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
+            ) from None
 
     # -- 空间动态视频 feed（best-effort，合规同主路径） --
     def collect_dynamics(self, url: str, limit: int = 30) -> list[dict]:

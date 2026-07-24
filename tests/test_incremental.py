@@ -108,10 +108,53 @@ def test_resume_end_to_end(monkeypatch):
     assert task["collected_count"] == 4
 
 
-def test_resume_without_out_returns_error():
-    # 无 --out 时 --resume 必须在触网前报错(rc=2)
+def test_resume_without_out_returns_error_before_adapter_or_workspace(
+    monkeypatch, tmp_path
+):
+    # 无 --out 时 --resume 必须在加载适配器和创建默认目录前报错(rc=2)
+    monkeypatch.setattr(collect, "_HERE", str(tmp_path / "skill" / "scripts"))
+    monkeypatch.setattr(
+        collect,
+        "_load_adapters",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("adapter loading must not happen")
+        ),
+    )
+
     rc = collect.run("https://space.bilibili.com/123", out_dir=None, resume=True)
+
     assert rc == 2
+    assert not (tmp_path / "skill" / "workspace").exists()
+
+
+def test_resume_effective_since_after_date_to_rejects_without_mutation(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "existing"
+    original = {
+        "post_id": "BV_KEEP",
+        "bvid": "BV_KEEP",
+        "published_at": "2026-07-20T10:00:00+08:00",
+    }
+    _setup_existing(str(out), [original])
+    before = (out / "source" / "posts.jsonl").read_bytes()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
+    monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
+
+    rc = collect.run(
+        "https://space.bilibili.com/123",
+        out_dir=str(out),
+        resume=True,
+        since="2026-07-25",
+        date_to="2026-07-24",
+    )
+
+    assert rc == 2
+    assert (out / "source" / "posts.jsonl").read_bytes() == before
+    assert sorted(path.relative_to(out).as_posix() for path in out.rglob("*")) == [
+        "source",
+        "source/posts.jsonl",
+    ]
 
 
 def test_resume_degrade_when_empty(monkeypatch):

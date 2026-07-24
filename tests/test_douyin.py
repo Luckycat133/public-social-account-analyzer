@@ -169,6 +169,7 @@ def test_detail_enrichment_is_bounded_preserves_list_evidence_and_records_outcom
             if post_url.endswith("/7003"):
                 raise RuntimeError("unsafe upstream body must not persist")
             return {
+                "post_id": post_url.rsplit("/", 1)[-1],
                 "title": "详情冲突标题",
                 "published_at": "2026-07-19T12:00:00+08:00",
                 "duration_seconds": 12,
@@ -214,6 +215,59 @@ def test_detail_enrichment_is_bounded_preserves_list_evidence_and_records_outcom
     report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
     assert "stage=collect_post_detail" in report
     assert "unsafe upstream body must not persist" not in report
+
+
+def test_detail_enrichment_rejects_mismatched_detail_post_id():
+    import collect
+
+    class MismatchedDetailAdapter:
+        def collect_post_detail(self, post_url):
+            return {
+                "post_id": "9999",
+                "duration_seconds": 99,
+                "title": "wrong item evidence",
+            }
+
+    post = {
+        "platform": "douyin",
+        "post_id": "7001",
+        "post_url": "https://www.douyin.com/video/7001",
+        "title": "list title",
+        "published_at": "2026-07-20T10:00:00+08:00",
+        "duration_seconds": None,
+        "hashtags": ["list topic"],
+        "collection_status": "SUCCESS",
+    }
+    errors = []
+
+    unavailable = collect._enrich_douyin_details(
+        MismatchedDetailAdapter(),
+        [post],
+        errors,
+        "2026-07-24T10:00:00+08:00",
+    )
+
+    assert unavailable == 1
+    assert post["duration_seconds"] is None
+    assert post["title"] == "list title"
+    assert post["collection_status"] == "PARTIAL"
+    assert post["platform_metrics"]["detail_status"] == "UNAVAILABLE"
+    assert errors[0]["message"] == "作品详情补充不可用"
+
+
+def test_douyin_detail_rejects_candidate_whose_id_does_not_match_url():
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(browser_fallback=False)
+    collector._fetch = lambda _url: _ssr_html({
+        "aweme": {"detail": dict(AWEME, aweme_id="9999", desc="wrong")},
+        "analytics": {"aweme_id": "7001", "cursor": "unrelated"},
+    })
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == "PARSER_FAILED"
 
 
 def test_enrich_details_cli_flag_is_forwarded(monkeypatch):
@@ -620,6 +674,74 @@ def test_all_collector_rejects_items_without_numeric_platform_post_id(invalid_it
     assert exc_info.value.partial_posts == []
     assert collector.get_collection_coverage()["is_exhaustive"] is False
     assert collector.get_collection_coverage()["terminal_page_observed"] is False
+
+
+def test_limited_ssr_invalid_only_payload_raises_parser_failed():
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(browser_fallback=False)
+    collector._fetch = lambda _url: _ssr_html({
+        "user": {"post": {"data": [
+            {"desc": "missing id"},
+            {"aweme_id": "not-numeric", "desc": "invalid id"},
+        ]}}
+    })
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_list(ACCOUNT_URL, limit=30)
+
+    assert exc_info.value.stop_reason == "PARSER_FAILED"
+    assert exc_info.value.diagnostic_code == "INVALID_PLATFORM_POST_ID"
+    assert exc_info.value.partial_posts == []
+
+
+def test_limited_browser_invalid_only_payload_raises_parser_failed():
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[{"aweme_id": "bad", "desc": "invalid id"}],
+            source="network",
+        )
+    )
+    collector._fetch = lambda _url: "<html>no render data</html>"
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_list(ACCOUNT_URL, limit=30)
+
+    assert exc_info.value.stop_reason == "PARSER_FAILED"
+    assert exc_info.value.diagnostic_code == "INVALID_PLATFORM_POST_ID"
+    assert exc_info.value.partial_posts == []
+
+
+def test_duplicate_merge_fills_empty_containers_but_preserves_zero_and_false():
+    from collectors.douyin import DouyinCollector
+
+    items = DouyinCollector._validated_aweme_items([
+        {
+            "aweme_id": "7001",
+            "text_extra": [],
+            "video": {},
+            "statistics": {"digg_count": 0},
+            "is_top": False,
+        },
+        {
+            "aweme_id": "7001",
+            "text_extra": [{"hashtag_name": "filled"}],
+            "video": {"duration": 9000},
+            "statistics": {"digg_count": 99, "comment_count": 5},
+            "is_top": True,
+        },
+    ])
+
+    assert items == [{
+        "aweme_id": "7001",
+        "text_extra": [{"hashtag_name": "filled"}],
+        "video": {"duration": 9000},
+        "statistics": {"digg_count": 0, "comment_count": 5},
+        "is_top": False,
+    }]
 
 
 def test_all_collector_drops_invalid_ids_without_profile_url_fallback():
