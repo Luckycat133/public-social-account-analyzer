@@ -304,6 +304,31 @@ def test_douyin_comments_distinguish_explicit_empty_from_unavailable():
     assert exc_info.value.stop_reason == "COMMENTS_UNAVAILABLE"
 
 
+@pytest.mark.parametrize(
+    "comments",
+    [
+        ["secret malformed comment"],
+        [
+            {"cid": "c1", "user": {}, "text": "valid-looking comment"},
+            "secret malformed comment",
+        ],
+    ],
+)
+def test_douyin_nonempty_malformed_comments_are_unavailable(comments):
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(browser_fallback=False)
+    collector._fetch = lambda _url: _ssr_html(
+        {"comment": {"data": {"comments": comments}}}
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_comments("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == "COMMENTS_UNAVAILABLE"
+    assert "secret malformed comment" not in str(exc_info.value)
+
+
 def test_load_adapters_can_disable_only_douyin_browser_fallback():
     """Adapter policy controls the Douyin instance without changing others."""
     import collect

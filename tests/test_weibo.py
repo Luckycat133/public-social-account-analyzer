@@ -88,6 +88,16 @@ def test_enabled_collect_post_detail_parses(enabled, monkeypatch):
     assert "话题1" in (post.get("hashtags") or [])
 
 
+def test_enabled_comments_raise_unavailable_instead_of_false_empty(enabled):
+    c = WeiboCollector()
+
+    with pytest.raises(WeiboError) as exc:
+        c.collect_comments("https://weibo.com/123456/a1")
+
+    assert exc.value.stop_reason == "COMMENTS_UNAVAILABLE"
+    assert str(exc.value) == "[COMMENTS_UNAVAILABLE] 微博公开评论采样未实现"
+
+
 def test_login_wall_raises_login_required(enabled, monkeypatch):
     def _boom(url: str):
         raise WeiboError(LOGIN_REQUIRED, "微博要求登录")

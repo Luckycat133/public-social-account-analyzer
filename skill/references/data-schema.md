@@ -139,7 +139,9 @@ workspace/<platform>-<account>-<date>/
 空结果与失败必须分开计数。评论失败只写清洗后的 `COMMENTS_UNAVAILABLE` 内容级错误，不能
 改变账号任务状态或写入任务级 `stop_reason`。只有适配器确认上游请求成功且明确返回空评论
 数组时才能增加 `empty_results`；受限、网络错误、非 JSON、字段缺失或非空畸形响应都增加
-`failures`。持久化失败时 `comments_collected` 必须按最终文件中的实际行数（通常为 0）记录。
+`failures`。持久化失败时 `comments_collected` 必须按最终文件中通过当前父锚点与字段校验的
+有效唯一行数记录；既有文件为畸形内容、符号链接或其他非普通文件时按 0 记录，且不得跟随、
+删除或改写其目标。
 
 ## 4. Profile 数据结构
 
@@ -293,6 +295,10 @@ workspace/<platform>-<account>-<date>/
 与否都清理临时文件。任务目录或 `source/` 为符号链接时必须在读取/写入前拒绝；不得使用
 可预测临时文件名或跟随预置临时符号链接。写入失败只落固定清洗错误，随后仍须生成
 `task.json` 与 `collection-report.md`。
+
+作品父 URL 在详情调用、评论调用、报告和数据落盘前必须完成平台级主机、路径与作品 ID
+关联校验，并规范化为无凭据、query 和 fragment 的公开 URL。报告与终端输出中的访问原因、
+异常文本和诊断元数据只能使用固定阶段消息及受控枚举，不能透传适配器异常或上游敏感值。
 
 ## 7. Analysis 数据结构
 

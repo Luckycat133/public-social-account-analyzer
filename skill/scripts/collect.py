@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import tempfile
 import urllib.parse
@@ -61,6 +62,20 @@ _KNOWN_STOP_REASONS = frozenset({
     SR_NO_PUBLIC_CONTENT, SR_INTERNAL,
 })
 
+_ERROR_STAGE_MESSAGES = {
+    "check_access": "访问检查不可用",
+    "collect_post_list": "内容列表采集不可用",
+    "collect_profile": "账号资料采集不可用",
+    "collection_coverage": "全量采集覆盖证据不完整",
+    "collect_post_detail": "作品详情补充不可用",
+    "collect_comments": "公开评论采样不可用",
+    "persist_comments": "评论产物写入失败",
+}
+_REPORT_ERROR_CODES = _KNOWN_STOP_REASONS | {
+    "POST_UNAVAILABLE",
+    "COMMENTS_UNAVAILABLE",
+}
+
 
 def _stop_reason_from_exc(e: Exception) -> str:
     """从适配器异常中提取 stop_reason;无法识别时 INTERNAL_ERROR。
@@ -71,7 +86,7 @@ def _stop_reason_from_exc(e: Exception) -> str:
     3. 兜底 INTERNAL_ERROR
     """
     reason = getattr(e, "stop_reason", None)
-    if isinstance(reason, str) and reason:
+    if isinstance(reason, str) and reason in _KNOWN_STOP_REASONS:
         return reason
     msg = str(e)
     m = re.search(r"\[([A-Z_]+)\]", msg)
@@ -93,8 +108,8 @@ def _load_adapters(
         adapters.append(
             BilibiliCollector(browser_fallback=bilibili_browser_fallback)
         )
-    except Exception as e:  # pragma: no cover
-        print(f"[warn] 加载 bilibili 适配器失败: {e}", file=sys.stderr)
+    except Exception:  # pragma: no cover
+        print("[warn] 加载 bilibili 适配器失败", file=sys.stderr)
     # 抖音(P0)/微博(P1):若实现则加载
     # 用 importlib.import_module 而非 __import__:后者返回顶层包,取不到子模块的类
     import importlib
@@ -242,7 +257,8 @@ def _douyin_item_url(post: dict) -> str | None:
     match = re.fullmatch(r"/(?:video|note)/(\d+)/?", parsed.path)
     if match is None or match.group(1) != post_id:
         return None
-    return post_url
+    kind = "note" if parsed.path.startswith("/note/") else "video"
+    return f"https://www.douyin.com/{kind}/{post_id}"
 
 
 def _set_detail_status(post: dict, status: str) -> None:
@@ -257,7 +273,8 @@ def _valid_comment_parent(platform: str, post: dict) -> tuple[str, str] | None:
     if not post_id or not isinstance(post_url, str):
         return None
     if platform == "douyin":
-        return (post_id, post_url) if _douyin_item_url(post) else None
+        canonical = _douyin_item_url(post)
+        return (post_id, canonical) if canonical else None
     try:
         parsed = urllib.parse.urlparse(post_url)
     except ValueError:
@@ -274,7 +291,30 @@ def _valid_comment_parent(platform: str, post: dict) -> tuple[str, str] | None:
         match = re.fullmatch(r"/video/(BV[0-9A-Za-z]+)/?", parsed.path)
         if match is None or match.group(1) != post_id:
             return None
+        post_url = f"https://www.bilibili.com/video/{post_id}"
+    elif platform == "weibo":
+        if parsed.hostname not in {"weibo.com", "www.weibo.com"}:
+            return None
+        match = re.fullmatch(r"/(\d+)/([0-9A-Za-z]+)/?", parsed.path)
+        if match is None or match.group(2) != post_id:
+            return None
+        post_url = f"https://weibo.com/{match.group(1)}/{post_id}"
+    else:
+        return None
     return post_id, post_url
+
+
+def _canonicalize_post_urls(platform: str, posts: list[dict]) -> None:
+    """Replace accepted public item URLs before downstream use or persistence."""
+    for post in posts:
+        parent = _valid_comment_parent(platform, post)
+        if parent is None:
+            continue
+        _, canonical_url = parent
+        original_url = post.get("post_url")
+        post["post_url"] = canonical_url
+        if post.get("source_url") == original_url:
+            post["source_url"] = canonical_url
 
 
 def _normalize_comment_record(
@@ -383,6 +423,61 @@ def _write_comments_atomic(path: str, records: list[dict]) -> bool:
         if temporary is not None:
             try:
                 os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _count_valid_comments_artifact(
+    path: str,
+    platform: str,
+    posts: list[dict],
+    occurred_at: str,
+) -> int:
+    """Count valid current-parent rows without following an untrusted link."""
+    parents = {
+        parent[0]: parent[1]
+        for post in posts
+        if (parent := _valid_comment_parent(platform, post)) is not None
+    }
+    if not parents:
+        return 0
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        elif os.path.islink(path):
+            return 0
+        descriptor = os.open(path, flags)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return 0
+        seen: set[tuple[str, str]] = set()
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = -1
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except (json.JSONDecodeError, UnicodeError):
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                parent_id = str(value.get("parent_post_id") or "").strip()
+                parent_url = parents.get(parent_id)
+                if parent_url is None:
+                    continue
+                normalized = _normalize_comment_record(
+                    value, parent_id, parent_url, occurred_at
+                )
+                if normalized is None or normalized != value:
+                    continue
+                seen.add((parent_id, normalized["comment_id"]))
+        return len(seen)
+    except (OSError, UnicodeError):
+        return 0
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
             except OSError:
                 pass
 
@@ -524,7 +619,9 @@ def _collect_and_persist_comments(
     else:
         affected = {record["parent_post_id"] for record in records}
         outcome["failures"] += len(affected - failed_parents)
-        outcome["comments_collected"] = 0
+        outcome["comments_collected"] = _count_valid_comments_artifact(
+            path, str(adapter.platform), posts, occurred_at
+        )
         error_log.append({
             "url": None,
             "stage": "persist_comments",
@@ -658,6 +755,69 @@ def _sanitize_collection_coverage(value) -> dict:
     return clean
 
 
+def _safe_public_url(value) -> str | None:
+    """Return a credential/query/fragment-free public URL for output fields."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urllib.parse.urlparse(value)
+        hostname = parsed.hostname
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+        ):
+            return None
+    except ValueError:
+        return None
+    return urllib.parse.urlunsplit(("https", hostname.lower(), parsed.path or "/", "", ""))
+
+
+def _safe_stop_reason(value) -> str:
+    return (
+        value
+        if isinstance(value, str) and value in _KNOWN_STOP_REASONS
+        else SR_INTERNAL
+    )
+
+
+def _safe_timestamp(value) -> str | None:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if parsed.tzinfo is not None else None
+
+
+def _sanitize_report_error(value) -> dict:
+    """Map an internal/adaptor error to the report's fixed public vocabulary."""
+    source = value if isinstance(value, dict) else {}
+    stage = source.get("stage")
+    if not isinstance(stage, str) or stage not in _ERROR_STAGE_MESSAGES:
+        stage = "check_access"
+    error_code = source.get("error_code")
+    if not isinstance(error_code, str) or error_code not in _REPORT_ERROR_CODES:
+        error_code = SR_INTERNAL
+    clean = {
+        "stage": stage,
+        "error_code": error_code,
+        "url": _safe_public_url(source.get("url")),
+        "message": _ERROR_STAGE_MESSAGES[stage],
+        "occurred_at": _safe_timestamp(source.get("occurred_at")),
+    }
+    diagnostic_code = source.get("diagnostic_code")
+    if (
+        isinstance(diagnostic_code, str)
+        and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", diagnostic_code)
+    ):
+        clean["diagnostic_code"] = diagnostic_code
+    return clean
+
+
 def _write_task_json(
     ws: str,
     *,
@@ -681,16 +841,18 @@ def _write_task_json(
     """落盘 task.json(任务状态与停止原因,见 SKILL.md「任务状态与停止原因」)。"""
     payload = {
         "platform": platform,
-        "profile_url": profile_url,
+        "profile_url": _safe_public_url(profile_url),
         "requested_limit": requested_limit,
         "date_from": date_from,
         "date_to": date_to,
         "include_comments": include_comments,
         "enrich_details": enrich_details,
         "task_status": task_status,
-        "stop_reason": stop_reason,
+        "stop_reason": (
+            _safe_stop_reason(stop_reason) if stop_reason is not None else None
+        ),
         "collected_count": collected_count,
-        "collected_at": collected_at,
+        "collected_at": _safe_timestamp(collected_at),
         "incremental": incremental,
         "existing_count": existing_count,
         "new_count": new_count,
@@ -722,11 +884,12 @@ def _write_report(
         "# 采集质量报告",
         "",
         f"- 平台: {adapter.platform}",
-        f"- 账号: {url}",
+        f"- 账号: {_safe_public_url(url)}",
         f"- 采集时间: {datetime.now(_BEIJING).isoformat()}",
         f"- 任务状态 task_status: {task_status}",
-        f"- 停止原因 stop_reason: {stop_reason if stop_reason else 'null'}",
-        f"- 资料 field_visibility: {profile.get('field_visibility')}",
+        "- 停止原因 stop_reason: "
+        f"{_safe_stop_reason(stop_reason) if stop_reason else 'null'}",
+        f"- 资料 field_visibility 可见字段数: {_vis_count(profile)}",
         f"- 内容条数: {len(posts)}",
     ]
     if incremental:
@@ -756,7 +919,8 @@ def _write_report(
         lines.append("")
         lines.append("## 错误日志")
         lines.append("")
-        for e in error_log:
+        for raw_error in error_log:
+            e = _sanitize_report_error(raw_error)
             diagnostic_code = e.get("diagnostic_code")
             diagnostic = (
                 f" diagnostic_code={diagnostic_code}"
@@ -835,10 +999,11 @@ def run(
     adapter = _pick(adapters, url)
     if adapter is None:
         # URL 不属于任何已加载平台 → UNSUPPORTED_PLATFORM(见 exceptions.md §1)
-        print(f"[FAILED] 无支持的适配器: {url} (stop_reason={SR_UNSUPPORTED})", file=sys.stderr)
+        print(f"[FAILED] 无支持的适配器 (stop_reason={SR_UNSUPPORTED})", file=sys.stderr)
         return 2
 
     platform = adapter.platform
+    safe_url = _safe_public_url(url)
     if collect_all and platform != "douyin":
         print("[FAILED] --all 目前仅支持抖音账号主页", file=sys.stderr)
         return 2
@@ -904,7 +1069,7 @@ def run(
     try:
         access = adapter.check_access(url)
         if not access.get("accessible"):
-            stop_reason = access.get("stop_reason") or SR_INTERNAL
+            stop_reason = _safe_stop_reason(access.get("stop_reason"))
             # check_access 阶段尚无已采数据,所有受阻场景统一 FAILED(见 exceptions.md §1)
             task_status = "FAILED"
             _write_task_json(
@@ -919,13 +1084,13 @@ def run(
                 adapter, url, profile or {}, posts, ws,
                 task_status=task_status, stop_reason=stop_reason,
                 collection_coverage=collection_coverage, error_log=[{
-                    "url": url, "stage": "check_access",
+                    "url": safe_url, "stage": "check_access",
                     "error_code": stop_reason,
-                    "message": access.get("reason", "访问受限"),
+                    "message": _ERROR_STAGE_MESSAGES["check_access"],
                     "occurred_at": collected_at, "retryable": False,
                 }],
             )
-            print(f"[STOP] task_status={task_status} stop_reason={stop_reason} reason={access.get('reason')}")
+            print(f"[STOP] task_status={task_status} stop_reason={stop_reason} stage=check_access")
             return 3
     except Exception as e:
         # 适配器未启用(WeiboCollector._require_enabled 抛 RuntimeError 携 ADAPTER_UNAVAILABLE)
@@ -943,12 +1108,13 @@ def run(
             adapter, url, profile, posts, ws,
             task_status=task_status, stop_reason=stop_reason,
             collection_coverage=collection_coverage, error_log=[{
-                "url": url, "stage": "check_access",
-                "error_code": stop_reason, "message": str(e),
+                "url": safe_url, "stage": "check_access",
+                "error_code": stop_reason,
+                "message": _ERROR_STAGE_MESSAGES["check_access"],
                 "occurred_at": collected_at, "retryable": False,
             }],
         )
-        print(f"[STOP] task_status={task_status} stop_reason={stop_reason} message={e}")
+        print(f"[STOP] task_status={task_status} stop_reason={stop_reason} stage=check_access")
         return 3
 
     # 2) 内容列表(先于资料,便于回填;失败不阻断资料写入)
@@ -972,14 +1138,15 @@ def run(
         # 登录/验证/频控/解析失败 → PARTIAL(已有数据保留)或 FAILED(无已采数据)
         task_status = "PARTIAL" if posts else "FAILED"
         entry = {
-            "url": url, "stage": "collect_post_list",
-            "error_code": stop_reason, "message": str(e),
+            "url": safe_url, "stage": "collect_post_list",
+            "error_code": stop_reason,
+            "message": _ERROR_STAGE_MESSAGES["collect_post_list"],
             "occurred_at": collected_at, "retryable": False,
         }
         if isinstance(diagnostic_code, str) and diagnostic_code:
             entry["diagnostic_code"] = diagnostic_code
         error_log.append(entry)
-        print(f"[warn] 内容列表采集异常 stop_reason={stop_reason}: {e}", file=sys.stderr)
+        print(f"[warn] 内容列表采集异常 stop_reason={stop_reason}", file=sys.stderr)
     try:
         collection_coverage = _sanitize_collection_coverage(
             adapter.get_collection_coverage()
@@ -1014,6 +1181,7 @@ def run(
     new_count = 0
     if resume_mode and existing_posts:
         posts, new_count = _merge_incremental(existing_posts, posts)
+    _canonicalize_post_urls(platform, posts)
 
     # 3) 资料(失败不阻塞已采内容)
     try:
@@ -1023,11 +1191,12 @@ def run(
             stop_reason = _stop_reason_from_exc(e)
             task_status = "PARTIAL" if posts else "FAILED"
         error_log.append({
-            "url": url, "stage": "collect_profile",
-            "error_code": _stop_reason_from_exc(e), "message": str(e),
+            "url": safe_url, "stage": "collect_profile",
+            "error_code": _stop_reason_from_exc(e),
+            "message": _ERROR_STAGE_MESSAGES["collect_profile"],
             "occurred_at": collected_at, "retryable": False,
         })
-        print(f"[warn] 资料采集异常: {e}", file=sys.stderr)
+        print("[warn] 资料采集异常", file=sys.stderr)
         profile = {}
 
     if enrich_details and platform == "douyin" and posts:

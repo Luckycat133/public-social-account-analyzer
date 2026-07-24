@@ -403,7 +403,6 @@ class WeiboCollector(BaseCollector):
     # 评论（best-effort）
     # ------------------------------------------------------------------
     def collect_comments(self, post_url: str, limit: int = 20) -> list[dict[str, Any]]:
-        """公开评论采样（best-effort）。暂返回 []，符合「评论不可见不影响任务」。"""
-        if not ENABLED:
-            return []
-        return []
+        """公开评论采样尚未实现；不得用空列表伪装成功。"""
+        self._require_enabled()
+        raise WeiboError("COMMENTS_UNAVAILABLE", "微博公开评论采样未实现")

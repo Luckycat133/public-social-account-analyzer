@@ -805,10 +805,21 @@ class DouyinCollector(BaseCollector):
         comments_raw = self._find_comments(data)
         if comments_raw is None:
             raise DouyinError("COMMENTS_UNAVAILABLE", "作品页未提供公开评论结构")
+        for comment in comments_raw[:limit]:
+            if not isinstance(comment, dict):
+                raise DouyinError("COMMENTS_UNAVAILABLE", "公开评论结构无效")
+            comment_id = comment.get("cid") or comment.get("id")
+            user = comment.get("user")
+            text = comment.get("text") or comment.get("content")
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, (str, int))
+                or (user is not None and not isinstance(user, dict))
+                or (text is not None and not isinstance(text, str))
+            ):
+                raise DouyinError("COMMENTS_UNAVAILABLE", "公开评论结构无效")
         out: list[dict[str, Any]] = []
         for c in comments_raw[:limit]:
-            if not isinstance(c, dict):
-                continue
             out.append(
                 {
                     "comment_id": c.get("cid") or c.get("id"),
