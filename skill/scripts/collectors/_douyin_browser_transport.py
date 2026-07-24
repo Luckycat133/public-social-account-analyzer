@@ -647,6 +647,10 @@ def collect_account_page(
                 session.page_text,
                 timeout=budget,
             )
+            if remaining() <= 0:
+                deadline_expired = True
+                stop_condition = "timeout"
+                break
             restriction = detect_restriction(visible_text)
             if restriction:
                 stop_condition = restriction

@@ -1456,6 +1456,51 @@ def test_terminal_page_timeout_after_response_decode_is_not_exhaustive():
     assert result.coverage["is_exhaustive"] is False
 
 
+def test_terminal_page_timeout_during_page_text_is_not_exhaustive():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    state = {"decoded": False, "expired": False}
+
+    class PageTextExpiryBrowser(FakeBrowser):
+        def get_response_body(self, request_id):
+            body = super().get_response_body(request_id)
+            state["decoded"] = True
+            return body
+
+        def page_text(self):
+            text = super().page_text()
+            if state["decoded"]:
+                state["expired"] = True
+            return text
+
+    browser = PageTextExpiryBrowser(
+        events=[
+            _response_event("terminal"),
+            _loading_event("Network.loadingFinished", "terminal"),
+        ],
+        bodies={
+            "terminal": json.dumps({
+                "aweme_list": [AWEME],
+                "has_more": False,
+            })
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        all_posts=True,
+        max_seconds=1.0,
+        session_factory=lambda: browser,
+        monotonic=lambda: 2.0 if state["expired"] else 0.0,
+        sleep=lambda _: None,
+    )
+
+    assert result.diagnostics["stop_condition"] == "timeout"
+    assert result.coverage["stop_condition"] == "timeout"
+    assert result.coverage["is_exhaustive"] is False
+
+
 def test_terminal_page_timeout_during_dom_fallback_is_not_exhaustive():
     from collectors._douyin_browser_transport import collect_account_page
 
