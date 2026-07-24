@@ -7,7 +7,9 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
@@ -33,7 +35,7 @@ def _write_csv(posts: list[dict[str, Any]], path: str) -> None:
         writer.writerows(posts)
 
 
-def _write_artifacts(
+def _serialize_artifacts(
     workspace: str,
     *,
     profile: dict[str, Any],
@@ -106,6 +108,47 @@ def _write_artifacts(
         handle.write("\n".join(lines) + "\n")
 
 
+def _write_artifacts(
+    workspace: str,
+    *,
+    profile: dict[str, Any],
+    posts: list[dict[str, Any]],
+    requested_limit: int | None,
+    task_status: str,
+    stop_reason: str | None,
+    coverage: dict[str, Any],
+    diagnostic_code: str | None = None,
+) -> None:
+    """Serialize in a sibling directory, then atomically promote on success."""
+
+    target = os.path.abspath(workspace)
+    parent = os.path.dirname(target)
+    basename = os.path.basename(target)
+    os.makedirs(parent, exist_ok=True)
+    if os.path.lexists(target):
+        raise FileExistsError("output workspace already exists")
+    staging = tempfile.mkdtemp(prefix=f".{basename}.staging-", dir=parent)
+    promoted = False
+    try:
+        _serialize_artifacts(
+            staging,
+            profile=profile,
+            posts=posts,
+            requested_limit=requested_limit,
+            task_status=task_status,
+            stop_reason=stop_reason,
+            coverage=coverage,
+            diagnostic_code=diagnostic_code,
+        )
+        if os.path.lexists(target):
+            raise FileExistsError("output workspace already exists")
+        os.rename(staging, target)
+        promoted = True
+    finally:
+        if not promoted and os.path.isdir(staging):
+            shutil.rmtree(staging)
+
+
 def run(
     *,
     out_dir: str | None = None,
@@ -142,7 +185,6 @@ def run(
         return 2
 
     api = client or DouyinOpenAPIClient(access_token)
-    os.makedirs(out_dir, exist_ok=False)
     profile: dict[str, Any] = {}
     posts: list[dict[str, Any]] = []
     coverage: dict[str, Any] = {
@@ -180,7 +222,10 @@ def run(
         if collect_all:
             complete = coverage.get("is_exhaustive") is True
         else:
-            complete = bool(posts) or coverage.get("terminal_page_observed") is True
+            complete = (
+                len(posts) >= limit
+                or coverage.get("terminal_page_observed") is True
+            )
         task_status = "COMPLETED" if complete else ("PARTIAL" if posts else "FAILED")
         stop_reason = None if complete else "PARSER_FAILED"
         diagnostic_code = None if complete else "OPENAPI_LIST_INCOMPLETE"

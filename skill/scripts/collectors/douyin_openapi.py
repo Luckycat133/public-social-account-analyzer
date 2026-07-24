@@ -20,6 +20,14 @@ _VIDEO_LIST_URL = "https://open.douyin.com/video/list/"
 _BEIJING = timezone(timedelta(hours=8))
 _NUMERIC_ID = re.compile(r"^[0-9]+$")
 _HASHTAG = re.compile(r"#([^#\s]+)")
+_MEDIA_TYPES = {2: "video", 4: "image_text"}
+_SAFE_ERROR_CODES = frozenset({
+    "INVALID_ENDPOINT",
+    "INVALID_RESPONSE",
+    "OPENAPI_ERROR",
+    "SECRET_ECHO",
+    "TRANSPORT_ERROR",
+})
 
 
 class DouyinOpenAPIError(RuntimeError):
@@ -57,13 +65,18 @@ def _urllib_transport(
     headers: dict[str, str],
     data: bytes | None = None,
 ) -> bytes:
+    class RejectRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
     request = urllib.request.Request(
         url,
         data=data,
         headers=headers,
         method=method,
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    opener = urllib.request.build_opener(RejectRedirects())
+    with opener.open(request, timeout=20) as response:
         return response.read()
 
 
@@ -80,14 +93,21 @@ def _sanitize_share_url(value: Any) -> str:
         raise DouyinOpenAPIError(
             "INVALID_RESPONSE", "Douyin OpenAPI returned an invalid share URL"
         )
+    parse_failed = False
+    parsed = None
+    hostname = ""
+    port = None
     try:
         parsed = urllib.parse.urlsplit(value)
         hostname = (parsed.hostname or "").lower()
         port = parsed.port
     except ValueError:
+        parse_failed = True
+    if parse_failed:
         raise DouyinOpenAPIError(
             "INVALID_RESPONSE", "Douyin OpenAPI returned an invalid share URL"
-        ) from None
+        )
+    assert parsed is not None
     is_douyin_owned = any(
         hostname == suffix or hostname.endswith(f".{suffix}")
         for suffix in ("douyin.com", "iesdouyin.com")
@@ -138,7 +158,11 @@ def _check_error_codes(payload: dict[str, Any]) -> None:
         if not isinstance(container, dict) or "error_code" not in container:
             continue
         code = container["error_code"]
-        if code not in (0, "0") or isinstance(code, bool):
+        exact_success = (
+            (type(code) is int and code == 0)
+            or (type(code) is str and code == "0")
+        )
+        if not exact_success:
             raise DouyinOpenAPIError(
                 "OPENAPI_ERROR",
                 f"Douyin OpenAPI {container_name} reported an error",
@@ -149,14 +173,18 @@ def _decode_payload(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         payload = raw
     else:
+        decode_failed = False
+        payload = None
         try:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             payload = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            decode_failed = True
+        if decode_failed:
             raise DouyinOpenAPIError(
                 "INVALID_RESPONSE", "Douyin OpenAPI returned invalid JSON"
-            ) from None
+            )
     if not isinstance(payload, dict):
         raise DouyinOpenAPIError(
             "INVALID_RESPONSE", "Douyin OpenAPI returned a non-object response"
@@ -178,14 +206,12 @@ def _contains_secret(value: Any, secret: str) -> bool:
     return False
 
 
-def _content_type(media_type: Any) -> str:
-    if isinstance(media_type, str) and media_type.lower() in {
-        "image",
-        "image_text",
-        "note",
-    }:
-        return "image_text"
-    return "video"
+def _recognized_media_type(media_type: Any) -> tuple[int, str]:
+    if type(media_type) is int and media_type in _MEDIA_TYPES:
+        return media_type, _MEDIA_TYPES[media_type]
+    raise DouyinOpenAPIError(
+        "INVALID_RESPONSE", "Douyin OpenAPI returned an unknown media_type"
+    )
 
 
 def _map_video(item: Any) -> dict[str, Any]:
@@ -204,12 +230,15 @@ def _map_video(item: Any) -> dict[str, Any]:
     title = item.get("title") if isinstance(item.get("title"), str) else None
     create_time = item.get("create_time")
     if isinstance(create_time, int) and not isinstance(create_time, bool):
+        timestamp_invalid = False
         try:
             published_at = datetime.fromtimestamp(create_time, _BEIJING).isoformat()
         except (OverflowError, OSError, ValueError):
+            timestamp_invalid = True
+        if timestamp_invalid:
             raise DouyinOpenAPIError(
                 "INVALID_RESPONSE", "Douyin OpenAPI returned an invalid create_time"
-            ) from None
+            )
     else:
         published_at = None
     is_top = item.get("is_top")
@@ -222,14 +251,14 @@ def _map_video(item: Any) -> dict[str, Any]:
     statistics = item.get("statistics")
     if not isinstance(statistics, dict):
         statistics = {}
-    media_type = item.get("media_type")
+    media_type, content_type = _recognized_media_type(item.get("media_type"))
     now = datetime.now(_BEIJING).isoformat()
     return {
         "platform": "douyin",
         "post_id": video_id,
         "post_url": post_url,
         "published_at": published_at,
-        "content_type": _content_type(media_type),
+        "content_type": content_type,
         "title": title,
         "text": title,
         "duration_seconds": None,
@@ -270,16 +299,56 @@ class DouyinOpenAPIClient:
         self._access_token = access_token
         self._transport = transport or _urllib_transport
 
+    @staticmethod
+    def _is_fixed_endpoint(method: str, url: str) -> bool:
+        if method == "POST":
+            return url == _PROFILE_URL
+        if method != "GET":
+            return False
+        parse_failed = False
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            port = parsed.port
+            query = urllib.parse.parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+        except ValueError:
+            parse_failed = True
+        if parse_failed:
+            return False
+        return bool(
+            parsed.scheme == "https"
+            and parsed.hostname == "open.douyin.com"
+            and parsed.username is None
+            and parsed.password is None
+            and port is None
+            and parsed.path == "/video/list/"
+            and not parsed.fragment
+            and set(query) == {"cursor", "count"}
+            and len(query["cursor"]) == 1
+            and len(query["count"]) == 1
+            and query["cursor"][0].isdigit()
+            and query["count"][0].isdigit()
+        )
+
     def _request(self, method: str, url: str, data: bytes | None = None) -> dict[str, Any]:
+        if not self._is_fixed_endpoint(method, url):
+            raise DouyinOpenAPIError(
+                "INVALID_ENDPOINT", "Douyin OpenAPI request endpoint is not allowed"
+            )
         headers = {"Accept": "application/json", "access-token": self._access_token}
+        transport_failed = False
+        raw = None
         try:
             raw = self._transport(method=method, url=url, headers=headers, data=data)
-        except DouyinOpenAPIError:
-            raise
         except Exception:
+            transport_failed = True
+        if transport_failed:
             raise DouyinOpenAPIError(
                 "TRANSPORT_ERROR", "Douyin OpenAPI request failed"
-            ) from None
+            )
         payload = _decode_payload(raw)
         if _contains_secret(payload, self._access_token):
             raise DouyinOpenAPIError(
@@ -371,6 +440,7 @@ class DouyinOpenAPIClient:
 
         while True:
             count = page_size if limit is None else min(page_size, limit - len(posts))
+            page_error_code = None
             try:
                 payload = self._request(
                     "GET", _video_list_request_url(cursor, count), None
@@ -389,13 +459,19 @@ class DouyinOpenAPIClient:
                 has_more = _parse_has_more(data.get("has_more"))
                 mapped_page = [_map_video(item) for item in raw_items]
             except DouyinOpenAPIError as exc:
+                page_error_code = (
+                    exc.error_code
+                    if exc.error_code in _SAFE_ERROR_CODES
+                    else "INVALID_RESPONSE"
+                )
+            if page_error_code is not None:
                 partial_coverage = coverage("api_error")
                 raise DouyinOpenAPIError(
-                    exc.error_code,
-                    str(exc),
+                    page_error_code,
+                    "Douyin OpenAPI video page could not be collected",
                     partial_posts=posts,
                     coverage=partial_coverage,
-                ) from None
+                )
 
             pages += 1
             new_count = 0
