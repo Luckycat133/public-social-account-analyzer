@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Added an experimental Douyin browser fallback for missing SSR post lists. It observes eligible public CDP network responses and falls back to visible post cards when needed; no Python runtime package is added.
+- Added offline Douyin tests for browser-response parsing, bounded collection, CLI policy, retained partial posts, and documentation coverage.
+
+### Changed
+- Douyin collection now defaults to the experimental fallback, while `--no-browser-fallback` and `SOCIAL_BROWSER_FALLBACK=0` disable it. Each browser run uses a temporary profile and does not reuse login state.
+- When browser collection is stopped by a public access restriction, normalized posts already collected are preserved as partial results. Diagnostics are limited to safe codes and sanitized response paths.
+
+### Security
+- The fallback does not reproduce signatures or bypass login, CAPTCHA, slider, rate-limit, or other access protections. It does not persist cookies, request headers, signed URLs, response bodies, or media.
+
 ## [1.0.0] - 2026-07-24
 
 ### Added

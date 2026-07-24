@@ -20,6 +20,24 @@ AWEME = {
 ACCOUNT_URL = "https://www.douyin.com/user/example"
 
 
+def test_docs_describe_zero_python_dependency_browser_fallback():
+    """Public documentation states the implemented browser-fallback policy."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    usage = (root / "USAGE.md").read_text(encoding="utf-8")
+    platform = (root / "skill/references/platform-douyin.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "实验性支持" in readme
+    assert "--no-browser-fallback" in usage
+    assert "SOCIAL_BROWSER_FALLBACK" in usage
+    assert "不新增 pip" in platform
+    assert "临时用户目录" in platform
+
+
 def _ssr_html(data):
     return '<script id="RENDER_DATA">' + json.dumps(data) + "</script>"
 

@@ -43,7 +43,10 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 - `--date-from / --date-to`：采集时间范围（YYYY-MM-DD 或 ISO 8601，北京时间）。两者与 `--limit` 共同限定结果。
 - `--resume`：增量续采。读取 `--out` 指定目录既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧）。**必须配合 `--out`**，否则直接报错退出。
 - `--since`：增量续采起点（YYYY-MM-DD 或 ISO 8601），覆盖由既有数据推导的起始时间；仅与 `--resume` 联用。
-- `--browser-fallback`：当主机出口 IP 被目标平台 WAF 拦截时，开启传输层浏览器重试机制。
+- `--browser-fallback`：显式启用浏览器降级。抖音默认已启用：仅当 SSR 作品列表缺失时，按 CDP 网络响应观察、可见 DOM 卡片的顺序尝试；该参数可覆盖环境变量中的禁用设置。对 B站仍会启用其既有的浏览器传输层降级。
+- `--no-browser-fallback`：禁止抖音启动浏览器降级，只使用 HTTP/SSR 快速路径。
+
+抖音浏览器降级是实验性能力，不代表任何账号均可采集成功。它只读取无需登录可见的公开页面：每次运行创建并在退出时删除临时用户目录，不附着或复用本机 Chrome 的登录状态、Cookie 或用户配置。系统不会复现签名、绕过登录/验证码/滑块，或尝试规避频控；遇到这些限制会如实停止。
 
 ---
 
@@ -99,7 +102,10 @@ python skill/scripts/render_report.py --input <WORKSPACE_DIR>
 | 环境变量 | 默认值 | 作用说明 |
 |:---|:---|:---|
 | `BILIBILI_BROWSER_FALLBACK` | `0` | 设置为 `1` 启用 B站 传输层浏览器降级重试机制。 |
+| `SOCIAL_BROWSER_FALLBACK` | `1` | 抖音浏览器降级策略：`0` 禁用，`1` 启用；未设置时默认启用。命令行 `--browser-fallback` 或 `--no-browser-fallback` 优先于此变量。 |
 | `BROWSER_BIN` / `CHROME_BIN` | 空 | 指定用于传输层降级重试的 Chrome/Chromium/Edge 可执行文件路径。 |
+
+浏览器为可选的系统前置条件，不新增 Python 运行时依赖。未发现可用浏览器时，抖音采集对外仍返回 `PARSER_FAILED`；采集报告可包含经过清理的诊断码 `BROWSER_UNAVAILABLE`，不记录 Cookie、请求头、签名查询参数或响应正文。
 
 ---
 
@@ -122,6 +128,30 @@ python skill/scripts/analyze.py --input workspace/bilibili-123456-20260724 --pla
 # 4. 渲染报告
 python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 ```
+
+---
+
+### 示例 2：采集抖音公开账号
+
+以下命令默认在 SSR 作品列表缺失时自动尝试浏览器降级：
+
+```bash
+python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30
+```
+
+仅使用 HTTP/SSR 快速路径：
+
+```bash
+python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30 --no-browser-fallback
+```
+
+通过环境变量禁用默认降级：
+
+```bash
+SOCIAL_BROWSER_FALLBACK=0 python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30
+```
+
+设置 `SOCIAL_BROWSER_FALLBACK=1` 可显式保持默认启用状态。命令行开关优先于环境变量。
 
 ---
 
