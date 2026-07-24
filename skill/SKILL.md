@@ -9,7 +9,8 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 本 Skill 仅基于**无需登录即可查看的公开页面**采集账号资料与近期内容，完成归一化、指标计算、内容分类与策略归类，输出可复核的账号内容分析报告。
 
-- **正式支持（P0）**：B站（bilibili）、抖音（douyin）
+- **正式支持（P0）**：B站（bilibili）
+- **实验性支持（P0）**：抖音（douyin，浏览器降级尚待在线验收）
 - **条件支持（P1）**：微博（weibo，仅在适配器已实现并启用时）
 - **不支持**：小红书、视频号及任意其他平台
 
@@ -22,7 +23,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 3. **不绕过风控**：遇到验证码、滑块、登录墙、访问频控时立即停止，绝不上爬虫逆向手段绕过。
 4. **不修改数据**：不自动发布、修改、删除内容，不自动回复评论或私信。
 5. **严禁推测**：未公开显示的字段写 `null`，禁止用 `0` 代替未知，禁止强行推测。
-6. **传输层浏览器降级**：当 IP 被封禁时仅作为传输层重试机制，绝不用于规避验证码或登录墙。
+6. **抖音实验性浏览器降级**：仅在主页没有可解析的 `RENDER_DATA` 时使用，绝不用于规避验证码、登录墙或其他保护。
 
 ## 核心流程
 
@@ -77,7 +78,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - **不跨平台打总分**：不同平台指标可见度不同，不构造统一总分。
 - **中位数优先**：聚合指标优先采用中位数与四分位数，避免极值拉偏平均数。
 - **证据 100% 覆盖**：报告中每项核心洞察必须至少附带一个具体帖子 URL 作为证据。
-- **抖音动态 JS 虚拟机渲染与降级**：当抖音页面由静态 SSR `RENDER_DATA` 切换为客户端 `_$jsvmprt` JS 虚拟机渲染时，HTTP 直连将诚信上报 `PARSER_FAILED`。此为预期风控/架构表现，可带 `--browser-fallback` 参数通过 Headless Chrome 传输层渲染；后置流水线会在 0 数据时无缝降级输出完整的空值标准化报告。
+- **抖音动态 JS 虚拟机渲染与降级（实验性）**：主页没有可解析的 `RENDER_DATA` 时，默认自动降级：使用新的临时用户目录启动可选系统浏览器，先观察公开 CDP 网络响应，再从可见作品卡片提取最小字段；不附着或复用登录状态。可用 `--no-browser-fallback` 或 `SOCIAL_BROWSER_FALLBACK=0` 禁用。若 `RENDER_DATA` 存在但无法识别作品列表，仍返回 `PARSER_FAILED`；未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外仍为 `PARSER_FAILED`。不复现签名或绕过登录、验证码、滑块、频控。
 
 ## 任务状态与停止原因
 
@@ -92,7 +93,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 必须通过项目脚本执行真实采集与分析，严禁虚构或推测数据：
 
-1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--browser-fallback] [--resume --out <dir> [--since ...]]`
+1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--no-browser-fallback] [--resume --out <dir> [--since ...]]`
 2. `python scripts/normalize.py --input <workspace_path>`
 3. `python scripts/analyze.py --input <workspace_path> [--with-llm-tax | --llm-tax-results <file>]`
 4. `python scripts/render_report.py --input <workspace_path>`

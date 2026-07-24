@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Added an experimental Douyin browser fallback for missing SSR post lists. It observes eligible public CDP network responses and falls back to visible post cards when needed; no Python runtime package is added.
+- Added an experimental Douyin browser fallback when a profile homepage has no parseable `RENDER_DATA`. It observes eligible public CDP network responses and falls back to visible post cards when needed; no Python runtime package is added.
 - Added offline Douyin tests for browser-response parsing, bounded collection, CLI policy, retained partial posts, and documentation coverage.
 
 ### Changed
@@ -45,4 +45,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful degradation**: the report pipeline emits complete null-valued standard artifacts even at 0 collected posts (no crash).
 
 ### Security
-- Enforced strict compliance boundaries prohibiting login credential storage, WAF bypass, private backend metrics scraping, and automated account management. Douyin JS-VM / dynamic-render pages are reported honestly as `PARSER_FAILED`; only a transport-layer `--browser-fallback` (Headless Chrome) is offered, never signature forging or WAF bypass.
+- Enforced strict compliance boundaries prohibiting login credential storage, WAF bypass, private backend metrics scraping, and automated account management. Douyin JS-VM / dynamic-render pages without parseable SSR data may use the experimental browser transport, which observes public network responses then visible cards; it never forges signatures or bypasses WAF protections.

@@ -45,4 +45,4 @@
 - **render 验证**：在 `workspace/bilibili-518388027-20260723` 样例上渲染无告警，四类产物（MD/HTML/CSV/JSON）均含新增章节（深度认可率、社群讨论率、IQR 表、覆盖率徽章、高低表现雷达图、发布时段分布图）。
 - **LLM 回填验证**：`--with-llm-tax` → 生成 prompt；`--llm-tax-results` 回填后 `meta.llm_taxonomy` 与 `meta.classification_status=llm-1` 正确写入。
 - **深度互动率口径（混合口径）**：经确认，`deep_approval_rate` 采用 `(投币+收藏)/播放` 分母（与「播放」维度一致），`community_discussion_rate` 采用 `(评论+弹幕)/播放` 并保留弹幕（贴合 B站讨论形态）。两者分母均透明、禁止用 0 做分母。
-- **抖音浏览器降级（实验性）**：SSR 作品列表缺失时可按 CDP 网络响应观察、可见 DOM 卡片顺序降级；默认启用且可禁用。它使用临时用户目录，不复用登录状态，不新增 Python 运行时依赖；在线账号验收仍待完成。
+- **抖音浏览器降级（实验性）**：主页没有可解析的 `RENDER_DATA` 时可按 CDP 网络响应观察、可见 DOM 卡片顺序降级；默认启用且可禁用。若 `RENDER_DATA` 存在但无法识别作品列表，仍返回 `PARSER_FAILED`。它使用临时用户目录，不复用登录状态，不新增 Python 运行时依赖；在线账号验收仍待完成。

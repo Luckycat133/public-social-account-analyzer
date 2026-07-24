@@ -43,7 +43,7 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 - `--date-from / --date-to`：采集时间范围（YYYY-MM-DD 或 ISO 8601，北京时间）。两者与 `--limit` 共同限定结果。
 - `--resume`：增量续采。读取 `--out` 指定目录既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧）。**必须配合 `--out`**，否则直接报错退出。
 - `--since`：增量续采起点（YYYY-MM-DD 或 ISO 8601），覆盖由既有数据推导的起始时间；仅与 `--resume` 联用。
-- `--browser-fallback`：显式启用浏览器降级。抖音默认已启用：仅当 SSR 作品列表缺失时，按 CDP 网络响应观察、可见 DOM 卡片的顺序尝试；该参数可覆盖环境变量中的禁用设置。对 B站仍会启用其既有的浏览器传输层降级。
+- `--browser-fallback`：显式启用浏览器降级。抖音默认已启用：仅当主页没有可解析的 `RENDER_DATA` 时，按 CDP 网络响应观察、可见 DOM 卡片的顺序尝试；该参数可覆盖环境变量中的禁用设置。若 `RENDER_DATA` 存在但无法识别作品列表，仍返回 `PARSER_FAILED`。对 B站仍会启用其既有的浏览器传输层降级。
 - `--no-browser-fallback`：禁止抖音启动浏览器降级，只使用 HTTP/SSR 快速路径。
 
 抖音浏览器降级是实验性能力，不代表任何账号均可采集成功。它只读取无需登录可见的公开页面：每次运行创建并在退出时删除临时用户目录，不附着或复用本机 Chrome 的登录状态、Cookie 或用户配置。系统不会复现签名、绕过登录/验证码/滑块，或尝试规避频控；遇到这些限制会如实停止。
@@ -133,7 +133,7 @@ python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 
 ### 示例 2：采集抖音公开账号
 
-以下命令默认在 SSR 作品列表缺失时自动尝试浏览器降级：
+以下命令默认在主页没有可解析的 `RENDER_DATA` 时自动尝试浏览器降级：
 
 ```bash
 python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30

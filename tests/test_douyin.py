@@ -30,12 +30,23 @@ def test_docs_describe_zero_python_dependency_browser_fallback():
     platform = (root / "skill/references/platform-douyin.md").read_text(
         encoding="utf-8"
     )
+    skill = (root / "skill/SKILL.md").read_text(encoding="utf-8")
+    roadmap = (root / "TODO.md").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    docs = "\n".join((readme, usage, platform, skill, roadmap, changelog))
 
     assert "实验性支持" in readme
     assert "--no-browser-fallback" in usage
     assert "SOCIAL_BROWSER_FALLBACK" in usage
     assert "不新增 pip" in platform
     assert "临时用户目录" in platform
+    assert "实验性支持" in skill
+    assert "主页没有可解析的 `RENDER_DATA`" in skill
+    assert "默认自动降级" in skill
+    assert "--no-browser-fallback" in skill
+    assert "BROWSER_UNAVAILABLE" in skill
+    assert "SSR 作品列表缺失" not in docs
+    assert "Headless Chrome" not in skill
 
 
 def _ssr_html(data):
