@@ -19,7 +19,7 @@ CDP 客户端驱动独立临时浏览器，观察页面公开响应并读取可�
 - `check_access`：返回 `{"accessible", "reason", "stop_reason"}`，不绕过。
 - `collect_profile` / `collect_post_list` / `collect_post_detail`：best-effort 解析
   页面内嵌 `RENDER_DATA`（URL 编码 JSON）；解析失败或受限如实上抛。
-- `collect_comments`：覆盖基类，best-effort，任何限制/错误一律返回 `[]`。
+- `collect_comments`：覆盖基类；明确空列表返回 `[]`，不可用则上抛内容级原因。
 """
 
 from __future__ import annotations
@@ -466,6 +466,7 @@ class DouyinCollector(BaseCollector):
                 diagnostic_code=code,
             ) from exc
 
+        valid_items = self._validated_aweme_items(result.aweme_items)
         posts = [
             self.normalize_post(
                 self._build_post_raw(
@@ -476,8 +477,7 @@ class DouyinCollector(BaseCollector):
                     ),
                 )
             )
-            for item in result.aweme_items
-            if isinstance(item, dict)
+            for item in valid_items
         ]
         if date_range:
             posts = self._filter_by_date(posts, date_range)
@@ -605,14 +605,7 @@ class DouyinCollector(BaseCollector):
         self._collection_coverage = self._sanitize_collection_coverage(
             getattr(result, "coverage", {})
         )
-        valid_by_id: dict[str, dict[str, Any]] = {}
-        for item in result.aweme_items:
-            if not isinstance(item, dict):
-                continue
-            post_id = str(item.get("aweme_id") or item.get("aweme_id_str") or "")
-            if re.fullmatch(r"\d+", post_id) and post_id not in valid_by_id:
-                valid_by_id[post_id] = item
-        valid_items = list(valid_by_id.values())
+        valid_items = self._validated_aweme_items(result.aweme_items)
         posts = [
             self.normalize_post(
                 self._build_post_raw(
@@ -704,9 +697,7 @@ class DouyinCollector(BaseCollector):
             )
 
         posts: list[dict[str, Any]] = []
-        for item in aweme_list:
-            if not isinstance(item, dict):
-                continue
+        for item in self._validated_aweme_items(aweme_list):
             if len(posts) >= limit:
                 break
             raw = self._build_post_raw(url, item, source="list")
@@ -715,6 +706,33 @@ class DouyinCollector(BaseCollector):
         if date_range:
             posts = self._filter_by_date(posts, date_range)
         return posts[:limit]
+
+    @classmethod
+    def _validated_aweme_items(cls, items: Any) -> list[dict[str, Any]]:
+        """Keep numeric platform items and fill duplicate gaps without overwrites."""
+        by_id: dict[str, dict[str, Any]] = {}
+        if not isinstance(items, list):
+            return []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            post_id = str(item.get("aweme_id") or item.get("aweme_id_str") or "")
+            if re.fullmatch(r"\d+", post_id) is None:
+                continue
+            if post_id not in by_id:
+                by_id[post_id] = dict(item)
+                continue
+            cls._merge_missing_values(by_id[post_id], item)
+        return list(by_id.values())
+
+    @classmethod
+    def _merge_missing_values(cls, target: dict[str, Any], incoming: dict[str, Any]) -> None:
+        for key, value in incoming.items():
+            current = target.get(key)
+            if isinstance(current, dict) and isinstance(value, dict):
+                cls._merge_missing_values(current, value)
+            elif current in (None, "") and value not in (None, ""):
+                target[key] = value
 
     # -- 单条详情 -----------------------------------------------------------
     def collect_post_detail(self, post_url: str) -> dict[str, Any]:
@@ -741,41 +759,35 @@ class DouyinCollector(BaseCollector):
     def collect_comments(
         self, post_url: str, limit: int = 20
     ) -> list[dict[str, Any]]:
-        """公开评论采样（best-effort）。
-
-        抖音评论走签名接口，urllib 直连不可达；任何限制/错误一律返回 []，不绕过、
-        不报错。上层按 COMMENTS_UNAVAILABLE 行为处理（不影响任务状态）。
-        """
-        try:
-            if not isinstance(post_url, str) or not post_url.strip():
-                return []
-            html = self._fetch(post_url)
-            restriction = _detect_restriction(html)
-            if restriction:
-                return []
-            data = _extract_render_data(html)
-            if data is None:
-                return []
-            comments_raw = self._find_comments(data)
-            out: list[dict[str, Any]] = []
-            for c in (comments_raw or [])[:limit]:
-                if not isinstance(c, dict):
-                    continue
-                out.append(
-                    {
-                        "comment_id": c.get("cid") or c.get("id"),
-                        "post_url": post_url,
-                        "author": (c.get("user") or {}).get("nickname"),
-                        "text": c.get("text") or c.get("content"),
-                        "likes": _int(c.get("digg_count")),
-                        "published_at": _ts_to_iso(c.get("create_time")),
-                        "collected_at": _now_iso(),
-                    }
-                )
-            return out
-        except Exception:
-            # 任何异常（含限制）均降级为 []，不绕过、不向上抛。
-            return []
+        """公开评论采样；区分明确空结果与不可用，均不绕过保护。"""
+        if not isinstance(post_url, str) or not post_url.strip():
+            raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL")
+        html = self._fetch(post_url)
+        restriction = _detect_restriction(html)
+        if restriction:
+            raise DouyinError(restriction, "公开评论采样命中访问限制")
+        data = _extract_render_data(html)
+        if data is None:
+            raise DouyinError(STOP_PARSER_FAILED, "作品页无可解析公开数据")
+        comments_raw = self._find_comments(data)
+        if comments_raw is None:
+            raise DouyinError("COMMENTS_UNAVAILABLE", "作品页未提供公开评论结构")
+        out: list[dict[str, Any]] = []
+        for c in comments_raw[:limit]:
+            if not isinstance(c, dict):
+                continue
+            out.append(
+                {
+                    "comment_id": c.get("cid") or c.get("id"),
+                    "post_url": post_url,
+                    "author": (c.get("user") or {}).get("nickname"),
+                    "text": c.get("text") or c.get("content"),
+                    "likes": _int(c.get("digg_count")),
+                    "published_at": _ts_to_iso(c.get("create_time")),
+                    "collected_at": _now_iso(),
+                }
+            )
+        return out
 
     # ----------------------------------------------------------------------
     # 内部解析（best-effort，安全取值）

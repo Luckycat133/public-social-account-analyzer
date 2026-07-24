@@ -66,6 +66,190 @@ def _ssr_html(data):
     return '<script id="RENDER_DATA">' + json.dumps(data) + "</script>"
 
 
+def test_ssr_list_skips_invalid_ids_merges_duplicate_gaps_and_uses_item_urls():
+    """Only numeric platform IDs may become posts; duplicate evidence fills gaps."""
+    from collectors.douyin import DouyinCollector
+
+    first = {
+        "aweme_id": "7001",
+        "desc": "列表页可靠标题 #列表话题",
+        "create_time": None,
+        "video": {},
+    }
+    duplicate = {
+        "aweme_id": "7001",
+        "desc": "后出现的冲突标题",
+        "create_time": 1_700_000_000,
+        "video": {"duration": 9_000},
+    }
+    invalid = {"desc": "没有 ID，不能以主页充当作品证据"}
+    collector = DouyinCollector(browser_fallback=False)
+    collector._fetch = lambda _url: _ssr_html(
+        {"user": {"post": {"data": [first, duplicate, invalid]}}}
+    )
+
+    posts = collector.collect_post_list(ACCOUNT_URL, limit=30)
+
+    assert len(posts) == 1
+    assert posts[0]["post_id"] == "7001"
+    assert posts[0]["post_url"] == "https://www.douyin.com/video/7001"
+    assert posts[0]["post_url"] != ACCOUNT_URL
+    assert posts[0]["title"] == "列表页可靠标题 #列表话题"
+    assert posts[0]["published_at"] is not None
+    assert posts[0]["duration_seconds"] == 9
+
+
+def test_detail_enrichment_is_bounded_preserves_list_evidence_and_records_outcomes(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class DetailAdapter:
+        platform = "douyin"
+
+        def __init__(self):
+            self.detail_calls = []
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_profile(self, url):
+            return {"platform": "douyin", "field_visibility": {}}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            common = {
+                "platform": "douyin",
+                "collection_status": "SUCCESS",
+                "platform_metrics": {"collection_source": "list"},
+            }
+            return [
+                dict(
+                    common,
+                    post_id="7001",
+                    post_url="https://www.douyin.com/video/7001",
+                    title="列表标题",
+                    published_at="2026-07-20T12:00:00+08:00",
+                    duration_seconds=None,
+                    hashtags=["列表话题"],
+                ),
+                dict(
+                    common,
+                    post_id="7002",
+                    post_url="https://www.douyin.com/note/7002",
+                    title="完整标题",
+                    published_at="2026-07-21T12:00:00+08:00",
+                    duration_seconds=8,
+                    hashtags=["完整话题"],
+                ),
+                dict(
+                    common,
+                    post_id="7003",
+                    post_url="https://www.douyin.com/video/7003",
+                    title=None,
+                    published_at="2026-07-22T12:00:00+08:00",
+                    duration_seconds=9,
+                    hashtags=["失败话题"],
+                ),
+                dict(
+                    common,
+                    post_id="7004",
+                    post_url=ACCOUNT_URL,
+                    title=None,
+                    published_at=None,
+                    duration_seconds=None,
+                    hashtags=[],
+                ),
+            ]
+
+        def collect_post_detail(self, post_url):
+            self.detail_calls.append(post_url)
+            if post_url.endswith("/7003"):
+                raise RuntimeError("unsafe upstream body must not persist")
+            return {
+                "title": "详情冲突标题",
+                "published_at": "2026-07-19T12:00:00+08:00",
+                "duration_seconds": 12,
+                "hashtags": ["详情话题"],
+            }
+
+        def get_collection_coverage(self):
+            return {}
+
+    adapter = DetailAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(
+        ACCOUNT_URL,
+        out_dir=str(tmp_path),
+        enrich_details=True,
+    ) == 0
+
+    assert adapter.detail_calls == [
+        "https://www.douyin.com/video/7001",
+        "https://www.douyin.com/video/7003",
+    ]
+    posts = [
+        json.loads(line)
+        for line in (tmp_path / "source" / "posts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert posts[0]["title"] == "列表标题"
+    assert posts[0]["published_at"] == "2026-07-20T12:00:00+08:00"
+    assert posts[0]["hashtags"] == ["列表话题"]
+    assert posts[0]["duration_seconds"] == 12
+    assert posts[0]["platform_metrics"]["detail_status"] == "SUCCESS"
+    assert posts[1]["platform_metrics"]["detail_status"] == "NOT_NEEDED"
+    assert posts[2]["platform_metrics"]["detail_status"] == "UNAVAILABLE"
+    assert posts[3]["platform_metrics"]["detail_status"] == "UNAVAILABLE"
+    assert posts[2]["collection_status"] == "PARTIAL"
+    assert posts[3]["collection_status"] == "PARTIAL"
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["enrich_details"] is True
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] is None
+    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    assert "stage=collect_post_detail" in report
+    assert "unsafe upstream body must not persist" not in report
+
+
+def test_enrich_details_cli_flag_is_forwarded(monkeypatch):
+    import collect
+
+    captured = {}
+    monkeypatch.setattr(
+        collect,
+        "run",
+        lambda *args, **kwargs: captured.update(kwargs) or 0,
+    )
+    monkeypatch.setattr("sys.argv", ["collect.py", ACCOUNT_URL, "--enrich-details"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        collect.main()
+
+    assert exc_info.value.code == 0
+    assert captured["enrich_details"] is True
+
+
+def test_douyin_comments_distinguish_explicit_empty_from_unavailable():
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(browser_fallback=False)
+    collector._fetch = lambda _url: _ssr_html(
+        {"comment": {"data": {"comments": []}}}
+    )
+    assert collector.collect_comments("https://www.douyin.com/video/7001") == []
+
+    collector._fetch = lambda _url: _ssr_html({"aweme": {"detail": AWEME}})
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_comments("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == "COMMENTS_UNAVAILABLE"
+
+
 def test_load_adapters_can_disable_only_douyin_browser_fallback():
     """Adapter policy controls the Douyin instance without changing others."""
     import collect

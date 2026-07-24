@@ -10,6 +10,8 @@
 
 网络相关场景用轻量 FakeCollector 抛真实 BilibiliError 或文档化单元断言，保持 GREEN。
 """
+import json
+
 import analyze
 from collectors.bilibili import (
     BilibiliCollector,
@@ -255,6 +257,98 @@ def test_normalize_post_preserves_unknown_public_booleans():
     assert normalized["is_pinned"] is None
     assert normalized["is_repost"] is None
     assert normalized["is_promoted"] is None
+
+
+def test_all_comments_persist_returns_parents_and_honest_outcomes(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class CommentAdapter:
+        platform = "douyin"
+
+        def __init__(self):
+            self.calls = []
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_profile(self, url):
+            return {"platform": "douyin", "field_visibility": {}}
+
+        def collect_all_post_list(self, url, **kwargs):
+            return [
+                {
+                    "platform": "douyin",
+                    "post_id": str(7000 + number),
+                    "post_url": f"https://www.douyin.com/video/{7000 + number}",
+                    "collection_status": "SUCCESS",
+                }
+                for number in range(1, 33)
+            ]
+
+        def get_collection_coverage(self):
+            return {
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "observed_post_count": 32,
+                "stop_condition": "terminal_page",
+            }
+
+        def collect_comments(self, post_url, limit=20):
+            self.calls.append((post_url, limit))
+            post_id = post_url.rsplit("/", 1)[-1]
+            if post_id == "7002":
+                return []
+            if post_id == "7003":
+                raise RuntimeError("upstream response must not persist")
+            count = 2 if post_id == "7001" else 1
+            return [
+                {"comment_id": f"{post_id}-{number}", "text": f"评论 {number}"}
+                for number in range(count)
+            ][:limit]
+
+    adapter = CommentAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(tmp_path),
+        collect_all=True,
+        include_comments=True,
+    ) == 0
+
+    assert len(adapter.calls) == 32
+    assert all(limit == 20 for _, limit in adapter.calls)
+    comments = [
+        json.loads(line)
+        for line in (tmp_path / "source" / "comments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(comments) == 31
+    assert comments[0]["comment_id"] == "7001-0"
+    assert comments[0]["text"] == "评论 0"
+    assert comments[0]["parent_post_id"] == "7001"
+    assert comments[0]["parent_post_url"] == "https://www.douyin.com/video/7001"
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["comment_collection"] == {
+        "attempted_posts": 32,
+        "comments_collected": 31,
+        "empty_results": 1,
+        "failures": 1,
+        "per_post_limit": 20,
+    }
+    assert task["task_status"] == "COMPLETED"
+    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    assert "comments_collected: 31" in report
+    assert "empty_results: 1" in report
+    assert "failures: 1" in report
+    assert "upstream response must not persist" not in report
 
 
 def test_normalize_post_preserves_explicit_public_booleans():

@@ -22,6 +22,7 @@ workspace/<platform>-<account>-<date>/
   task.json                  # 任务参数、状态与来源元数据
   source/profile.json        # 账号原始快照
   source/posts.jsonl         # 内容原始快照（每行一条）
+  source/comments.jsonl      # 启用评论采样时的评论记录（每行一条）
   source/index-evidence.json # 仅 Web 索引降级；经过白名单规范化的证据副本
   normalized-posts.csv       # 归一化内容表
   collection-report.md       # 采集质量报告
@@ -46,6 +47,7 @@ workspace/<platform>-<account>-<date>/
 | date_to | datetime | 否 | 是 | 2026-07-23T23:59:59+08:00 | 采集结束时间 |
 | analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | 用户填写的分析目的 |
 | include_comments | boolean | 是 | 否 | false | 评论采样开关，默认关闭 |
+| enrich_details | boolean | 否 | 否 | false | 仅补充缺失公开字段的抖音详情开关 |
 | task_status | enum | 是 | 否 | COMPLETED | 生命周期状态（§9.1） |
 | stop_reason | enum | 否 | 是 | VERIFICATION_REQUIRED | 停止原因（§9.2），未中止时为 `null` |
 | collected_count | integer | 是 | 否 | 20 | 本次任务已保留的内容条数 |
@@ -62,6 +64,7 @@ workspace/<platform>-<account>-<date>/
 | snapshot_age_label | string | 否 | 是 | 约 6 个月前 | 仅保存来源明确显示的相对年龄，不反推精确日期 |
 | evidence_is_exhaustive | boolean | 否 | 是 | false | 索引降级固定为 `false` |
 | collection_coverage | object | 否 | 否 | 见 §3.1 / §3.2 | 公开页面或授权 OpenAPI 列表采集的覆盖与完备性账本；普通限量采集可为 `{}` |
+| comment_collection | object | 否 | 否 | 见 §3.3 | 评论采样结果计数；未请求时为 `{}` |
 
 约束：
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
@@ -116,6 +119,22 @@ workspace/<platform>-<account>-<date>/
 出现在 URL、产物、标准输出/错误、异常或诊断信息中。账本同样不得保存请求头、原始游标、
 查询字符串、响应正文或令牌。当前官方在线令牌的端到端验证仍为 **pending**；在完成该
 验证前，不增加 OAuth 登录、授权码交换、刷新令牌或未文档化内部接口。
+
+### 3.3 comment_collection 评论采样账本
+
+启用 `--comments` 时，通用公开采集命令写入下列聚合计数。每条作品最多请求和保留 20 条
+评论；`--all` 对所有已保留作品尝试评论采样，不受普通默认样本数 30 的隐式限制。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `attempted_posts` | integer | 实际调用评论适配器的作品数 |
+| `comments_collected` | integer | `source/comments.jsonl` 实际持久化评论条数 |
+| `empty_results` | integer | 适配器明确返回空列表的作品数；不得描述为已采到评论 |
+| `failures` | integer | 适配器报告不可用或抛错的作品数 |
+| `per_post_limit` | integer | 固定为 20 |
+
+空结果与失败必须分开计数。评论失败只写清洗后的 `COMMENTS_UNAVAILABLE` 内容级错误，不能
+改变账号任务状态或写入任务级 `stop_reason`。
 
 ## 4. Profile 数据结构
 
@@ -181,6 +200,12 @@ workspace/<platform>-<account>-<date>/
 - `is_pinned` / `is_repost` / `is_promoted` 仅保留明确公开的 `true` / `false`；未知时为 `null`，不得把缺失证据断言为 `false` 或 `true`。
 - 默认分析排除置顶、转载、投放内容（见 `analysis-rules.md`），但须在数据中保留标记。
 - 授权 OpenAPI 作品必须使用响应提供的、经校验属于抖音的 HTTPS `share_url`；持久化前移除查询参数与片段。缺失或非法 `video_id` / `share_url` 视为响应错误，不得合成证据 URL。
+- 公开抖音列表仅接受数字平台作品 ID，并按 ID 去重；重复项只能补齐先前缺失字段，不能覆盖
+  先出现的可靠列表证据。缺失或非法 ID 的记录必须跳过，账号主页不能充当作品 URL。
+- 启用 `--enrich-details` 时，只有真实、数字 ID 匹配的 `/video/<id>` 或 `/note/<id>` URL，
+  且 `title`、`published_at`、`duration_seconds`、`hashtags` 至少一项缺失，才允许请求详情。
+  详情只能补空值，不能覆盖列表值。`platform_metrics.detail_status` 固定为 `SUCCESS`
+  （详情请求成功）、`UNAVAILABLE`（详情不可用）或 `NOT_NEEDED`（所需字段完整）。
 
 ### 5.1 抖音搜索索引降级的显式例外
 
@@ -235,6 +260,23 @@ workspace/<platform>-<account>-<date>/
 | shares | 分享 | 分享 | 转发 |
 | coins | 投币 | null | null |
 | danmaku | 弹幕 | null | null |
+
+### 6.1 Comment 评论记录
+
+`source/comments.jsonl` 中每行保存适配器实际返回的一条公开评论，并由编排层补充父作品锚点：
+
+| 字段 | 类型 | 必填 | 可空 | 说明 |
+|---|---|---:|---:|---|
+| `comment_id` | string | 否 | 是 | 平台评论 ID；适配器未提供时保持 `null` |
+| `parent_post_id` | string | 是 | 否 | 父作品平台 ID |
+| `parent_post_url` | string | 是 | 否 | 父作品真实详情 URL |
+| `author` | string | 否 | 是 | 页面公开的评论作者名 |
+| `text` | string | 否 | 是 | 页面公开的评论文本 |
+| `likes` | integer | 否 | 是 | 页面公开的点赞数 |
+| `published_at` | datetime | 否 | 是 | 评论发布时间 |
+| `collected_at` | datetime | 否 | 是 | 适配器采集时间 |
+
+除父作品锚点外，编排层不得改写适配器实际返回字段；每个父作品最多持久化 20 条。
 
 ## 7. Analysis 数据结构
 

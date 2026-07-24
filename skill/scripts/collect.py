@@ -23,6 +23,7 @@ import math
 import os
 import re
 import sys
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 # 让脚本可直接运行:把 scripts/collectors/ 与 scripts/ 都加入 sys.path,
@@ -48,6 +49,8 @@ SR_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
 SR_PARSER_FAILED = "PARSER_FAILED"
 SR_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
 SR_INTERNAL = "INTERNAL_ERROR"
+
+_DETAIL_FIELDS = ("title", "published_at", "duration_seconds", "hashtags")
 
 # 适配器异常类 → stop_reason 映射(按异常属性 / 类名兜底)
 # 已知 stop_reason 集合,用于从异常消息前缀 [REASON] 兜底识别
@@ -214,6 +217,146 @@ def _filter_by_date(
     return out
 
 
+def _missing_detail_value(value) -> bool:
+    return value is None or value == "" or value == []
+
+
+def _douyin_item_url(post: dict) -> str | None:
+    """Return a genuine ID-matching Douyin item URL, never a profile URL."""
+    post_id = str(post.get("post_id") or "")
+    post_url = post.get("post_url")
+    if re.fullmatch(r"\d+", post_id) is None or not isinstance(post_url, str):
+        return None
+    try:
+        parsed = urllib.parse.urlparse(post_url)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {"douyin.com", "www.douyin.com", "iesdouyin.com"}
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    match = re.fullmatch(r"/(?:video|note)/(\d+)/?", parsed.path)
+    if match is None or match.group(1) != post_id:
+        return None
+    return post_url
+
+
+def _set_detail_status(post: dict, status: str) -> None:
+    metrics = post.get("platform_metrics")
+    post["platform_metrics"] = dict(metrics) if isinstance(metrics, dict) else {}
+    post["platform_metrics"]["detail_status"] = status
+
+
+def _enrich_douyin_details(
+    adapter,
+    posts: list[dict],
+    error_log: list[dict],
+    occurred_at: str,
+) -> int:
+    """Fill only missing public fields; isolate and sanitize item failures."""
+    unavailable_count = 0
+    for post in posts:
+        missing = [field for field in _DETAIL_FIELDS if _missing_detail_value(post.get(field))]
+        if not missing:
+            _set_detail_status(post, "NOT_NEEDED")
+            continue
+        item_url = _douyin_item_url(post)
+        if item_url is None:
+            unavailable_count += 1
+            _set_detail_status(post, "UNAVAILABLE")
+            if post.get("collection_status") == "SUCCESS":
+                post["collection_status"] = "PARTIAL"
+            error_log.append({
+                "url": None,
+                "stage": "collect_post_detail",
+                "error_code": "POST_UNAVAILABLE",
+                "message": "作品详情补充跳过：缺少可验证的单条作品 URL",
+                "occurred_at": occurred_at,
+                "retryable": False,
+            })
+            continue
+        try:
+            detail = adapter.collect_post_detail(item_url)
+            if not isinstance(detail, dict):
+                raise ValueError("invalid detail result")
+        except Exception:
+            unavailable_count += 1
+            _set_detail_status(post, "UNAVAILABLE")
+            if post.get("collection_status") == "SUCCESS":
+                post["collection_status"] = "PARTIAL"
+            error_log.append({
+                "url": item_url,
+                "stage": "collect_post_detail",
+                "error_code": "POST_UNAVAILABLE",
+                "message": "作品详情补充不可用",
+                "occurred_at": occurred_at,
+                "retryable": False,
+            })
+            continue
+        for field in missing:
+            value = detail.get(field)
+            if not _missing_detail_value(value):
+                post[field] = value
+        _set_detail_status(post, "SUCCESS")
+    return unavailable_count
+
+
+def _collect_and_persist_comments(
+    adapter,
+    posts: list[dict],
+    path: str,
+    error_log: list[dict],
+    occurred_at: str,
+) -> dict:
+    per_post_limit = 20
+    records: list[dict] = []
+    outcome = {
+        "attempted_posts": 0,
+        "comments_collected": 0,
+        "empty_results": 0,
+        "failures": 0,
+        "per_post_limit": per_post_limit,
+    }
+    for post in posts:
+        post_id = str(post.get("post_id") or "")
+        post_url = str(post.get("post_url") or "")
+        outcome["attempted_posts"] += 1
+        try:
+            returned = adapter.collect_comments(post_url, limit=per_post_limit)
+            if not isinstance(returned, list):
+                raise ValueError("invalid comments result")
+        except Exception:
+            outcome["failures"] += 1
+            error_log.append({
+                "url": post_url or None,
+                "stage": "collect_comments",
+                "error_code": "COMMENTS_UNAVAILABLE",
+                "message": "公开评论采样不可用",
+                "occurred_at": occurred_at,
+                "retryable": False,
+            })
+            continue
+        valid = [comment for comment in returned[:per_post_limit] if isinstance(comment, dict)]
+        if not valid:
+            outcome["empty_results"] += 1
+            continue
+        for comment in valid:
+            record = dict(comment)
+            record["parent_post_id"] = post_id
+            record["parent_post_url"] = post_url
+            records.append(record)
+    outcome["comments_collected"] = len(records)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    os.replace(temporary, path)
+    return outcome
+
+
 def _post_key(p: dict) -> str:
     """增量去重主键:post_id > bvid > post_url。"""
     return str(p.get("post_id") or p.get("bvid") or p.get("post_url") or "")
@@ -345,6 +488,7 @@ def _write_task_json(
     date_from: str | None,
     date_to: str | None,
     include_comments: bool,
+    enrich_details: bool = False,
     task_status: str,
     stop_reason: str | None,
     collected_count: int,
@@ -353,6 +497,7 @@ def _write_task_json(
     existing_count: int = 0,
     new_count: int = 0,
     collection_coverage: dict | None = None,
+    comment_collection: dict | None = None,
 ) -> None:
     """落盘 task.json(任务状态与停止原因,见 SKILL.md「任务状态与停止原因」)。"""
     payload = {
@@ -362,6 +507,7 @@ def _write_task_json(
         "date_from": date_from,
         "date_to": date_to,
         "include_comments": include_comments,
+        "enrich_details": enrich_details,
         "task_status": task_status,
         "stop_reason": stop_reason,
         "collected_count": collected_count,
@@ -370,6 +516,7 @@ def _write_task_json(
         "existing_count": existing_count,
         "new_count": new_count,
         "collection_coverage": _sanitize_collection_coverage(collection_coverage),
+        "comment_collection": comment_collection or {},
     }
     with open(os.path.join(ws, "task.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -389,6 +536,7 @@ def _write_report(
     existing_count: int = 0,
     new_count: int = 0,
     collection_coverage: dict | None = None,
+    comment_collection: dict | None = None,
 ) -> None:
     """生成采集质量报告(含停止位置、成功/失败数量、字段覆盖率、错误日志)。"""
     lines = [
@@ -414,6 +562,12 @@ def _write_report(
             lines.append(f"- {key}: {rendered}")
     else:
         lines.append("- collection_coverage: {}")
+    if comment_collection:
+        lines.append("")
+        lines.append("## 评论采集")
+        lines.append("")
+        for key, value in comment_collection.items():
+            lines.append(f"- {key}: {value}")
     lines.append("")
     if posts:
         for fld in ("views", "likes", "comments", "favorites", "shares", "coins", "danmaku"):
@@ -453,6 +607,7 @@ def run(
     max_items: int = 10_000,
     max_seconds: float = 1800.0,
     max_scrolls: int = 2000,
+    enrich_details: bool = False,
 ) -> int:
     env_value = os.environ.get("SOCIAL_BROWSER_FALLBACK")
     douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
@@ -493,6 +648,13 @@ def run(
 
     requested_count = max_items if collect_all else limit
 
+    user_from = _parse_date(date_from)
+    user_to = _default_date_to(date_to)
+    if user_from and user_to:
+        if datetime.fromisoformat(user_from) > datetime.fromisoformat(user_to):
+            print("[FAILED] --date-from 不能晚于 --date-to", file=sys.stderr)
+            return 2
+
     m = re.search(r"(\d+)", url)
     account = m.group(1) if m else "account"
     date = datetime.now(_BEIJING).strftime("%Y%m%d")
@@ -515,8 +677,6 @@ def run(
             resume_mode = False
 
     # 规范化日期范围(中国平台默认 +08:00);增量续采时起点取既有最新发布时间
-    user_from = _parse_date(date_from)
-    user_to = _default_date_to(date_to)
     if resume_mode:
         latest = _latest_published_at(existing_posts)
         since_iso = _parse_date(since) if since else _parse_date(latest)
@@ -552,6 +712,8 @@ def run(
     posts: list = []
     profile: dict = {}
     collection_coverage: dict = {}
+    comment_collection: dict = {}
+    detail_unavailable_count = 0
 
     # 1) check_access:不绕过任何保护(见 base.py / exceptions.md §2)
     try:
@@ -564,6 +726,7 @@ def run(
                 ws, platform=platform, profile_url=url, requested_limit=requested_count,
                 date_from=date_from_iso, date_to=date_to_iso,
                 include_comments=include_comments, task_status=task_status,
+                enrich_details=enrich_details,
                 stop_reason=stop_reason, collected_count=0, collected_at=collected_at,
                 collection_coverage=collection_coverage,
             )
@@ -587,6 +750,7 @@ def run(
             ws, platform=platform, profile_url=url, requested_limit=requested_count,
             date_from=date_from_iso, date_to=date_to_iso,
             include_comments=include_comments, task_status=task_status,
+            enrich_details=enrich_details,
             stop_reason=stop_reason, collected_count=0, collected_at=collected_at,
             collection_coverage=collection_coverage,
         )
@@ -681,6 +845,11 @@ def run(
         print(f"[warn] 资料采集异常: {e}", file=sys.stderr)
         profile = {}
 
+    if enrich_details and platform == "douyin" and posts:
+        detail_unavailable_count = _enrich_douyin_details(
+            adapter, posts, error_log, collected_at
+        )
+
     # 4) 落盘原始数据与归一化 CSV(已采集数据必须保留,见 exceptions.md §2 规则 3)
     with open(os.path.join(src, "profile.json"), "w", encoding="utf-8") as f:
         json.dump(profile, f, ensure_ascii=False, indent=2)
@@ -692,13 +861,21 @@ def run(
     _write_csv(posts, os.path.join(ws, "normalized-posts.csv"))
 
     # 5) 评论(可选;失败不阻塞主任务,见 exceptions.md §1.1)
-    if include_comments and posts:
-        try:
-            for p in posts[:limit]:
-                adapter.collect_comments(p.get("post_url", ""), limit=20)
-            print(f"[OK] 评论采样:已对 {min(limit, len(posts))} 条触发(可选)")
-        except Exception as e:
-            print(f"[warn] 评论采样异常(不阻塞主任务): {e}", file=sys.stderr)
+    if include_comments:
+        comment_collection = _collect_and_persist_comments(
+            adapter,
+            posts,
+            os.path.join(src, "comments.jsonl"),
+            error_log,
+            collected_at,
+        )
+        print(
+            "[OK] 评论采样: "
+            f"attempted_posts={comment_collection['attempted_posts']} "
+            f"comments_collected={comment_collection['comments_collected']} "
+            f"empty_results={comment_collection['empty_results']} "
+            f"failures={comment_collection['failures']}"
+        )
 
     # 6) 最终任务状态:无 stop_reason → COMPLETED;有 stop_reason 但有数据 → PARTIAL
     exhaustive_range_no_match = bool(
@@ -713,6 +890,8 @@ def run(
     )
     if stop_reason is None:
         task_status = "COMPLETED" if posts or exhaustive_range_no_match else "FAILED"
+        if task_status == "COMPLETED" and detail_unavailable_count:
+            task_status = "PARTIAL"
         if not posts and not profile:
             stop_reason = SR_NO_PUBLIC_CONTENT
             task_status = "FAILED"
@@ -723,15 +902,18 @@ def run(
         ws, platform=platform, profile_url=url, requested_limit=requested_count,
         date_from=date_from_iso, date_to=date_to_iso,
         include_comments=include_comments, task_status=task_status,
+        enrich_details=enrich_details,
         stop_reason=stop_reason, collected_count=len(posts), collected_at=collected_at,
         incremental=resume_mode, existing_count=len(existing_posts), new_count=new_count,
         collection_coverage=collection_coverage,
+        comment_collection=comment_collection,
     )
     _write_report(
         adapter, url, profile, posts, ws,
         task_status=task_status, stop_reason=stop_reason, error_log=error_log,
         incremental=resume_mode, existing_count=len(existing_posts), new_count=new_count,
         collection_coverage=collection_coverage,
+        comment_collection=comment_collection,
     )
 
     print(
@@ -755,6 +937,11 @@ def main() -> None:
         "--out", default=None, help="输出目录(默认 workspace/<platform>-<account>-<date>/)"
     )
     ap.add_argument("--comments", action="store_true", help="开启评论采样(默认关)")
+    ap.add_argument(
+        "--enrich-details",
+        action="store_true",
+        help="仅对缺少公开基础字段的抖音作品补充详情",
+    )
     ap.add_argument("--date-from", default=None, help="起始日期 YYYY-MM-DD 或 ISO 8601(北京时间)")
     ap.add_argument("--date-to", default=None, help="结束日期 YYYY-MM-DD 或 ISO 8601(北京时间)")
     ap.add_argument(
@@ -797,6 +984,7 @@ def main() -> None:
         resume=args.resume, since=args.since, browser_fallback=args.browser_fallback,
         collect_all=args.collect_all, max_items=args.max_items,
         max_seconds=args.max_seconds, max_scrolls=args.max_scrolls,
+        enrich_details=args.enrich_details,
     ))
 
 

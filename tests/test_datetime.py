@@ -76,3 +76,28 @@ def test_unix_timestamp_converted():
     dt = normalize.parse_time(1784602500)
     assert dt is not None
     assert dt.isoformat().endswith("+08:00")
+
+
+def test_reversed_collection_range_fails_before_workspace_creation(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class DateAdapter:
+        platform = "douyin"
+
+        def supports(self, url):
+            return True
+
+    out = tmp_path / "must-not-exist"
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [DateAdapter()])
+
+    rc = collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(out),
+        date_from="2026-07-25",
+        date_to="2026-07-24",
+    )
+
+    assert rc == 2
+    assert not out.exists()

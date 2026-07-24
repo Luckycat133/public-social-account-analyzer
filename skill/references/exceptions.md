@@ -31,6 +31,12 @@
 - 它们被记录在 **每条内容的错误日志** 中，并反映在该条内容自身的 `collection_status`（对应取 `DELETED` / `RESTRICTED` 或 `PARTIAL`）。
 - **评论不可见**（`COMMENTS_UNAVAILABLE`）：任务级 `task_status` 保持 **状态不变**（任务不因评论不可见而整体失败或中止）。
 - **单条内容失效**（`POST_UNAVAILABLE`）：因该条内容无法采集，任务级 `task_status` 降级为 **PARTIAL**（对应决策表"单条内容失效"行），但任务级 `stop_reason` 仍为 `null`，且任务继续采集其余内容（"是否继续 = 是"）。
+- **可选详情补充不可用**：保留列表证据，仅将该条 `collection_status` 降为 `PARTIAL`、设置
+  `platform_metrics.detail_status=UNAVAILABLE` 并写清洗后的内容级错误。账号任务最多降为
+  `PARTIAL`，不得变成 `FAILED`，任务级 `stop_reason` 仍为 `null`。详情只允许在真实作品 URL
+  且基础公开字段缺失时调用，成功时也只能补空值。
+- **评论采样结果**：适配器明确返回 `[]` 计入 `empty_results`；适配器报告不可用或抛错计入
+  `failures` 并写 `COMMENTS_UNAVAILABLE`。两者都不改变任务状态，且不得把空结果描述成已采评论。
 - 只有当 **整个任务需要中止** 时，才设置任务级 `stop_reason`（如登录墙、验证码、频控等场景）。换言之：单条内容问题只下钻到内容级（记录于内容错误日志），其任务级影响仅限 `task_status`，且绝不写入任务级 `stop_reason` 字段。
 
 > 决策原则：内容级原因的处置目标是"跳过该条、保留其余"；任务级原因的处置目标是"任务中止、保留已采集"。二者不应混淆——`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE` 永远不应出现在任务级 `stop_reason` 字段。
