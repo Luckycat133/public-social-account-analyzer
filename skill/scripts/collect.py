@@ -40,6 +40,7 @@ from collectors.base import BaseCollector  # noqa: E402
 from collectors.url_policy import (  # noqa: E402
     canonical_item_url,
     canonical_profile_url,
+    sanitize_routing_url,
 )
 
 # 北京时间为中国平台默认时区(见 references/data-schema.md §1)
@@ -984,14 +985,23 @@ def run(
     if not adapters:
         print("[FAILED] 没有可用适配器(采集器均未实现)", file=sys.stderr)
         return 2
-    adapter = _pick(adapters, url)
+    routing_url = sanitize_routing_url(url)
+    if routing_url is None:
+        print("[FAILED] 账号主页 URL 权限或路径格式无效", file=sys.stderr)
+        return 2
+    adapter = _pick(adapters, routing_url)
     if adapter is None:
         # URL 不属于任何已加载平台 → UNSUPPORTED_PLATFORM(见 exceptions.md §1)
         print(f"[FAILED] 无支持的适配器 (stop_reason={SR_UNSUPPORTED})", file=sys.stderr)
         return 2
 
     platform = adapter.platform
-    canonical_url = canonical_profile_url(platform, url)
+    adapter_canonicalizer = getattr(adapter, "canonicalize_profile_url", None)
+    canonical_url = (
+        adapter_canonicalizer(routing_url)
+        if callable(adapter_canonicalizer)
+        else canonical_profile_url(platform, routing_url)
+    )
     if canonical_url is None:
         print("[FAILED] 账号主页 URL 不符合平台公开路径规范", file=sys.stderr)
         return 2

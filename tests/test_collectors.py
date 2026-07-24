@@ -743,6 +743,11 @@ def test_account_and_all_artifact_urls_are_canonical_or_null(
     class AccountUrlBoundaryAdapter(_SafeCommentAdapter):
         def __init__(self):
             self.calls = []
+            self.support_calls = []
+
+        def supports(self, url):
+            self.support_calls.append(url)
+            return True
 
         def check_access(self, url):
             self.calls.append(("access", url))
@@ -783,6 +788,9 @@ def test_account_and_all_artifact_urls_are_canonical_or_null(
 
     assert collect.run(supplied_url, out_dir=str(tmp_path)) == 0
 
+    assert adapter.support_calls == [
+        "https://iesdouyin.com/user/public_account/"
+    ]
     assert adapter.calls == [
         ("access", canonical_profile_url),
         ("list", canonical_profile_url),
@@ -823,21 +831,31 @@ def test_account_and_all_artifact_urls_are_canonical_or_null(
 
 
 @pytest.mark.parametrize(
-    "profile_url",
+    ("profile_url", "expected_support_calls"),
     [
-        "https://user:password@www.douyin.com/user/public_account",
-        "https://www.douyin.com:443/user/public_account",
-        "https://www.douyin.com/video/7001?token=INVALID_PATH_SECRET",
+        ("https://user:password@www.douyin.com/user/public_account", []),
+        ("https://www.douyin.com:443/user/public_account", []),
+        (
+            "https://www.douyin.com/video/7001?token=INVALID_PATH_SECRET",
+            ["https://www.douyin.com/video/7001"],
+        ),
+        ("https://www.douyin.com%3A/user/public_account", []),
+        ("https://www.douyin.com/user%2Fpublic_account", []),
     ],
 )
 def test_invalid_supported_profile_url_is_rejected_before_adapter_calls(
-    monkeypatch, tmp_path, profile_url
+    monkeypatch, tmp_path, profile_url, expected_support_calls
 ):
     import collect
 
     class OverbroadAdapter(_SafeCommentAdapter):
         def __init__(self):
             self.calls = []
+            self.support_calls = []
+
+        def supports(self, url):
+            self.support_calls.append(url)
+            return True
 
         def check_access(self, url):
             self.calls.append(url)
@@ -856,7 +874,38 @@ def test_invalid_supported_profile_url_is_rejected_before_adapter_calls(
 
     assert collect.run(profile_url, out_dir=str(tmp_path / "out")) == 2
     assert adapter.calls == []
+    assert adapter.support_calls == expected_support_calls
     assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    ("platform", "value"),
+    [
+        ("douyin", "https://www.douyin.com/user/example;secret=1"),
+        ("douyin", "https://www.douyin.com:/user/example"),
+        ("bilibili", "https://space.bilibili.com/123;secret=1"),
+        ("weibo", "https://weibo.com/u/123;secret=1"),
+    ],
+)
+def test_profile_url_policy_rejects_params_and_nonexact_authority(platform, value):
+    from collectors.url_policy import canonical_profile_url
+
+    assert canonical_profile_url(platform, value) is None
+
+
+@pytest.mark.parametrize(
+    ("platform", "value"),
+    [
+        ("douyin", "https://www.douyin.com/video/7001;secret=1"),
+        ("douyin", "https://www.douyin.com:/video/7001"),
+        ("bilibili", "https://www.bilibili.com/video/BV1abc;secret=1"),
+        ("weibo", "https://weibo.com/123/a1;secret=1"),
+    ],
+)
+def test_item_url_policy_rejects_params_and_nonexact_authority(platform, value):
+    from collectors.url_policy import canonical_item_url
+
+    assert canonical_item_url(platform, value) is None
 
 
 @pytest.mark.parametrize(

@@ -47,7 +47,11 @@ from ._constants import (
     STOP_VERIFICATION,
 )
 from .base import BaseCollector
-from .url_policy import canonical_item_url
+from .url_policy import (
+    canonical_item_url,
+    canonical_profile_url,
+    sanitize_routing_url,
+)
 
 
 # 抖音公开接口 / 主页均使用北京时间（+08:00）
@@ -231,55 +235,42 @@ class DouyinCollector(BaseCollector):
     # -- 路由 ---------------------------------------------------------------
     def supports(self, url: str) -> bool:
         """仅支持抖音账号主页（含短链 best-effort 解析）；拒绝作品/搜索/其他。"""
-        if not isinstance(url, str) or not url.strip():
+        u = sanitize_routing_url(url)
+        if u is None:
             return False
-        u = url.strip()
         try:
-            parsed = urllib.parse.urlparse(u)
+            parsed = urllib.parse.urlsplit(u)
         except ValueError:
             return False
-        host = parsed.netloc.lower()
+        host = parsed.hostname
         path = parsed.path
 
         if host == "v.douyin.com":
-            # 短链：best-effort 解析为长链后再判定；解析失败则按短链形式保守支持。
-            final = self._resolve_final_url(u)
-            if final:
-                return self._is_user_url(final)
-            # 解析失败：短链形式本身作为合法入口 best-effort 判为支持。
-            return bool(
-                re.match(r"^https?://v\.douyin\.com/[A-Za-z0-9_\-]+/?(\?[^/]*)?$", u)
-            )
+            return re.fullmatch(r"/[A-Za-z0-9_-]+/?", path) is not None
 
-        if host in ("www.douyin.com", "douyin.com", "iesdouyin.com"):
-            # 明确拒绝作品/搜索/话题/直播/发现页。
-            if any(
-                seg in path
-                for seg in ("/video/", "/note/", "/search", "/topic/", "/music/",
-                            "/challenge/", "/live/", "/discover/")
-            ):
-                return False
-            if "/user/" in path or "/share/user/" in path:
-                return True
-            return False
+        return canonical_profile_url("douyin", u) is not None
 
-        return False
+    def canonicalize_profile_url(self, url: str) -> str | None:
+        """Resolve a sanitized short link once, then apply strict profile policy."""
+        safe_url = sanitize_routing_url(url)
+        if safe_url is None:
+            return None
+        direct = canonical_profile_url("douyin", safe_url)
+        if direct is not None:
+            return direct
+        parsed = urllib.parse.urlsplit(safe_url)
+        if (
+            parsed.hostname != "v.douyin.com"
+            or re.fullmatch(r"/[A-Za-z0-9_-]+/?", parsed.path) is None
+        ):
+            return None
+        final_url = self._resolve_final_url(safe_url)
+        return canonical_profile_url("douyin", final_url)
 
     @staticmethod
     def _is_user_url(url: str) -> bool:
         """判定解析后的长链是否为账号主页。"""
-        try:
-            p = urllib.parse.urlparse(url)
-        except ValueError:
-            return False
-        path = p.path
-        if any(
-            seg in path
-            for seg in ("/video/", "/note/", "/search", "/topic/", "/music/",
-                        "/challenge/", "/live/", "/discover/")
-        ):
-            return False
-        return "/user/" in path or "/share/user/" in path
+        return canonical_profile_url("douyin", url) is not None
 
     @staticmethod
     def _resolve_final_url(url: str) -> str | None:

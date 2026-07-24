@@ -304,6 +304,12 @@ workspace/<platform>-<account>-<date>/
 该规范 URL。每条作品的 `post_url` 和 `source_url` 都在产物边界独立校验；无法关联当前平台与
 作品 ID 的值写为 `null`，不得保留原始 query、fragment 或任意外域证据。
 
+平台路由本身也属于不可信边界：调用任一适配器 `supports` 前，必须先要求 HTTPS、精确的
+无凭据/无端口 authority，并拒绝分号 path params、百分号编码 authority/path 和其他混淆形式；
+只把移除 query/fragment 后的安全 host/path 候选交给适配器。抖音 `v.douyin.com` 短链只允许
+以该安全候选解析一次重定向，落点仍须通过抖音账号主页策略，随后所有账号调用只使用规范化
+的 `https://www.douyin.com/user/...` URL。
+
 原子替换失败后的既有评论重计必须使用 `O_NONBLOCK` 与有效的 `O_NOFOLLOW` 打开最终路径，
 再以 `fstat` 仅接受已打开的普通文件，并限制最大读取字节数。FIFO、设备、socket、符号链接及
 超限文件均按 0 处理；平台没有有效 `O_NOFOLLOW` 时也保守按 0 处理，不能退回先检查再打开。

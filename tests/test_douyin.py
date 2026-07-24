@@ -39,6 +39,71 @@ def test_douyin_supports_canonicalizable_profile_and_rejects_authority_data():
     assert collector.supports("https://www.douyin.com:443/user/example") is False
 
 
+def test_short_profile_url_resolves_once_from_sanitized_candidate(
+    monkeypatch, tmp_path, capsys
+):
+    import collect
+    from collectors.douyin import DouyinCollector
+
+    safe_short_url = "https://v.douyin.com/AbC123/"
+    canonical_profile_url = "https://www.douyin.com/user/resolved_account"
+
+    class ShortLinkAdapter(DouyinCollector):
+        def __init__(self):
+            super().__init__(browser_fallback=False)
+            self.resolution_calls = []
+            self.account_calls = []
+
+        def _resolve_final_url(self, url):
+            self.resolution_calls.append(url)
+            return (
+                canonical_profile_url
+                + "?token=REDIRECT_SECRET#REDIRECT_FRAGMENT_SECRET"
+            )
+
+        def check_access(self, url):
+            self.account_calls.append(("access", url))
+            return {"accessible": True}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            self.account_calls.append(("list", url))
+            return [{
+                "platform": "douyin",
+                "post_id": "7001",
+                "post_url": "https://www.douyin.com/video/7001",
+                "source_url": "https://www.douyin.com/video/7001",
+                "collection_status": "SUCCESS",
+            }]
+
+        def collect_profile(self, url):
+            self.account_calls.append(("profile", url))
+            return {"platform": "douyin", "field_visibility": {}}
+
+    adapter = ShortLinkAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(
+        "https://v.douyin.com/AbC123/?token=SHORT_SECRET#SHORT_FRAGMENT_SECRET",
+        out_dir=str(tmp_path),
+    ) == 0
+
+    assert adapter.resolution_calls == [safe_short_url]
+    assert adapter.account_calls == [
+        ("access", canonical_profile_url),
+        ("list", canonical_profile_url),
+        ("profile", canonical_profile_url),
+    ]
+    captured = capsys.readouterr()
+    all_output = captured.out + captured.err
+    for artifact in tmp_path.rglob("*"):
+        if artifact.is_file():
+            all_output += artifact.read_text(encoding="utf-8")
+    assert "SHORT_SECRET" not in all_output
+    assert "SHORT_FRAGMENT_SECRET" not in all_output
+    assert "REDIRECT_SECRET" not in all_output
+    assert "REDIRECT_FRAGMENT_SECRET" not in all_output
+
+
 def test_docs_describe_zero_python_dependency_browser_fallback():
     """Public documentation states the implemented browser-fallback policy."""
     from pathlib import Path

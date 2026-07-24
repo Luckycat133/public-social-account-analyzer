@@ -11,23 +11,37 @@ _WEIBO_RESERVED_SEGMENTS = frozenset({
 })
 
 
-def _parse_public_https(value: object) -> urllib.parse.ParseResult | None:
+def sanitize_routing_url(value: object) -> str | None:
+    """Remove query/fragment before routing and reject ambiguous authorities."""
     if not isinstance(value, str) or not value or any(ord(ch) < 32 for ch in value):
         return None
     try:
-        parsed = urllib.parse.urlparse(value)
+        parsed = urllib.parse.urlsplit(value)
         port = parsed.port
     except ValueError:
         return None
+    hostname = parsed.hostname
     if (
         parsed.scheme != "https"
-        or not parsed.hostname
+        or not hostname
         or parsed.username is not None
         or parsed.password is not None
         or port is not None
+        or parsed.netloc != hostname
+        or re.fullmatch(r"[a-z0-9.-]+", hostname) is None
+        or "%" in parsed.netloc
+        or "%" in parsed.path
+        or ";" in urllib.parse.unquote(parsed.path)
     ):
         return None
-    return parsed
+    return urllib.parse.urlunsplit(
+        ("https", hostname, parsed.path or "/", "", "")
+    )
+
+
+def _parse_public_https(value: object) -> urllib.parse.SplitResult | None:
+    safe_url = sanitize_routing_url(value)
+    return urllib.parse.urlsplit(safe_url) if safe_url is not None else None
 
 
 def canonical_profile_url(platform: str, value: object) -> str | None:
