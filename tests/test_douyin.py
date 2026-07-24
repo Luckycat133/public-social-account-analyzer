@@ -336,6 +336,235 @@ def test_standard_limit_thirty_keeps_existing_collection_path(monkeypatch, tmp_p
     assert adapter.standard_calls == [(ACCOUNT_URL, 30, None)]
 
 
+@pytest.mark.parametrize(
+    "coverage",
+    [
+        {
+            "requested_all": True,
+            "is_exhaustive": True,
+            "terminal_page_observed": False,
+            "stop_condition": "terminal_page",
+        },
+        {
+            "requested_all": True,
+            "is_exhaustive": True,
+            "terminal_page_observed": True,
+            "stop_condition": "idle",
+        },
+        {
+            "requested_all": True,
+            "is_exhaustive": True,
+            "terminal_page_observed": True,
+            "stop_condition": ["terminal_page"],
+        },
+    ],
+)
+def test_all_collector_rejects_contradictory_exhaustive_coverage(coverage):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[AWEME],
+            coverage=coverage,
+        )
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_all_post_list(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == "PARSER_FAILED"
+    assert exc_info.value.partial_posts[0]["post_id"] == "7001"
+    assert collector.get_collection_coverage()["is_exhaustive"] is False
+
+
+def test_all_workspace_downgrades_contradictory_exhaustive_coverage(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class ContradictoryCoverageAdapter(_AllDouyinAdapter):
+        def get_collection_coverage(self):
+            return {
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "stop_condition": "idle",
+            }
+
+    monkeypatch.setattr(
+        collect,
+        "_load_adapters",
+        lambda: [ContradictoryCoverageAdapter()],
+    )
+
+    assert collect.run(ACCOUNT_URL, out_dir=str(tmp_path), collect_all=True) == 0
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["collection_coverage"]["is_exhaustive"] is False
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] == "PARSER_FAILED"
+
+
+@pytest.mark.parametrize(
+    "invalid_item",
+    [
+        {"desc": "缺少平台作品 ID"},
+        {"aweme_id": "not-a-number", "desc": "非数字平台作品 ID"},
+        {"aweme_id_str": "", "desc": "空平台作品 ID"},
+    ],
+)
+def test_all_collector_rejects_items_without_numeric_platform_post_id(invalid_item):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[invalid_item],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "stop_condition": "terminal_page",
+            },
+        )
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_all_post_list(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_NO_PUBLIC_CONTENT
+    assert exc_info.value.partial_posts == []
+
+
+def test_all_collector_drops_invalid_ids_without_profile_url_fallback():
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[
+                {"aweme_id": "invalid", "desc": "必须丢弃"},
+                AWEME,
+            ],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "stop_condition": "terminal_page",
+            },
+        )
+    )
+
+    posts = collector.collect_all_post_list(ACCOUNT_URL)
+
+    assert [post["post_id"] for post in posts] == ["7001"]
+    assert posts[0]["post_url"] != ACCOUNT_URL
+    assert posts[0]["source_url"] != ACCOUNT_URL
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        ({}, (None, None, None)),
+        (
+            {"is_top": True, "is_repost": True, "is_ad": True},
+            (True, True, True),
+        ),
+        (
+            {"is_top": False, "is_repost": False, "is_ad": False},
+            (False, False, False),
+        ),
+    ],
+)
+def test_all_collector_preserves_public_boolean_evidence(flags, expected):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[dict(AWEME, **flags)],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "stop_condition": "terminal_page",
+            },
+        )
+    )
+
+    post = collector.collect_all_post_list(ACCOUNT_URL)[0]
+
+    assert (
+        post["is_pinned"],
+        post["is_repost"],
+        post["is_promoted"],
+    ) == expected
+
+
+def test_all_terminal_empty_list_raises_no_public_content_with_coverage():
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "observed_page_count": 1,
+                "observed_post_count": 0,
+                "stop_condition": "terminal_page",
+            },
+        )
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_all_post_list(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_NO_PUBLIC_CONTENT
+    assert collector.get_collection_coverage()["is_exhaustive"] is True
+
+
+def test_all_terminal_empty_list_writes_failed_no_public_content(
+    monkeypatch, tmp_path
+):
+    import collect
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "observed_page_count": 1,
+                "observed_post_count": 0,
+                "stop_condition": "terminal_page",
+            },
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "check_access",
+        lambda url: {"accessible": True},
+    )
+    monkeypatch.setattr(
+        collector,
+        "collect_profile",
+        lambda url: {"platform": "douyin", "field_visibility": {}},
+    )
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [collector])
+
+    assert collect.run(ACCOUNT_URL, out_dir=str(tmp_path), collect_all=True) == 3
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "FAILED"
+    assert task["stop_reason"] == STOP_NO_PUBLIC_CONTENT
+    assert task["collection_coverage"]["is_exhaustive"] is True
+
+
 def test_collect_post_list_keeps_ssr_fast_path_without_browser(monkeypatch):
     """A valid SSR document must not start the optional browser fallback."""
     from collectors.douyin import DouyinCollector
@@ -827,6 +1056,46 @@ def test_collect_account_page_returns_restriction_with_retained_items():
     assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
     assert result.aweme_items[0]["_collection_source"] == "network"
     assert result.diagnostics["stop_condition"] == STOP_VERIFICATION
+
+
+@pytest.mark.parametrize(
+    ("visible_text", "expected"),
+    [
+        ("登录后查看", STOP_LOGIN),
+        ("请完成滑动验证", STOP_VERIFICATION),
+        ("访问过于频繁", STOP_ACCESS_RESTRICTED),
+    ],
+)
+def test_terminal_page_cannot_bypass_visible_restriction(visible_text, expected):
+    from collectors._douyin_browser_transport import collect_account_page
+
+    terminal_payload = {
+        "data": {
+            "aweme_list": [AWEME],
+            "has_more": False,
+            "max_cursor": "must-not-persist",
+        }
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event("terminal"),
+            _loading_event("Network.loadingFinished", "terminal"),
+        ],
+        bodies={"terminal": json.dumps(terminal_payload)},
+        page_texts=["", visible_text],
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _: None,
+    )
+
+    assert result.restriction == expected
+    assert result.coverage["is_exhaustive"] is False
+    assert result.coverage["stop_condition"] == expected
 
 
 def test_collect_account_page_uses_dom_cards_when_network_is_empty():

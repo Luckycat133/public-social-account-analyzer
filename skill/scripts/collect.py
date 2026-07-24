@@ -292,9 +292,10 @@ def _sanitize_collection_coverage(value) -> dict:
     if not isinstance(value, dict):
         return {}
     clean = {}
-    for key in ("requested_all", "is_exhaustive", "terminal_page_observed"):
-        if isinstance(value.get(key), bool):
-            clean[key] = value[key]
+    requested_all = value.get("requested_all") is True
+    terminal_observed = value.get("terminal_page_observed") is True
+    clean["requested_all"] = requested_all
+    clean["terminal_page_observed"] = terminal_observed
     for key in (
         "observed_page_count",
         "observed_post_count",
@@ -305,7 +306,7 @@ def _sanitize_collection_coverage(value) -> dict:
         if isinstance(field_value, int) and not isinstance(field_value, bool):
             clean[key] = max(0, field_value)
     stop_condition = value.get("stop_condition")
-    if stop_condition in {
+    if isinstance(stop_condition, str) and stop_condition in {
         "terminal_page",
         "idle",
         "timeout",
@@ -316,6 +317,12 @@ def _sanitize_collection_coverage(value) -> dict:
         "limit",
     }:
         clean["stop_condition"] = stop_condition
+    clean["is_exhaustive"] = bool(
+        value.get("is_exhaustive") is True
+        and requested_all
+        and terminal_observed
+        and stop_condition == "terminal_page"
+    )
     return clean
 
 
@@ -620,6 +627,22 @@ def run(
         )
     except Exception:
         collection_coverage = {}
+    if (
+        collect_all
+        and stop_reason is None
+        and not collection_coverage.get("is_exhaustive", False)
+    ):
+        stop_reason = SR_PARSER_FAILED
+        task_status = "PARTIAL" if posts else "FAILED"
+        error_log.append({
+            "url": url,
+            "stage": "collection_coverage",
+            "error_code": SR_PARSER_FAILED,
+            "message": "全量采集覆盖账本缺少一致的末页完备性证据",
+            "occurred_at": collected_at,
+            "retryable": False,
+            "diagnostic_code": "ALL_POSTS_INCOMPLETE",
+        })
 
     # limit 与 date_range 的交集:适配器可能仅应用其一,此处再做一次本地交集过滤
     # (见 SKILL.md §1「采集数量和日期范围同时存在时,取两者共同限定的结果」)

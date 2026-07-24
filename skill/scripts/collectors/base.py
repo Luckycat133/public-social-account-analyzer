@@ -125,8 +125,9 @@ class BaseCollector(ABC):
     def normalize_post(self, raw: dict) -> dict:
         """Map a platform-specific raw post dict to the unified Post schema.
 
-        Defaults boolean flags to False, hashtags to [], content_type to
-        "other" when unknown, and collection_status to "SUCCESS". Interaction
+        Preserves explicit boolean flags and leaves unknown flags as None,
+        defaults hashtags to [], content_type to "other" when unknown, and
+        collection_status to "SUCCESS". Interaction
         metrics that the adapter actually supplied are passed through (views /
         likes / comments / favorites / shares / coins / danmaku); when absent
         they stay None — never invented. platform_metrics carries any
@@ -158,6 +159,10 @@ class BaseCollector(ABC):
 
         platform_metrics = dict(raw.get("platform_metrics") or {})
 
+        def public_boolean(field: str) -> bool | None:
+            value = raw.get(field)
+            return value if isinstance(value, bool) else None
+
         result = {
             "platform": raw.get("platform"),
             "post_id": raw.get("post_id"),
@@ -168,9 +173,9 @@ class BaseCollector(ABC):
             "text": raw.get("text"),
             "duration_seconds": raw.get("duration_seconds"),
             "hashtags": hashtags,
-            "is_pinned": bool(raw.get("is_pinned", False)),
-            "is_repost": bool(raw.get("is_repost", False)),
-            "is_promoted": bool(raw.get("is_promoted", False)),
+            "is_pinned": public_boolean("is_pinned"),
+            "is_repost": public_boolean("is_repost"),
+            "is_promoted": public_boolean("is_promoted"),
             "collection_status": self._canon_status(raw.get("collection_status")),
             "collected_at": raw.get("collected_at") or now,
             "source_url": raw.get("source_url") or raw.get("post_url"),

@@ -139,15 +139,15 @@ workspace/<platform>-<account>-<date>/
 | text | string | 否 | 是 | 正文 / 文案全文 |
 | duration_seconds | integer | 否 | 是 | 视频时长（秒） |
 | hashtags | array[string] | 否 | 是 | 话题 / 标签 |
-| is_pinned | boolean | 是 | 否 | 是否置顶 |
-| is_repost | boolean | 是 | 否 | 是否转载 / 转发 |
-| is_promoted | boolean | 是 | 否 | 是否投放 / 推广标记 |
+| is_pinned | boolean | 是 | 是 | 是否置顶；无公开证据时为 `null` |
+| is_repost | boolean | 是 | 是 | 是否转载 / 转发；无公开证据时为 `null` |
+| is_promoted | boolean | 是 | 是 | 是否投放 / 推广标记；无公开证据时为 `null` |
 | collection_status | enum | 是 | 否 | 采集状态（§9.3） |
 | collected_at | datetime | 是 | 否 | 采集时间（ISO 8601） |
 | source_url | string | 是 | 否 | 来源 URL（证据锚点） |
 
 约束：
-- `is_pinned` / `is_repost` / `is_promoted` 默认为 `false`；未知时不得臆测为 `true`。
+- `is_pinned` / `is_repost` / `is_promoted` 仅保留明确公开的 `true` / `false`；未知时为 `null`，不得把缺失证据断言为 `false` 或 `true`。
 - 默认分析排除置顶、转载、投放内容（见 `analysis-rules.md`），但须在数据中保留标记。
 
 ### 5.1 抖音搜索索引降级的显式例外

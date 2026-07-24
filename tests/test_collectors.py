@@ -249,6 +249,40 @@ def test_base_collector_collection_coverage_defaults_to_empty():
     assert FakeLoginWallCollector().get_collection_coverage() == {}
 
 
+def test_normalize_post_preserves_unknown_public_booleans():
+    normalized = FakeLoginWallCollector().normalize_post({"post_id": "1"})
+
+    assert normalized["is_pinned"] is None
+    assert normalized["is_repost"] is None
+    assert normalized["is_promoted"] is None
+
+
+def test_normalize_post_preserves_explicit_public_booleans():
+    collector = FakeLoginWallCollector()
+
+    explicit_true = collector.normalize_post({
+        "is_pinned": True,
+        "is_repost": True,
+        "is_promoted": True,
+    })
+    explicit_false = collector.normalize_post({
+        "is_pinned": False,
+        "is_repost": False,
+        "is_promoted": False,
+    })
+
+    assert (
+        explicit_true["is_pinned"],
+        explicit_true["is_repost"],
+        explicit_true["is_promoted"],
+    ) == (True, True, True)
+    assert (
+        explicit_false["is_pinned"],
+        explicit_false["is_repost"],
+        explicit_false["is_promoted"],
+    ) == (False, False, False)
+
+
 # ---------------------------------------------------------------------------
 # P0 B站标签接口接线：collect_tags 已接入 collect_post_list 全量流程，
 # API 标签合并进 base.hashtags（离线 FakeSession 验证真实调用路径）。

@@ -123,6 +123,16 @@ def _int(v: Any) -> int | None:
         return None
 
 
+def _public_boolean(source: dict[str, Any], *keys: str) -> bool | None:
+    """Preserve explicit public boolean evidence and leave absence unknown."""
+    values = [source[key] for key in keys if isinstance(source.get(key), bool)]
+    if True in values:
+        return True
+    if False in values:
+        return False
+    return None
+
+
 def _extract_hashtags(desc: Any, text_extra: Any) -> list[str]:
     """从文案与 text_extra 抽取话题标签，去重保序。"""
     tags: list[str] = []
@@ -501,11 +511,6 @@ class DouyinCollector(BaseCollector):
         """Keep only the bounded coverage ledger; never retain transport secrets."""
         if not isinstance(value, dict):
             return {}
-        boolean_fields = (
-            "requested_all",
-            "is_exhaustive",
-            "terminal_page_observed",
-        )
         count_fields = (
             "observed_page_count",
             "observed_post_count",
@@ -523,16 +528,23 @@ class DouyinCollector(BaseCollector):
             "limit",
         }
         clean: dict[str, Any] = {}
-        for key in boolean_fields:
-            if isinstance(value.get(key), bool):
-                clean[key] = value[key]
+        requested_all = value.get("requested_all") is True
+        terminal_observed = value.get("terminal_page_observed") is True
+        clean["requested_all"] = requested_all
+        clean["terminal_page_observed"] = terminal_observed
         for key in count_fields:
             field_value = value.get(key)
             if isinstance(field_value, int) and not isinstance(field_value, bool):
                 clean[key] = max(0, field_value)
         stop_condition = value.get("stop_condition")
-        if stop_condition in allowed_stops:
+        if isinstance(stop_condition, str) and stop_condition in allowed_stops:
             clean["stop_condition"] = stop_condition
+        clean["is_exhaustive"] = bool(
+            value.get("is_exhaustive") is True
+            and requested_all
+            and terminal_observed
+            and stop_condition == "terminal_page"
+        )
         return clean
 
     def get_collection_coverage(self) -> dict[str, Any]:
@@ -583,6 +595,15 @@ class DouyinCollector(BaseCollector):
         self._collection_coverage = self._sanitize_collection_coverage(
             getattr(result, "coverage", {})
         )
+        valid_items = [
+            item
+            for item in result.aweme_items
+            if isinstance(item, dict)
+            and re.fullmatch(
+                r"\d+",
+                str(item.get("aweme_id") or item.get("aweme_id_str") or ""),
+            )
+        ]
         posts = [
             self.normalize_post(
                 self._build_post_raw(
@@ -593,8 +614,7 @@ class DouyinCollector(BaseCollector):
                     ),
                 )
             )
-            for item in result.aweme_items
-            if isinstance(item, dict)
+            for item in valid_items
         ]
         if date_range:
             posts = self._filter_by_date(posts, date_range)
@@ -620,6 +640,12 @@ class DouyinCollector(BaseCollector):
                 "全量作品采集在安全边界停止，结果不具完备性",
                 partial_posts=posts,
                 diagnostic_code="ALL_POSTS_INCOMPLETE",
+            )
+        if not posts:
+            raise DouyinError(
+                STOP_NO_PUBLIC_CONTENT,
+                "公开作品列表已到末页，账号没有可验证的公开作品",
+                partial_posts=[],
             )
         return posts
 
@@ -878,17 +904,15 @@ class DouyinCollector(BaseCollector):
 
     @staticmethod
     def _build_post_raw(url: str, aweme: dict, source: str) -> dict:
-        from ._douyin_browser_transport import (
-            canonical_post_url_for_item,
-            sanitize_response_url,
-        )
+        from ._douyin_browser_transport import canonical_post_url_for_item
 
         desc = aweme.get("desc") or ""
         text_extra = aweme.get("text_extra")
         statistics = aweme.get("statistics") or {}
         video = aweme.get("video") or {}
-        is_top = bool(aweme.get("is_top") or aweme.get("is_top_aweme"))
-        is_ad = bool(aweme.get("is_ad") or aweme.get("is_commerce"))
+        is_top = _public_boolean(aweme, "is_top", "is_top_aweme")
+        is_repost = _public_boolean(aweme, "is_repost", "is_forward")
+        is_ad = _public_boolean(aweme, "is_ad", "is_commerce")
         # 图文/笔记 best-effort 判定。
         content_type = "video"
         if aweme.get("images") and not video:
@@ -897,7 +921,7 @@ class DouyinCollector(BaseCollector):
         collection_name = (collection or {}).get("mix_name") if isinstance(collection, dict) else None
         single_text = (desc or "").split("\n")[0] if isinstance(desc, str) else None
         post_id = str(aweme.get("aweme_id") or aweme.get("aweme_id_str") or "")
-        post_url = canonical_post_url_for_item(aweme, post_id) or sanitize_response_url(url)
+        post_url = canonical_post_url_for_item(aweme, post_id)
         collection_source = str(
             aweme.get("_collection_source") or source or "unknown"
         )
@@ -912,7 +936,7 @@ class DouyinCollector(BaseCollector):
             "duration_seconds": (_int(video.get("duration")) // 1000) if video.get("duration") is not None else None,
             "hashtags": _extract_hashtags(desc, text_extra),
             "is_pinned": is_top,
-            "is_repost": False,
+            "is_repost": is_repost,
             "is_promoted": is_ad,
             # 播放可能不公开 → None（绝不以互动数反推）。
             "views": _int(statistics.get("play_count")),

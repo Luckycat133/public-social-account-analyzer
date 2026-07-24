@@ -638,9 +638,6 @@ def collect_account_page(
             if event is None:
                 flush_pending(session)
 
-            if all_posts and stop_condition in {"terminal_page", "repeated_cursor"}:
-                break
-
             budget = remaining()
             if budget <= 0:
                 deadline_expired = True
@@ -653,6 +650,8 @@ def collect_account_page(
             restriction = detect_restriction(visible_text)
             if restriction:
                 stop_condition = restriction
+                break
+            if all_posts and stop_condition in {"terminal_page", "repeated_cursor"}:
                 break
             if len(items) >= requested:
                 stop_condition = "limit"
