@@ -17,9 +17,10 @@ AWEME = {
 class FakeBrowser:
     """Small in-memory CDP page double for bounded collection tests."""
 
-    def __init__(self, events=(), bodies=None, page_texts=(), cards=()):
+    def __init__(self, events=(), bodies=None, body_errors=None, page_texts=(), cards=()):
         self.events = list(events)
         self.bodies = dict(bodies or {})
+        self.body_errors = dict(body_errors or {})
         self.page_texts = list(page_texts)
         self.cards = list(cards)
         self.navigations = []
@@ -38,6 +39,8 @@ class FakeBrowser:
         return self.events.pop(0) if self.events else None
 
     def get_response_body(self, request_id):
+        if request_id in self.body_errors:
+            raise self.body_errors[request_id]
         return self.bodies[request_id]
 
     def page_text(self):
@@ -110,6 +113,20 @@ def test_restriction_priority_and_url_sanitization():
     )
 
 
+def test_sanitize_response_url_removes_userinfo_and_handles_ports():
+    from collectors._douyin_browser_transport import sanitize_response_url
+
+    assert sanitize_response_url(
+        "https://name:password@www.douyin.com:8443/aweme/post/?secret=1#x"
+    ) == "https://www.douyin.com:8443/aweme/post/"
+    assert sanitize_response_url(
+        "https://name:password@[2001:db8::1]:8443/aweme/post/?secret=1"
+    ) == "https://[2001:db8::1]:8443/aweme/post/"
+    assert sanitize_response_url(
+        "https://name:password@www.douyin.com:not-a-port/aweme/post/?secret=1"
+    ) == "https://www.douyin.com/aweme/post/"
+
+
 def test_collect_account_page_keeps_allowed_network_items_and_safe_paths():
     from collectors._douyin_browser_transport import collect_account_page
 
@@ -171,3 +188,37 @@ def test_collect_account_page_uses_dom_cards_when_network_is_empty():
     assert result.source == "dom"
     assert result.aweme_items[0]["aweme_id"] == "7002"
     assert result.aweme_items[0]["share_url"] == "https://www.douyin.com/video/7002"
+
+
+def test_collect_account_page_continues_after_response_body_is_unavailable():
+    from collectors._douyin_browser_transport import collect_account_page
+    from collectors.browser_backend import BrowserError
+
+    later_event = {
+        "method": "Network.responseReceived",
+        "params": {
+            "requestId": "r2",
+            "type": "Fetch",
+            "response": {
+                "url": "https://www.iesdouyin.com/aweme/v1/web/aweme/post/?signed=later",
+                "mimeType": "application/json",
+            },
+        },
+    }
+    browser = FakeBrowser(
+        events=[RESPONSE_EVENT, later_event],
+        bodies={"r2": json.dumps({"aweme_list": [AWEME]})},
+        body_errors={"r1": BrowserError("response body is no longer available")},
+    )
+
+    result = collect_account_page(
+        "https://www.douyin.com/user/example",
+        limit=1,
+        session_factory=lambda: browser,
+        sleep=lambda _: None,
+    )
+
+    assert result.aweme_items == [AWEME]
+    assert result.diagnostics["response_paths"] == [
+        "https://www.iesdouyin.com/aweme/v1/web/aweme/post/"
+    ]

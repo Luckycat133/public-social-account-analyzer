@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ._constants import STOP_LOGIN, STOP_VERIFICATION
-from .browser_backend import BrowserSession
+from .browser_backend import BrowserError, BrowserSession
 
 
 _RESTRICTIONS = [
@@ -62,9 +62,23 @@ def detect_restriction(text: str) -> Optional[str]:
 
 
 def sanitize_response_url(url: str) -> str:
-    """Remove sensitive query and fragment components from an observed URL."""
-    parsed = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    """Remove credentials, query, and fragment from an observed URL."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return ""
+    hostname = parsed.hostname
+    if not hostname:
+        authority = ""
+    else:
+        authority = f"[{hostname}]" if ":" in hostname else hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port is not None:
+            authority = f"{authority}:{port}"
+    return urllib.parse.urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
 
 
 def _item_id(item: dict[str, Any]) -> Optional[str]:
@@ -153,7 +167,10 @@ def _allowed_response(event: dict[str, Any]) -> Optional[tuple[str, str]]:
     url = response.get("url")
     if not isinstance(request_id, str) or not request_id or not isinstance(url, str):
         return None
-    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
     if not _is_allowed_host(parsed.hostname or ""):
         return None
     resource_type = str(params.get("type") or "").lower()
@@ -206,7 +223,7 @@ def collect_account_page(
                 request_id, safe_url = candidate
                 try:
                     decoded = json.loads(session.get_response_body(request_id))
-                except (ValueError, TypeError, UnicodeError, RuntimeError):
+                except (ValueError, TypeError, UnicodeError, RuntimeError, BrowserError):
                     decoded = None
                 if decoded is not None:
                     for item in extract_aweme_items(decoded):
