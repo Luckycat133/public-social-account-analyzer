@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,14 @@ from collectors.douyin_openapi import DouyinOpenAPIClient, DouyinOpenAPIError
 _BEIJING = timezone(timedelta(hours=8))
 _PROFILE_ENDPOINT = "https://open.douyin.com/oauth/userinfo/"
 _TOKEN_ENV = "DOUYIN_OPENAPI_ACCESS_TOKEN"
+
+
+class ArtifactPromotionError(RuntimeError):
+    """Sanitized final-path acquisition or child-promotion failure."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("artifact workspace could not be promoted")
+        self.reason = reason
 
 
 def _write_csv(posts: list[dict[str, Any]], path: str) -> None:
@@ -119,16 +128,15 @@ def _write_artifacts(
     coverage: dict[str, Any],
     diagnostic_code: str | None = None,
 ) -> None:
-    """Serialize in a sibling directory, then atomically promote on success."""
+    """Serialize beside the target, exclusively reserve it, then move children."""
 
     target = os.path.abspath(workspace)
     parent = os.path.dirname(target)
     basename = os.path.basename(target)
     os.makedirs(parent, exist_ok=True)
     if os.path.lexists(target):
-        raise FileExistsError("output workspace already exists")
+        raise ArtifactPromotionError("TARGET_EXISTS")
     staging = tempfile.mkdtemp(prefix=f".{basename}.staging-", dir=parent)
-    promoted = False
     try:
         _serialize_artifacts(
             staging,
@@ -140,13 +148,55 @@ def _write_artifacts(
             coverage=coverage,
             diagnostic_code=diagnostic_code,
         )
-        if os.path.lexists(target):
-            raise FileExistsError("output workspace already exists")
-        os.rename(staging, target)
-        promoted = True
-    finally:
-        if not promoted and os.path.isdir(staging):
-            shutil.rmtree(staging)
+    except Exception:
+        if os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    reservation_identity = None
+    acquisition_error = None
+    try:
+        os.mkdir(target)
+        target_stat = os.stat(target, follow_symlinks=False)
+        reservation_identity = (target_stat.st_dev, target_stat.st_ino)
+    except FileExistsError:
+        acquisition_error = "TARGET_EXISTS"
+    except OSError:
+        acquisition_error = "RESERVATION_FAILED"
+
+    if acquisition_error is not None:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise ArtifactPromotionError(acquisition_error)
+
+    promotion_failed = False
+    try:
+        for child in os.listdir(staging):
+            os.rename(os.path.join(staging, child), os.path.join(target, child))
+        os.rmdir(staging)
+    except OSError:
+        promotion_failed = True
+
+    if promotion_failed:
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            current_stat = os.stat(target, follow_symlinks=False)
+            target_is_owned_reservation = bool(
+                stat.S_ISDIR(current_stat.st_mode)
+                and reservation_identity == (current_stat.st_dev, current_stat.st_ino)
+            )
+        except OSError:
+            target_is_owned_reservation = False
+        if target_is_owned_reservation:
+            shutil.rmtree(target, ignore_errors=True)
+        raise ArtifactPromotionError("PROMOTION_FAILED")
+
+
+def _promotion_failure_status(error: ArtifactPromotionError) -> int:
+    if error.reason == "TARGET_EXISTS":
+        print("[FAILED] 输出目录已被其他任务占用；拒绝覆盖", file=sys.stderr)
+        return 2
+    print("[FAILED] 输出产物提升失败；未覆盖其他目录", file=sys.stderr)
+    return 3
 
 
 def run(
@@ -201,16 +251,19 @@ def run(
     try:
         profile = api.collect_profile()
     except DouyinOpenAPIError as exc:
-        _write_artifacts(
-            out_dir,
-            profile=profile,
-            posts=posts,
-            requested_limit=None if collect_all else limit,
-            task_status="FAILED",
-            stop_reason="OPENAPI_ERROR",
-            coverage=coverage,
-            diagnostic_code=exc.error_code,
-        )
+        try:
+            _write_artifacts(
+                out_dir,
+                profile=profile,
+                posts=posts,
+                requested_limit=None if collect_all else limit,
+                task_status="FAILED",
+                stop_reason="OPENAPI_ERROR",
+                coverage=coverage,
+                diagnostic_code=exc.error_code,
+            )
+        except ArtifactPromotionError as promotion_error:
+            return _promotion_failure_status(promotion_error)
         print("[FAILED] 授权账号资料请求失败", file=sys.stderr)
         return 3
 
@@ -245,16 +298,19 @@ def run(
         stop_reason = "PARSER_FAILED"
         diagnostic_code = "OPENAPI_LIST_INCOMPLETE"
 
-    _write_artifacts(
-        out_dir,
-        profile=profile,
-        posts=posts,
-        requested_limit=None if collect_all else limit,
-        task_status=task_status,
-        stop_reason=stop_reason,
-        coverage=coverage,
-        diagnostic_code=diagnostic_code,
-    )
+    try:
+        _write_artifacts(
+            out_dir,
+            profile=profile,
+            posts=posts,
+            requested_limit=None if collect_all else limit,
+            task_status=task_status,
+            stop_reason=stop_reason,
+            coverage=coverage,
+            diagnostic_code=diagnostic_code,
+        )
+    except ArtifactPromotionError as promotion_error:
+        return _promotion_failure_status(promotion_error)
     print(
         f"[OK] 平台=douyin 授权账号内容条数={len(posts)} "
         f"task_status={task_status} stop_reason={stop_reason or 'null'}"

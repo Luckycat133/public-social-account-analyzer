@@ -611,6 +611,77 @@ def test_artifact_failure_cleans_staging_and_allows_recovery(
     assert (out_dir / "task.json").is_file()
 
 
+def test_concurrent_target_creation_preserves_marker_and_aborts_promotion(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    marker_bytes = b"concurrent owner data\x00must survive"
+    original_serialize = authorized._serialize_artifacts
+
+    def serialize_then_create_competing_target(workspace, **kwargs):
+        original_serialize(workspace, **kwargs)
+        out_dir.mkdir()
+        (out_dir / "marker.bin").write_bytes(marker_bytes)
+
+    monkeypatch.setattr(
+        authorized,
+        "_serialize_artifacts",
+        serialize_then_create_competing_target,
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert (out_dir / "marker.bin").read_bytes() == marker_bytes
+    assert [path.name for path in out_dir.iterdir()] == ["marker.bin"]
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
+def test_child_promotion_failure_cleans_only_owned_reservation(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+
+    def fail_child_promotion(source, target):
+        raise OSError(f"raw promotion failure {TOKEN}")
+
+    monkeypatch.setattr(authorized.os, "rename", fail_child_promotion)
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert not out_dir.exists()
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
 def test_all_writes_standard_completed_artifacts_without_token(tmp_path, capsys):
     out_dir = tmp_path / "authorized"
     video = _video(7001, title="授权作品", create_time=1700000000, is_top=0, play_count=10)
