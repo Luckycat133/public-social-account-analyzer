@@ -27,7 +27,7 @@ _RESTRICTIONS = [
 
 _ITEM_LIST_KEYS = {"aweme_list", "awemeList", "post_list"}
 _ITEM_DETAIL_KEYS = {"aweme_detail", "awemeDetail"}
-_POST_LINK = re.compile(r"/(?:video|note)/(\d+)(?:[/?#]|$)")
+_POST_PATH = re.compile(r"/(?:video|note)/(\d+)")
 
 
 @dataclass
@@ -104,7 +104,7 @@ def extract_dom_items(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     for card in cards:
         href = str(card.get("href") or "")
-        match = _POST_LINK.search(href)
+        match = _POST_PATH.fullmatch(urllib.parse.urlsplit(href).path)
         if not match or match.group(1) in seen:
             continue
         post_id = match.group(1)

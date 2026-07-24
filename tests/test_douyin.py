@@ -32,6 +32,20 @@ def test_extract_dom_items_only_keeps_post_links():
     assert result[0]["_collection_source"] == "dom"
 
 
+def test_extract_dom_items_requires_exact_post_path():
+    from collectors._douyin_browser_transport import extract_dom_items
+
+    cards = [
+        {"href": "https://www.douyin.com/video/7002/extra", "text": "无效"},
+        {"href": "https://www.douyin.com/note/7003?x=1#part", "text": "有效"},
+    ]
+
+    result = extract_dom_items(cards)
+
+    assert [item["aweme_id"] for item in result] == ["7003"]
+    assert result[0]["share_url"] == "https://www.douyin.com/note/7003"
+
+
 def test_restriction_priority_and_url_sanitization():
     from collectors._douyin_browser_transport import (
         detect_restriction,
