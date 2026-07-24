@@ -47,6 +47,7 @@ from ._constants import (
     STOP_VERIFICATION,
 )
 from .base import BaseCollector
+from .url_policy import canonical_item_url
 
 
 # 抖音公开接口 / 主页均使用北京时间（+08:00）
@@ -756,23 +757,11 @@ class DouyinCollector(BaseCollector):
     # -- 单条详情 -----------------------------------------------------------
     def collect_post_detail(self, post_url: str) -> dict[str, Any]:
         """采集单条作品详情并归一化。播放数可能不公开 → views=None。"""
-        if not isinstance(post_url, str) or not post_url.strip():
+        canonical_url = canonical_item_url("douyin", post_url)
+        if canonical_url is None:
             raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL")
-        try:
-            parsed = urllib.parse.urlparse(post_url)
-        except ValueError:
-            raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL") from None
-        match = re.fullmatch(r"/(?:video|note)/(\d+)/?", parsed.path)
-        if (
-            parsed.scheme != "https"
-            or parsed.hostname not in {"douyin.com", "www.douyin.com", "iesdouyin.com"}
-            or parsed.username is not None
-            or parsed.password is not None
-            or match is None
-        ):
-            raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL")
-        expected_post_id = match.group(1)
-        html = self._fetch(post_url)
+        expected_post_id = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+        html = self._fetch(canonical_url)
         restriction = _detect_restriction(html)
         if restriction:
             raise DouyinError(restriction, f"采集作品详情时命中访问限制: {restriction}")
@@ -785,7 +774,7 @@ class DouyinCollector(BaseCollector):
             raise DouyinError(
                 STOP_PARSER_FAILED, "RENDER_DATA 中未识别到单条作品结构"
             )
-        raw = self._build_post_raw(post_url, aweme, source="detail")
+        raw = self._build_post_raw(canonical_url, aweme, source="detail")
         return self.normalize_post(raw)
 
     # -- 评论（覆盖基类，best-effort） -------------------------------------
@@ -793,9 +782,10 @@ class DouyinCollector(BaseCollector):
         self, post_url: str, limit: int = 20
     ) -> list[dict[str, Any]]:
         """公开评论采样；区分明确空结果与不可用，均不绕过保护。"""
-        if not isinstance(post_url, str) or not post_url.strip():
+        canonical_url = canonical_item_url("douyin", post_url)
+        if canonical_url is None:
             raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL")
-        html = self._fetch(post_url)
+        html = self._fetch(canonical_url)
         restriction = _detect_restriction(html)
         if restriction:
             raise DouyinError(restriction, "公开评论采样命中访问限制")
@@ -823,7 +813,7 @@ class DouyinCollector(BaseCollector):
             out.append(
                 {
                     "comment_id": c.get("cid") or c.get("id"),
-                    "post_url": post_url,
+                    "post_url": canonical_url,
                     "author": (c.get("user") or {}).get("nickname"),
                     "text": c.get("text") or c.get("content"),
                     "likes": _int(c.get("digg_count")),

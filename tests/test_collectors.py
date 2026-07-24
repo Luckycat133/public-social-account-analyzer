@@ -11,6 +11,9 @@
 网络相关场景用轻量 FakeCollector 抛真实 BilibiliError 或文档化单元断言，保持 GREEN。
 """
 import json
+import os
+import subprocess
+import sys
 
 import analyze
 import pytest
@@ -46,7 +49,17 @@ def test_bilibili_supports_profile_url():
     # 允许「数字 ID + 可选尾部斜杠 + 可选 ?query」形式
     assert c.supports("https://space.bilibili.com/946974/") is True
     assert c.supports("https://space.bilibili.com/946974/?from=feed") is True
+    assert c.supports(
+        "https://space.bilibili.com/946974?token=QUERY#FRAGMENT"
+    ) is True
     assert c.supports("http://space.bilibili.com/946974") is True
+
+
+def test_bilibili_supports_rejects_profile_credentials_and_ports():
+    c = BilibiliCollector()
+
+    assert c.supports("https://user:pass@space.bilibili.com/946974") is False
+    assert c.supports("https://space.bilibili.com:443/946974") is False
 
 
 def test_bilibili_supports_rejects_video_and_dynamic():
@@ -121,6 +134,57 @@ def test_bilibili_comments_sanitize_aid_resolution_failure(monkeypatch):
     assert "secret" not in str(exc_info.value)
 
 
+def test_direct_bilibili_detail_canonicalizes_item_evidence(monkeypatch):
+    class DetailSession:
+        def ensure_buvid(self):
+            return None
+
+        def get_json(self, path, params):
+            assert path == "/x/web-interface/view"
+            assert params == {"bvid": "BV1abc"}
+            return {
+                "code": 0,
+                "data": {
+                    "bvid": "BV1abc",
+                    "title": "safe title",
+                    "owner": {},
+                    "stat": {},
+                },
+            }
+
+    collector = BilibiliCollector()
+    monkeypatch.setattr(collector, "_new_session", lambda: DetailSession())
+
+    post = collector.collect_post_detail(
+        "https://bilibili.com/video/BV1abc?token=DETAIL_SECRET#DETAIL_FRAGMENT"
+    )
+
+    assert post["post_url"] == "https://www.bilibili.com/video/BV1abc"
+    assert post["source_url"] == "https://www.bilibili.com/video/BV1abc"
+
+
+@pytest.mark.parametrize("method_name", ["collect_post_detail", "collect_comments"])
+def test_direct_bilibili_item_methods_reject_untrusted_hosts(
+    monkeypatch, method_name
+):
+    collector = BilibiliCollector()
+    monkeypatch.setattr(
+        collector,
+        "_new_session",
+        lambda: pytest.fail("invalid item URL must not create a session"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_bv_to_aid_urllib",
+        lambda _bvid: pytest.fail("invalid item URL must not resolve aid"),
+    )
+
+    with pytest.raises(BilibiliError):
+        getattr(collector, method_name)(
+            "https://evil.example/path/BV1abc?token=EVIL_HOST_SECRET"
+        )
+
+
 # ---------------------------------------------------------------------------
 # WeiboCollector 未启用
 # ---------------------------------------------------------------------------
@@ -128,6 +192,12 @@ def test_weibo_supports_profile():
     c = WeiboCollector()
     assert c.supports("https://weibo.com/u/123456") is True
     assert c.supports("https://weibo.com/SomeName") is True
+    assert c.supports(
+        "https://www.weibo.com/u/123456?token=QUERY#FRAGMENT"
+    ) is True
+    assert c.supports("https://user:pass@weibo.com/u/123456") is False
+    assert c.supports("https://weibo.com:443/u/123456") is False
+    assert c.supports("https://weibo.com/home") is False
     # 保留一级路径（搜索 / 话题）不匹配为账号主页
     assert c.supports("https://weibo.com/search/x") is False
     assert c.supports("https://weibo.com/") is False
@@ -659,6 +729,136 @@ def test_douyin_item_url_is_canonical_before_calls_and_persistence(
     assert "FRAGMENT_SECRET" not in all_output
 
 
+def test_account_and_all_artifact_urls_are_canonical_or_null(
+    monkeypatch, tmp_path, capsys
+):
+    import collect
+
+    supplied_url = (
+        "https://iesdouyin.com/user/public_account/?token=ACCOUNT_SECRET"
+        "#ACCOUNT_FRAGMENT_SECRET"
+    )
+    canonical_profile_url = "https://www.douyin.com/user/public_account"
+
+    class AccountUrlBoundaryAdapter(_SafeCommentAdapter):
+        def __init__(self):
+            self.calls = []
+
+        def check_access(self, url):
+            self.calls.append(("access", url))
+            return {"accessible": True}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            self.calls.append(("list", url))
+            return [
+                {
+                    "platform": "douyin",
+                    "post_id": "7001",
+                    "post_url": (
+                        "https://iesdouyin.com/video/7001?token=POST_SECRET"
+                        "#POST_FRAGMENT_SECRET"
+                    ),
+                    "source_url": "https://evil.example/evidence?token=SOURCE_SECRET",
+                    "collection_status": "SUCCESS",
+                },
+                {
+                    "platform": "douyin",
+                    "post_id": "7002",
+                    "post_url": "https://evil.example/video/7002?token=INVALID_POST_SECRET",
+                    "source_url": "not-a-url-SOURCE_TEXT_SECRET",
+                    "collection_status": "SUCCESS",
+                },
+            ]
+
+        def collect_profile(self, url):
+            self.calls.append(("profile", url))
+            return {
+                "platform": "douyin",
+                "profile_url": supplied_url,
+                "field_visibility": {},
+            }
+
+    adapter = AccountUrlBoundaryAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(supplied_url, out_dir=str(tmp_path)) == 0
+
+    assert adapter.calls == [
+        ("access", canonical_profile_url),
+        ("list", canonical_profile_url),
+        ("profile", canonical_profile_url),
+    ]
+    profile = json.loads(
+        (tmp_path / "source" / "profile.json").read_text(encoding="utf-8")
+    )
+    posts = [
+        json.loads(line)
+        for line in (tmp_path / "source" / "posts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert profile["profile_url"] == canonical_profile_url
+    assert task["profile_url"] == canonical_profile_url
+    assert posts[0]["post_url"] == "https://www.douyin.com/video/7001"
+    assert posts[0]["source_url"] is None
+    assert posts[1]["post_url"] is None
+    assert posts[1]["source_url"] is None
+
+    captured = capsys.readouterr()
+    all_output = captured.out + captured.err
+    for artifact in tmp_path.rglob("*"):
+        if artifact.is_file():
+            all_output += artifact.read_text(encoding="utf-8")
+    for secret in (
+        "ACCOUNT_SECRET",
+        "ACCOUNT_FRAGMENT_SECRET",
+        "POST_SECRET",
+        "POST_FRAGMENT_SECRET",
+        "SOURCE_SECRET",
+        "INVALID_POST_SECRET",
+        "SOURCE_TEXT_SECRET",
+    ):
+        assert secret not in all_output
+
+
+@pytest.mark.parametrize(
+    "profile_url",
+    [
+        "https://user:password@www.douyin.com/user/public_account",
+        "https://www.douyin.com:443/user/public_account",
+        "https://www.douyin.com/video/7001?token=INVALID_PATH_SECRET",
+    ],
+)
+def test_invalid_supported_profile_url_is_rejected_before_adapter_calls(
+    monkeypatch, tmp_path, profile_url
+):
+    import collect
+
+    class OverbroadAdapter(_SafeCommentAdapter):
+        def __init__(self):
+            self.calls = []
+
+        def check_access(self, url):
+            self.calls.append(url)
+            return {"accessible": True}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            self.calls.append(url)
+            return []
+
+        def collect_profile(self, url):
+            self.calls.append(url)
+            return {}
+
+    adapter = OverbroadAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(profile_url, out_dir=str(tmp_path / "out")) == 2
+    assert adapter.calls == []
+    assert not (tmp_path / "out").exists()
+
+
 @pytest.mark.parametrize(
     ("failure_stage", "expected_code"),
     [
@@ -1039,6 +1239,75 @@ def test_failed_comment_replace_does_not_follow_existing_symlink(
     assert comments_path.is_symlink()
     assert victim.read_bytes() == victim_before
     assert list(source.glob(".comments.jsonl.*.tmp")) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
+def test_comment_artifact_recount_returns_without_blocking_on_fifo(tmp_path):
+    import collect
+
+    fifo = tmp_path / "comments.jsonl"
+    os.mkfifo(fifo)
+    script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import collect
+posts = [{
+    "post_id": "7001",
+    "post_url": "https://www.douyin.com/video/7001",
+}]
+print(collect._count_valid_comments_artifact(
+    sys.argv[2], "douyin", posts, "2026-07-24T10:00:00+08:00"
+))
+"""
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            os.path.dirname(collect.__file__),
+            str(fifo),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert completed.stdout.strip() == "0"
+
+
+@pytest.mark.parametrize("no_follow_value", [None, 0])
+def test_comment_artifact_recount_without_effective_no_follow_is_conservative(
+    monkeypatch, tmp_path, no_follow_value
+):
+    import collect
+
+    artifact = tmp_path / "comments.jsonl"
+    artifact.write_text(json.dumps({
+        "comment_id": "old1",
+        "parent_post_id": "7001",
+        "parent_post_url": "https://www.douyin.com/video/7001",
+        "author": None,
+        "text": "persisted comment",
+        "likes": None,
+        "published_at": None,
+        "collected_at": "2026-07-24T10:00:00+08:00",
+    }) + "\n", encoding="utf-8")
+    if no_follow_value is None:
+        monkeypatch.delattr(collect.os, "O_NOFOLLOW", raising=False)
+    else:
+        monkeypatch.setattr(collect.os, "O_NOFOLLOW", no_follow_value)
+
+    assert collect._count_valid_comments_artifact(
+        str(artifact),
+        "douyin",
+        [{
+            "post_id": "7001",
+            "post_url": "https://www.douyin.com/video/7001",
+        }],
+        "2026-07-24T10:00:00+08:00",
+    ) == 0
 
 
 def test_normalize_post_preserves_explicit_public_booleans():

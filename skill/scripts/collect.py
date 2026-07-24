@@ -37,6 +37,10 @@ for _p in (_COLLECTORS, _HERE):
         sys.path.insert(0, _p)
 
 from collectors.base import BaseCollector  # noqa: E402
+from collectors.url_policy import (  # noqa: E402
+    canonical_item_url,
+    canonical_profile_url,
+)
 
 # 北京时间为中国平台默认时区(见 references/data-schema.md §1)
 _BEIJING = timezone(timedelta(hours=8))
@@ -75,6 +79,7 @@ _REPORT_ERROR_CODES = _KNOWN_STOP_REASONS | {
     "POST_UNAVAILABLE",
     "COMMENTS_UNAVAILABLE",
 }
+_MAX_COMMENT_ARTIFACT_BYTES = 16 * 1024 * 1024
 
 
 def _stop_reason_from_exc(e: Exception) -> str:
@@ -243,22 +248,7 @@ def _douyin_item_url(post: dict) -> str | None:
     post_url = post.get("post_url")
     if re.fullmatch(r"\d+", post_id) is None or not isinstance(post_url, str):
         return None
-    try:
-        parsed = urllib.parse.urlparse(post_url)
-    except ValueError:
-        return None
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname not in {"douyin.com", "www.douyin.com", "iesdouyin.com"}
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        return None
-    match = re.fullmatch(r"/(?:video|note)/(\d+)/?", parsed.path)
-    if match is None or match.group(1) != post_id:
-        return None
-    kind = "note" if parsed.path.startswith("/note/") else "video"
-    return f"https://www.douyin.com/{kind}/{post_id}"
+    return canonical_item_url("douyin", post_url, post_id)
 
 
 def _set_detail_status(post: dict, status: str) -> None:
@@ -272,49 +262,20 @@ def _valid_comment_parent(platform: str, post: dict) -> tuple[str, str] | None:
     post_url = post.get("post_url")
     if not post_id or not isinstance(post_url, str):
         return None
-    if platform == "douyin":
-        canonical = _douyin_item_url(post)
-        return (post_id, canonical) if canonical else None
-    try:
-        parsed = urllib.parse.urlparse(post_url)
-    except ValueError:
-        return None
-    if (
-        parsed.scheme != "https"
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        return None
-    if platform == "bilibili":
-        if parsed.hostname not in {"bilibili.com", "www.bilibili.com"}:
-            return None
-        match = re.fullmatch(r"/video/(BV[0-9A-Za-z]+)/?", parsed.path)
-        if match is None or match.group(1) != post_id:
-            return None
-        post_url = f"https://www.bilibili.com/video/{post_id}"
-    elif platform == "weibo":
-        if parsed.hostname not in {"weibo.com", "www.weibo.com"}:
-            return None
-        match = re.fullmatch(r"/(\d+)/([0-9A-Za-z]+)/?", parsed.path)
-        if match is None or match.group(2) != post_id:
-            return None
-        post_url = f"https://weibo.com/{match.group(1)}/{post_id}"
-    else:
-        return None
-    return post_id, post_url
+    canonical = canonical_item_url(platform, post_url, post_id)
+    return (post_id, canonical) if canonical else None
 
 
 def _canonicalize_post_urls(platform: str, posts: list[dict]) -> None:
-    """Replace accepted public item URLs before downstream use or persistence."""
+    """Canonicalize valid item evidence and null every untrusted URL value."""
     for post in posts:
-        parent = _valid_comment_parent(platform, post)
-        if parent is None:
-            continue
-        _, canonical_url = parent
-        original_url = post.get("post_url")
-        post["post_url"] = canonical_url
-        if post.get("source_url") == original_url:
-            post["source_url"] = canonical_url
+        post_id = str(post.get("post_id") or "").strip()
+        post["post_url"] = canonical_item_url(
+            platform, post.get("post_url"), post_id
+        )
+        post["source_url"] = canonical_item_url(
+            platform, post.get("source_url"), post_id
+        )
 
 
 def _normalize_comment_record(
@@ -441,36 +402,63 @@ def _count_valid_comments_artifact(
     }
     if not parents:
         return 0
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if (
+        not isinstance(no_follow, int)
+        or no_follow == 0
+        or not isinstance(nonblock, int)
+        or nonblock == 0
+    ):
+        return 0
     descriptor = -1
     try:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        elif os.path.islink(path):
-            return 0
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | no_follow
+            | nonblock
+        )
         descriptor = os.open(path, flags)
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > _MAX_COMMENT_ARTIFACT_BYTES
+        ):
             return 0
+
+        chunks: list[bytes] = []
+        total = 0
+        while total <= _MAX_COMMENT_ARTIFACT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, _MAX_COMMENT_ARTIFACT_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > _MAX_COMMENT_ARTIFACT_BYTES:
+            return 0
+        content = b"".join(chunks).decode("utf-8")
         seen: set[tuple[str, str]] = set()
-        with os.fdopen(descriptor, encoding="utf-8") as handle:
-            descriptor = -1
-            for line in handle:
-                try:
-                    value = json.loads(line)
-                except (json.JSONDecodeError, UnicodeError):
-                    continue
-                if not isinstance(value, dict):
-                    continue
-                parent_id = str(value.get("parent_post_id") or "").strip()
-                parent_url = parents.get(parent_id)
-                if parent_url is None:
-                    continue
-                normalized = _normalize_comment_record(
-                    value, parent_id, parent_url, occurred_at
-                )
-                if normalized is None or normalized != value:
-                    continue
-                seen.add((parent_id, normalized["comment_id"]))
+        for line in content.splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict):
+                continue
+            parent_id = str(value.get("parent_post_id") or "").strip()
+            parent_url = parents.get(parent_id)
+            if parent_url is None:
+                continue
+            normalized = _normalize_comment_record(
+                value, parent_id, parent_url, occurred_at
+            )
+            if normalized is None or normalized != value:
+                continue
+            seen.add((parent_id, normalized["comment_id"]))
         return len(seen)
     except (OSError, UnicodeError):
         return 0
@@ -1003,7 +991,12 @@ def run(
         return 2
 
     platform = adapter.platform
-    safe_url = _safe_public_url(url)
+    canonical_url = canonical_profile_url(platform, url)
+    if canonical_url is None:
+        print("[FAILED] 账号主页 URL 不符合平台公开路径规范", file=sys.stderr)
+        return 2
+    url = canonical_url
+    safe_url = canonical_url
     if collect_all and platform != "douyin":
         print("[FAILED] --all 目前仅支持抖音账号主页", file=sys.stderr)
         return 2
@@ -1186,6 +1179,9 @@ def run(
     # 3) 资料(失败不阻塞已采内容)
     try:
         profile = adapter.collect_profile(url)
+        if not isinstance(profile, dict):
+            raise ValueError("invalid profile result")
+        profile["profile_url"] = url
     except Exception as e:
         if stop_reason is None:
             stop_reason = _stop_reason_from_exc(e)

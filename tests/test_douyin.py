@@ -25,6 +25,20 @@ AWEME = {
 ACCOUNT_URL = "https://www.douyin.com/user/example"
 
 
+def test_douyin_supports_canonicalizable_profile_and_rejects_authority_data():
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(browser_fallback=False)
+
+    assert collector.supports(
+        "https://iesdouyin.com/user/example?token=QUERY#FRAGMENT"
+    ) is True
+    assert collector.supports(
+        "https://user:pass@www.douyin.com/user/example"
+    ) is False
+    assert collector.supports("https://www.douyin.com:443/user/example") is False
+
+
 def test_docs_describe_zero_python_dependency_browser_fallback():
     """Public documentation states the implemented browser-fallback policy."""
     from pathlib import Path
@@ -327,6 +341,55 @@ def test_douyin_nonempty_malformed_comments_are_unavailable(comments):
 
     assert exc_info.value.stop_reason == "COMMENTS_UNAVAILABLE"
     assert "secret malformed comment" not in str(exc_info.value)
+
+
+def test_direct_douyin_item_methods_fetch_only_canonical_urls():
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(browser_fallback=False)
+    fetched = []
+
+    def detail_fetch(url):
+        fetched.append(url)
+        return _ssr_html({"aweme": {"detail": AWEME}})
+
+    collector._fetch = detail_fetch
+    detail = collector.collect_post_detail(
+        "https://iesdouyin.com/video/7001?token=DETAIL_SECRET#DETAIL_FRAGMENT"
+    )
+    assert detail["post_url"] == "https://www.douyin.com/video/7001"
+
+    def comments_fetch(url):
+        fetched.append(url)
+        return _ssr_html({"comment": {"data": {"comments": []}}})
+
+    collector._fetch = comments_fetch
+    assert collector.collect_comments(
+        "https://iesdouyin.com/video/7001?token=COMMENT_SECRET#COMMENT_FRAGMENT"
+    ) == []
+    assert fetched == [
+        "https://www.douyin.com/video/7001",
+        "https://www.douyin.com/video/7001",
+    ]
+
+
+@pytest.mark.parametrize(
+    "post_url",
+    [
+        "https://user:password@www.douyin.com/video/7001",
+        "https://www.douyin.com:443/video/7001",
+    ],
+)
+def test_direct_douyin_item_methods_reject_credentials_and_ports(post_url):
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(browser_fallback=False)
+    collector._fetch = lambda _url: pytest.fail("invalid URL must not be fetched")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail(post_url)
+
+    assert exc_info.value.stop_reason == "UNSUPPORTED_PLATFORM"
 
 
 def test_load_adapters_can_disable_only_douyin_browser_fallback():

@@ -29,6 +29,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from .base import BaseCollector  # 适配 scripts/collectors 作为 sys.path 入口
+from .url_policy import canonical_item_url, canonical_profile_url
 
 # P2 可选平台：默认关闭，经环境变量开启真实采集，不阻塞 MVP。
 ENABLED = os.environ.get("WEIBO_COLLECTOR_ENABLED", "0") == "1"
@@ -183,7 +184,9 @@ def _parse_weibo_time(s: Any) -> str | None:
 
 def _resolve_uid(url: str) -> str:
     """从 URL 解析微博 uid；命名主页 best-effort 从主页 HTML 提取。"""
-    u = (url or "").strip()
+    u = canonical_profile_url("weibo", url)
+    if u is None:
+        raise WeiboError(ACCOUNT_UNAVAILABLE, "不支持的微博公开账号 URL")
     m = _RE_UID.match(u)
     if m:
         return m.group(1)
@@ -195,7 +198,7 @@ def _resolve_uid(url: str) -> str:
         if uid_m:
             return uid_m.group(1)
         raise WeiboError(ACCOUNT_UNAVAILABLE, f"无法从微博主页解析 uid: {name}")
-    raise WeiboError(ACCOUNT_UNAVAILABLE, f"不支持的微博 URL: {url}")
+    raise WeiboError(ACCOUNT_UNAVAILABLE, "不支持的微博公开账号 URL")
 
 
 def _build_post_raw(it: dict, uid: str) -> dict:
@@ -272,16 +275,7 @@ class WeiboCollector(BaseCollector):
 
         仅匹配账号主页，不匹配 weibo.com 裸域名、/u 占位、搜索 / 话题等子路径。
         """
-        if not isinstance(url, str):
-            return False
-        u = url.strip()
-        if _RE_UID.match(u):
-            return True
-        m = _RE_NAME.match(u)
-        # 排除形如 weibo.com/u（无数字 uid）的占位路径，以及保留一级路径
-        if m and m.group(1) != "u" and m.group(1) not in _RESERVED_SEGMENTS:
-            return True
-        return False
+        return canonical_profile_url("weibo", url) is not None
 
     # ------------------------------------------------------------------
     # 访问检查（不绕过登录 / 验证码）
@@ -304,7 +298,10 @@ class WeiboCollector(BaseCollector):
         """采集公开账号信息并归一化到统一 Profile schema。"""
         if not ENABLED:
             self._require_enabled()
-        uid = _resolve_uid(url)
+        canonical_url = canonical_profile_url("weibo", url)
+        if canonical_url is None:
+            raise WeiboError(ACCOUNT_UNAVAILABLE, "不支持的微博公开账号 URL")
+        uid = _resolve_uid(canonical_url)
         data = _http_get_json(f"https://weibo.com/ajax/profile/info?uid={uid}")
         user = (data.get("data") or {}).get("user") or {}
         if not user:
@@ -315,7 +312,7 @@ class WeiboCollector(BaseCollector):
             "platform": PLATFORM,
             "account_id": str(user.get("id") or uid),
             "account_name": user.get("screen_name"),
-            "profile_url": url,
+            "profile_url": canonical_url,
             "bio": user.get("description"),
             "verified": bool(user.get("verified")),
             "followers": followers,
@@ -389,10 +386,10 @@ class WeiboCollector(BaseCollector):
         """采集单条博文详情与公开指标（best-effort）。"""
         if not ENABLED:
             self._require_enabled()
-        m = re.search(r"weibo\.com/(\d+)/(\w+)", post_url or "")
-        if not m:
-            raise WeiboError(PARSER_FAILED, f"无法从 URL 解析博文: {post_url}")
-        uid, bid = m.group(1), m.group(2)
+        canonical_url = canonical_item_url("weibo", post_url)
+        if canonical_url is None:
+            raise WeiboError(PARSER_FAILED, "无法从公开 URL 解析博文")
+        _, uid, bid = canonical_url.rsplit("/", 2)
         data = _http_get_json(f"https://weibo.com/ajax/statuses/show?id={bid}")
         it = ((data.get("data") or {}).get("status")) or data.get("status") or {}
         if not it:
@@ -405,4 +402,6 @@ class WeiboCollector(BaseCollector):
     def collect_comments(self, post_url: str, limit: int = 20) -> list[dict[str, Any]]:
         """公开评论采样尚未实现；不得用空列表伪装成功。"""
         self._require_enabled()
+        if canonical_item_url("weibo", post_url) is None:
+            raise WeiboError("COMMENTS_UNAVAILABLE", "微博公开评论采样未实现")
         raise WeiboError("COMMENTS_UNAVAILABLE", "微博公开评论采样未实现")

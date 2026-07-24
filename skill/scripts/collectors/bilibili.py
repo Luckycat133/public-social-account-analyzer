@@ -33,6 +33,7 @@ from functools import reduce
 from typing import Any
 
 from .base import BaseCollector
+from .url_policy import canonical_item_url
 
 API = "https://api.bilibili.com"
 WEB = "https://space.bilibili.com"
@@ -656,9 +657,10 @@ class BilibiliCollector(BaseCollector):
         # 任何额外路径段（/dynamic、/video、/search 等）。
         if not isinstance(url, str):
             return False
-        return bool(
-            re.match(r"^https?://space\.bilibili\.com/\d+/?(/\?[^/]*)?$", url.strip())
-        )
+        return bool(re.fullmatch(
+            r"https?://space\.bilibili\.com/\d+/?(?:\?[^#/]*)?(?:#[^/]*)?",
+            url.strip(),
+        ))
 
     # -- 访问检查（不绕过） --
     def check_access(self, url: str) -> dict:
@@ -841,10 +843,10 @@ class BilibiliCollector(BaseCollector):
 
     # -- 单条详情 --
     def collect_post_detail(self, post_url: str) -> dict:
-        m = re.search(r"BV[0-9A-Za-z]+", post_url)
-        if not m:
-            raise BilibiliError(STOP_UNSUPPORTED, f"无法解析 BV: {post_url}")
-        bv = m.group(0)
+        canonical_url = canonical_item_url("bilibili", post_url)
+        if canonical_url is None:
+            raise BilibiliError(STOP_UNSUPPORTED, "无法解析公开 BV URL")
+        bv = canonical_url.rsplit("/", 1)[-1]
         s = self._new_session()
         s.ensure_buvid()
         data = s.get_json("/x/web-interface/view", {"bvid": bv})
@@ -857,17 +859,17 @@ class BilibiliCollector(BaseCollector):
         view_data = data.get("data")
         if not view_data:
             raise BilibiliError(STOP_ACCESS_RESTRICTED, "view 响应数据为空")
-        return self.normalize_post(_build_post_raw_from_view(view_data, post_url))
+        return self.normalize_post(_build_post_raw_from_view(view_data, canonical_url))
 
     # -- 评论采集（best-effort，urllib-only，免登录） --
     def collect_comments(self, post_url: str, limit: int = 20) -> list[dict]:
         """取公开评论；仅明确成功的空 replies 可返回空列表。"""
-        m = re.search(r"BV[0-9A-Za-z]+", post_url)
-        if not m:
+        canonical_url = canonical_item_url("bilibili", post_url)
+        if canonical_url is None:
             raise BilibiliError(
                 STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
             )
-        bvid = m.group(0)
+        bvid = canonical_url.rsplit("/", 1)[-1]
         try:
             aid = self._bv_to_aid_urllib(bvid)
             if aid is None:

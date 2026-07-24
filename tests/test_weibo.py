@@ -62,6 +62,17 @@ def test_enabled_collect_profile_parses(enabled, monkeypatch):
     assert prof["field_visibility"]["post_count"] == "visible"
 
 
+def test_enabled_profile_canonicalizes_direct_profile_url(enabled, monkeypatch):
+    monkeypatch.setattr(weibo, "_http_get_json", _fake_json)
+    c = WeiboCollector()
+
+    profile = c.collect_profile(
+        "https://www.weibo.com/u/123456?token=PROFILE_SECRET#PROFILE_FRAGMENT"
+    )
+
+    assert profile["profile_url"] == "https://weibo.com/u/123456"
+
+
 def test_enabled_collect_post_list_parses(enabled, monkeypatch):
     monkeypatch.setattr(weibo, "_http_get_json", _fake_json)
     c = WeiboCollector()
@@ -86,6 +97,25 @@ def test_enabled_collect_post_detail_parses(enabled, monkeypatch):
     post = c.collect_post_detail("https://weibo.com/123456/a1")
     assert post["post_id"] == "a1"
     assert "话题1" in (post.get("hashtags") or [])
+
+
+def test_enabled_detail_rejects_item_id_hidden_in_untrusted_host(
+    enabled, monkeypatch
+):
+    monkeypatch.setattr(
+        weibo,
+        "_http_get_json",
+        lambda _url: pytest.fail("invalid item URL must not fetch"),
+    )
+    c = WeiboCollector()
+
+    with pytest.raises(WeiboError) as exc:
+        c.collect_post_detail(
+            "https://evil.example/path/weibo.com/123456/a1?token=EVIL_SECRET"
+        )
+
+    assert exc.value.stop_reason == "PARSER_FAILED"
+    assert "EVIL_SECRET" not in str(exc.value)
 
 
 def test_enabled_comments_raise_unavailable_instead_of_false_empty(enabled):
