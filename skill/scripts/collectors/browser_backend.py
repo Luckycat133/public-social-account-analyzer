@@ -288,6 +288,7 @@ class BrowserSession:
         self._cmd_id = 0
         self._events: deque = deque()
         self._startup_timeout = startup_timeout
+        self._cleanup_diagnostics: list[str] = []
 
     # -- 生命周期 --
     def start(self) -> "BrowserSession":
@@ -371,25 +372,40 @@ class BrowserSession:
         self._send_cdp("Network.enable", {})
         self._send_cdp("Page.enable", {})
 
-    def _send_cdp(self, method: str, params: dict) -> dict:
+    def _send_cdp(
+        self,
+        method: str,
+        params: dict,
+        timeout: Optional[float] = None,
+    ) -> dict:
         assert self._ws is not None
+        bounded_timeout = None
+        if timeout is not None:
+            bounded_timeout = max(0.001, float(timeout))
+            self._ws.set_timeout(bounded_timeout)
         self._cmd_id += 1
         cid = self._cmd_id
         self._ws.send_text(
             json.dumps({"id": cid, "method": method, "params": params})
         )
-        while True:
-            msg = self._ws.recv_message()
-            if msg is None:
-                raise BrowserError("浏览器连接在处理 CDP 指令时关闭")
-            if msg.get("method"):
-                self._events.append(msg)
-                continue
-            if msg.get("id") != cid:
-                continue
-            if "error" in msg:
-                raise BrowserError(f"CDP {method} 失败: {msg['error']}")
-            return msg.get("result", {})
+        try:
+            while True:
+                msg = self._ws.recv_message()
+                if msg is None:
+                    raise BrowserError("浏览器连接在处理 CDP 指令时关闭")
+                if msg.get("method"):
+                    self._events.append(msg)
+                    continue
+                if msg.get("id") != cid:
+                    continue
+                if "error" in msg:
+                    raise BrowserError(f"CDP {method} 失败: {msg['error']}")
+                return msg.get("result", {})
+        except socket.timeout as exc:
+            raise BrowserError(f"CDP {method} 超时") from exc
+        finally:
+            if bounded_timeout is not None:
+                self._ws.set_timeout(self._startup_timeout)
 
     def drain_events(self, method: Optional[str] = None) -> list[dict]:
         matched, remaining = [], deque()
@@ -434,13 +450,23 @@ class BrowserSession:
                 },
             )
 
-    def evaluate(self, expression: str, await_promise: bool = False) -> Any:
-        result = self._send_cdp("Runtime.evaluate", {
+    def evaluate(
+        self,
+        expression: str,
+        await_promise: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        params = {
             "expression": expression,
             "awaitPromise": await_promise,
             "returnByValue": True,
             "userGesture": False,
-        })
+        }
+        result = (
+            self._send_cdp("Runtime.evaluate", params)
+            if timeout is None
+            else self._send_cdp("Runtime.evaluate", params, timeout=timeout)
+        )
         if "exceptionDetails" in result:
             raise BrowserError(
                 f"浏览器脚本执行失败: {result['exceptionDetails'].get('text')}"
@@ -449,23 +475,46 @@ class BrowserSession:
 
     def navigate(self, url: str, timeout: float = 30.0) -> None:
         self.drain_events("Page.loadEventFired")
+        started = time.monotonic()
         result = self._send_cdp("Page.navigate", {"url": url})
         if result.get("errorText"):
             raise BrowserError(f"页面导航失败: {result['errorText']}")
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            event = self.poll_event(min(1.0, deadline - time.monotonic()))
-            if event and event.get("method") == "Page.loadEventFired":
-                return
-        raise BrowserError(f"页面加载超时: {url}")
+        deadline = started + timeout
+        deferred: list[dict] = []
+        try:
+            while time.monotonic() < deadline:
+                event = self.poll_event(min(1.0, deadline - time.monotonic()))
+                if event and event.get("method") == "Page.loadEventFired":
+                    return
+                if event is not None:
+                    deferred.append(event)
+            raise BrowserError(f"页面加载超时: {url}")
+        finally:
+            # `poll_event` removes events from the FIFO.  Navigation is only
+            # interested in the load marker, so restore every other event in
+            # front of events that arrived later, preserving observation order.
+            self._events.extendleft(reversed(deferred))
 
-    def scroll_by(self, viewports: int = 1) -> None:
-        self.evaluate(
+    def scroll_by(
+        self,
+        viewports: int = 1,
+        timeout: Optional[float] = None,
+    ) -> None:
+        expression = (
             f"window.scrollBy(0, window.innerHeight * {max(1, int(viewports))}); true"
         )
+        if timeout is None:
+            self.evaluate(expression)
+        else:
+            self.evaluate(expression, timeout=timeout)
 
-    def page_text(self) -> str:
-        value = self.evaluate("document.body ? document.body.innerText : ''")
+    def page_text(self, timeout: Optional[float] = None) -> str:
+        expression = "document.body ? document.body.innerText : ''"
+        value = (
+            self.evaluate(expression)
+            if timeout is None
+            else self.evaluate(expression, timeout=timeout)
+        )
         return value if isinstance(value, str) else ""
 
     def fetch_text(self, url: str, headers: Optional[Dict[str, str]] = None) -> str:
@@ -482,32 +531,66 @@ class BrowserSession:
         value = self.evaluate(expr, await_promise=True)
         return value if isinstance(value, str) else ""
 
-    def get_response_body(self, request_id: str) -> str:
-        result = self._send_cdp("Network.getResponseBody", {"requestId": request_id})
+    def get_response_body(
+        self,
+        request_id: str,
+        timeout: Optional[float] = None,
+    ) -> str:
+        params = {"requestId": request_id}
+        result = (
+            self._send_cdp("Network.getResponseBody", params)
+            if timeout is None
+            else self._send_cdp("Network.getResponseBody", params, timeout=timeout)
+        )
         body = result.get("body", "")
         if result.get("base64Encoded"):
             return base64.b64decode(body).decode("utf-8", errors="replace")
         return body
 
+    @property
+    def cleanup_diagnostics(self) -> tuple[str, ...]:
+        """Return sanitized lifecycle diagnostics (never filesystem paths)."""
+        return tuple(self._cleanup_diagnostics)
+
+    def _record_cleanup_diagnostic(self, code: str) -> None:
+        if code not in self._cleanup_diagnostics:
+            self._cleanup_diagnostics.append(code)
+
     def close(self) -> None:
         if self._ws is not None:
             try:
                 self._ws.close()
-            except OSError:
-                pass
+            except Exception:  # noqa: BLE001 - cleanup must preserve active errors
+                self._record_cleanup_diagnostic("WEBSOCKET_CLOSE_FAILED")
             self._ws = None
         if self._proc is not None:
+            proc = self._proc
+            self._proc = None
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=5)
+                proc.terminate()
+                proc.wait(timeout=5)
             except Exception:  # noqa: BLE001
                 try:
-                    self._proc.kill()
+                    proc.kill()
                 except Exception:  # noqa: BLE001
-                    pass
-            self._proc = None
+                    self._record_cleanup_diagnostic("PROCESS_KILL_FAILED")
+                else:
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:  # noqa: BLE001
+                        self._record_cleanup_diagnostic("PROCESS_REAP_FAILED")
         if os.path.isdir(self._user_data_dir):
-            shutil.rmtree(self._user_data_dir, ignore_errors=True)
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(self._user_data_dir)
+                    break
+                except Exception:  # noqa: BLE001 - bounded cleanup retry
+                    if not os.path.exists(self._user_data_dir):
+                        break
+                    if attempt < 2:
+                        time.sleep(0.05)
+            if os.path.exists(self._user_data_dir):
+                self._record_cleanup_diagnostic("PROFILE_REMOVE_FAILED")
 
     def __enter__(self) -> "BrowserSession":
         return self.start()

@@ -4,7 +4,9 @@
 """
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 from collections import deque
 
@@ -349,6 +351,58 @@ def test_navigate_ignores_stale_load_event_but_observes_fresh_one():
     assert seen == ["fresh"]
 
 
+def test_navigate_restores_non_load_events_in_original_order():
+    """Network events observed before load stay available to the transport."""
+    session = BrowserSession.__new__(BrowserSession)
+    network = {
+        "method": "Network.responseReceived",
+        "params": {"requestId": "first-screen"},
+    }
+    after_load = {
+        "method": "Network.loadingFinished",
+        "params": {"requestId": "first-screen"},
+    }
+    session._events = deque()
+
+    def navigate_command(method, params):
+        session._events.extend([
+            network,
+            {"method": "Page.loadEventFired", "params": {}},
+            after_load,
+        ])
+        return {}
+
+    session._send_cdp = navigate_command
+
+    session.navigate("https://www.douyin.com/user/example")
+
+    assert list(session._events) == [network, after_load]
+
+
+def test_page_apis_forward_bounded_command_timeouts():
+    """Every potentially blocking page command accepts the remaining budget."""
+    session = BrowserSession.__new__(BrowserSession)
+    calls = []
+
+    def send(method, params, timeout=None):
+        calls.append((method, timeout))
+        if method == "Runtime.evaluate":
+            return {"result": {"value": "visible"}}
+        return {"body": "{}", "base64Encoded": False}
+
+    session._send_cdp = send
+
+    assert session.page_text(timeout=0.4) == "visible"
+    assert session.get_response_body("r1", timeout=0.3) == "{}"
+    session.scroll_by(1, timeout=0.2)
+
+    assert calls == [
+        ("Runtime.evaluate", 0.4),
+        ("Network.getResponseBody", 0.3),
+        ("Runtime.evaluate", 0.2),
+    ]
+
+
 def test_scroll_by_evaluates_at_least_one_viewport():
     session = BrowserSession.__new__(BrowserSession)
     calls = []
@@ -364,6 +418,72 @@ def test_page_text_returns_only_string_values():
     session.evaluate = lambda expression: 42
 
     assert session.page_text() == ""
+
+
+def test_close_kills_waits_and_retries_profile_cleanup(monkeypatch):
+    """A timed-out browser is reaped before its temporary profile is removed."""
+
+    class StuckProc:
+        def __init__(self):
+            self.calls = []
+            self.wait_count = 0
+
+        def terminate(self):
+            self.calls.append("terminate")
+
+        def wait(self, timeout):
+            self.calls.append(("wait", timeout))
+            self.wait_count += 1
+            if self.wait_count == 1:
+                raise subprocess.TimeoutExpired("chrome", timeout)
+            return 0
+
+        def kill(self):
+            self.calls.append("kill")
+
+    session = BrowserSession(port=9222)
+    proc = StuckProc()
+    session._proc = proc
+    profile_dir = session._user_data_dir
+    real_rmtree = shutil.rmtree
+    attempts = []
+
+    def flaky_rmtree(path):
+        attempts.append(path)
+        if len(attempts) < 3:
+            raise PermissionError("profile still locked")
+        real_rmtree(path)
+
+    monkeypatch.setattr("collectors.browser_backend.shutil.rmtree", flaky_rmtree)
+    monkeypatch.setattr("collectors.browser_backend.time.sleep", lambda _: None)
+
+    session.close()
+
+    assert proc.calls == ["terminate", ("wait", 5), "kill", ("wait", 5)]
+    assert attempts == [profile_dir, profile_dir, profile_dir]
+    assert session.cleanup_diagnostics == ()
+    assert not os.path.exists(profile_dir)
+
+
+def test_close_reports_sanitized_cleanup_failure_without_raising(monkeypatch):
+    """Cleanup failure is observable without disclosing the profile path."""
+    session = BrowserSession(port=9222)
+    profile_dir = session._user_data_dir
+    real_rmtree = shutil.rmtree
+    monkeypatch.setattr(
+        "collectors.browser_backend.shutil.rmtree",
+        lambda path: (_ for _ in ()).throw(PermissionError(path)),
+    )
+    monkeypatch.setattr("collectors.browser_backend.time.sleep", lambda _: None)
+
+    session.close()
+
+    assert session.cleanup_diagnostics == ("PROFILE_REMOVE_FAILED",)
+    assert profile_dir not in repr(session.cleanup_diagnostics)
+
+    # The method remains idempotent and never replaces an active exception.
+    session.close()
+    real_rmtree(profile_dir)
 
 
 # --------------------------------------------------------------------------
