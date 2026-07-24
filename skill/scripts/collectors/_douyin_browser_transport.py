@@ -705,12 +705,17 @@ def collect_account_page(
         ):
             budget = remaining()
             if budget > 0:
-                for item in extract_dom_items(_dom_cards(session, budget)):
-                    item_id = str(item["aweme_id"])
-                    if item_id not in items:
-                        items[item_id] = item
-                    else:
-                        _merge_missing(items[item_id], item)
+                cards = _dom_cards(session, budget)
+                if remaining() <= 0:
+                    deadline_expired = True
+                    stop_condition = "timeout"
+                else:
+                    for item in extract_dom_items(cards):
+                        item_id = str(item["aweme_id"])
+                        if item_id not in items:
+                            items[item_id] = item
+                        else:
+                            _merge_missing(items[item_id], item)
             else:
                 deadline_expired = True
                 stop_condition = "timeout"
@@ -727,6 +732,8 @@ def collect_account_page(
     item_budget_truncated = len(items) > requested
     if restriction:
         stop_condition = restriction
+    elif deadline_expired or stop_condition == "timeout":
+        stop_condition = "timeout"
     elif all_posts and terminal_page_observed and not item_budget_truncated:
         stop_condition = "terminal_page"
     elif len(final) >= requested:
@@ -737,6 +744,7 @@ def collect_account_page(
         all_posts
         and terminal_page_observed
         and not item_budget_truncated
+        and not deadline_expired
         and not restriction
         and stop_condition == "terminal_page"
     )

@@ -432,8 +432,10 @@ def test_all_collector_rejects_items_without_numeric_platform_post_id(invalid_it
     with pytest.raises(DouyinError) as exc_info:
         collector.collect_all_post_list(ACCOUNT_URL)
 
-    assert exc_info.value.stop_reason == STOP_NO_PUBLIC_CONTENT
+    assert exc_info.value.stop_reason == "PARSER_FAILED"
     assert exc_info.value.partial_posts == []
+    assert collector.get_collection_coverage()["is_exhaustive"] is False
+    assert collector.get_collection_coverage()["terminal_page_observed"] is False
 
 
 def test_all_collector_drops_invalid_ids_without_profile_url_fallback():
@@ -563,6 +565,82 @@ def test_all_terminal_empty_list_writes_failed_no_public_content(
     assert task["task_status"] == "FAILED"
     assert task["stop_reason"] == STOP_NO_PUBLIC_CONTENT
     assert task["collection_coverage"]["is_exhaustive"] is True
+
+
+def test_all_exhaustive_date_range_with_no_matches_returns_successful_empty():
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[AWEME],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "observed_page_count": 1,
+                "observed_post_count": 1,
+                "stop_condition": "terminal_page",
+            },
+        )
+    )
+
+    posts = collector.collect_all_post_list(
+        ACCOUNT_URL,
+        date_range=("2030-01-01T00:00:00+08:00", None),
+    )
+
+    assert posts == []
+    assert collector.get_collection_coverage()["observed_post_count"] == 1
+    assert collector.get_collection_coverage()["range_filter_applied"] is True
+    assert collector.get_collection_coverage()["range_match_count"] == 0
+    assert collector.get_collection_coverage()["range_no_match"] is True
+
+
+def test_all_exhaustive_date_range_no_match_writes_completed_workspace(
+    monkeypatch, tmp_path
+):
+    import collect
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[AWEME],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "observed_page_count": 1,
+                "observed_post_count": 1,
+                "stop_condition": "terminal_page",
+            },
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "check_access",
+        lambda url: {"accessible": True},
+    )
+    monkeypatch.setattr(
+        collector,
+        "collect_profile",
+        lambda url: {"platform": "douyin", "field_visibility": {}},
+    )
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [collector])
+
+    assert collect.run(
+        ACCOUNT_URL,
+        out_dir=str(tmp_path),
+        collect_all=True,
+        date_from="2030-01-01",
+    ) == 0
+    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "COMPLETED"
+    assert task["stop_reason"] is None
+    assert task["collected_count"] == 0
+    assert task["collection_coverage"]["observed_post_count"] == 1
+    assert task["collection_coverage"]["range_no_match"] is True
 
 
 def test_collect_post_list_keeps_ssr_fast_path_without_browser(monkeypatch):
@@ -1337,6 +1415,95 @@ def test_collect_account_page_skips_dom_after_deadline():
     assert result.aweme_items == []
     assert browser.evaluations == []
     assert result.diagnostics["stop_condition"] == "timeout"
+
+
+def test_terminal_page_timeout_after_response_decode_is_not_exhaustive():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    state = {"decoded": False}
+
+    class DecodeExpiryBrowser(FakeBrowser):
+        def get_response_body(self, request_id):
+            body = super().get_response_body(request_id)
+            state["decoded"] = True
+            return body
+
+    browser = DecodeExpiryBrowser(
+        events=[
+            _response_event("terminal"),
+            _loading_event("Network.loadingFinished", "terminal"),
+        ],
+        bodies={
+            "terminal": json.dumps({
+                "aweme_list": [AWEME],
+                "has_more": False,
+            })
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        max_seconds=1.0,
+        session_factory=lambda: browser,
+        monotonic=lambda: 2.0 if state["decoded"] else 0.0,
+        sleep=lambda _: None,
+    )
+
+    assert result.diagnostics["stop_condition"] == "timeout"
+    assert result.coverage["stop_condition"] == "timeout"
+    assert result.coverage["is_exhaustive"] is False
+
+
+def test_terminal_page_timeout_during_dom_fallback_is_not_exhaustive():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    state = {"expired": False}
+
+    class DomFallbackExpiryBrowser(FakeBrowser):
+        def __init__(self):
+            super().__init__(
+                events=[
+                    _response_event("terminal"),
+                    _loading_event("Network.loadingFinished", "terminal"),
+                ],
+                bodies={
+                    "terminal": json.dumps({
+                        "aweme_list": [AWEME],
+                        "has_more": False,
+                    })
+                },
+                cards=[{
+                    "href": "https://www.douyin.com/video/7002",
+                    "text": "must not be read",
+                }],
+            )
+            self.evaluations = []
+
+        def evaluate(self, expression):
+            self.evaluations.append(expression)
+            cards = super().evaluate(expression)
+            state["expired"] = True
+            return cards
+
+    browser = DomFallbackExpiryBrowser()
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        max_seconds=1.0,
+        session_factory=lambda: browser,
+        monotonic=lambda: 2.0 if state["expired"] else 0.0,
+        sleep=lambda _: None,
+    )
+
+    assert len(browser.evaluations) == 1
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
+    assert result.diagnostics["stop_condition"] == "timeout"
+    assert result.coverage["stop_condition"] == "timeout"
+    assert result.coverage["is_exhaustive"] is False
 
 
 def test_collect_account_page_confirms_date_lower_bound_on_following_round():

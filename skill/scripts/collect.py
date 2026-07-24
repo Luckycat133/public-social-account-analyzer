@@ -301,6 +301,7 @@ def _sanitize_collection_coverage(value) -> dict:
         "observed_post_count",
         "cursor_fingerprint_count",
         "repeated_cursor_count",
+        "range_match_count",
     ):
         field_value = value.get(key)
         if isinstance(field_value, int) and not isinstance(field_value, bool):
@@ -322,6 +323,15 @@ def _sanitize_collection_coverage(value) -> dict:
         and requested_all
         and terminal_observed
         and stop_condition == "terminal_page"
+    )
+    range_filter_applied = value.get("range_filter_applied") is True
+    range_match_count = clean.get("range_match_count")
+    clean["range_filter_applied"] = range_filter_applied
+    clean["range_no_match"] = bool(
+        value.get("range_no_match") is True
+        and range_filter_applied
+        and clean.get("observed_post_count", 0) > 0
+        and range_match_count == 0
     )
     return clean
 
@@ -691,8 +701,18 @@ def run(
             print(f"[warn] 评论采样异常(不阻塞主任务): {e}", file=sys.stderr)
 
     # 6) 最终任务状态:无 stop_reason → COMPLETED;有 stop_reason 但有数据 → PARTIAL
+    exhaustive_range_no_match = bool(
+        collect_all
+        and date_range is not None
+        and collection_coverage.get("is_exhaustive") is True
+        and collection_coverage.get("range_filter_applied") is True
+        and collection_coverage.get("range_no_match") is True
+        and collection_coverage.get("observed_post_count", 0) > 0
+        and collection_coverage.get("range_match_count") == 0
+        and not posts
+    )
     if stop_reason is None:
-        task_status = "COMPLETED" if posts else "FAILED"
+        task_status = "COMPLETED" if posts or exhaustive_range_no_match else "FAILED"
         if not posts and not profile:
             stop_reason = SR_NO_PUBLIC_CONTENT
             task_status = "FAILED"

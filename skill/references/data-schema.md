@@ -85,11 +85,17 @@ workspace/<platform>-<account>-<date>/
 | `observed_post_count` | integer | 去重后保留作品数量 |
 | `cursor_fingerprint_count` | integer | 仅在内存中计算后得到的不同游标指纹数量 |
 | `repeated_cursor_count` | integer | 观察到重复游标指纹的次数 |
+| `range_filter_applied` | boolean | 是否应用了日期范围过滤 |
+| `range_match_count` | integer | 日期范围过滤后保留的作品数量 |
+| `range_no_match` | boolean | 已观察到有效作品但日期范围内匹配数为零 |
 | `stop_condition` | enum | `terminal_page` / `idle` / `timeout` / `repeated_cursor` / `max_items` / `max_scrolls` / `date_lower_bound` |
 
 只有已验证作品列表载荷上的显式 `has_more=false` 可以令 `is_exhaustive=true`。空闲、超时、
 重复游标、数量/滚动预算或日期边界停止都属于非穷尽结果；若已保留作品，任务状态为
 `PARTIAL`。原始游标、请求头、查询字符串、响应正文和请求体不得写入账本或其他任务产物。
+当公开列表已验证到末页、存在有效数字作品 ID，但日期范围过滤后为零条时，任务可以
+`COMPLETED`；此时 `observed_post_count>0`、`range_filter_applied=true`、
+`range_match_count=0`、`range_no_match=true`，不得与账号原始公开作品列表为空混淆。
 
 ## 4. Profile 数据结构
 

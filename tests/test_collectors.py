@@ -283,6 +283,26 @@ def test_normalize_post_preserves_explicit_public_booleans():
     ) == (False, False, False)
 
 
+def test_collection_coverage_preserves_coherent_range_no_match_disclosure():
+    from collect import _sanitize_collection_coverage
+
+    coverage = _sanitize_collection_coverage({
+        "requested_all": True,
+        "is_exhaustive": True,
+        "terminal_page_observed": True,
+        "observed_post_count": 3,
+        "stop_condition": "terminal_page",
+        "range_filter_applied": True,
+        "range_match_count": 0,
+        "range_no_match": True,
+    })
+
+    assert coverage["observed_post_count"] == 3
+    assert coverage["range_filter_applied"] is True
+    assert coverage["range_match_count"] == 0
+    assert coverage["range_no_match"] is True
+
+
 # ---------------------------------------------------------------------------
 # P0 B站标签接口接线：collect_tags 已接入 collect_post_list 全量流程，
 # API 标签合并进 base.hashtags（离线 FakeSession 验证真实调用路径）。

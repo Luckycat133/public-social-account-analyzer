@@ -516,6 +516,7 @@ class DouyinCollector(BaseCollector):
             "observed_post_count",
             "cursor_fingerprint_count",
             "repeated_cursor_count",
+            "range_match_count",
         )
         allowed_stops = {
             "terminal_page",
@@ -544,6 +545,15 @@ class DouyinCollector(BaseCollector):
             and requested_all
             and terminal_observed
             and stop_condition == "terminal_page"
+        )
+        range_filter_applied = value.get("range_filter_applied") is True
+        range_match_count = clean.get("range_match_count")
+        clean["range_filter_applied"] = range_filter_applied
+        clean["range_no_match"] = bool(
+            value.get("range_no_match") is True
+            and range_filter_applied
+            and clean.get("observed_post_count", 0) > 0
+            and range_match_count == 0
         )
         return clean
 
@@ -595,15 +605,14 @@ class DouyinCollector(BaseCollector):
         self._collection_coverage = self._sanitize_collection_coverage(
             getattr(result, "coverage", {})
         )
-        valid_items = [
-            item
-            for item in result.aweme_items
-            if isinstance(item, dict)
-            and re.fullmatch(
-                r"\d+",
-                str(item.get("aweme_id") or item.get("aweme_id_str") or ""),
-            )
-        ]
+        valid_by_id: dict[str, dict[str, Any]] = {}
+        for item in result.aweme_items:
+            if not isinstance(item, dict):
+                continue
+            post_id = str(item.get("aweme_id") or item.get("aweme_id_str") or "")
+            if re.fullmatch(r"\d+", post_id) and post_id not in valid_by_id:
+                valid_by_id[post_id] = item
+        valid_items = list(valid_by_id.values())
         posts = [
             self.normalize_post(
                 self._build_post_raw(
@@ -619,6 +628,12 @@ class DouyinCollector(BaseCollector):
         if date_range:
             posts = self._filter_by_date(posts, date_range)
         posts = posts[:max_items]
+        self._collection_coverage["observed_post_count"] = len(valid_items)
+        self._collection_coverage["range_filter_applied"] = date_range is not None
+        self._collection_coverage["range_match_count"] = len(posts)
+        self._collection_coverage["range_no_match"] = bool(
+            date_range is not None and valid_items and not posts
+        )
 
         if result.restriction:
             raise DouyinError(
@@ -634,6 +649,15 @@ class DouyinCollector(BaseCollector):
                 partial_posts=posts,
                 diagnostic_code=result.diagnostic_code,
             )
+        if result.aweme_items and not valid_items:
+            self._collection_coverage["terminal_page_observed"] = False
+            self._collection_coverage["is_exhaustive"] = False
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器作品载荷未包含有效的数字平台作品 ID",
+                partial_posts=[],
+                diagnostic_code="INVALID_PLATFORM_POST_ID",
+            )
         if not self._collection_coverage.get("is_exhaustive", False):
             raise DouyinError(
                 STOP_PARSER_FAILED,
@@ -641,7 +665,7 @@ class DouyinCollector(BaseCollector):
                 partial_posts=posts,
                 diagnostic_code="ALL_POSTS_INCOMPLETE",
             )
-        if not posts:
+        if not valid_items:
             raise DouyinError(
                 STOP_NO_PUBLIC_CONTENT,
                 "公开作品列表已到末页，账号没有可验证的公开作品",
