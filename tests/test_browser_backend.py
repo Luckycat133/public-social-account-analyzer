@@ -5,10 +5,13 @@
 import os
 import sys
 
+import pytest
+
+# pytest 由 conftest.py 注入 sys.path；此处仅为 `python tests/test_xxx.py` 独立运行保留
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
-    if os.path.isdir(_d) and _d not in sys.path:
-        sys.path.insert(0, _d)
+_SCRIPTS = os.path.join(_REPO_ROOT, "skill", "scripts")
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
 
 from collectors.browser_backend import (  # noqa: E402
     BrowserError,
@@ -176,7 +179,8 @@ def test_ws_client_fragmented_text():
 def test_get_json_browser_fallback_wiring(monkeypatch):
     from collectors.bilibili import Session, STOP_ACCESS_RESTRICTED, BilibiliError
 
-    monkeypatch.setattr("collectors.bilibili._backoff", lambda _: 0)
+    # _backoff 现定义于 _bilibili_transport（Session.get_json 在该模块解析 _backoff 名）
+    monkeypatch.setattr("collectors._bilibili_transport._backoff", lambda _: 0)
     s = Session(browser_fallback=True)
     s._wbi = ("a" * 64, "b" * 64)  # 跳过真实 wbi 刷新（需 64 字符密钥）
 
@@ -195,7 +199,7 @@ def test_get_json_browser_fallback_wiring(monkeypatch):
 def test_get_json_no_fallback_raises_on_waf(monkeypatch):
     from collectors.bilibili import Session, STOP_ACCESS_RESTRICTED, BilibiliError
 
-    monkeypatch.setattr("collectors.bilibili._backoff", lambda _: 0)
+    monkeypatch.setattr("collectors._bilibili_transport._backoff", lambda _: 0)
     s = Session(browser_fallback=False)
     s._wbi = ("a" * 64, "b" * 64)
 
@@ -209,6 +213,60 @@ def test_get_json_no_fallback_raises_on_waf(monkeypatch):
         raise AssertionError("expected BilibiliError")
     except BilibiliError as e:
         assert e.stop_reason == STOP_ACCESS_RESTRICTED
+
+
+def test_get_json_browser_fallback_wraps_browser_error(monkeypatch):
+    """浏览器降级自身失败时保留结构化访问受限错误，而非 NameError。"""
+    from collectors.bilibili import Session, STOP_ACCESS_RESTRICTED, BilibiliError
+
+    monkeypatch.setattr("collectors._bilibili_transport._backoff", lambda _: 0)
+    s = Session(browser_fallback=True)
+    monkeypatch.setattr(
+        s,
+        "_curl",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            BilibiliError(STOP_ACCESS_RESTRICTED, "WAF -412")
+        ),
+    )
+    monkeypatch.setattr(s, "ensure_buvid", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "_fetch_via_browser",
+        lambda *args, **kwargs: (_ for _ in ()).throw(BrowserError("Chrome 启动失败")),
+    )
+
+    try:
+        s.get_json("/x/space/wbi/arc/search", {"mid": 1}, retry=1)
+        raise AssertionError("expected BilibiliError")
+    except BilibiliError as exc:
+        assert exc.stop_reason == STOP_ACCESS_RESTRICTED
+        assert "浏览器降级也失败" in exc.message
+
+
+def test_get_json_non_json_login_does_not_retry_or_fallback(monkeypatch):
+    """明确登录墙必须立即停止，不能被当成临时非 JSON 响应重试。"""
+    from collectors.bilibili import Session, BilibiliError, STOP_LOGIN
+
+    attempts = []
+    s = Session(browser_fallback=True)
+
+    def login_page(*args, **kwargs):
+        attempts.append(1)
+        return "<html>login 请先登录后查看</html>"
+
+    monkeypatch.setattr(s, "_curl", login_page)
+    monkeypatch.setattr(s, "ensure_buvid", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "_fetch_via_browser",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not fallback")),
+    )
+
+    with pytest.raises(BilibiliError) as exc:
+        s.get_json("/x/web-interface/view", {"bvid": "BV1"}, retry=3)
+
+    assert exc.value.stop_reason == STOP_LOGIN
+    assert len(attempts) == 1
 
 
 if __name__ == "__main__":

@@ -7,13 +7,16 @@ import os
 import sys
 import json
 
+# pytest 由 conftest.py 注入 sys.path；此处仅为 `python tests/test_xxx.py` 独立运行保留
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
-    if os.path.isdir(_d) and _d not in sys.path:
-        sys.path.insert(0, _d)
+_SCRIPTS = os.path.join(_REPO_ROOT, "skill", "scripts")
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
 
 from collectors.bilibili import (  # noqa: E402
     BilibiliCollector,
+    _Retryable,
+    _backoff,
     _build_post_raw_from_vlist,
     _build_post_raw_from_view,
     enc_wbi,
@@ -165,6 +168,12 @@ def test_wbi():
     check("wts 存在", "wts" in signed)
     check("web_location 参与签名(仍在参数中)", signed.get("web_location") == "333.1007")
     check("mixin 表长度 64", len(MIXIN_KEY_ENC_TAB) == 64)
+
+
+def test_transport_compatibility_reexports():
+    """拆分传输层后，既有从 bilibili 模块导入私有兼容符号的路径仍可用。"""
+    assert _Retryable.__name__ == "_Retryable"
+    assert _backoff(0) > 0
 
 
 def test_stop_reason_codes():

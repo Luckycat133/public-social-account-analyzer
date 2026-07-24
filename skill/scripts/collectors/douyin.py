@@ -1,4 +1,4 @@
-"""抖音公开账号采集适配器（P0，urllib-only）。
+"""抖音公开账号采集适配器（P0）。
 
 仅用标准库 `urllib` 访问 douyin.com / iesdouyin.com / v.douyin.com 的**公开**
 账号主页，把可解析到的字段映射到统一 `Profile` / `Post` 结构（见
@@ -29,27 +29,28 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from typing import Any
 
 
 from .base import BaseCollector
-
-
-# --------------------------------------------------------------------------
-# stop_reason 常量（取值严格对齐 exceptions.md §9.2，不得新增）
-# --------------------------------------------------------------------------
-STOP_LOGIN = "LOGIN_REQUIRED"
-STOP_VERIFICATION = "VERIFICATION_REQUIRED"
-STOP_ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
-STOP_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
-STOP_PARSER_FAILED = "PARSER_FAILED"
-STOP_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
-STOP_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
-STOP_INTERNAL = "INTERNAL_ERROR"
-
-# 抖音公开接口 / 主页均使用北京时间（+08:00）
-_BEIJING = timezone(timedelta(hours=8))
+from ._constants import (  # 共享常量（re-export：测试通过 from collectors.douyin import STOP_* 仍可用）
+    BEIJING_TZ as _BEIJING,
+    STOP_LOGIN,
+    STOP_VERIFICATION,
+    STOP_ACCOUNT_UNAVAILABLE,
+    STOP_ACCESS_RESTRICTED,
+    STOP_PARSER_FAILED,
+    STOP_NO_PUBLIC_CONTENT,
+    STOP_UNSUPPORTED,
+    STOP_INTERNAL,
+)
+from ._utils import (  # 共享工具函数（本地别名以最小化调用点改动）
+    now_iso as _now_iso,
+    parse_int as _int,
+    ts_to_iso as _ts_to_iso,
+    extract_hashtags,
+)
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -82,46 +83,10 @@ class DouyinError(Exception):
 
 
 # --------------------------------------------------------------------------
-# 工具函数
+# 工具函数（_now_iso / _ts_to_iso / _int 已下沉至 _utils.py，此处仅保留
+# 抖音特有的 _extract_hashtags —— 它需从 text_extra 结构化字段提取，并复用
+# 共享 extract_hashtags 处理 desc 文本部分）
 # --------------------------------------------------------------------------
-def _now_iso() -> str:
-    """当前北京时间 ISO 8601。"""
-    return datetime.now(_BEIJING).isoformat()
-
-
-def _ts_to_iso(ts: Any) -> str | None:
-    """Unix 秒 → 北京时间 ISO 8601；失败返回 None。"""
-    if not ts:
-        return None
-    try:
-        return datetime.fromtimestamp(int(ts), tz=_BEIJING).isoformat()
-    except (ValueError, OverflowError, OSError, TypeError):
-        return None
-
-
-def _int(v: Any) -> int | None:
-    """宽松数字解析：支持 '1.2万' / '3.4亿' / 纯数字；失败返回 None。"""
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
-        return int(v)
-    s = str(v).strip()
-    if not s:
-        return None
-    mult = 1
-    if "亿" in s:
-        mult = 100_000_000
-    if "万" in s:
-        mult = 10_000
-    s = s.replace("亿", "").replace("万", "").replace(",", "").replace("+", "").strip()
-    try:
-        return int(float(s) * mult)
-    except ValueError:
-        return None
-
-
 def _extract_hashtags(desc: Any, text_extra: Any) -> list[str]:
     """从文案与 text_extra 抽取话题标签，去重保序。"""
     tags: list[str] = []
@@ -131,8 +96,8 @@ def _extract_hashtags(desc: Any, text_extra: Any) -> list[str]:
             if name and name not in tags:
                 tags.append(name)
     if isinstance(desc, str):
-        for m in re.findall(r"#([^#\s]+)#?", desc):
-            if m and m not in tags:
+        for m in extract_hashtags(desc):
+            if m not in tags:
                 tags.append(m)
     return tags
 
@@ -271,7 +236,16 @@ class DouyinCollector(BaseCollector):
 
     # -- 传输 ---------------------------------------------------------------
     def _fetch(self, url: str) -> str:
-        """urllib 取页面文本；HTTP/网络错误如实上抛对应 stop_reason。"""
+        """urllib 取页面文本；如开启浏览器降级且 urllib 直连无可用 RENDER_DATA，则通过 BrowserSession 发起 CDP 页面导航渲染。"""
+        import os
+
+        html: str | None = None
+        use_fallback = bool(
+            os.environ.get("DOUYIN_BROWSER_FALLBACK") == "1"
+            or os.environ.get("BILIBILI_BROWSER_FALLBACK") == "1"
+            or os.environ.get("BROWSER_FALLBACK") == "1"
+        )
+
         req = urllib.request.Request(
             url,
             headers={
@@ -283,7 +257,7 @@ class DouyinCollector(BaseCollector):
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
                 charset = resp.headers.get_content_charset() or "utf-8"
-                return resp.read().decode(charset, errors="replace")
+                html = resp.read().decode(charset, errors="replace")
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 429):
                 raise DouyinError(
@@ -295,10 +269,37 @@ class DouyinCollector(BaseCollector):
                 )
             raise DouyinError(STOP_ACCESS_RESTRICTED, f"HTTP {e.code}: {url}")
         except urllib.error.URLError as e:
-            # 网络层错误（DNS/连接被拒等），按访问受限如实上抛，不重试绕过。
-            raise DouyinError(
-                STOP_ACCESS_RESTRICTED, f"网络错误: {e.reason} ({url})"
-            )
+            if not use_fallback:
+                raise DouyinError(
+                    STOP_ACCESS_RESTRICTED, f"网络错误: {e.reason} ({url})"
+                )
+
+        # 直连页面已明确提示登录/验证/访问受限时，立即停止；浏览器降级不是
+        # 绕过这些保护的路径。
+        if html:
+            restriction = _detect_restriction(html)
+            if restriction:
+                raise DouyinError(restriction, f"页面命中访问限制标记: {restriction}")
+
+        # 尝试浏览器降级：仅在直连无明确限制、且没有可解析数据时进行。
+        if use_fallback and (not html or _extract_render_data(html) is None):
+            try:
+                from .browser_backend import BrowserSession, find_browser
+
+                if find_browser():
+                    with BrowserSession() as b:
+                        rendered_html = b.navigate_and_get_html(url, wait_seconds=3.5)
+                        if rendered_html and _detect_restriction(rendered_html) is None:
+                            return rendered_html
+                        if rendered_html:
+                            html = rendered_html
+            except Exception:
+                pass
+
+        if html:
+            return html
+        raise DouyinError(STOP_ACCESS_RESTRICTED, f"页面抓取失败: {url}")
+
 
     # -- 访问检查（不绕过） -------------------------------------------------
     def check_access(self, url: str) -> dict[str, Any]:
@@ -372,7 +373,7 @@ class DouyinCollector(BaseCollector):
                         "unique_id": ui.get("unique_id"),
                         "enterprise_verify_reason": ui.get("enterprise_verify_reason"),
                     },
-                    "collected_at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
+                    "collected_at": datetime.now(_BEIJING).isoformat(),
                     "field_visibility": {
                         "account_name": "visible" if ui.get("nickname") else "hidden",
                         "bio": "visible" if ui.get("signature") else "hidden",
@@ -685,6 +686,9 @@ class DouyinCollector(BaseCollector):
         collection = aweme.get("mix_info") or aweme.get("collection")
         collection_name = (collection or {}).get("mix_name") if isinstance(collection, dict) else None
         single_text = (desc or "").split("\n")[0] if isinstance(desc, str) else None
+        # 抖音 duration 单位为毫秒，归一化为秒；_int 对非数字返回 None，需先判空避免 TypeError。
+        duration_ms = _int(video.get("duration"))
+        duration_seconds = (duration_ms // 1000) if duration_ms is not None else None
         return {
             "platform": "douyin",
             "post_id": str(aweme.get("aweme_id") or aweme.get("aweme_id_str")),
@@ -693,7 +697,7 @@ class DouyinCollector(BaseCollector):
             "content_type": content_type,
             "title": single_text,
             "text": desc,
-            "duration_seconds": (_int(video.get("duration")) // 1000) if video.get("duration") is not None else None,
+            "duration_seconds": duration_seconds,
             "hashtags": _extract_hashtags(desc, text_extra),
             "is_pinned": is_top,
             "is_repost": False,

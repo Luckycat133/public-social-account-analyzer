@@ -15,6 +15,7 @@
 - [快速上手](#快速上手)
 - [产物结构](#产物结构)
 - [自动化测试](#自动化测试)
+- [评估数据集管理](#评估数据集管理)
 - [许可证](#许可证)
 
 ---
@@ -36,20 +37,26 @@ public-social-account-analyzer/             # 项目根目录
 ├── README.md                              # 项目主说明文档 (Standard Readme)
 ├── USAGE.md                               # 详细使用指南与故障排查
 ├── CHANGELOG.md                           # 变更日志 (Keep a Changelog v1.1.0)
-├── TODO.md                                # 待办事项与开发路线图
-├── 测试分析-问题整理与目录结构.md           # 架构分析与 Agent 观测日志
+├── ROADMAP.md                             # 历史路线图（既有条目已完成；评论洞察待实施）
 ├── pyproject.toml                         # Python 项目与 Pytest 配置
 ├── docs/                                  # 架构设计与技术文档
+│   ├── STRUCTURE.md                        # 目录、模块职责与依赖关系
+│   ├── plans/                             # 重构与优化实施方案
+│   └── observations/                      # 历史观测日志与分析文档
 ├── tests/                                 # Pytest 自动化单元测试集
 ├── workspace/                             # 任务运行产物输出目录
 └── skill/                                 # AI Agent 纯净技能包 (Agent Skills 规范)
     ├── SKILL.md                           # Agent 技能指令与执行契约
     ├── scripts/                           # Python 执行脚本 (collect/normalize/analyze/render)
-    │   └── collectors/                    # 平台适配器 (bilibili / douyin / weibo)
+    │   ├── README.md                       # 脚本入口、模块边界与依赖说明
+    │   └── collectors/                    # 平台适配器 (bilibili / douyin / weibo + 共享层)
     ├── references/                        # 领域数据模型与分析规则规范
     ├── assets/                            # HTML 仪表盘模版 (report-template.html)
-    └── evals/                             # 评估与验收测试用例 (cases.md)
+    └── evals/                             # 评估与验收
+        └── datasets/                      # source / validation_data / test_data
 ```
+
+完整目录结构、模块责任清单与依赖关系见 [docs/STRUCTURE.md](docs/STRUCTURE.md)。
 
 ---
 
@@ -57,7 +64,7 @@ public-social-account-analyzer/             # 项目根目录
 
 | 平台 | 成熟度 | 适配器路径 | 核心能力 |
 |:---|:---|:---|:---|
-| **B站 (Bilibili)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/bilibili.py` | 三级接口降级链、WBI 签名、置顶/合集标识、传输层降级重试 |
+| **B站 (Bilibili)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/bilibili.py` + `_bilibili_transport.py` | 三级接口降级链、WBI 签名、置顶/合集标识、传输层降级重试 |
 | **抖音 (Douyin)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/douyin.py` | SSR `RENDER_DATA` 解析、公开指标提取、风控模式识别 |
 | **微博 (Weibo)** | 🟡 P1 (条件支持) | `skill/scripts/collectors/weibo.py` | 需显式启用适配器；未启用时返回 `ADAPTER_UNAVAILABLE` |
 
@@ -102,7 +109,7 @@ pip install -e ".[dev]"
 
 ## 快速上手
 
-系统通过四步标准化流水线完成账号分析：
+系统通过确定性流水线完成账号分析；在有有效样本时，Agent Skill 流程默认再执行一轮分类标注：
 
 ```bash
 # 步骤 1：采集公开账号数据（以 B站 为例）
@@ -111,10 +118,16 @@ python skill/scripts/collect.py "https://space.bilibili.com/123456" --limit 30
 # 步骤 2：数据归一化
 python skill/scripts/normalize.py --input workspace/bilibili-123456-20260724
 
-# 步骤 3：计算确定性指标与分类策略
-python skill/scripts/analyze.py --input workspace/bilibili-123456-20260724 --platform bilibili
+# 步骤 3：计算确定性指标，并生成分类 Prompt（CLI 不会自行调用 LLM）
+python skill/scripts/analyze.py --input workspace/bilibili-123456-20260724 --platform bilibili --with-llm-tax
 
-# 步骤 4：生成报告与 HTML 仪表盘
+# 步骤 4：由执行 Agent 读取 taxonomy-prompt.md，按分类规则写 taxonomy-results.json
+# 仅填分类槽位，不修改确定性数值；这一步由 Agent 执行，不是脚本自动调用 LLM。
+
+# 步骤 5：回填 Agent 产出的分类结果
+python skill/scripts/analyze.py --input workspace/bilibili-123456-20260724 --llm-tax-results workspace/bilibili-123456-20260724/taxonomy-results.json
+
+# 步骤 6：生成报告与 HTML 仪表盘
 python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 ```
 
@@ -124,12 +137,13 @@ python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 
 ## 产物结构
 
-执行完成后，在 `workspace/<platform>-<account>-<date>/` 目录下生成以下标准化产物：
+从仓库根执行完整流水线后，产物位于 `workspace/<platform>-<account>-<date>/`：
 
 - `source/profile.json` — 原始公开账号资料快照
 - `source/posts.jsonl` — 原始公开内容列表
 - `normalized-posts.csv` — 遵循统一数据模型的归一化 CSV 表格
-- `collection-report.md` — 采集质量与字段覆盖率说明
+- `normalized-coverage.json` — 归一化阶段生成的字段覆盖率、去重和解析错误摘要
+- `collection-report.md` — 采集阶段生成的公开字段可见性与质量说明
 - `account-analysis-report.md` — 完整 Markdown 账号分析报告（含具体证据 URL）
 - `dashboard.html` — 可视化 HTML 仪表盘
 - `analysis.json` — 机器可读的统计指标与分类分析 JSON
@@ -144,7 +158,28 @@ python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 pytest tests/
 ```
 
-当前包含 73 项单元测试，覆盖适配器解析、日期时间计算、去重映射与指标统计算法。
+当前包含 128 项单元测试，覆盖适配器解析、浏览器降级接线、日期时间计算、去重与增量续采、指标统计、归一化、报告渲染、微博适配器及数据集划分。
+
+---
+
+## 评估数据集管理
+
+Agent Skill 的离线评估数据位于 `skill/evals/datasets/`，采用以下用途隔离：
+
+- `source/`：唯一可维护的主数据池；
+- `validation_data/`：开发阶段的回归与错误分析；
+- `test_data/`：版本候选和发布验收使用的留出集；
+- `manifest.json`：记录数据版本、分层策略、记录数、分布和 SHA-256。
+
+```bash
+# 预览固定 seed 的分层划分
+python3 skill/scripts/split_dataset.py --dry-run
+
+# 校验 schema、重复 ID、分区泄漏、覆盖、数量与 checksum
+python3 skill/scripts/split_dataset.py --verify
+```
+
+数据来源、字段定义、划分比例、权限和使用边界见 [评估数据集说明](skill/evals/datasets/README.md) 与 [使用规范](skill/evals/datasets/USAGE.md)。
 
 ---
 

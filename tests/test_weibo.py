@@ -6,12 +6,13 @@
 """
 import pytest
 
+import collect
 import collectors.weibo as weibo
 from collectors.weibo import (
     WeiboCollector,
     WeiboError,
-    LOGIN_REQUIRED,
-    ADAPTER_UNAVAILABLE,
+    STOP_LOGIN,
+    STOP_ADAPTER_UNAVAILABLE,
 )
 
 
@@ -62,6 +63,35 @@ def test_enabled_collect_profile_parses(enabled, monkeypatch):
     assert prof["field_visibility"]["post_count"] == "visible"
 
 
+def test_enabled_check_access_uses_base_collector_success_contract(enabled, monkeypatch):
+    monkeypatch.setattr(weibo, "_http_get_json", _fake_json)
+
+    access = WeiboCollector().check_access("https://weibo.com/u/123456")
+
+    assert access["accessible"] is True
+    # status 是平台扩展字段：微博仍提供 ok，但 BaseCollector 不要求所有适配器使用它。
+    assert access.get("status") == "ok"
+    assert access["stop_reason"] is None
+
+
+def test_enabled_weibo_collect_run_continues_past_access_check(enabled, monkeypatch, tmp_path):
+    """已启用的微博适配器不能因 access 成功响应缺字段而在编排层失败。"""
+    calls = []
+
+    def tracked_json(url):
+        calls.append(url)
+        return _fake_json(url)
+
+    monkeypatch.setattr(weibo, "_http_get_json", tracked_json)
+    monkeypatch.setattr(weibo.time, "sleep", lambda _: None)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [WeiboCollector()])
+
+    out_dir = tmp_path / "weibo-run"
+    assert collect.run("https://weibo.com/u/123456", out_dir=str(out_dir)) == 0
+    assert any("mymblog" in url for url in calls)
+    assert (out_dir / "source" / "profile.json").exists()
+
+
 def test_enabled_collect_post_list_parses(enabled, monkeypatch):
     monkeypatch.setattr(weibo, "_http_get_json", _fake_json)
     c = WeiboCollector()
@@ -90,12 +120,12 @@ def test_enabled_collect_post_detail_parses(enabled, monkeypatch):
 
 def test_login_wall_raises_login_required(enabled, monkeypatch):
     def _boom(url: str):
-        raise WeiboError(LOGIN_REQUIRED, "微博要求登录")
+        raise WeiboError(STOP_LOGIN, "微博要求登录")
     monkeypatch.setattr(weibo, "_http_get_json", _boom)
     c = WeiboCollector()
     with pytest.raises(WeiboError) as exc:
         c.collect_profile("https://weibo.com/u/123456")
-    assert exc.value.stop_reason == LOGIN_REQUIRED
+    assert exc.value.stop_reason == STOP_LOGIN
 
 
 def test_disabled_still_adapter_unavailable(monkeypatch):
@@ -105,4 +135,4 @@ def test_disabled_still_adapter_unavailable(monkeypatch):
     c = WeiboCollector()
     with pytest.raises(RuntimeError) as exc:
         c.collect_profile("https://weibo.com/u/123456")
-    assert ADAPTER_UNAVAILABLE in str(exc.value)
+    assert STOP_ADAPTER_UNAVAILABLE in str(exc.value)

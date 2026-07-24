@@ -8,9 +8,9 @@
 
     说明:
     - 通过 `from collectors.base import` / `from collectors.bilibili import` 导入
-      (需 scripts/ 在 sys.path,且 scripts/collectors/__init__.py 存在,本文件已自动处理)。
+      (需 scripts/ 在 sys.path,本文件已自动处理)。
     - 抖音/微博适配器若未实现,自动跳过(不会报错)。
-    - 输出到 workspace/<platform>-<account>-<date>/ 下:
+    - 未指定 --out 时输出到仓库根 workspace/<platform>-<account>-<date>/ 下:
       source/profile.json、source/posts.jsonl、normalized-posts.csv、collection-report.md、task.json。
     - task.json 记录 task_status 与 stop_reason(见 references/exceptions.md §1)。
 """
@@ -22,39 +22,28 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
-# 让脚本可直接运行:把 scripts/collectors/ 与 scripts/ 都加入 sys.path,
-# 以支持采集器内的平级 `from base import` / `from bilibili import`。
+# 让脚本可直接运行:把 scripts/ 加入 sys.path,使 `from collectors.* import` 可解析。
+# collectors 子包使用相对导入,无需把 collectors/ 本身加入 sys.path。
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_COLLECTORS = os.path.join(_HERE, "collectors")
-for _p in (_COLLECTORS, _HERE):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from collectors.base import BaseCollector  # noqa: E402
-
-# 北京时间为中国平台默认时区(见 references/data-schema.md §1)
-_BEIJING = timezone(timedelta(hours=8))
-
-# 任务级 stop_reason 取值,严格对齐 references/exceptions.md §9.2 / references/data-schema.md §9.2
-SR_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
-SR_ADAPTER_UNAVAILABLE = "ADAPTER_UNAVAILABLE"
-SR_LOGIN = "LOGIN_REQUIRED"
-SR_VERIFICATION = "VERIFICATION_REQUIRED"
-SR_ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
-SR_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
-SR_PARSER_FAILED = "PARSER_FAILED"
-SR_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
-SR_INTERNAL = "INTERNAL_ERROR"
-
-# 适配器异常类 → stop_reason 映射(按异常属性 / 类名兜底)
-# 已知 stop_reason 集合,用于从异常消息前缀 [REASON] 兜底识别
-_KNOWN_STOP_REASONS = frozenset({
-    SR_UNSUPPORTED, SR_ADAPTER_UNAVAILABLE, SR_LOGIN, SR_VERIFICATION,
-    SR_ACCOUNT_UNAVAILABLE, SR_ACCESS_RESTRICTED, SR_PARSER_FAILED,
-    SR_NO_PUBLIC_CONTENT, SR_INTERNAL,
-})
+from collectors._constants import (  # 共享常量（时区 + stop_reason 枚举）
+    BEIJING_TZ as _BEIJING,
+    STOP_UNSUPPORTED,
+    STOP_ADAPTER_UNAVAILABLE,
+    STOP_LOGIN,
+    STOP_VERIFICATION,
+    STOP_ACCOUNT_UNAVAILABLE,
+    STOP_ACCESS_RESTRICTED,
+    STOP_PARSER_FAILED,
+    STOP_NO_PUBLIC_CONTENT,
+    STOP_INTERNAL,
+    KNOWN_STOP_REASONS as _KNOWN_STOP_REASONS,
+)
 
 
 def _stop_reason_from_exc(e: Exception) -> str:
@@ -72,7 +61,7 @@ def _stop_reason_from_exc(e: Exception) -> str:
     m = re.search(r"\[([A-Z_]+)\]", msg)
     if m and m.group(1) in _KNOWN_STOP_REASONS:
         return m.group(1)
-    return SR_INTERNAL
+    return STOP_INTERNAL
 
 
 def _load_adapters() -> list[BaseCollector]:
@@ -278,6 +267,22 @@ def _merge_incremental(existing: list[dict], new: list[dict]) -> tuple[list[dict
     return list(merged_map.values()) + kept_no_key, new_count
 
 
+def _reserve_default_workspace(platform: str, account: str, date: str) -> str:
+    """原子保留一个默认任务目录，避免并发采集覆盖彼此的产物。"""
+    workspace_root = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "workspace")
+    os.makedirs(workspace_root, exist_ok=True)
+    base = os.path.join(workspace_root, f"{platform}-{account}-{date}")
+    candidate = base
+    suffix = 2
+    while True:
+        try:
+            os.mkdir(candidate)
+            return candidate
+        except FileExistsError:
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+
+
 def _write_task_json(
     ws: str,
     *,
@@ -378,7 +383,7 @@ def run(
     adapter = _pick(adapters, url)
     if adapter is None:
         # URL 不属于任何已加载平台 → UNSUPPORTED_PLATFORM(见 exceptions.md §1)
-        print(f"[FAILED] 无支持的适配器: {url} (stop_reason={SR_UNSUPPORTED})", file=sys.stderr)
+        print(f"[FAILED] 无支持的适配器: {url} (stop_reason={STOP_UNSUPPORTED})", file=sys.stderr)
         return 2
 
     platform = adapter.platform
@@ -386,9 +391,7 @@ def run(
     m = re.search(r"(\d+)", url)
     account = m.group(1) if m else "account"
     date = datetime.now(_BEIJING).strftime("%Y%m%d")
-    ws = out_dir or os.path.join(
-        os.path.dirname(_HERE), "workspace", f"{platform}-{account}-{date}"
-    )
+    ws = out_dir or _reserve_default_workspace(platform, account, date)
     src = os.path.join(ws, "source")
     os.makedirs(src, exist_ok=True)
 
@@ -440,7 +443,7 @@ def run(
     try:
         access = adapter.check_access(url)
         if not access.get("accessible"):
-            stop_reason = access.get("stop_reason") or SR_INTERNAL
+            stop_reason = access.get("stop_reason") or STOP_INTERNAL
             # check_access 阶段尚无已采数据,所有受阻场景统一 FAILED(见 exceptions.md §1)
             task_status = "FAILED"
             _write_task_json(
@@ -547,7 +550,7 @@ def run(
     if stop_reason is None:
         task_status = "COMPLETED" if posts else "FAILED"
         if not posts and not profile:
-            stop_reason = SR_NO_PUBLIC_CONTENT
+            stop_reason = STOP_NO_PUBLIC_CONTENT
             task_status = "FAILED"
     else:
         task_status = "PARTIAL" if posts else "FAILED"
@@ -579,7 +582,7 @@ def main() -> None:
     ap.add_argument("url", help="账号主页 URL,如 https://space.bilibili.com/123")
     ap.add_argument("--limit", type=int, default=30, help="采集条数(默认30,最大100)")
     ap.add_argument(
-        "--out", default=None, help="输出目录(默认 workspace/<platform>-<account>-<date>/)"
+        "--out", default=None, help="输出目录(默认仓库根 workspace/<platform>-<account>-<date>/)"
     )
     ap.add_argument("--comments", action="store_true", help="开启评论采样(默认关)")
     ap.add_argument("--date-from", default=None, help="起始日期 YYYY-MM-DD 或 ISO 8601(北京时间)")
@@ -601,8 +604,9 @@ def main() -> None:
     )
     args = ap.parse_args()
     if args.browser_fallback:
-        # 透传给采集适配器(Session 构造时读取此环境变量)
+        # 透传给采集适配器(Session 构造与 DouyinCollector 读取此环境变量)
         os.environ["BILIBILI_BROWSER_FALLBACK"] = "1"
+        os.environ["DOUYIN_BROWSER_FALLBACK"] = "1"
     limit = max(1, min(args.limit, 100))
     date_from_iso = _parse_date(args.date_from)
     date_to_iso = _default_date_to(args.date_to)

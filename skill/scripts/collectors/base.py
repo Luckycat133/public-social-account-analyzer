@@ -14,7 +14,14 @@ class BaseCollector(ABC):
 
     @abstractmethod
     def check_access(self, url: str) -> dict[str, Any]:
-        """Return accessibility status without bypassing protection."""
+        """Return access status without bypassing protection.
+
+        Successful checks must return at least ``accessible=True``. ``status``
+        is an optional platform-specific detail. Failed checks must return
+        ``accessible=False`` and a concrete ``stop_reason``; adapters may
+        raise their structured error type for failures that cannot be
+        represented as a response.
+        """
 
     @abstractmethod
     def collect_profile(self, url: str) -> dict[str, Any]:

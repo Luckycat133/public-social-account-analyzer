@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Added standardized `source`, `validation_data`, and held-out `test_data` documentation, a path configuration example, and an operational data usage guide.
+- Added evaluation dataset tests covering schema contracts, duplicate IDs, partition leakage, source coverage, manifest counts, and local file modes.
+- Added script-layer and historical-observation indexes that document entry-point contracts, module boundaries, and evidence freshness.
+
+### Changed
+- Extended `split_dataset.py --verify` to validate JSONL structure, required fields, partition integrity, record counts, and SHA-256 checksums.
+- Upgraded the evaluation dataset manifest to schema version 2 with dataset version, path, split-policy, and quality-check metadata.
+- Consolidated the repository structure documentation with the current 128-test suite, collector dependency direction, networking boundaries, and relocated historical records.
+- Kept comment sampling explicitly best-effort only; comment persistence and comment-insight conclusions remain unimplemented rather than being claimed by evaluation data.
+- Clarified LLM taxonomy behavior: the Agent Skill flow assigns classification to the executing agent when valid samples exist, while `analyze.py` only exposes optional prompt-generation and result-backfill interfaces and never calls an LLM itself.
+
+### Security
+- Established a local permission baseline of `0750` for dataset directories and `0640` for dataset files, with deployment guidance because Git does not preserve full Unix modes.
+
 ## [1.0.0] - 2026-07-24
 
 ### Added

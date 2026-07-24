@@ -38,7 +38,7 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 
 #### 可选选项：
 - `--limit INT`：最大采集条数。默认值：`30`，上限：`100`。
-- `--out PATH`：指定输出目录路径。默认自动生成为 `workspace/<platform>-<account>-<date>/`。
+- `--out PATH`：指定输出目录路径。默认自动生成为仓库根 `workspace/<platform>-<account>-<date>/`（从仓库根执行命令）。
 - `--comments`：开启评论采样（默认关闭）。
 - `--date-from / --date-to`：采集时间范围（YYYY-MM-DD 或 ISO 8601，北京时间）。两者与 `--limit` 共同限定结果。
 - `--resume`：增量续采。读取 `--out` 指定目录既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧）。**必须配合 `--out`**，否则直接报错退出。
@@ -75,8 +75,10 @@ python skill/scripts/analyze.py --input <WORKSPACE_DIR> --platform <PLATFORM> [O
 #### 可选选项：
 - `--analysis-goal STRING`：分析目标描述（如："分析选题与发布节奏"）。
 - `--requested-limit INT`：请求的采集条数限制。
-- `--with-llm-tax`：生成分类 Prompt 模版 `taxonomy-prompt.md`（主题/形式/漏斗/钩子四维度），交给外部 LLM 对 `normalized-posts.csv` 打标。
-- `--llm-tax-results PATH`：回填经外部 LLM 打标的结果文件（JSON/CSV），经枚举校验后写入 `analysis.json`，`classification_version = llm-1`。未提供时不臆造分类。
+- `--with-llm-tax`：生成分类 Prompt 模版 `taxonomy-prompt.md`（主题/形式/漏斗/钩子四维度），供执行 Agent 或外部 LLM 打标。
+- `--llm-tax-results PATH`：回填执行 Agent 或外部 LLM 产出的结果文件（JSON/CSV），经枚举校验后写入 `analysis.json`，`classification_version = llm-1`。未提供时不臆造分类。
+
+> Agent Skill 流程在存在有效样本时默认安排执行 Agent 完成分类：先传 `--with-llm-tax`，由 Agent 写出 `taxonomy-results.json`，再传 `--llm-tax-results` 回填。`analyze.py` 的两个 CLI 参数本身始终是可选接口，脚本不内调 LLM、不会自动产生分类结果。
 
 > 分析脚本默认输出四分法互动率（含 `deep_approval_rate`、`community_discussion_rate`）、IQR 散布比与季节性/学期检测指标，详见 `skill/references/analysis-rules.md`。
 
@@ -111,7 +113,7 @@ python skill/scripts/render_report.py --input <WORKSPACE_DIR>
 # 1. 采集前 50 条公开投稿
 python skill/scripts/collect.py "https://space.bilibili.com/123456" --limit 50
 
-# 假设生成的输出目录为 workspace/bilibili-123456-20260724
+# 从仓库根执行时，假设生成的输出目录为 workspace/bilibili-123456-20260724
 
 # 2. 归一化
 python skill/scripts/normalize.py --input workspace/bilibili-123456-20260724

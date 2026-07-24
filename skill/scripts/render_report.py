@@ -697,6 +697,9 @@ def build_metrics_dashboard(analysis) -> tuple[str, str]:
 
 
 def _render_perf_group(group, main_metric: str | None = None) -> tuple[str, str]:
+    if isinstance(group, str):
+        return (f"样本不足（{group}），本模块不输出高低表现组，不补造结论。",
+                f'<p class="note warn">样本不足（{h_esc(group)}），本模块不输出高低表现组，不补造结论。</p>')
     if not isinstance(group, list) or not group:
         return EMPTY_MD, EMPTY_HTML
 

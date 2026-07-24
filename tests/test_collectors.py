@@ -10,6 +10,8 @@
 
 网络相关场景用轻量 FakeCollector 抛真实 BilibiliError 或文档化单元断言，保持 GREEN。
 """
+import pytest
+
 import analyze
 from collectors.bilibili import (
     BilibiliCollector,
@@ -17,7 +19,8 @@ from collectors.bilibili import (
     STOP_LOGIN,
     STOP_VERIFICATION,
 )
-from collectors.weibo import WeiboCollector, ADAPTER_UNAVAILABLE
+from collectors.weibo import WeiboCollector, STOP_ADAPTER_UNAVAILABLE
+from collectors.douyin import DouyinCollector, DouyinError, STOP_LOGIN
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,36 @@ def test_bilibili_supports_rejects_bare_domain_and_non_numeric():
     assert c.supports("https://bilibili.com/946974") is False
 
 
+def test_douyin_direct_login_wall_stops_before_browser_fallback(monkeypatch):
+    """直连已明确要求登录时不得因启用 fallback 再启动浏览器。"""
+    import collectors.douyin as douyin
+    import collectors.browser_backend as browser_backend
+
+    class Response:
+        headers = type("Headers", (), {"get_content_charset": lambda self: "utf-8"})()
+
+        def read(self):
+            return "<html>请先登录后查看</html>".encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setenv("DOUYIN_BROWSER_FALLBACK", "1")
+    monkeypatch.setattr(douyin.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(
+        browser_backend,
+        "find_browser",
+        lambda: (_ for _ in ()).throw(AssertionError("browser fallback must not run")),
+    )
+
+    with pytest.raises(DouyinError) as exc:
+        DouyinCollector()._fetch("https://www.douyin.com/user/example")
+    assert exc.value.stop_reason == STOP_LOGIN
+
+
 # ---------------------------------------------------------------------------
 # WeiboCollector 未启用
 # ---------------------------------------------------------------------------
@@ -71,7 +104,7 @@ def test_weibo_disabled_raises_adapter_unavailable():
         raised = False
     except RuntimeError as e:
         raised = True
-        assert ADAPTER_UNAVAILABLE in str(e)
+        assert STOP_ADAPTER_UNAVAILABLE in str(e)
     assert raised, "未启用时应抛 ADAPTER_UNAVAILABLE，而非返回空数据"
 
 
@@ -294,4 +327,3 @@ def test_collect_tags_wired_into_full_flow(monkeypatch):
     assert "apiTagA" in tags and "apiTagB" in tags
     # 文本提取标签也保留
     assert "t1" in tags and "t2" in tags and "t3" in tags
-

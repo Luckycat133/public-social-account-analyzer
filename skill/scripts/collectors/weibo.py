@@ -25,25 +25,27 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
-from .base import BaseCollector  # 适配 scripts/collectors 作为 sys.path 入口
+from .base import BaseCollector  # 相对导入：collectors 作为 skill/scripts 子包
+from ._constants import (  # 共享常量（re-export：测试通过 from collectors.weibo import STOP_* 仍可用）
+    BEIJING_TZ as _BEIJING,
+    STOP_LOGIN,
+    STOP_VERIFICATION,
+    STOP_ACCOUNT_UNAVAILABLE,
+    STOP_ACCESS_RESTRICTED,
+    STOP_PARSER_FAILED,
+    STOP_NO_PUBLIC_CONTENT,
+    STOP_UNSUPPORTED,
+    STOP_ADAPTER_UNAVAILABLE,
+)
+from ._utils import extract_hashtags as _extract_hashtags  # 共享工具函数
 
 # P2 可选平台：默认关闭，经环境变量开启真实采集，不阻塞 MVP。
 ENABLED = os.environ.get("WEIBO_COLLECTOR_ENABLED", "0") == "1"
 
 PLATFORM = "weibo"
-
-# 微博 stop_reason 取值严格对齐 references/exceptions.md 枚举（字符串值一致）
-ADAPTER_UNAVAILABLE = "ADAPTER_UNAVAILABLE"
-LOGIN_REQUIRED = "LOGIN_REQUIRED"
-VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
-ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
-ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
-PARSER_FAILED = "PARSER_FAILED"
-NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
-UNSUPPORTED_PLATFORM = "UNSUPPORTED_PLATFORM"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -54,9 +56,6 @@ _HEADERS = {
     "Referer": "https://weibo.com/",
     "Accept": "application/json, text/plain, */*",
 }
-
-# 北京时间为微博默认时区
-_BEIJING = timezone(timedelta(hours=8))
 
 # URL 路由正则
 _RE_UID = re.compile(r"^https?://weibo\.com/u/(\d+)(?:[/?].*)?$", re.IGNORECASE)
@@ -102,10 +101,10 @@ def _http_get_text(url: str) -> str:
     except urllib.error.HTTPError as e:
         # 401/403/302/405 → 登录墙或验证码，立即停止
         if e.code in (401, 403, 302, 405):
-            raise WeiboError(LOGIN_REQUIRED, f"微博要求登录/验证码 (HTTP {e.code}): {url}")
-        raise WeiboError(ACCESS_RESTRICTED, f"微博访问受限 (HTTP {e.code}): {url}")
+            raise WeiboError(STOP_LOGIN, f"微博要求登录/验证码 (HTTP {e.code}): {url}")
+        raise WeiboError(STOP_ACCESS_RESTRICTED, f"微博访问受限 (HTTP {e.code}): {url}")
     except urllib.error.URLError as e:
-        raise WeiboError(ACCESS_RESTRICTED, f"微博网络不可达: {e}")
+        raise WeiboError(STOP_ACCESS_RESTRICTED, f"微博网络不可达: {e}")
 
 
 def _http_get_json(url: str) -> dict:
@@ -115,8 +114,8 @@ def _http_get_json(url: str) -> dict:
     except json.JSONDecodeError:
         low = raw.lower()
         if "passport" in low or "登录" in raw or "login" in low:
-            raise WeiboError(LOGIN_REQUIRED, "微博返回登录页而非 JSON，需登录")
-        raise WeiboError(PARSER_FAILED, "微博返回非 JSON，解析失败")
+            raise WeiboError(STOP_LOGIN, "微博返回登录页而非 JSON，需登录")
+        raise WeiboError(STOP_PARSER_FAILED, "微博返回非 JSON，解析失败")
 
 
 # ---------------------------------------------------------------------------
@@ -126,16 +125,6 @@ def _strip_html(html_text: str) -> str:
     if not html_text:
         return ""
     return html.unescape(re.sub(r"<[^>]+>", "", html_text)).strip()
-
-
-def _extract_hashtags(text: str) -> list[str]:
-    if not text:
-        return []
-    tags: list[str] = []
-    for m in re.findall(r"#([^#\s]+)#?", text):
-        if m and m not in tags:
-            tags.append(m)
-    return tags
 
 
 def _parse_weibo_time(s: Any) -> str | None:
@@ -194,8 +183,8 @@ def _resolve_uid(url: str) -> str:
         uid_m = re.search(r'"uid"\s*:\s*"?(\d+)"?', page) or re.search(r"/u/(\d+)", page)
         if uid_m:
             return uid_m.group(1)
-        raise WeiboError(ACCOUNT_UNAVAILABLE, f"无法从微博主页解析 uid: {name}")
-    raise WeiboError(ACCOUNT_UNAVAILABLE, f"不支持的微博 URL: {url}")
+        raise WeiboError(STOP_ACCOUNT_UNAVAILABLE, f"无法从微博主页解析 uid: {name}")
+    raise WeiboError(STOP_ACCOUNT_UNAVAILABLE, f"不支持的微博 URL: {url}")
 
 
 def _build_post_raw(it: dict, uid: str) -> dict:
@@ -260,7 +249,7 @@ class WeiboCollector(BaseCollector):
         """
         if not ENABLED:
             raise RuntimeError(
-                f"[{ADAPTER_UNAVAILABLE}] WeiboCollector 未启用（可选平台，"
+                f"[{STOP_ADAPTER_UNAVAILABLE}] WeiboCollector 未启用（可选平台，"
                 "ENABLED=False），采集被拒绝；不得伪装为已采集。"
             )
 
@@ -294,8 +283,8 @@ class WeiboCollector(BaseCollector):
         data = _http_get_json(f"https://weibo.com/ajax/profile/info?uid={uid}")
         user = (data.get("data") or {}).get("user")
         if not user:
-            raise WeiboError(ACCOUNT_UNAVAILABLE, "微博账号不存在或无公开资料")
-        return {"status": "ok", "stop_reason": None}
+            raise WeiboError(STOP_ACCOUNT_UNAVAILABLE, "微博账号不存在或无公开资料")
+        return {"accessible": True, "status": "ok", "stop_reason": None}
 
     # ------------------------------------------------------------------
     # 账号资料
@@ -308,7 +297,7 @@ class WeiboCollector(BaseCollector):
         data = _http_get_json(f"https://weibo.com/ajax/profile/info?uid={uid}")
         user = (data.get("data") or {}).get("user") or {}
         if not user:
-            raise WeiboError(ACCOUNT_UNAVAILABLE, "微博 profile/info 未返回用户信息")
+            raise WeiboError(STOP_ACCOUNT_UNAVAILABLE, "微博 profile/info 未返回用户信息")
         followers = _int(user.get("followers_count"))
         post_count = _int(user.get("statuses_count"))
         raw = {
@@ -379,7 +368,7 @@ class WeiboCollector(BaseCollector):
             page += 1
             time.sleep(1.0)  # 翻页间隔，降低频控概率
         if not out:
-            raise WeiboError(NO_PUBLIC_CONTENT, f"微博账号 {uid} 无公开博文")
+            raise WeiboError(STOP_NO_PUBLIC_CONTENT, f"微博账号 {uid} 无公开博文")
         return out[:limit]
 
     # ------------------------------------------------------------------
@@ -391,12 +380,12 @@ class WeiboCollector(BaseCollector):
             self._require_enabled()
         m = re.search(r"weibo\.com/(\d+)/(\w+)", post_url or "")
         if not m:
-            raise WeiboError(PARSER_FAILED, f"无法从 URL 解析博文: {post_url}")
+            raise WeiboError(STOP_PARSER_FAILED, f"无法从 URL 解析博文: {post_url}")
         uid, bid = m.group(1), m.group(2)
         data = _http_get_json(f"https://weibo.com/ajax/statuses/show?id={bid}")
         it = ((data.get("data") or {}).get("status")) or data.get("status") or {}
         if not it:
-            raise WeiboError(ACCESS_RESTRICTED, "微博博文详情未公开")
+            raise WeiboError(STOP_ACCESS_RESTRICTED, "微博博文详情未公开")
         return self.normalize_post(_build_post_raw(it, uid))
 
     # ------------------------------------------------------------------

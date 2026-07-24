@@ -23,7 +23,7 @@
 ## 观察记录 1 — 技能「有文档无代码」场景（4 subagent 并行）
 
 - **观察日期**：2026-07-23
-- **来源**：`tests/test.txt`（4 并行 subagent 评估，覆盖 <1k / 1k–10万 / 10万–100万 / 100万+ 四个粉丝层级）
+- **来源**：`docs/observations/bilibili-subagent-traces.md`（4 并行 subagent 评估，覆盖 <1k / 1k–10万 / 10万–100万 / 100万+ 四个粉丝层级）
 - **测试前提**：技能 `public-social-account-analyzer` 存在，但 `scripts/` 为注释桩，无可执行采集代码
 - **时效性**：🔴 **STALE**（前提"无代码"已于 2026-07-24 被推翻；行动路径本身保留为历史样本）
 

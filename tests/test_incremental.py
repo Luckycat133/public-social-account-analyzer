@@ -10,11 +10,13 @@ import json
 import os
 import sys
 import tempfile
+import threading
 
+# pytest 由 conftest.py 注入 sys.path；此处仅为 `python tests/test_xxx.py` 独立运行保留
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
-    if os.path.isdir(_d) and _d not in sys.path:
-        sys.path.insert(0, _d)
+_SCRIPTS = os.path.join(_REPO_ROOT, "skill", "scripts")
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
 
 import collect  # noqa: E402
 from collectors.base import BaseCollector  # noqa: E402
@@ -124,3 +126,63 @@ def test_resume_degrade_when_empty(monkeypatch):
     assert task["incremental"] is False
     assert task["existing_count"] == 0
     assert task["collected_count"] == 2
+
+
+def test_default_output_is_repository_root_workspace(monkeypatch, tmp_path):
+    """直接执行 collect.py 时，文档中的 workspace/... 后续路径必须可用。"""
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
+    monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
+    scripts_dir = tmp_path / "skill" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    monkeypatch.setattr(collect, "_HERE", str(scripts_dir))
+
+    assert collect.run("https://space.bilibili.com/123", limit=1) == 0
+    workspaces = list((tmp_path / "workspace").glob("bilibili-123-*"))
+    assert len(workspaces) == 1
+    assert (workspaces[0] / "source" / "posts.jsonl").exists()
+
+
+def test_default_output_uses_suffix_without_overwriting_existing_workspace(monkeypatch, tmp_path):
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
+    monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
+    scripts_dir = tmp_path / "skill" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    monkeypatch.setattr(collect, "_HERE", str(scripts_dir))
+
+    assert collect.run("https://space.bilibili.com/123", limit=1) == 0
+    first = next((tmp_path / "workspace").glob("bilibili-123-*"))
+    marker = first / "preserve-me.txt"
+    marker.write_text("original", encoding="utf-8")
+
+    assert collect.run("https://space.bilibili.com/123", limit=1) == 0
+    workspaces = sorted((tmp_path / "workspace").glob("bilibili-123-*"))
+    assert len(workspaces) == 2
+    assert marker.read_text(encoding="utf-8") == "original"
+    assert any(path.name.endswith("-2") for path in workspaces)
+
+
+def test_reserve_default_workspace_is_atomic_for_concurrent_callers(monkeypatch, tmp_path):
+    """并发默认任务必须各自原子占用一个目录，且不覆盖先占用者的内容。"""
+    scripts_dir = tmp_path / "skill" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    monkeypatch.setattr(collect, "_HERE", str(scripts_dir))
+
+    barrier = threading.Barrier(2)
+    reserved = []
+
+    def reserve():
+        barrier.wait()
+        reserved.append(collect._reserve_default_workspace("bilibili", "123", "20260724"))
+
+    workers = [threading.Thread(target=reserve) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    assert len(set(reserved)) == 2
+    first = os.path.join(os.path.dirname(reserved[0]), "bilibili-123-20260724")
+    assert os.path.isdir(first)
+    with open(os.path.join(first, "preserve-me.txt"), "w", encoding="utf-8") as f:
+        f.write("original")
+    assert open(os.path.join(first, "preserve-me.txt"), encoding="utf-8").read() == "original"

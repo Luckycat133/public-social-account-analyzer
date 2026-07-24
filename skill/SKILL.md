@@ -28,7 +28,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 1. **任务初始化**
    - 规范化参数：账号主页 URL、采集数量（默认 30，上限 100）、日期范围（可选）、分析目的（可选）、评论采样（默认关闭）。
-   - 创建任务独立目录：`workspace/<platform>-<account>-<date>/`（如已存在则追加后缀或 ID，防止覆盖）。
+   - 创建任务独立目录：仓库根 `workspace/<platform>-<account>-<date>/`（从 `skill/` 目录执行下文命令时为 `../workspace/...`；如已存在则追加后缀或 ID，防止覆盖）。
    - 设置初始状态 `task_status = CREATED`。
 
 2. **平台识别与合规检查**
@@ -51,7 +51,11 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
    - **IQR 散布比**：对每项可见指标额外输出 `iqr = p75-p25` 与 `dispersion_ratio = iqr/median`（`median` 为 0/`null` 时置 `null`）。
    - **季节性 / 学期检测**：输出 `monthly_distribution`、`seasonal_intensity`（月变异系数）、`break_month_share`（寒暑假月份 1/2/7/8 占比）。
    - **内联可视化**：报告含发布时间-播放量散点图、高低表现雷达图、字段覆盖率徽章、发布时段分布（24 小时）柱状图（零依赖 SVG/HTML）。
-   - **LLM 协同分类（可选）**：`--with-llm-tax` 生成分类 Prompt 模版（`taxonomy-prompt.md`），交给外部 LLM 打标后用 `--llm-tax-results` 回填；回填内容经枚举校验后写入 `analysis.json`，`classification_version = llm-1`。不得在无 `--llm-tax-results` 时臆造分类。
+   - **LLM 分类（默认执行）**：本 Skill 的执行者（即 LLM agent 自身）负责完成内容语义分类，**默认在每次分析中产出分类值**，不输出 `pending-model` 占位。流程为两步式底层接口（脚本本身保持确定性，不在内部调用模型）：
+     1. `python scripts/analyze.py --input <workspace> --with-llm-tax` 生成分类 Prompt 模版（`taxonomy-prompt.md`）与含占位分类的 `analysis.json`。
+     2. 执行者（LLM agent）读取 `taxonomy-prompt.md`，**自身作为标注 LLM**，按 [references/analysis-rules.md §5](references/analysis-rules.md) 的枚举与一致性规则为每条 `post_id` 产出 `topic/format/funnel_stage/hook_type/series_name/is_original/has_product_placement/analysis_labels/classification_confidence`，写成 JSON 数组文件 `taxonomy-results.json`（与 `taxonomy-prompt.md` 同目录）。**不得修改任何确定性数字**（播放/互动率/中位数/高低表现），仅填充分类槽位。
+     3. `python scripts/analyze.py --input <workspace> --llm-tax-results <workspace>/taxonomy-results.json` 回填，`apply_taxonomy` 经枚举校验后写入 `analysis.json`，`classification_version = llm-1`，`classification_status = llm-1`。
+     - 约束：当有效样本为 0、或采集受限导致无 `posts` 可标注时，可跳过本步骤并在报告中显式说明（仍输出完整空值标准化产物）。不得在无内容时臆造分类。
    - 标注主题、形式、钩子类型等策略维度，提取高低表现对比特征。
 
 6. **报告渲染**
@@ -94,10 +98,13 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--browser-fallback] [--resume --out <dir> [--since ...]]`
 2. `python scripts/normalize.py --input <workspace_path>`
-3. `python scripts/analyze.py --input <workspace_path> [--with-llm-tax | --llm-tax-results <file>]`
-4. `python scripts/render_report.py --input <workspace_path>`
+3. `python scripts/analyze.py --input <workspace_path> --with-llm-tax`  # 生成 taxonomy-prompt.md 与含占位分类的 analysis.json
+4. **LLM 自标注（执行者默认执行）**：读取 `<workspace_path>/taxonomy-prompt.md`，由执行者自身按 [references/analysis-rules.md §5](references/analysis-rules.md) 枚举为每条 `post_id` 产出分类 JSON 数组，写入 `<workspace_path>/taxonomy-results.json`；**仅填充分类槽位，不得修改任何确定性数字**。
+5. `python scripts/analyze.py --input <workspace_path> --llm-tax-results <workspace_path>/taxonomy-results.json`  # 回填分类，`classification_status = llm-1`
+6. `python scripts/render_report.py --input <workspace_path>`
 
-在数据有效样本少于 15 条时，标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现归纳。
+- 当第 3 步产出 `valid_count == 0`（无有效样本可标注）时，跳过第 4-5 步，在报告中显式说明，仍继续第 6 步输出完整空值标准化产物。
+- 在数据有效样本少于 15 条时，标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现归纳（分类仍可执行）。
 
 ## 输出验证清单
 
@@ -107,6 +114,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - [ ] 核心洞察证据 URL 覆盖率达 100%
 - [ ] 附带“公开页面快照”免责声明
 - [ ] `task_status` 与 `stop_reason` 设置准确
+- [ ] `analysis.json` 的 `classification_status = llm-1`（有效样本 > 0 时）；有效样本为 0 时已在报告中显式说明跳过原因
 
 ## 参考文件索引
 

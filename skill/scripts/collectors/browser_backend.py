@@ -415,6 +415,24 @@ class BrowserSession:
             raise BrowserError(f"浏览器内 fetch 抛出异常: {exc.get('text')}")
         return result.get("result", {}).get("value", "") or ""
 
+    def navigate_and_get_html(self, url: str, wait_seconds: float = 3.0) -> str:
+        """通过 CDP 导航至目标 URL，等待前端 JS 渲染后提取页面 DOM outerHTML。"""
+        self._send_cdp("Page.enable", {})
+        self._send_cdp("Page.navigate", {"url": url})
+        time.sleep(max(0.5, wait_seconds))
+        result = self._send_cdp(
+            "Runtime.evaluate",
+            {
+                "expression": "document.documentElement.outerHTML",
+                "returnByValue": True,
+            },
+        )
+        if "exceptionDetails" in result:
+            exc = result["exceptionDetails"]
+            raise BrowserError(f"提取 DOM outerHTML 异常: {exc.get('text')}")
+        return result.get("result", {}).get("value", "") or ""
+
+
     def close(self) -> None:
         if self._ws is not None:
             try:
