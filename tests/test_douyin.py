@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from collectors._constants import STOP_LOGIN, STOP_VERIFICATION
 
 
@@ -12,6 +14,93 @@ AWEME = {
     "statistics": {"digg_count": 12, "comment_count": 3},
     "video": {"duration": 9000},
 }
+
+
+ACCOUNT_URL = "https://www.douyin.com/user/example"
+
+
+def _ssr_html(data):
+    return '<script id="RENDER_DATA">' + json.dumps(data) + "</script>"
+
+
+def test_collect_post_list_keeps_ssr_fast_path_without_browser(monkeypatch):
+    """A valid SSR document must not start the optional browser fallback."""
+    from collectors.douyin import DouyinCollector
+
+    browser_calls = []
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: browser_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda url: _ssr_html({"user": {"post": {"data": [AWEME]}}}),
+    )
+
+    posts = collector.collect_post_list(ACCOUNT_URL, limit=1)
+
+    assert [post["post_id"] for post in posts] == ["7001"]
+    assert browser_calls == []
+
+
+def test_collect_post_list_uses_browser_when_ssr_is_missing(monkeypatch):
+    """Browser-aweme data shares the existing normalization path."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    browser_calls = []
+
+    def browser_collect(**kwargs):
+        browser_calls.append(kwargs)
+        return DouyinBrowserResult(aweme_items=[AWEME], source="network")
+
+    collector = DouyinCollector(browser_collect=browser_collect)
+    monkeypatch.setattr(collector, "_fetch", lambda url: "<html>shell</html>")
+
+    posts = collector.collect_post_list(ACCOUNT_URL, limit=1)
+
+    assert browser_calls == [{"url": ACCOUNT_URL, "limit": 1, "date_range": None}]
+    assert posts[0]["post_id"] == "7001"
+    assert posts[0]["likes"] == 12
+
+
+def test_collect_post_list_can_disable_browser_fallback(monkeypatch):
+    """The opt-out preserves the previous public parser-failure behavior."""
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector(
+        browser_fallback=False,
+        browser_collect=lambda **kwargs: pytest.fail("browser should stay disabled"),
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_list(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+
+
+def test_collect_post_list_retains_normalized_partial_posts_on_restriction(monkeypatch):
+    """A browser restriction retains already-collected normalized post data."""
+    from collectors._constants import STOP_VERIFICATION
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[AWEME],
+            source="network",
+            restriction=STOP_VERIFICATION,
+            diagnostics={"stop_condition": STOP_VERIFICATION},
+        )
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_list(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_VERIFICATION
+    assert exc_info.value.partial_posts[0]["post_id"] == "7001"
 
 
 class FakeBrowser:

@@ -72,13 +72,22 @@ _RESTRICTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 
 class DouyinError(Exception):
-    """采集错误，携带 stop_reason 供上层决策（不绕过、如实上抛）。"""
+    """采集错误，携带 stop_reason 和可安全保留的部分结果。"""
 
-    def __init__(self, stop_reason: str, message: str, raw: Any = None):
+    def __init__(
+        self,
+        stop_reason: str,
+        message: str,
+        raw: Any = None,
+        partial_posts: list[dict[str, Any]] | None = None,
+        diagnostic_code: str | None = None,
+    ):
         super().__init__(message)
         self.stop_reason = stop_reason
         self.message = message
         self.raw = raw
+        self.partial_posts = list(partial_posts or [])
+        self.diagnostic_code = diagnostic_code
 
 
 # --------------------------------------------------------------------------
@@ -205,6 +214,15 @@ def _dig(data: dict | None, *path: str) -> Any:
 # --------------------------------------------------------------------------
 class DouyinCollector(BaseCollector):
     platform = "douyin"
+
+    def __init__(self, browser_fallback: bool = True, browser_collect=None):
+        """Configure the optional, dependency-free browser collection fallback."""
+        if browser_collect is None:
+            from ._douyin_browser_transport import collect_account_page
+
+            browser_collect = collect_account_page
+        self.browser_fallback = bool(browser_fallback)
+        self._browser_collect = browser_collect
 
     # -- 路由 ---------------------------------------------------------------
     def supports(self, url: str) -> bool:
@@ -435,7 +453,51 @@ class DouyinCollector(BaseCollector):
 
         data = _extract_render_data(html)
         if data is None:
-            raise DouyinError(STOP_PARSER_FAILED, "账号主页可访问但无 RENDER_DATA，无法解析作品列表")
+            if not self.browser_fallback:
+                raise DouyinError(
+                    STOP_PARSER_FAILED,
+                    "账号主页无 RENDER_DATA，且浏览器降级已禁用",
+                )
+            try:
+                result = self._browser_collect(
+                    url=url, limit=limit, date_range=date_range
+                )
+            except Exception as exc:
+                code = (
+                    "BROWSER_UNAVAILABLE"
+                    if "未找到可用的浏览器" in str(exc)
+                    else "BROWSER_TRANSPORT_FAILED"
+                )
+                raise DouyinError(
+                    STOP_PARSER_FAILED,
+                    f"抖音浏览器降级失败: {exc}",
+                    diagnostic_code=code,
+                ) from exc
+
+            posts = [
+                self.normalize_post(
+                    self._build_post_raw(url, item, source=result.source)
+                )
+                for item in result.aweme_items
+                if isinstance(item, dict)
+            ]
+            if date_range:
+                posts = self._filter_by_date(posts, date_range)
+            posts = posts[:limit]
+            if result.restriction:
+                raise DouyinError(
+                    result.restriction,
+                    f"浏览器采集中止: {result.restriction}",
+                    raw=result.diagnostics,
+                    partial_posts=posts,
+                )
+            if not posts:
+                raise DouyinError(
+                    STOP_PARSER_FAILED,
+                    "浏览器未识别到可验证的作品结构",
+                    raw=result.diagnostics,
+                )
+            return posts
 
         aweme_list = self._find_aweme_list(data)
         if aweme_list is None:
