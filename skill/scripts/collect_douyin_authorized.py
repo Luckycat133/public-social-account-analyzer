@@ -7,7 +7,6 @@ import argparse
 import csv
 import json
 import os
-import shutil
 import stat
 import sys
 import tempfile
@@ -20,6 +19,13 @@ from collectors.douyin_openapi import DouyinOpenAPIClient, DouyinOpenAPIError
 _BEIJING = timezone(timedelta(hours=8))
 _PROFILE_ENDPOINT = "https://open.douyin.com/oauth/userinfo/"
 _TOKEN_ENV = "DOUYIN_OPENAPI_ACCESS_TOKEN"
+_ARTIFACT_CHILDREN = (
+    "source",
+    "normalized-posts.csv",
+    "task.json",
+    "collection-report.md",
+)
+_SOURCE_ARTIFACT_CHILDREN = ("profile.json", "posts.jsonl")
 
 
 class ArtifactPromotionError(RuntimeError):
@@ -28,6 +34,100 @@ class ArtifactPromotionError(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__("artifact workspace could not be promoted")
         self.reason = reason
+
+
+def _entry_identity(metadata) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _snapshot_known_node(path: str, children: tuple[str, ...] = ()) -> dict | None:
+    """Snapshot only collector-owned names; never adopt concurrent entries."""
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return None
+    node = {
+        "identity": _entry_identity(metadata),
+        "directory": stat.S_ISDIR(metadata.st_mode),
+        "children": {},
+    }
+    if node["directory"]:
+        for child in children:
+            child_node = _snapshot_known_node(os.path.join(path, child))
+            if child_node is not None:
+                node["children"][child] = child_node
+    return node
+
+
+def _known_staging_snapshot(staging: str) -> dict[str, dict]:
+    snapshot: dict[str, dict] = {}
+    for child in _ARTIFACT_CHILDREN:
+        nested = _SOURCE_ARTIFACT_CHILDREN if child == "source" else ()
+        node = _snapshot_known_node(os.path.join(staging, child), nested)
+        if node is not None:
+            snapshot[child] = node
+    return snapshot
+
+
+def _node_matches(path: str, node: dict) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return False
+    return bool(
+        _entry_identity(metadata) == node["identity"]
+        and stat.S_ISDIR(metadata.st_mode) is node["directory"]
+    )
+
+
+def _remove_exact_known_node(path: str, node: dict) -> None:
+    """Remove an unchanged known node, leaving replacements and unknown children."""
+    if not _node_matches(path, node):
+        return
+    if node["directory"]:
+        for child, child_node in node["children"].items():
+            if not _node_matches(path, node):
+                return
+            _remove_exact_known_node(os.path.join(path, child), child_node)
+        if not _node_matches(path, node):
+            return
+        try:
+            os.rmdir(path)
+        except OSError:
+            return
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        return
+
+
+def _remove_exact_empty_directory(
+    path: str, identity: tuple[int, int] | None
+) -> None:
+    if identity is None:
+        return
+    try:
+        metadata = os.lstat(path)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or _entry_identity(metadata) != identity
+        ):
+            return
+        os.rmdir(path)
+    except OSError:
+        return
+
+
+def _cleanup_known_staging(
+    staging: str,
+    staging_identity: tuple[int, int] | None,
+    snapshot: dict[str, dict] | None = None,
+) -> None:
+    known = _known_staging_snapshot(staging) if snapshot is None else snapshot
+    for child, node in known.items():
+        _remove_exact_known_node(os.path.join(staging, child), node)
+    _remove_exact_empty_directory(staging, staging_identity)
 
 
 def _write_csv(posts: list[dict[str, Any]], path: str) -> None:
@@ -138,6 +238,13 @@ def _write_artifacts(
         raise ArtifactPromotionError("TARGET_EXISTS")
     staging = tempfile.mkdtemp(prefix=f".{basename}.staging-", dir=parent)
     try:
+        staging_metadata = os.lstat(staging)
+        if not stat.S_ISDIR(staging_metadata.st_mode):
+            raise OSError("invalid staging directory")
+        staging_identity = _entry_identity(staging_metadata)
+    except OSError:
+        staging_identity = None
+    try:
         _serialize_artifacts(
             staging,
             profile=profile,
@@ -149,45 +256,85 @@ def _write_artifacts(
             diagnostic_code=diagnostic_code,
         )
     except Exception:
-        if os.path.isdir(staging):
-            shutil.rmtree(staging, ignore_errors=True)
+        _cleanup_known_staging(staging, staging_identity)
         raise
+
+    staging_snapshot = _known_staging_snapshot(staging)
+    if any(child not in staging_snapshot for child in _ARTIFACT_CHILDREN):
+        _cleanup_known_staging(staging, staging_identity, staging_snapshot)
+        raise ArtifactPromotionError("PROMOTION_FAILED")
 
     reservation_identity = None
     acquisition_error = None
     try:
         os.mkdir(target)
-        target_stat = os.stat(target, follow_symlinks=False)
-        reservation_identity = (target_stat.st_dev, target_stat.st_ino)
+        try:
+            target_stat = os.stat(target, follow_symlinks=False)
+            if not stat.S_ISDIR(target_stat.st_mode):
+                raise OSError("reserved target is not a directory")
+            reservation_identity = _entry_identity(target_stat)
+        except OSError:
+            try:
+                fallback_stat = os.lstat(target)
+                fallback_identity = (
+                    _entry_identity(fallback_stat)
+                    if stat.S_ISDIR(fallback_stat.st_mode)
+                    else None
+                )
+            except OSError:
+                fallback_identity = None
+            _remove_exact_empty_directory(target, fallback_identity)
+            acquisition_error = "RESERVATION_FAILED"
     except FileExistsError:
         acquisition_error = "TARGET_EXISTS"
     except OSError:
         acquisition_error = "RESERVATION_FAILED"
 
     if acquisition_error is not None:
-        shutil.rmtree(staging, ignore_errors=True)
+        _cleanup_known_staging(staging, staging_identity, staging_snapshot)
         raise ArtifactPromotionError(acquisition_error)
 
-    promotion_failed = False
+    promoted: dict[str, dict] = {}
     try:
-        for child in os.listdir(staging):
-            os.rename(os.path.join(staging, child), os.path.join(target, child))
+        for child in _ARTIFACT_CHILDREN:
+            source_child = os.path.join(staging, child)
+            target_child = os.path.join(target, child)
+            node = staging_snapshot[child]
+            if not _node_matches(source_child, node) or os.path.lexists(target_child):
+                raise OSError("artifact identity changed before promotion")
+            os.rename(source_child, target_child)
+            promoted[child] = node
+            if not _node_matches(target_child, node):
+                raise OSError("artifact identity changed during promotion")
+        try:
+            current_staging = os.lstat(staging)
+        except OSError as exc:
+            raise OSError("staging identity unavailable") from exc
+        if (
+            not stat.S_ISDIR(current_staging.st_mode)
+            or _entry_identity(current_staging) != staging_identity
+        ):
+            raise OSError("staging identity changed")
         os.rmdir(staging)
     except OSError:
-        promotion_failed = True
-
-    if promotion_failed:
-        shutil.rmtree(staging, ignore_errors=True)
+        _cleanup_known_staging(staging, staging_identity, staging_snapshot)
         try:
-            current_stat = os.stat(target, follow_symlinks=False)
+            current_stat = os.lstat(target)
             target_is_owned_reservation = bool(
                 stat.S_ISDIR(current_stat.st_mode)
-                and reservation_identity == (current_stat.st_dev, current_stat.st_ino)
+                and reservation_identity == _entry_identity(current_stat)
             )
         except OSError:
             target_is_owned_reservation = False
         if target_is_owned_reservation:
-            shutil.rmtree(target, ignore_errors=True)
+            for child, node in promoted.items():
+                if not _node_matches(target, {
+                    "identity": reservation_identity,
+                    "directory": True,
+                }):
+                    break
+                _remove_exact_known_node(os.path.join(target, child), node)
+            _remove_exact_empty_directory(target, reservation_identity)
         raise ArtifactPromotionError("PROMOTION_FAILED")
 
 

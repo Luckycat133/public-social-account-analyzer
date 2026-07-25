@@ -161,6 +161,7 @@ def test_resume_degrade_when_empty(monkeypatch):
     monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
     monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
     tmp = tempfile.mkdtemp()  # 无既有 posts.jsonl
+    os.mkdir(os.path.join(tmp, "source"))
     rc = collect.run("https://space.bilibili.com/123", limit=30, out_dir=tmp, resume=True)
     assert rc == 0
     task = json.load(open(os.path.join(tmp, "task.json"), encoding="utf-8"))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 from pathlib import Path
 
@@ -678,6 +679,126 @@ def test_child_promotion_failure_cleans_only_owned_reservation(
     captured = capsys.readouterr()
     assert rc == 3
     assert not out_dir.exists()
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
+def test_stat_after_authorized_mkdir_failure_cleans_empty_owned_target(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    original_stat = authorized.os.stat
+
+    def fail_owned_target_stat(path, *args, **kwargs):
+        if os.fspath(path) == str(out_dir) and kwargs.get("follow_symlinks") is False:
+            raise OSError(f"injected stat failure {TOKEN}")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(authorized.os, "stat", fail_owned_target_stat)
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert not out_dir.exists()
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
+def test_promotion_failure_preserves_concurrent_marker_and_owned_target(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    marker_bytes = b"concurrent marker\x00must survive"
+    original_rename = authorized.os.rename
+    promoted = []
+
+    def promote_one_then_fail(source, target):
+        if not promoted:
+            original_rename(source, target)
+            promoted.append(Path(target).name)
+            return
+        (out_dir / "marker.bin").write_bytes(marker_bytes)
+        raise OSError(f"raw promotion failure {TOKEN}")
+
+    monkeypatch.setattr(authorized.os, "rename", promote_one_then_fail)
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert (out_dir / "marker.bin").read_bytes() == marker_bytes
+    assert sorted(path.name for path in out_dir.iterdir()) == ["marker.bin"]
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
+def test_promotion_failure_leaves_replaced_promoted_child_untouched(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    displaced_source = tmp_path / "displaced-promoted-source"
+    marker_bytes = b"replacement child\x00must survive"
+    original_rename = authorized.os.rename
+    promoted = False
+
+    def replace_first_promoted_child_then_fail(source, target):
+        nonlocal promoted
+        if not promoted:
+            original_rename(source, target)
+            promoted = True
+            return
+        (out_dir / "source").rename(displaced_source)
+        (out_dir / "source").mkdir()
+        (out_dir / "source" / "marker.bin").write_bytes(marker_bytes)
+        raise OSError(f"raw promotion failure {TOKEN}")
+
+    monkeypatch.setattr(
+        authorized.os, "rename", replace_first_promoted_child_then_fail
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert (out_dir / "source" / "marker.bin").read_bytes() == marker_bytes
+    assert displaced_source.is_dir()
     assert list(tmp_path.glob(".authorized.staging-*")) == []
     assert TOKEN not in captured.out + captured.err
 

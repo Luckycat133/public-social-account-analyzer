@@ -488,10 +488,11 @@ def test_all_comments_persist_returns_parents_and_honest_outcomes(
 
     adapter = CommentAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
     assert collect.run(
         "https://www.douyin.com/user/example",
-        out_dir=str(tmp_path),
+        out_dir=str(out),
         collect_all=True,
         include_comments=True,
     ) == 0
@@ -500,7 +501,7 @@ def test_all_comments_persist_returns_parents_and_honest_outcomes(
     assert all(limit == 20 for _, limit in adapter.calls)
     comments = [
         json.loads(line)
-        for line in (tmp_path / "source" / "comments.jsonl")
+        for line in (out / "source" / "comments.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]
@@ -509,7 +510,7 @@ def test_all_comments_persist_returns_parents_and_honest_outcomes(
     assert comments[0]["text"] == "评论 0"
     assert comments[0]["parent_post_id"] == "7001"
     assert comments[0]["parent_post_url"] == "https://www.douyin.com/video/7001"
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["comment_collection"] == {
         "attempted_posts": 32,
         "comments_collected": 31,
@@ -518,7 +519,7 @@ def test_all_comments_persist_returns_parents_and_honest_outcomes(
         "per_post_limit": 20,
     }
     assert task["task_status"] == "COMPLETED"
-    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
     assert "comments_collected: 31" in report
     assert "empty_results: 1" in report
     assert "failures: 1" in report
@@ -589,16 +590,17 @@ def test_comment_artifact_normalizes_allowlist_dedupes_and_rejects_malformed(
             ]
 
     monkeypatch.setattr(collect, "_load_adapters", lambda: [BoundaryAdapter()])
+    out = tmp_path / "task"
 
     assert collect.run(
         "https://www.douyin.com/user/example",
-        out_dir=str(tmp_path),
+        out_dir=str(out),
         include_comments=True,
     ) == 0
 
     rows = [
         json.loads(line)
-        for line in (tmp_path / "source" / "comments.jsonl")
+        for line in (out / "source" / "comments.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]
@@ -612,7 +614,7 @@ def test_comment_artifact_normalizes_allowlist_dedupes_and_rejects_malformed(
         "published_at": "2026-07-20T10:00:00+08:00",
         "collected_at": "2026-07-24T10:00:00+08:00",
     }]
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["comment_collection"] == {
         "attempted_posts": 2,
         "comments_collected": 1,
@@ -620,12 +622,12 @@ def test_comment_artifact_normalizes_allowlist_dedupes_and_rejects_malformed(
         "failures": 2,
         "per_post_limit": 20,
     }
-    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
     assert "secret-one" not in report
     assert "secret-two" not in report
-    assert "secret-id" not in (tmp_path / "source" / "comments.jsonl").read_text()
-    assert "secret raw timestamp" not in (tmp_path / "source" / "comments.jsonl").read_text()
-    assert "must-not-persist" not in (tmp_path / "source" / "comments.jsonl").read_text()
+    assert "secret-id" not in (out / "source" / "comments.jsonl").read_text()
+    assert "secret raw timestamp" not in (out / "source" / "comments.jsonl").read_text()
+    assert "must-not-persist" not in (out / "source" / "comments.jsonl").read_text()
 
 
 class _SafeCommentAdapter:
@@ -735,10 +737,11 @@ def test_douyin_item_url_is_canonical_before_calls_and_persistence(
 
     adapter = CanonicalUrlAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
     assert collect.run(
         "https://www.douyin.com/user/example",
-        out_dir=str(tmp_path),
+        out_dir=str(out),
         include_comments=True,
         enrich_details=True,
     ) == 0
@@ -746,10 +749,10 @@ def test_douyin_item_url_is_canonical_before_calls_and_persistence(
     assert adapter.detail_calls == [canonical_url]
     assert adapter.comment_calls == [canonical_url]
     post = json.loads(
-        (tmp_path / "source" / "posts.jsonl").read_text(encoding="utf-8")
+        (out / "source" / "posts.jsonl").read_text(encoding="utf-8")
     )
     comment = json.loads(
-        (tmp_path / "source" / "comments.jsonl").read_text(encoding="utf-8")
+        (out / "source" / "comments.jsonl").read_text(encoding="utf-8")
     )
     assert post["post_url"] == canonical_url
     assert post["source_url"] == canonical_url
@@ -819,8 +822,9 @@ def test_account_and_all_artifact_urls_are_canonical_or_null(
 
     adapter = AccountUrlBoundaryAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
-    assert collect.run(supplied_url, out_dir=str(tmp_path)) == 0
+    assert collect.run(supplied_url, out_dir=str(out)) == 0
 
     assert adapter.support_calls == [
         "https://iesdouyin.com/user/public_account/"
@@ -831,15 +835,15 @@ def test_account_and_all_artifact_urls_are_canonical_or_null(
         ("profile", canonical_profile_url),
     ]
     profile = json.loads(
-        (tmp_path / "source" / "profile.json").read_text(encoding="utf-8")
+        (out / "source" / "profile.json").read_text(encoding="utf-8")
     )
     posts = [
         json.loads(line)
-        for line in (tmp_path / "source" / "posts.jsonl")
+        for line in (out / "source" / "posts.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert profile["profile_url"] == canonical_profile_url
     assert task["profile_url"] == canonical_profile_url
     assert posts[0]["post_url"] == "https://www.douyin.com/video/7001"
@@ -999,8 +1003,9 @@ def test_adapter_failure_text_is_sanitized_at_every_output_boundary(
             return {"platform": "douyin", "field_visibility": {}}
 
     monkeypatch.setattr(collect, "_load_adapters", lambda: [SecretBoundaryAdapter()])
+    out = tmp_path / "task"
 
-    assert collect.run(profile_url, out_dir=str(tmp_path)) == expected_code
+    assert collect.run(profile_url, out_dir=str(out)) == expected_code
 
     captured = capsys.readouterr()
     all_output = captured.out + captured.err
@@ -1010,7 +1015,7 @@ def test_adapter_failure_text_is_sanitized_at_every_output_boundary(
     assert secret not in all_output
     assert "PROFILE_QUERY_SECRET" not in all_output
     assert "PROFILE_FRAGMENT_SECRET" not in all_output
-    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
     if failure_stage == "post_list":
         assert "diagnostic_code=SAFE_DIAGNOSTIC" in report
 
@@ -1108,14 +1113,15 @@ def test_invalid_comment_parent_is_failure_without_adapter_attempt(
 
     adapter = InvalidParentAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
     assert collect.run(
         "https://www.douyin.com/user/example",
-        out_dir=str(tmp_path),
+        out_dir=str(out),
         include_comments=True,
     ) == 0
 
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert adapter.comment_calls == 0
     assert task["comment_collection"]["attempted_posts"] == 0
     assert task["comment_collection"]["failures"] == 1
@@ -1149,14 +1155,15 @@ def test_weibo_comment_parent_requires_matching_public_post_url(
 
     adapter = InvalidWeiboParentAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
     assert collect.run(
         "https://weibo.com/u/123456",
-        out_dir=str(tmp_path),
+        out_dir=str(out),
         include_comments=True,
     ) == 0
 
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert adapter.comment_calls == 0
     assert task["comment_collection"]["attempted_posts"] == 0
     assert task["comment_collection"]["failures"] == 1

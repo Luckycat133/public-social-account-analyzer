@@ -81,10 +81,11 @@ def test_short_profile_url_resolves_once_from_sanitized_candidate(
 
     adapter = ShortLinkAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
     assert collect.run(
         "https://v.douyin.com/AbC123/?token=SHORT_SECRET#SHORT_FRAGMENT_SECRET",
-        out_dir=str(tmp_path),
+        out_dir=str(out),
     ) == 0
 
     assert adapter.resolution_calls == [safe_short_url]
@@ -260,10 +261,11 @@ def test_detail_enrichment_is_bounded_preserves_list_evidence_and_records_outcom
 
     adapter = DetailAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
     assert collect.run(
         ACCOUNT_URL,
-        out_dir=str(tmp_path),
+        out_dir=str(out),
         enrich_details=True,
     ) == 0
 
@@ -273,7 +275,7 @@ def test_detail_enrichment_is_bounded_preserves_list_evidence_and_records_outcom
     ]
     posts = [
         json.loads(line)
-        for line in (tmp_path / "source" / "posts.jsonl")
+        for line in (out / "source" / "posts.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]
@@ -287,11 +289,11 @@ def test_detail_enrichment_is_bounded_preserves_list_evidence_and_records_outcom
     assert posts[3]["platform_metrics"]["detail_status"] == "UNAVAILABLE"
     assert posts[2]["collection_status"] == "PARTIAL"
     assert posts[3]["collection_status"] == "PARTIAL"
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["enrich_details"] is True
     assert task["task_status"] == "PARTIAL"
     assert task["stop_reason"] is None
-    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
     assert "stage=collect_post_detail" in report
     assert "unsafe upstream body must not persist" not in report
 
@@ -572,17 +574,18 @@ def test_run_persists_partial_douyin_posts_before_marking_task_partial(monkeypat
         "_load_adapters",
         lambda douyin_browser_fallback=True: [_PartialDouyinAdapter()],
     )
+    out = tmp_path / "task"
 
-    rc = collect.run(ACCOUNT_URL, limit=30, out_dir=str(tmp_path))
+    rc = collect.run(ACCOUNT_URL, limit=30, out_dir=str(out))
 
     assert rc == 0
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["task_status"] == "PARTIAL"
     assert task["stop_reason"] == "VERIFICATION_REQUIRED"
-    rows = (tmp_path / "source" / "posts.jsonl").read_text(encoding="utf-8").splitlines()
+    rows = (out / "source" / "posts.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
     assert json.loads(rows[0])["post_id"] == "7001"
-    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
     assert "BROWSER_RESTRICTION" in report
     assert "must not be written" not in report
 
@@ -643,15 +646,16 @@ def test_all_rejects_non_douyin_urls_before_writing(monkeypatch, tmp_path):
         platform = "bilibili"
 
     monkeypatch.setattr(collect, "_load_adapters", lambda: [OtherAdapter()])
+    out = tmp_path / "task"
 
     rc = collect.run(
         "https://space.bilibili.com/1",
-        out_dir=str(tmp_path),
+        out_dir=str(out),
         collect_all=True,
     )
 
     assert rc == 2
-    assert not (tmp_path / "task.json").exists()
+    assert not (out / "task.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -680,15 +684,16 @@ def test_all_terminal_page_writes_exhaustive_coverage(monkeypatch, tmp_path):
 
     adapter = _AllDouyinAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
-    rc = collect.run(ACCOUNT_URL, out_dir=str(tmp_path), collect_all=True)
+    rc = collect.run(ACCOUNT_URL, out_dir=str(out), collect_all=True)
 
     assert rc == 0
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["task_status"] == "COMPLETED"
     assert task["collection_coverage"]["is_exhaustive"] is True
     assert "raw_cursor" not in task["collection_coverage"]
-    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
     assert "## 覆盖与完备性" in report
     assert "is_exhaustive: true" in report
     assert "must-not-persist" not in report
@@ -705,15 +710,16 @@ def test_all_safety_stops_keep_posts_and_mark_task_partial(
 
     adapter = _AllDouyinAdapter(stop_condition)
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
-    rc = collect.run(ACCOUNT_URL, out_dir=str(tmp_path), collect_all=True)
+    rc = collect.run(ACCOUNT_URL, out_dir=str(out), collect_all=True)
 
     assert rc == 0
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["task_status"] == "PARTIAL"
     assert task["collection_coverage"]["is_exhaustive"] is False
     assert task["collection_coverage"]["stop_condition"] == stop_condition
-    rows = (tmp_path / "source" / "posts.jsonl").read_text(encoding="utf-8").splitlines()
+    rows = (out / "source" / "posts.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
 
 
@@ -722,8 +728,9 @@ def test_standard_limit_thirty_keeps_existing_collection_path(monkeypatch, tmp_p
 
     adapter = _AllDouyinAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
 
-    assert collect.run(ACCOUNT_URL, limit=30, out_dir=str(tmp_path)) == 0
+    assert collect.run(ACCOUNT_URL, limit=30, out_dir=str(out)) == 0
     assert adapter.standard_calls == [(ACCOUNT_URL, 30, None)]
 
 
@@ -788,9 +795,10 @@ def test_all_workspace_downgrades_contradictory_exhaustive_coverage(
         "_load_adapters",
         lambda: [ContradictoryCoverageAdapter()],
     )
+    out = tmp_path / "task"
 
-    assert collect.run(ACCOUNT_URL, out_dir=str(tmp_path), collect_all=True) == 0
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert collect.run(ACCOUNT_URL, out_dir=str(out), collect_all=True) == 0
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["collection_coverage"]["is_exhaustive"] is False
     assert task["task_status"] == "PARTIAL"
     assert task["stop_reason"] == "PARSER_FAILED"
@@ -1018,9 +1026,10 @@ def test_all_terminal_empty_list_writes_failed_no_public_content(
         lambda url: {"platform": "douyin", "field_visibility": {}},
     )
     monkeypatch.setattr(collect, "_load_adapters", lambda: [collector])
+    out = tmp_path / "task"
 
-    assert collect.run(ACCOUNT_URL, out_dir=str(tmp_path), collect_all=True) == 3
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    assert collect.run(ACCOUNT_URL, out_dir=str(out), collect_all=True) == 3
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["task_status"] == "FAILED"
     assert task["stop_reason"] == STOP_NO_PUBLIC_CONTENT
     assert task["collection_coverage"]["is_exhaustive"] is True
@@ -1087,14 +1096,15 @@ def test_all_exhaustive_date_range_no_match_writes_completed_workspace(
         lambda url: {"platform": "douyin", "field_visibility": {}},
     )
     monkeypatch.setattr(collect, "_load_adapters", lambda: [collector])
+    out = tmp_path / "task"
 
     assert collect.run(
         ACCOUNT_URL,
-        out_dir=str(tmp_path),
+        out_dir=str(out),
         collect_all=True,
         date_from="2030-01-01",
     ) == 0
-    task = json.loads((tmp_path / "task.json").read_text(encoding="utf-8"))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["task_status"] == "COMPLETED"
     assert task["stop_reason"] is None
     assert task["collected_count"] == 0

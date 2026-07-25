@@ -410,6 +410,224 @@ def test_new_public_task_rejects_nonempty_explicit_output_before_adapters(
     assert [path.name for path in out.iterdir()] == ["keep.bin"]
 
 
+def test_new_public_task_rejects_empty_explicit_output_before_adapters(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    out.mkdir()
+    monkeypatch.setattr(collect, "_load_adapters", _must_not_load_adapters)
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert out.is_dir()
+    assert list(out.iterdir()) == []
+
+
+def test_resume_requires_existing_source_without_adapter_or_mutation(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    out.mkdir()
+    monkeypatch.setattr(collect, "_load_adapters", _must_not_load_adapters)
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out), resume=True) == 2
+    assert out.is_dir()
+    assert list(out.iterdir()) == []
+
+
+def test_resume_validates_existing_target_and_source_without_ownership(tmp_path):
+    out = tmp_path / "task"
+    (out / "source").mkdir(parents=True)
+
+    reservation = collect._prepare_explicit_workspace(str(out), resume=True)
+    try:
+        assert reservation.owned_target is False
+        assert reservation.owned_source is False
+        reservation.verify()
+    finally:
+        reservation.close()
+
+
+def test_explicit_reservation_source_failure_removes_empty_owned_target(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    adapter = RecordingBilibiliAdapter()
+    original_mkdir = collect.os.mkdir
+
+    def fail_source_mkdir(path, *args, **kwargs):
+        if os.fspath(path) == "source" or Path(path).name == "source":
+            raise OSError("injected source setup failure")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(collect.os, "mkdir", fail_source_mkdir)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert not out.exists()
+    assert adapter.network_calls == []
+
+
+def test_explicit_reservation_source_failure_preserves_concurrent_marker(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    marker_bytes = b"concurrent owner\x00must survive"
+    adapter = RecordingBilibiliAdapter()
+    original_mkdir = collect.os.mkdir
+
+    def fail_source_after_marker(path, *args, **kwargs):
+        if os.fspath(path) == "source" or Path(path).name == "source":
+            (out / "marker.bin").write_bytes(marker_bytes)
+            raise OSError("injected source setup failure")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(collect.os, "mkdir", fail_source_after_marker)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert (out / "marker.bin").read_bytes() == marker_bytes
+    assert [path.name for path in out.iterdir()] == ["marker.bin"]
+    assert adapter.network_calls == []
+
+
+def test_explicit_reservation_stat_failure_removes_empty_owned_target(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    adapter = RecordingBilibiliAdapter()
+    original_stat = collect.os.stat
+    failed = False
+
+    def fail_first_target_stat(path, *args, **kwargs):
+        nonlocal failed
+        if (
+            not failed
+            and os.fspath(path) == out.name
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+        ):
+            failed = True
+            raise OSError("injected target stat failure")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(collect.os, "stat", fail_first_target_stat)
+    monkeypatch.setattr(collect, "_dir_fd_reservations_available", lambda: True)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert failed is True
+    assert not out.exists()
+    assert adapter.network_calls == []
+
+
+def test_public_setup_identity_replacement_is_left_untouched(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    displaced = tmp_path / "displaced-owned-task"
+    adapter = RecordingBilibiliAdapter()
+    original_mkdir = collect.os.mkdir
+    swapped = False
+
+    def swap_target_after_source_mkdir(path, *args, **kwargs):
+        nonlocal swapped
+        result = original_mkdir(path, *args, **kwargs)
+        if not swapped and (os.fspath(path) == "source" or Path(path).name == "source"):
+            swapped = True
+            out.rename(displaced)
+            original_mkdir(str(out))
+        return result
+
+    monkeypatch.setattr(collect.os, "mkdir", swap_target_after_source_mkdir)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert swapped is True
+    assert out.is_dir()
+    assert list(out.iterdir()) == []
+    assert displaced.is_dir()
+    assert adapter.network_calls == []
+
+
+def test_public_reservation_identity_swap_aborts_before_artifact_mutation(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    displaced = tmp_path / "displaced-owned-task"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.bin"
+    marker.write_bytes(b"outside\x00must survive")
+
+    class SwappingAdapter(RecordingBilibiliAdapter):
+        def collect_profile(self, url):
+            self.network_calls.append(("collect_profile", url))
+            (out / "source").rename(displaced)
+            (out / "source").symlink_to(outside, target_is_directory=True)
+            return {"platform": "bilibili", "field_visibility": {}}
+
+    adapter = SwappingAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert marker.read_bytes() == b"outside\x00must survive"
+    assert sorted(path.name for path in outside.iterdir()) == ["keep.bin"]
+    assert displaced.is_dir()
+
+
+def test_public_reservation_falls_back_when_dir_fd_operations_are_unsupported(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    adapter = RecordingBilibiliAdapter()
+    original_mkdir = collect.os.mkdir
+    original_open = collect.os.open
+
+    def mkdir_without_dir_fd(path, *args, **kwargs):
+        if "dir_fd" in kwargs:
+            raise TypeError("dir_fd unsupported")
+        return original_mkdir(path, *args, **kwargs)
+
+    def open_without_dir_fd(path, *args, **kwargs):
+        if "dir_fd" in kwargs:
+            raise NotImplementedError("openat unsupported")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(collect, "_HERE", str(repo / "skill" / "scripts"))
+    monkeypatch.setattr(collect.os, "mkdir", mkdir_without_dir_fd)
+    monkeypatch.setattr(collect.os, "open", open_without_dir_fd)
+    monkeypatch.setattr(collect, "_dir_fd_reservations_available", lambda: True)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL) == 0
+    tasks = list((repo / "workspace").glob("bilibili-123-*"))
+    assert len(tasks) == 1
+    assert (tasks[0] / "source" / "posts.jsonl").is_file()
+
+
+def test_public_reservation_without_no_follow_fails_closed_on_workspace_symlink(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.bin"
+    marker.write_bytes(b"outside\x00must survive")
+    (repo / "workspace").symlink_to(outside, target_is_directory=True)
+    adapter = RecordingBilibiliAdapter()
+
+    monkeypatch.setattr(collect, "_HERE", str(repo / "skill" / "scripts"))
+    monkeypatch.delattr(collect.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL) == 2
+    assert marker.read_bytes() == b"outside\x00must survive"
+    assert sorted(path.name for path in outside.iterdir()) == ["keep.bin"]
+    assert adapter.network_calls == []
+
+
 def test_default_public_output_uses_repository_workspace(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -423,6 +641,22 @@ def test_default_public_output_uses_repository_workspace(monkeypatch, tmp_path):
     assert len(tasks) == 1
     assert (tasks[0] / "task.json").is_file()
     assert not (repo / "skill" / "workspace").exists()
+
+
+def test_default_reservation_creates_source_before_returning(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(collect, "_HERE", str(repo / "skill" / "scripts"))
+
+    reservation = collect._reserve_default_workspace("account-20260725")
+    try:
+        reserved_path = Path(os.fspath(reservation))
+        assert reserved_path.is_dir()
+        assert (reserved_path / "source").is_dir()
+    finally:
+        close = getattr(reservation, "close", None)
+        if close is not None:
+            close()
 
 
 def test_default_public_tasks_for_same_account_and_day_are_independent(
