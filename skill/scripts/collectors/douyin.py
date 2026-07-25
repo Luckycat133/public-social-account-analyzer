@@ -79,6 +79,7 @@ _TIMEOUT = 12
 # Shared with the browser transport so both paths use identical priority.
 _RESTRICTION_PATTERNS = DOUYIN_PAGE_STATE_PATTERNS
 _COLLECTION_SOURCES = frozenset({"list", "network", "dom", "network+dom", "detail"})
+_IMAGE_TEXT_AWEME_TYPES = frozenset({68})
 
 
 class DouyinError(Exception):
@@ -188,6 +189,18 @@ def _text_extra_is_structurally_observed(value: Any) -> bool:
     return True
 
 
+def _is_trusted_image_text(aweme_type: Any, images: Any) -> bool:
+    """Recognize image-text only from the platform's typed image payload."""
+    return bool(
+        isinstance(aweme_type, int)
+        and not isinstance(aweme_type, bool)
+        and aweme_type in _IMAGE_TEXT_AWEME_TYPES
+        and isinstance(images, list)
+        and images
+        and all(isinstance(image, dict) and image for image in images)
+    )
+
+
 def _extract_render_data(html: str) -> dict | None:
     """从页面提取内嵌 RENDER_DATA（URL 编码 JSON）及多变体 SSR 数据。
 
@@ -268,7 +281,7 @@ class DouyinCollector(BaseCollector):
         self._collection_coverage: dict[str, Any] = {}
         self._browser_profile_cache: dict[str, dict[str, Any]] = {}
         self._detail_provenance: dict[
-            int, tuple[dict[str, Any], tuple[str, ...]]
+            int, tuple[dict[str, Any], tuple[str, ...], bool]
         ] = {}
 
     # -- 路由 ---------------------------------------------------------------
@@ -530,27 +543,48 @@ class DouyinCollector(BaseCollector):
                 ),
             )
             trusted_missing = tuple(raw.pop("_trusted_detail_missing_fields", ()))
+            duration_not_applicable = bool(
+                raw.pop("_trusted_duration_not_applicable", False) is True
+            )
             post = self.normalize_post(raw)
-            if trusted_missing:
+            if trusted_missing or duration_not_applicable:
                 self._detail_provenance[id(post)] = (
                     post,
                     trusted_missing,
+                    duration_not_applicable,
                 )
             posts.append(post)
         return posts
 
-    def _take_trusted_detail_missing_fields(
+    def _take_trusted_detail_provenance(
         self, post: dict[str, Any]
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], bool] | None:
         """Consume same-process builder provenance for this exact post object."""
         entry = self._detail_provenance.pop(id(post), None)
         if entry is None or entry[0] is not post:
-            return ()
-        return entry[1]
+            return None
+        return entry[1], entry[2]
 
     def _clear_detail_provenance(self) -> None:
         """Drop all non-persistable detail provenance at the output boundary."""
         self._detail_provenance.clear()
+
+    def _retain_detail_provenance(self, posts: Any) -> None:
+        """Keep provenance only for exact post objects exposed by this batch."""
+        exposed = (
+            {
+                id(post): post
+                for post in posts
+                if isinstance(post, dict)
+            }
+            if isinstance(posts, list)
+            else {}
+        )
+        self._detail_provenance = {
+            identity: entry
+            for identity, entry in self._detail_provenance.items()
+            if exposed.get(identity) is entry[0]
+        }
 
     @staticmethod
     def _date_summary(
@@ -716,6 +750,30 @@ class DouyinCollector(BaseCollector):
         max_seconds: float = PUBLIC_ALL_DEFAULT_MAX_SECONDS,
         max_scrolls: int = PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
     ) -> list[dict[str, Any]]:
+        """Run one isolated all-post batch and retain only its returned evidence."""
+        self._clear_detail_provenance()
+        try:
+            posts = self._collect_all_post_list_current(
+                url,
+                date_range=date_range,
+                max_items=max_items,
+                max_seconds=max_seconds,
+                max_scrolls=max_scrolls,
+            )
+        except Exception as exc:
+            self._retain_detail_provenance(getattr(exc, "partial_posts", None))
+            raise
+        self._retain_detail_provenance(posts)
+        return posts
+
+    def _collect_all_post_list_current(
+        self,
+        url: str,
+        date_range: tuple[str | None, str | None] | None = None,
+        max_items: int = PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+        max_seconds: float = PUBLIC_ALL_DEFAULT_MAX_SECONDS,
+        max_scrolls: int = PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
+    ) -> list[dict[str, Any]]:
         """Passively observe public post-list pages until a verified terminal page."""
         self._collection_coverage = {}
         if not self.supports(url):
@@ -814,6 +872,26 @@ class DouyinCollector(BaseCollector):
         return posts
 
     def collect_post_list(
+        self,
+        url: str,
+        limit: int = PUBLIC_LIMIT_DEFAULT,
+        date_range: tuple[str | None, str | None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run one isolated limited batch and retain only its returned evidence."""
+        self._clear_detail_provenance()
+        try:
+            posts = self._collect_post_list_current(
+                url,
+                limit=limit,
+                date_range=date_range,
+            )
+        except Exception as exc:
+            self._retain_detail_provenance(getattr(exc, "partial_posts", None))
+            raise
+        self._retain_detail_provenance(posts)
+        return posts
+
+    def _collect_post_list_current(
         self,
         url: str,
         limit: int = PUBLIC_LIMIT_DEFAULT,
@@ -1172,10 +1250,10 @@ class DouyinCollector(BaseCollector):
         is_top = _public_boolean(aweme, "is_top", "is_top_aweme")
         is_repost = _public_boolean(aweme, "is_repost", "is_forward")
         is_ad = _public_boolean(aweme, "is_ad", "is_commerce")
-        # 图文/笔记 best-effort 判定。
-        content_type = "video"
-        if aweme.get("images") and not video:
-            content_type = "image_text"
+        trusted_image_text = _is_trusted_image_text(
+            aweme.get("aweme_type"), aweme.get("images")
+        )
+        content_type = "image_text" if trusted_image_text else "video"
         collection = aweme.get("mix_info") or aweme.get("collection")
         collection_name = (collection or {}).get("mix_name") if isinstance(collection, dict) else None
         single_text = (desc or "").split("\n")[0] if isinstance(desc, str) else None
@@ -1208,6 +1286,7 @@ class DouyinCollector(BaseCollector):
                 "content_type": content_type,
             },
             trusted_missing_fields=raw_missing_evidence,
+            trusted_duration_not_applicable=trusted_image_text,
         )
         collection_status = (
             "PARTIAL"
@@ -1241,6 +1320,11 @@ class DouyinCollector(BaseCollector):
             **(
                 {"_trusted_detail_missing_fields": p0_missing_fields}
                 if p0_missing_fields
+                else {}
+            ),
+            **(
+                {"_trusted_duration_not_applicable": True}
+                if trusted_image_text
                 else {}
             ),
             "platform_metrics": {

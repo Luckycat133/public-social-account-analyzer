@@ -2569,6 +2569,58 @@ def test_limited_ssr_browser_restriction_retains_merged_partial_posts(monkeypatc
     assert exc_info.value.partial_posts[0]["duration_seconds"] == 7
 
 
+def test_restriction_batch_keeps_current_provenance_through_orchestration_enrichment(
+    monkeypatch, tmp_path
+):
+    import collect
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **_request: DouyinBrowserResult(
+            aweme_items=[{
+                "aweme_id": "7001",
+                "desc": "",
+                "_collection_source": "network",
+            }],
+            restriction=STOP_VERIFICATION,
+        )
+    )
+    collector.check_access = lambda _url: {"accessible": True}
+    collector._fetch = lambda _url: "<html>shell</html>"
+    collector.collect_profile = lambda _url: {
+        "platform": "douyin",
+        "field_visibility": {},
+    }
+    collector.collect_post_detail = lambda _url: {
+        "post_id": "7001",
+        "title": "详情标题",
+        "published_at": "2026-07-20T10:00:00+08:00",
+        "duration_seconds": 1,
+        "hashtags": [],
+    }
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [collector])
+    out = tmp_path / "restricted"
+
+    assert collect.run(
+        ACCOUNT_URL,
+        out_dir=str(out),
+        limit=1,
+        enrich_details=True,
+    ) == 0
+
+    post = json.loads(
+        (out / "source" / "posts.jsonl").read_text(encoding="utf-8")
+    )
+    assert post["title"] == "详情标题"
+    assert post["collection_status"] == "PARTIAL"
+    assert post["platform_metrics"]["detail_status"] == "SUCCESS"
+    assert post["platform_metrics"]["partial_reasons"] == [
+        "verification_required"
+    ]
+    assert collector._detail_provenance == {}
+
+
 def test_ssr_underfill_keeps_restriction_priority_when_browser_rows_are_invalid(
     monkeypatch,
 ):
@@ -3061,6 +3113,67 @@ def test_transient_detail_provenance_never_reaches_jsonl_or_csv(
     assert collector._detail_provenance == {}
 
 
+def test_reused_collector_resets_detail_provenance_for_each_top_level_list_call():
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(browser_fallback=False)
+    call_count = 0
+
+    def fetch(_url):
+        nonlocal call_count
+        call_count += 1
+        return _ssr_html({
+            "user": {
+                "post": {
+                    "data": [{
+                        "aweme_id": str(7000 + call_count),
+                        "desc": "无话题字段的 SSR 作品",
+                        "create_time": 1700000000 + call_count,
+                        "video": {"duration": 9000},
+                    }]
+                }
+            }
+        })
+
+    collector._fetch = fetch
+    previous_post = None
+    for _ in range(25):
+        posts = collector.collect_post_list(ACCOUNT_URL, limit=1)
+        assert len(posts) == 1
+        assert len(collector._detail_provenance) == 1
+        if previous_post is not None:
+            assert id(previous_post) not in collector._detail_provenance
+        previous_post = posts[0]
+
+
+def test_failed_top_level_list_call_discards_previous_batch_provenance():
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(browser_fallback=False)
+    collector._fetch = lambda _url: _ssr_html({
+        "user": {
+            "post": {
+                "data": [{
+                    "aweme_id": "7001",
+                    "desc": "无话题字段的 SSR 作品",
+                    "create_time": 1700000000,
+                    "video": {"duration": 9000},
+                }]
+            }
+        }
+    })
+    collector.collect_post_list(ACCOUNT_URL, limit=1)
+    assert len(collector._detail_provenance) == 1
+
+    collector._fetch = lambda _url: (_ for _ in ()).throw(
+        DouyinError("ACCESS_RESTRICTED", "blocked")
+    )
+    with pytest.raises(DouyinError):
+        collector.collect_post_list(ACCOUNT_URL, limit=1)
+
+    assert collector._detail_provenance == {}
+
+
 def test_incomplete_successful_detail_response_downgrades_row_with_defined_status():
     import collect
 
@@ -3373,6 +3486,103 @@ def test_browser_p0_completeness_distinguishes_missing_from_known_empty_hashtags
     assert unknown_hashtags_post["platform_metrics"]["missing_detail_fields"] == [
         "hashtags"
     ]
+
+
+def test_trusted_raw_image_text_does_not_require_duration_or_detail_request():
+    import collect
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector()
+    post = collector._normalized_posts_from_items(
+        ACCOUNT_URL,
+        [{
+            "aweme_id": "7001",
+            "aweme_type": 68,
+            "desc": "完整图文作品",
+            "create_time": 1700000000,
+            "images": [{"url_list": ["https://p.example/image.jpeg"]}],
+            "text_extra": [],
+            "_collection_source": "network",
+        }],
+        "network",
+    )[0]
+    collector.collect_post_detail = lambda _url: pytest.fail(
+        "trusted image-text duration is not applicable"
+    )
+
+    unavailable = collect._enrich_douyin_details(
+        collector, [post], [], "2026-07-25T10:00:00+08:00"
+    )
+
+    assert unavailable == 0
+    assert post["content_type"] == "image_text"
+    assert post["duration_seconds"] is None
+    assert post["collection_status"] == "SUCCESS"
+    assert post["platform_metrics"]["detail_status"] == "NOT_NEEDED"
+
+
+def test_video_aweme_cannot_claim_image_text_from_images_or_external_content_type():
+    import collect
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector()
+    post = collector._normalized_posts_from_items(
+        ACCOUNT_URL,
+        [{
+            "aweme_id": "7001",
+            "aweme_type": 0,
+            "desc": "视频作品",
+            "create_time": 1700000000,
+            "images": [{"url_list": ["https://p.example/cover.jpeg"]}],
+            "text_extra": [],
+            "_collection_source": "network",
+        }],
+        "network",
+    )[0]
+    assert post["content_type"] == "video"
+    post["content_type"] = "image_text"
+    collector.collect_post_detail = lambda _url: {
+        "post_id": "7001",
+        "duration_seconds": 2,
+    }
+
+    unavailable = collect._enrich_douyin_details(
+        collector, [post], [], "2026-07-25T10:00:00+08:00"
+    )
+
+    assert unavailable == 0
+    assert post["duration_seconds"] == 2
+    assert post["collection_status"] == "SUCCESS"
+
+
+def test_legacy_image_text_without_transient_evidence_never_upgrades():
+    import collect
+
+    class CompleteDetailAdapter:
+        def collect_post_detail(self, _url):
+            return {"post_id": "7001", "duration_seconds": 2}
+
+    post = {
+        "platform": "douyin",
+        "post_id": "7001",
+        "post_url": "https://www.douyin.com/note/7001",
+        "content_type": "image_text",
+        "title": "旧图文",
+        "published_at": "2026-07-20T10:00:00+08:00",
+        "duration_seconds": None,
+        "hashtags": [],
+        "collection_status": "PARTIAL",
+        "platform_metrics": {"collection_source": "network"},
+    }
+
+    unavailable = collect._enrich_douyin_details(
+        CompleteDetailAdapter(), [post], [], "2026-07-25T10:00:00+08:00"
+    )
+
+    assert unavailable == 0
+    assert post["duration_seconds"] == 2
+    assert post["collection_status"] == "PARTIAL"
+    assert post["platform_metrics"]["partial_reasons"] == ["other_partial"]
 
 
 @pytest.mark.parametrize(

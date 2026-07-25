@@ -53,6 +53,7 @@ def missing_detail_fields(
     post: dict[str, Any],
     *,
     trusted_missing_fields: Iterable[str] = (),
+    trusted_duration_not_applicable: bool = False,
 ) -> list[str]:
     """Compute missing P0 fields from values plus ephemeral builder evidence."""
     trusted_missing = frozenset(
@@ -60,6 +61,8 @@ def missing_detail_fields(
     )
     missing: list[str] = []
     for field in P0_DETAIL_FIELDS:
+        if field == "duration_seconds" and trusted_duration_not_applicable:
+            continue
         if field in trusted_missing:
             missing.append(field)
             continue
@@ -114,6 +117,7 @@ def derive_detail_contract(
     post: dict[str, Any],
     *,
     trusted_missing_fields: Iterable[str] = (),
+    trusted_duration_not_applicable: bool = False,
     trusted_detail_only_partial: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Derive diagnostics without trusting persisted metadata as evidence."""
@@ -122,6 +126,7 @@ def derive_detail_contract(
     actual_missing = missing_detail_fields(
         post,
         trusted_missing_fields=trusted_missing_fields,
+        trusted_duration_not_applicable=trusted_duration_not_applicable,
     )
 
     reasons = sanitize_partial_reasons(metrics.get("partial_reasons"))

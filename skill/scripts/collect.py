@@ -541,18 +541,26 @@ def _enrich_douyin_details(
         if initial_status not in {"SUCCESS", "PARTIAL"}:
             continue
         trusted_missing: tuple[str, ...] = ()
+        trusted_duration_not_applicable = False
         take_provenance = getattr(
-            adapter, "_take_trusted_detail_missing_fields", None
+            adapter, "_take_trusted_detail_provenance", None
         )
         if callable(take_provenance):
             try:
                 candidate = take_provenance(post)
             except Exception:
                 candidate = ()
-            if isinstance(candidate, (list, tuple)):
+            if (
+                isinstance(candidate, tuple)
+                and len(candidate) == 2
+                and isinstance(candidate[0], (list, tuple))
+            ):
                 trusted_missing = tuple(
-                    field for field in candidate if field in P0_DETAIL_FIELDS
+                    field
+                    for field in candidate[0]
+                    if field in P0_DETAIL_FIELDS
                 )
+                trusted_duration_not_applicable = candidate[1] is True
         trusted_detail_only_partial = bool(trusted_missing)
         can_upgrade = initial_status == "SUCCESS" or (
             initial_status == "PARTIAL" and trusted_detail_only_partial
@@ -560,6 +568,7 @@ def _enrich_douyin_details(
         missing, reasons = derive_detail_contract(
             post,
             trusted_missing_fields=trusted_missing,
+            trusted_duration_not_applicable=trusted_duration_not_applicable,
             trusted_detail_only_partial=trusted_detail_only_partial,
         )
         set_detail_contract(post, missing, reasons)
