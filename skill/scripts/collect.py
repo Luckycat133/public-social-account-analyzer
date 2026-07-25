@@ -67,6 +67,7 @@ from immutable_workspace import (  # noqa: E402
     ensure_container,
     preflight_backend,
     read_resume_artifact,
+    reject_workspace_overlap,
     verify_committed_workspace,
 )
 
@@ -1128,6 +1129,7 @@ def run(
     if resume_out is not None:
         try:
             _preflight_explicit_workspace(resume_out, resume=False)
+            reject_workspace_overlap(str(out_dir), resume_out)
         except WorkspaceContractError:
             print("[FAILED] 续采输出目录不安全或已被占用", file=sys.stderr)
             return 2

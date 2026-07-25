@@ -96,6 +96,148 @@ def _create_flags() -> int:
     )
 
 
+@dataclass
+class _PosixChainEntry:
+    name: str | None
+    descriptor: int
+    identity: tuple[int, int]
+
+
+class _PosixDirectoryChain:
+    """Held no-follow descriptors for every component beneath ``/``."""
+
+    def __init__(self, entries: list[_PosixChainEntry]) -> None:
+        self.entries = entries
+        self.closed = False
+
+    @property
+    def leaf_fd(self) -> int:
+        if self.closed or not self.entries:
+            raise WorkspaceIdentityError("workspace path chain is closed")
+        return self.entries[-1].descriptor
+
+    @property
+    def identities(self) -> tuple[tuple[int, int], ...]:
+        return tuple(entry.identity for entry in self.entries)
+
+    def append(
+        self,
+        name: str,
+        *,
+        error_type: type[WorkspaceError],
+    ) -> _PosixChainEntry:
+        descriptor = -1
+        try:
+            descriptor = os.open(name, _directory_flags(), dir_fd=self.leaf_fd)
+            held = os.fstat(descriptor)
+            named = os.stat(
+                name, dir_fd=self.leaf_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(held.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or _identity(held) != _identity(named)
+            ):
+                raise error_type("workspace path component identity changed")
+            entry = _PosixChainEntry(name, descriptor, _identity(held))
+            self.entries.append(entry)
+            descriptor = -1
+            return entry
+        except WorkspaceError:
+            raise
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise error_type("workspace path component cannot be opened safely") from exc
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def validate(self, *, error_type: type[WorkspaceError]) -> None:
+        if self.closed or not self.entries:
+            raise error_type("workspace path chain is closed")
+        try:
+            root = self.entries[0]
+            held_root = os.fstat(root.descriptor)
+            named_root = os.stat(os.sep, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(held_root.st_mode)
+                or not stat.S_ISDIR(named_root.st_mode)
+                or _identity(held_root) != root.identity
+                or _identity(named_root) != root.identity
+            ):
+                raise error_type("workspace root identity changed")
+            for parent, child in zip(self.entries, self.entries[1:]):
+                held = os.fstat(child.descriptor)
+                named = os.stat(
+                    child.name,
+                    dir_fd=parent.descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(held.st_mode)
+                    or not stat.S_ISDIR(named.st_mode)
+                    or _identity(held) != child.identity
+                    or _identity(named) != child.identity
+                ):
+                    raise error_type("workspace path component identity changed")
+        except WorkspaceError:
+            raise
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise error_type("workspace path chain identity changed") from exc
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for entry in reversed(self.entries):
+            try:
+                os.close(entry.descriptor)
+            except OSError:
+                pass
+        self.entries.clear()
+
+
+def _open_posix_directory_chain(
+    path: str,
+    *,
+    error_type: type[WorkspaceError],
+) -> _PosixDirectoryChain:
+    target = os.path.normpath(os.path.abspath(path))
+    if not target.startswith(os.sep):
+        raise error_type("workspace path must be absolute")
+    root_fd = -1
+    chain: _PosixDirectoryChain | None = None
+    try:
+        root_fd = os.open(os.sep, _directory_flags())
+        root_metadata = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise error_type("workspace root is unsafe")
+        chain = _PosixDirectoryChain(
+            [_PosixChainEntry(None, root_fd, _identity(root_metadata))]
+        )
+        root_fd = -1
+        for component in (part for part in target.split(os.sep) if part):
+            chain.append(component, error_type=error_type)
+        chain.validate(error_type=error_type)
+        return chain
+    except WorkspaceError:
+        if chain is not None:
+            chain.close()
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        if chain is not None:
+            chain.close()
+        raise error_type("workspace path cannot be opened safely") from exc
+    finally:
+        if root_fd >= 0:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+
+
 def _preflight_posix() -> None:
     required_constants = ("O_NOFOLLOW", "O_NONBLOCK", "O_DIRECTORY")
     if any(not getattr(os, name, 0) for name in required_constants):
@@ -285,6 +427,92 @@ def preflight_backend() -> str:
     return backend
 
 
+def _normalized_comparison_path(path: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def _lexically_overlaps(first: str, second: str) -> bool:
+    normalized_first = _normalized_comparison_path(first)
+    normalized_second = _normalized_comparison_path(second)
+    try:
+        common = os.path.commonpath((normalized_first, normalized_second))
+    except ValueError:
+        return False
+    return common in {normalized_first, normalized_second}
+
+
+def reject_workspace_overlap(source_path: str, destination_path: str) -> None:
+    """Reject lexical or identity overlap without mutating either pathname."""
+    backend = preflight_backend()
+    source = os.path.abspath(source_path)
+    destination = os.path.abspath(destination_path)
+    if _lexically_overlaps(source, destination):
+        raise WorkspaceVerificationError(
+            "resume source and destination overlap"
+        )
+    destination_parent = os.path.dirname(destination)
+    if backend == "posix":
+        source_chain: _PosixDirectoryChain | None = None
+        destination_chain: _PosixDirectoryChain | None = None
+        try:
+            source_chain = _open_posix_directory_chain(
+                source, error_type=WorkspaceVerificationError
+            )
+            destination_chain = _open_posix_directory_chain(
+                destination_parent, error_type=WorkspaceVerificationError
+            )
+            source_chain.validate(error_type=WorkspaceVerificationError)
+            destination_chain.validate(error_type=WorkspaceVerificationError)
+            if source_chain.entries[-1].identity in destination_chain.identities:
+                raise WorkspaceVerificationError(
+                    "resume destination is inside the source workspace"
+                )
+            return
+        finally:
+            if destination_chain is not None:
+                destination_chain.close()
+            if source_chain is not None:
+                source_chain.close()
+
+    source_handle = -1
+    ancestor_handles: list[int] = []
+    try:
+        source_handle, source_metadata = _open_windows_path(
+            source, create_new=False, directory=True
+        )
+        current = destination_parent
+        while True:
+            handle, metadata = _open_windows_path(
+                current, create_new=False, directory=True
+            )
+            ancestor_handles.append(handle)
+            if metadata["identity"] == source_metadata["identity"]:
+                raise WorkspaceVerificationError(
+                    "resume destination is inside the source workspace"
+                )
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    except WorkspaceError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise WorkspaceVerificationError(
+            "resume paths cannot be compared safely"
+        ) from exc
+    finally:
+        for handle in reversed(ancestor_handles):
+            try:
+                _close_windows_handle(handle)
+            except OSError:
+                pass
+        if source_handle >= 0:
+            try:
+                _close_windows_handle(source_handle)
+            except OSError:
+                pass
+
+
 def _normalize_artifacts(values: Iterable[str]) -> frozenset[str]:
     normalized: set[str] = set()
     for value in values:
@@ -360,8 +588,11 @@ class ImmutableWorkspace:
         target_identity: tuple[int, int],
         source_identity: tuple[int, int],
         target_name: str,
+        parent_identity: tuple[int, int] | None = None,
+        posix_chain: _PosixDirectoryChain | None = None,
     ) -> None:
         self.path = os.path.abspath(path)
+        self.parent_path = os.path.dirname(self.path)
         self.source_path = os.path.join(self.path, "source")
         self.allowed_artifacts = allowed_artifacts
         self.backend = backend
@@ -370,10 +601,13 @@ class ImmutableWorkspace:
         self.source_handle = source_handle
         self.target_identity = target_identity
         self.source_identity = source_identity
+        self.parent_identity = parent_identity
         self.target_name = target_name
+        self.posix_chain = posix_chain
         self._leaves: dict[str, _OwnedLeaf] = {}
         self._invalid = False
         self._committed = False
+        self._marker_finalized = False
         self.closed = False
 
     def __fspath__(self) -> str:
@@ -390,10 +624,10 @@ class ImmutableWorkspace:
         name = os.path.basename(target)
         if not name or name in {".", ".."}:
             raise WorkspaceWriteError("invalid workspace target")
-        if not os.path.isdir(parent):
-            raise WorkspaceWriteError("workspace parent does not exist")
         if backend == "posix":
             return cls._reserve_posix(target, parent, name, allowed)
+        if not os.path.isdir(parent):
+            raise WorkspaceWriteError("workspace parent does not exist")
         return cls._reserve_windows(target, parent, name, allowed)
 
     @classmethod
@@ -404,47 +638,38 @@ class ImmutableWorkspace:
         name: str,
         allowed: frozenset[str],
     ) -> "ImmutableWorkspace":
-        parent_fd = target_fd = source_fd = -1
+        chain: _PosixDirectoryChain | None = None
         transferred = False
         try:
-            parent_fd = os.open(parent, _directory_flags())
+            chain = _open_posix_directory_chain(
+                parent, error_type=WorkspaceWriteError
+            )
+            chain.validate(error_type=WorkspaceIdentityError)
+            parent_fd = chain.leaf_fd
             try:
                 os.mkdir(name, 0o700, dir_fd=parent_fd)
             except FileExistsError as exc:
                 raise WorkspaceExistsError("workspace target already exists") from exc
-            target_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
-            target_metadata = os.fstat(target_fd)
-            named_target = os.stat(
-                name, dir_fd=parent_fd, follow_symlinks=False
+            target_entry = chain.append(
+                name, error_type=WorkspaceIdentityError
             )
-            if (
-                not stat.S_ISDIR(target_metadata.st_mode)
-                or not stat.S_ISDIR(named_target.st_mode)
-                or _identity(target_metadata) != _identity(named_target)
-            ):
-                raise WorkspaceIdentityError("workspace target identity changed")
-            os.mkdir("source", 0o700, dir_fd=target_fd)
-            source_fd = os.open("source", _directory_flags(), dir_fd=target_fd)
-            source_metadata = os.fstat(source_fd)
-            named_source = os.stat(
-                "source", dir_fd=target_fd, follow_symlinks=False
+            os.mkdir("source", 0o700, dir_fd=target_entry.descriptor)
+            source_entry = chain.append(
+                "source", error_type=WorkspaceIdentityError
             )
-            if (
-                not stat.S_ISDIR(source_metadata.st_mode)
-                or not stat.S_ISDIR(named_source.st_mode)
-                or _identity(source_metadata) != _identity(named_source)
-            ):
-                raise WorkspaceIdentityError("workspace source identity changed")
+            chain.validate(error_type=WorkspaceIdentityError)
             reservation = cls(
                 target,
                 allowed_artifacts=allowed,
                 backend="posix",
                 parent_handle=parent_fd,
-                target_handle=target_fd,
-                source_handle=source_fd,
-                target_identity=_identity(target_metadata),
-                source_identity=_identity(source_metadata),
+                target_handle=target_entry.descriptor,
+                source_handle=source_entry.descriptor,
+                target_identity=target_entry.identity,
+                source_identity=source_entry.identity,
                 target_name=name,
+                parent_identity=chain.entries[-3].identity,
+                posix_chain=chain,
             )
             transferred = True
             return reservation
@@ -455,13 +680,8 @@ class ImmutableWorkspace:
         except (OSError, NotImplementedError, TypeError) as exc:
             raise WorkspaceWriteError("workspace cannot be reserved") from exc
         finally:
-            if not transferred:
-                for descriptor in (source_fd, target_fd, parent_fd):
-                    if descriptor >= 0:
-                        try:
-                            os.close(descriptor)
-                        except OSError:
-                            pass
+            if not transferred and chain is not None:
+                chain.close()
 
     @classmethod
     def _reserve_windows(
@@ -474,7 +694,7 @@ class ImmutableWorkspace:
         parent_handle = target_handle = source_handle = -1
         transferred = False
         try:
-            parent_handle, _ = _open_windows_path(
+            parent_handle, parent_metadata = _open_windows_path(
                 parent, create_new=False, directory=True
             )
             try:
@@ -517,6 +737,7 @@ class ImmutableWorkspace:
                 target_identity=target_metadata["identity"],
                 source_identity=source_metadata["identity"],
                 target_name=name,
+                parent_identity=parent_metadata["identity"],
             )
             transferred = True
             return reservation
@@ -567,29 +788,39 @@ class ImmutableWorkspace:
             raise WorkspaceIdentityError("workspace is closed")
         if self.backend == "windows":
             try:
+                held_parent = _windows_handle_metadata(int(self.parent_handle))
                 held_target = _windows_handle_metadata(int(self.target_handle))
                 held_source = _windows_handle_metadata(int(self.source_handle))
-                named_target_handle, named_target = _open_windows_path(
-                    self.path, create_new=False, directory=True
+                named_parent_handle, named_parent = _open_windows_path(
+                    self.parent_path, create_new=False, directory=True
                 )
                 try:
-                    named_source_handle, named_source = _open_windows_path(
-                        self.source_path, create_new=False, directory=True
+                    named_target_handle, named_target = _open_windows_path(
+                        self.path, create_new=False, directory=True
                     )
                     try:
-                        if (
-                            held_target["identity"] != self.target_identity
-                            or named_target["identity"] != self.target_identity
-                            or held_source["identity"] != self.source_identity
-                            or named_source["identity"] != self.source_identity
-                        ):
-                            raise WorkspaceIdentityError(
-                                "workspace identity changed"
-                            )
+                        named_source_handle, named_source = _open_windows_path(
+                            self.source_path, create_new=False, directory=True
+                        )
+                        try:
+                            if (
+                                self.parent_identity is None
+                                or held_parent["identity"] != self.parent_identity
+                                or named_parent["identity"] != self.parent_identity
+                                or held_target["identity"] != self.target_identity
+                                or named_target["identity"] != self.target_identity
+                                or held_source["identity"] != self.source_identity
+                                or named_source["identity"] != self.source_identity
+                            ):
+                                raise WorkspaceIdentityError(
+                                    "workspace identity changed"
+                                )
+                        finally:
+                            _close_windows_handle(named_source_handle)
                     finally:
-                        _close_windows_handle(named_source_handle)
+                        _close_windows_handle(named_target_handle)
                 finally:
-                    _close_windows_handle(named_target_handle)
+                    _close_windows_handle(named_parent_handle)
                 return
             except WorkspaceError:
                 raise
@@ -597,31 +828,9 @@ class ImmutableWorkspace:
                 raise WorkspaceIdentityError(
                     "workspace identity cannot be verified"
                 ) from exc
-        try:
-            held_target = os.fstat(self._target_fd)
-            named_target = os.stat(
-                self.target_name,
-                dir_fd=self._parent_fd,
-                follow_symlinks=False,
-            )
-            held_source = os.fstat(self._source_fd)
-            named_source = os.stat(
-                "source", dir_fd=self._target_fd, follow_symlinks=False
-            )
-        except (OSError, NotImplementedError, TypeError) as exc:
-            raise WorkspaceIdentityError("workspace identity cannot be verified") from exc
-        checks = (
-            (held_target, self.target_identity),
-            (named_target, self.target_identity),
-            (held_source, self.source_identity),
-            (named_source, self.source_identity),
-        )
-        if any(
-            not stat.S_ISDIR(metadata.st_mode)
-            or _identity(metadata) != expected
-            for metadata, expected in checks
-        ):
-            raise WorkspaceIdentityError("workspace identity changed")
+        if self.posix_chain is None:
+            raise WorkspaceIdentityError("workspace path chain is unavailable")
+        self.posix_chain.validate(error_type=WorkspaceIdentityError)
 
     def _create_leaf(self, relative_path: str) -> _OwnedLeaf:
         if relative_path in self._leaves:
@@ -792,18 +1001,56 @@ class ImmutableWorkspace:
     def _write_metadata(self, relative_path: str, payload: bytes) -> _OwnedLeaf:
         owned = self._create_leaf(relative_path)
         try:
-            view = memoryview(payload)
-            while view:
-                written = os.write(owned.descriptor, view)
-                if written <= 0:
-                    raise OSError("short workspace metadata write")
-                view = view[written:]
+            self._write_descriptor(owned.descriptor, payload)
             os.fsync(owned.descriptor)
             self._verify_leaf_identity(owned)
             return owned
         except BaseException:
             self._invalid = True
             raise
+
+    @staticmethod
+    def _write_descriptor(descriptor: int, payload: bytes) -> None:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short workspace metadata write")
+            view = view[written:]
+
+    def _sync_precommit_directories(self) -> None:
+        if self.backend != "posix":
+            return
+        try:
+            os.fsync(self._source_fd)
+            os.fsync(self._target_fd)
+            os.fsync(self._parent_fd)
+        except OSError as exc:
+            self._invalid = True
+            raise WorkspaceWriteError("workspace commit cannot be synced") from exc
+
+    def _visible_commit(self, manifest_digest: str) -> bool | None:
+        try:
+            verified = verify_committed_workspace(
+                self.path, allowed_artifacts=self.allowed_artifacts
+            )
+        except WorkspaceVerificationError:
+            return False
+        except Exception:
+            return None
+        return verified.get("commit_sha256") == manifest_digest
+
+    def _held_commit_is_complete(
+        self, manifest: dict, manifest_digest: str
+    ) -> bool:
+        try:
+            self.verify_identity()
+            self._verify_committing_tree(
+                manifest, manifest_digest, marker=True
+            )
+        except Exception:
+            return False
+        return True
 
     def commit(self) -> str:
         """Create manifest then ``.complete``; never repair or roll back."""
@@ -833,18 +1080,40 @@ class ImmutableWorkspace:
         self._write_metadata(MANIFEST_NAME, manifest_bytes)
         self.verify_identity()
         self._verify_committing_tree(manifest, manifest_digest, marker=False)
-        marker = _MARKER_PREFIX + manifest_digest.encode("ascii") + b"\n"
-        self._write_metadata(COMPLETE_NAME, marker)
-        if self.backend == "posix":
-            try:
-                os.fsync(self._source_fd)
-                os.fsync(self._target_fd)
-                os.fsync(self._parent_fd)
-            except OSError as exc:
-                self._invalid = True
-                raise WorkspaceWriteError("workspace commit cannot be synced") from exc
+        marker_owned = self._create_leaf(COMPLETE_NAME)
+        try:
+            os.fsync(marker_owned.descriptor)
+        except OSError as exc:
+            self._invalid = True
+            raise WorkspaceWriteError("workspace marker cannot be prepared") from exc
+        self._sync_precommit_directories()
         self.verify_identity()
         self._verify_committing_tree(manifest, manifest_digest, marker=True)
+        marker = _MARKER_PREFIX + manifest_digest.encode("ascii") + b"\n"
+        try:
+            self._write_descriptor(marker_owned.descriptor, marker)
+            self._marker_finalized = True
+            os.fsync(marker_owned.descriptor)
+            self.verify_identity()
+            self._verify_committing_tree(manifest, manifest_digest, marker=True)
+            verified = verify_committed_workspace(
+                self.path, allowed_artifacts=self.allowed_artifacts
+            )
+            if verified.get("commit_sha256") != manifest_digest:
+                raise WorkspaceIdentityError("workspace commit digest changed")
+        except Exception:
+            if self._marker_finalized:
+                visible = self._visible_commit(manifest_digest)
+                if visible is True or (
+                    visible is None
+                    and self._held_commit_is_complete(
+                        manifest, manifest_digest
+                    )
+                ):
+                    self._committed = True
+                    return manifest_digest
+            self._invalid = True
+            raise
         self._committed = True
         return manifest_digest
 
@@ -870,19 +1139,46 @@ class ImmutableWorkspace:
             raise WorkspaceIdentityError("workspace inventory changed")
         if actual_source != expected_source:
             raise WorkspaceIdentityError("workspace inventory changed")
-        for relative in paths:
-            self._verify_leaf_identity(self._leaves[relative])
+        for item in manifest["artifacts"]:
+            relative = item["path"]
+            owned = self._leaves[relative]
+            metadata = self._verify_leaf_identity(owned)
+            payload = _read_descriptor(
+                owned.descriptor, DEFAULT_MAX_ARTIFACT_BYTES
+            )
+            if len(payload) != metadata.st_size or len(payload) != item["size"]:
+                raise WorkspaceIdentityError("workspace artifact size changed")
+            if hashlib.sha256(payload).hexdigest() != item["sha256"]:
+                raise WorkspaceIdentityError("workspace artifact digest changed")
+        manifest_metadata = self._verify_leaf_identity(
+            self._leaves[MANIFEST_NAME]
+        )
         manifest_payload = _read_descriptor(
             self._leaves[MANIFEST_NAME].descriptor, _MAX_MANIFEST_BYTES
         )
-        if hashlib.sha256(manifest_payload).hexdigest() != manifest_digest:
+        if (
+            len(manifest_payload) != manifest_metadata.st_size
+            or hashlib.sha256(manifest_payload).hexdigest() != manifest_digest
+        ):
             raise WorkspaceIdentityError("workspace manifest changed")
         if marker:
+            marker_metadata = self._verify_leaf_identity(
+                self._leaves[COMPLETE_NAME]
+            )
             marker_payload = _read_descriptor(
                 self._leaves[COMPLETE_NAME].descriptor, _MAX_MARKER_BYTES
             )
-            if marker_payload != _MARKER_PREFIX + manifest_digest.encode("ascii") + b"\n":
+            expected_marker = (
+                _MARKER_PREFIX + manifest_digest.encode("ascii") + b"\n"
+                if self._marker_finalized
+                else b""
+            )
+            if (
+                len(marker_payload) != marker_metadata.st_size
+                or marker_payload != expected_marker
+            ):
                 raise WorkspaceIdentityError("workspace marker changed")
+        self.verify_identity()
 
     def close(self) -> None:
         if self.closed:
@@ -895,16 +1191,9 @@ class ImmutableWorkspace:
                 pass
         self._leaves.clear()
         if self.backend == "posix":
-            for descriptor in (
-                int(self.source_handle),
-                int(self.target_handle),
-                int(self.parent_handle),
-            ):
-                if descriptor >= 0:
-                    try:
-                        os.close(descriptor)
-                    except OSError:
-                        pass
+            if self.posix_chain is not None:
+                self.posix_chain.close()
+                self.posix_chain = None
         elif self.backend == "windows":
             for handle in (
                 self.source_handle,
@@ -928,37 +1217,33 @@ class ImmutableWorkspace:
         return False
 
 
-def _open_posix_workspace(path: str) -> tuple[int, int, int, str, tuple[int, int], tuple[int, int]]:
-    target = os.path.abspath(path)
-    parent = os.path.dirname(target)
-    name = os.path.basename(target)
-    parent_fd = target_fd = source_fd = -1
+@dataclass
+class _PosixWorkspaceHandles:
+    chain: _PosixDirectoryChain
+
+    @property
+    def parent_fd(self) -> int:
+        return self.chain.entries[-3].descriptor
+
+    @property
+    def target_fd(self) -> int:
+        return self.chain.entries[-2].descriptor
+
+    @property
+    def source_fd(self) -> int:
+        return self.chain.entries[-1].descriptor
+
+
+def _open_posix_workspace(path: str) -> _PosixWorkspaceHandles:
+    chain: _PosixDirectoryChain | None = None
     transferred = False
     try:
-        parent_fd = os.open(parent, _directory_flags())
-        target_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
-        target_metadata = os.fstat(target_fd)
-        named_target = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        source_fd = os.open("source", _directory_flags(), dir_fd=target_fd)
-        source_metadata = os.fstat(source_fd)
-        named_source = os.stat("source", dir_fd=target_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(target_metadata.st_mode)
-            or not stat.S_ISDIR(named_target.st_mode)
-            or _identity(target_metadata) != _identity(named_target)
-            or not stat.S_ISDIR(source_metadata.st_mode)
-            or not stat.S_ISDIR(named_source.st_mode)
-            or _identity(source_metadata) != _identity(named_source)
-        ):
-            raise WorkspaceVerificationError("workspace identity changed")
-        handles = (
-            parent_fd,
-            target_fd,
-            source_fd,
-            name,
-            _identity(target_metadata),
-            _identity(source_metadata),
+        chain = _open_posix_directory_chain(
+            os.path.abspath(path), error_type=WorkspaceVerificationError
         )
+        chain.append("source", error_type=WorkspaceVerificationError)
+        chain.validate(error_type=WorkspaceVerificationError)
+        handles = _PosixWorkspaceHandles(chain)
         transferred = True
         return handles
     except WorkspaceError:
@@ -966,13 +1251,8 @@ def _open_posix_workspace(path: str) -> tuple[int, int, int, str, tuple[int, int
     except (OSError, NotImplementedError, TypeError) as exc:
         raise WorkspaceVerificationError("workspace cannot be opened safely") from exc
     finally:
-        if not transferred:
-            for descriptor in (source_fd, target_fd, parent_fd):
-                if descriptor >= 0:
-                    try:
-                        os.close(descriptor)
-                    except OSError:
-                        pass
+        if not transferred and chain is not None:
+            chain.close()
 
 
 def _read_named_regular(
@@ -1050,12 +1330,14 @@ def _parse_manifest(payload: bytes, allowed: frozenset[str]) -> dict:
 
 
 def _verify_posix_handles(
-    handles: tuple[int, int, int, str, tuple[int, int], tuple[int, int]],
+    handles: _PosixWorkspaceHandles,
     allowed: frozenset[str],
     *,
     capture_path: str | None = None,
 ) -> tuple[dict, bytes | None]:
-    parent_fd, target_fd, source_fd, name, target_identity, source_identity = handles
+    handles.chain.validate(error_type=WorkspaceVerificationError)
+    target_fd = handles.target_fd
+    source_fd = handles.source_fd
     marker = _read_named_regular(
         target_fd, COMPLETE_NAME, max_bytes=_MAX_MARKER_BYTES
     )
@@ -1107,43 +1389,31 @@ def _verify_posix_handles(
             raise WorkspaceVerificationError("workspace artifact digest changed")
         if relative == capture_path:
             captured = payload
-    held_target = os.fstat(target_fd)
-    named_target = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    held_source = os.fstat(source_fd)
-    named_source = os.stat("source", dir_fd=target_fd, follow_symlinks=False)
-    if any(
-        _identity(metadata) != expected
-        for metadata, expected in (
-            (held_target, target_identity),
-            (named_target, target_identity),
-            (held_source, source_identity),
-            (named_source, source_identity),
-        )
-    ):
-        raise WorkspaceVerificationError("workspace identity changed")
+    handles.chain.validate(error_type=WorkspaceVerificationError)
     result = dict(manifest)
     result["commit_sha256"] = manifest_digest
     return result, captured
 
 
-def _close_posix_handles(
-    handles: tuple[int, int, int, str, tuple[int, int], tuple[int, int]]
-) -> None:
-    for descriptor in (handles[2], handles[1], handles[0]):
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+def _close_posix_handles(handles: _PosixWorkspaceHandles) -> None:
+    handles.chain.close()
 
 
 def _open_windows_workspace(
     path: str,
-) -> tuple[int, int, int, tuple[int, int], tuple[int, int]]:
+) -> tuple[
+    int,
+    int,
+    int,
+    tuple[int, int],
+    tuple[int, int],
+    tuple[int, int],
+]:
     target = os.path.abspath(path)
     parent_handle = target_handle = source_handle = -1
     transferred = False
     try:
-        parent_handle, _ = _open_windows_path(
+        parent_handle, parent_metadata = _open_windows_path(
             os.path.dirname(target), create_new=False, directory=True
         )
         target_handle, target_metadata = _open_windows_path(
@@ -1156,6 +1426,7 @@ def _open_windows_workspace(
             parent_handle,
             target_handle,
             source_handle,
+            parent_metadata["identity"],
             target_metadata["identity"],
             source_metadata["identity"],
         )
@@ -1176,13 +1447,71 @@ def _open_windows_workspace(
 
 
 def _close_windows_workspace(
-    handles: tuple[int, int, int, tuple[int, int], tuple[int, int]]
+    handles: tuple[
+        int,
+        int,
+        int,
+        tuple[int, int],
+        tuple[int, int],
+        tuple[int, int],
+    ]
 ) -> None:
     for handle in (handles[2], handles[1], handles[0]):
         try:
             _close_windows_handle(handle)
         except OSError:
             pass
+
+
+def _verify_windows_workspace_identity(
+    path: str,
+    handles: tuple[
+        int,
+        int,
+        int,
+        tuple[int, int],
+        tuple[int, int],
+        tuple[int, int],
+    ],
+) -> None:
+    target = os.path.abspath(path)
+    named_handles: list[int] = []
+    try:
+        held = (
+            _windows_handle_metadata(handles[0]),
+            _windows_handle_metadata(handles[1]),
+            _windows_handle_metadata(handles[2]),
+        )
+        named = []
+        for candidate in (
+            os.path.dirname(target),
+            target,
+            os.path.join(target, "source"),
+        ):
+            handle, metadata = _open_windows_path(
+                candidate, create_new=False, directory=True
+            )
+            named_handles.append(handle)
+            named.append(metadata)
+        expected = handles[3:6]
+        if any(
+            held_metadata["identity"] != identity
+            or named_metadata["identity"] != identity
+            for held_metadata, named_metadata, identity in zip(
+                held, named, expected
+            )
+        ):
+            raise WorkspaceVerificationError("workspace identity changed")
+    except WorkspaceError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise WorkspaceVerificationError("workspace identity changed") from exc
+    finally:
+        for handle in reversed(named_handles):
+            try:
+                _close_windows_handle(handle)
+            except OSError:
+                pass
 
 
 def _read_windows_named_regular(path: str, *, max_bytes: int) -> bytes:
@@ -1204,12 +1533,20 @@ def _read_windows_named_regular(path: str, *, max_bytes: int) -> bytes:
 
 def _verify_windows_handles(
     path: str,
-    handles: tuple[int, int, int, tuple[int, int], tuple[int, int]],
+    handles: tuple[
+        int,
+        int,
+        int,
+        tuple[int, int],
+        tuple[int, int],
+        tuple[int, int],
+    ],
     allowed: frozenset[str],
     *,
     capture_path: str | None = None,
 ) -> tuple[dict, bytes | None]:
     target = os.path.abspath(path)
+    _verify_windows_workspace_identity(path, handles)
     marker = _read_windows_named_regular(
         os.path.join(target, COMPLETE_NAME), max_bytes=_MAX_MARKER_BYTES
     )
@@ -1257,13 +1594,7 @@ def _verify_windows_handles(
             raise WorkspaceVerificationError("workspace artifact digest changed")
         if item["path"] == capture_path:
             captured = payload
-    held_target = _windows_handle_metadata(handles[1])
-    held_source = _windows_handle_metadata(handles[2])
-    if (
-        held_target["identity"] != handles[3]
-        or held_source["identity"] != handles[4]
-    ):
-        raise WorkspaceVerificationError("workspace identity changed")
+    _verify_windows_workspace_identity(path, handles)
     result = dict(manifest)
     result["commit_sha256"] = manifest_digest
     return result, captured
@@ -1348,6 +1679,7 @@ def read_resume_artifact(
                     payload = None
                 else:
                     raise
+            _verify_windows_workspace_identity(path, handles_windows)
             return ResumeArtifact(
                 payload=payload,
                 source_format="legacy-read-only",
@@ -1356,7 +1688,8 @@ def read_resume_artifact(
         finally:
             _close_windows_workspace(handles_windows)
     handles = _open_posix_workspace(path)
-    parent_fd, target_fd, source_fd, _, _, _ = handles
+    target_fd = handles.target_fd
+    source_fd = handles.source_fd
     try:
         try:
             os.stat(COMPLETE_NAME, dir_fd=target_fd, follow_symlinks=False)
@@ -1393,12 +1726,7 @@ def read_resume_artifact(
             else:
                 raise
         digest_payload = payload if payload is not None else b""
-        held_target = os.fstat(target_fd)
-        named_target = os.stat(
-            handles[3], dir_fd=parent_fd, follow_symlinks=False
-        )
-        if _identity(held_target) != _identity(named_target):
-            raise WorkspaceVerificationError("resume workspace identity changed")
+        handles.chain.validate(error_type=WorkspaceVerificationError)
         return ResumeArtifact(
             payload=payload,
             source_format="legacy-read-only",
@@ -1414,9 +1742,11 @@ def ensure_container(path: str) -> str:
     target = os.path.abspath(path)
     parent = os.path.dirname(target)
     name = os.path.basename(target)
-    if not name or not os.path.isdir(parent):
+    if not name:
         raise WorkspaceWriteError("workspace container parent does not exist")
     if backend == "windows":
+        if not os.path.isdir(parent):
+            raise WorkspaceWriteError("workspace container parent does not exist")
         parent_handle = child_handle = -1
         try:
             parent_handle, _ = _open_windows_path(
@@ -1443,31 +1773,23 @@ def ensure_container(path: str) -> str:
                         _close_windows_handle(handle)
                     except OSError:
                         pass
-    parent_fd = child_fd = -1
+    chain: _PosixDirectoryChain | None = None
     try:
-        parent_fd = os.open(parent, _directory_flags())
+        chain = _open_posix_directory_chain(
+            parent, error_type=WorkspaceWriteError
+        )
+        chain.validate(error_type=WorkspaceIdentityError)
         try:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            os.mkdir(name, 0o700, dir_fd=chain.leaf_fd)
         except FileExistsError:
             pass
-        child_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
-        held = os.fstat(child_fd)
-        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(held.st_mode)
-            or not stat.S_ISDIR(named.st_mode)
-            or _identity(held) != _identity(named)
-        ):
-            raise WorkspaceIdentityError("workspace container is unsafe")
+        chain.append(name, error_type=WorkspaceIdentityError)
+        chain.validate(error_type=WorkspaceIdentityError)
         return target
     except WorkspaceError:
         raise
     except (OSError, NotImplementedError, TypeError) as exc:
         raise WorkspaceWriteError("workspace container cannot be prepared") from exc
     finally:
-        for descriptor in (child_fd, parent_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+        if chain is not None:
+            chain.close()

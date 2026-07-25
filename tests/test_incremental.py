@@ -9,7 +9,10 @@
 import json
 import hashlib
 import os
+import stat
 import sys
+
+import pytest
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
@@ -53,6 +56,34 @@ def _setup_existing(out_dir, posts):
     with open(os.path.join(src, "posts.jsonl"), "w", encoding="utf-8") as f:
         for p in posts:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+
+def _exact_tree_digest(root):
+    root = os.path.abspath(root)
+    entries = [root]
+    for current, directories, files in os.walk(root, followlinks=False):
+        directories.sort()
+        files.sort()
+        entries.extend(os.path.join(current, name) for name in directories + files)
+    digest = hashlib.sha256()
+    for path in sorted(entries):
+        metadata = os.lstat(path)
+        relative = os.path.relpath(path, root)
+        digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(str(stat.S_IFMT(metadata.st_mode)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(metadata.st_dev).encode("ascii"))
+        digest.update(b":")
+        digest.update(str(metadata.st_ino).encode("ascii"))
+        digest.update(b"\0")
+        if stat.S_ISLNK(metadata.st_mode):
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+        elif stat.S_ISREG(metadata.st_mode):
+            with open(path, "rb") as handle:
+                digest.update(handle.read())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def test_merge_incremental():
@@ -273,3 +304,46 @@ def test_corrupt_committed_resume_source_is_rejected_before_adapters(
         resume=True,
     ) == 2
     assert list(tmp_path.glob("committed-resume-*")) == []
+
+
+@pytest.mark.parametrize("destination_kind", ["direct", "symlinked-ancestor"])
+def test_resume_rejects_destination_inside_old_and_preserves_exact_tree(
+    monkeypatch, tmp_path, destination_kind
+):
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
+    monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
+    old = tmp_path / "committed"
+    assert collect.run(
+        "https://space.bilibili.com/123", out_dir=str(old)
+    ) == 0
+    before = _exact_tree_digest(old)
+
+    if destination_kind == "direct":
+        new = old / "nested"
+    else:
+        alias = tmp_path / "alias"
+        try:
+            alias.symlink_to(old, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks are unavailable")
+        new = alias / "source" / "nested"
+
+    adapter_loads = 0
+
+    def load_adapters():
+        nonlocal adapter_loads
+        adapter_loads += 1
+        return [FakeAdapter()]
+
+    monkeypatch.setattr(collect, "_load_adapters", load_adapters)
+    rc = collect.run(
+        "https://space.bilibili.com/123",
+        out_dir=str(old),
+        resume=True,
+        resume_out=str(new),
+    )
+
+    assert rc == 2
+    assert adapter_loads == 0
+    assert _exact_tree_digest(old) == before
+    assert not new.exists()

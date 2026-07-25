@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -369,3 +370,321 @@ def test_simulated_windows_backend_builds_and_verifies_create_only_workspace(
     assert verified["artifacts"][0]["path"] == "task.json"
     assert (target / ".complete").is_file()
     assert closed
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX rename semantics")
+@pytest.mark.parametrize("mutation_stage", ["manifest-fsync", "marker-fsync"])
+def test_commit_rehashes_artifacts_after_evidence_and_before_success(
+    monkeypatch, tmp_path, mutation_stage
+):
+    target = tmp_path / "task"
+    artifact = target / "task.json"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("AAAA")
+    original_fsync = workspace.os.fsync
+    injected = False
+
+    def fsync_with_in_place_rewrite(descriptor):
+        nonlocal injected
+        result = original_fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        candidate = target / (
+            workspace.MANIFEST_NAME
+            if mutation_stage == "manifest-fsync"
+            else workspace.COMPLETE_NAME
+        )
+        if candidate.exists():
+            named = os.lstat(candidate)
+            is_candidate = (metadata.st_dev, metadata.st_ino) == (
+                named.st_dev,
+                named.st_ino,
+            )
+        else:
+            is_candidate = False
+        if (
+            not injected
+            and is_candidate
+            and (
+                mutation_stage == "manifest-fsync"
+                or metadata.st_size > 0
+            )
+        ):
+            injected = True
+            artifact.write_bytes(b"BBBB")
+        return result
+
+    monkeypatch.setattr(workspace.os, "fsync", fsync_with_in_place_rewrite)
+    try:
+        with pytest.raises(workspace.WorkspaceIdentityError):
+            reservation.commit()
+    finally:
+        reservation.close()
+
+    assert injected is True
+    with pytest.raises(workspace.WorkspaceVerificationError):
+        workspace.verify_committed_workspace(
+            str(target), allowed_artifacts={"task.json"}
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX rename semantics")
+@pytest.mark.parametrize("metadata_name", [workspace.MANIFEST_NAME, workspace.COMPLETE_NAME])
+def test_commit_rejects_metadata_pathname_swap(
+    monkeypatch, tmp_path, metadata_name
+):
+    target = tmp_path / "task"
+    displaced = tmp_path / f"displaced-{metadata_name.lstrip('.')}"
+    replacement = b"replacement metadata\x00must-survive"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("payload")
+    original_verify_tree = reservation._verify_committing_tree
+    swapped = False
+
+    def verify_tree_with_swap(manifest, manifest_digest, *, marker):
+        nonlocal swapped
+        should_swap = (
+            metadata_name == workspace.MANIFEST_NAME and not marker
+        ) or (
+            metadata_name == workspace.COMPLETE_NAME and marker
+        )
+        if should_swap and not swapped:
+            swapped = True
+            path = target / metadata_name
+            path.rename(displaced)
+            path.write_bytes(replacement)
+        return original_verify_tree(manifest, manifest_digest, marker=marker)
+
+    monkeypatch.setattr(reservation, "_verify_committing_tree", verify_tree_with_swap)
+    try:
+        with pytest.raises(workspace.WorkspaceIdentityError):
+            reservation.commit()
+    finally:
+        reservation.close()
+
+    assert swapped is True
+    assert (target / metadata_name).read_bytes() == replacement
+    with pytest.raises(workspace.WorkspaceVerificationError):
+        workspace.verify_committed_workspace(
+            str(target), allowed_artifacts={"task.json"}
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX rename semantics")
+def test_writer_rejects_complete_ancestor_chain_swap(tmp_path):
+    visible_parent = tmp_path / "P"
+    displaced_parent = tmp_path / "P-old"
+    visible_parent.mkdir()
+    target = visible_parent / "task"
+    replacement_bytes = b"replacement\x00must-survive"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("owned")
+    visible_parent.rename(displaced_parent)
+    (visible_parent / "task" / "source").mkdir(parents=True)
+    (visible_parent / "task" / "replacement.bin").write_bytes(replacement_bytes)
+
+    try:
+        with pytest.raises(workspace.WorkspaceIdentityError):
+            reservation.commit()
+    finally:
+        reservation.close()
+
+    assert (visible_parent / "task" / "replacement.bin").read_bytes() == replacement_bytes
+    assert not (visible_parent / "task" / workspace.COMPLETE_NAME).exists()
+    assert not (displaced_parent / "task" / workspace.COMPLETE_NAME).exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX rename semantics")
+@pytest.mark.parametrize("reader", ["verify", "resume"])
+def test_reader_rejects_complete_ancestor_chain_swap(monkeypatch, tmp_path, reader):
+    visible_parent = tmp_path / "P"
+    displaced_parent = tmp_path / "P-old"
+    visible_parent.mkdir()
+    target = _committed(visible_parent)
+    replacement_bytes = b"replacement\x00must-survive"
+    original_verify = workspace._verify_posix_handles
+    swapped = False
+
+    def verify_after_parent_swap(handles, allowed, *, capture_path=None):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            visible_parent.rename(displaced_parent)
+            (visible_parent / "task" / "source").mkdir(parents=True)
+            (visible_parent / "task" / "replacement.bin").write_bytes(
+                replacement_bytes
+            )
+        return original_verify(
+            handles, allowed, capture_path=capture_path
+        )
+
+    monkeypatch.setattr(workspace, "_verify_posix_handles", verify_after_parent_swap)
+    with pytest.raises(workspace.WorkspaceVerificationError):
+        if reader == "verify":
+            workspace.verify_committed_workspace(
+                str(target), allowed_artifacts=ARTIFACTS
+            )
+        else:
+            workspace.read_resume_artifact(
+                str(target),
+                "task.json",
+                allowed_artifacts=ARTIFACTS,
+            )
+
+    assert swapped is True
+    assert (visible_parent / "task" / "replacement.bin").read_bytes() == replacement_bytes
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX directory fsync")
+def test_directory_fsync_failure_leaves_only_an_invalid_marker(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "task"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("payload")
+    original_fsync = workspace.os.fsync
+    injected = False
+
+    def fail_first_directory_fsync_after_marker_creation(descriptor):
+        nonlocal injected
+        if (
+            not injected
+            and (target / workspace.COMPLETE_NAME).exists()
+            and stat.S_ISDIR(os.fstat(descriptor).st_mode)
+        ):
+            injected = True
+            raise OSError("DIRECTORY_FSYNC_SENTINEL")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        workspace.os,
+        "fsync",
+        fail_first_directory_fsync_after_marker_creation,
+    )
+    try:
+        with pytest.raises(workspace.WorkspaceWriteError):
+            reservation.commit()
+    finally:
+        reservation.close()
+
+    assert injected is True
+    assert (target / workspace.COMPLETE_NAME).read_bytes() == b""
+    with pytest.raises(workspace.WorkspaceVerificationError):
+        workspace.verify_committed_workspace(
+            str(target), allowed_artifacts={"task.json"}
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX fsync injection")
+def test_final_marker_fsync_error_converges_to_verified_success(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "task"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("payload")
+    original_fsync = workspace.os.fsync
+    injected = False
+
+    def fail_final_marker_fsync_once(descriptor):
+        nonlocal injected
+        marker = target / workspace.COMPLETE_NAME
+        metadata = os.fstat(descriptor)
+        if marker.exists():
+            named = os.lstat(marker)
+            is_marker = (metadata.st_dev, metadata.st_ino) == (
+                named.st_dev,
+                named.st_ino,
+            )
+        else:
+            is_marker = False
+        if not injected and is_marker and metadata.st_size > 0:
+            injected = True
+            raise OSError("MARKER_FSYNC_SENTINEL")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(workspace.os, "fsync", fail_final_marker_fsync_once)
+    try:
+        digest = reservation.commit()
+    finally:
+        reservation.close()
+
+    assert injected is True
+    verified = workspace.verify_committed_workspace(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    assert digest == verified["commit_sha256"]
+
+
+def test_commit_uses_user_visible_verifier_and_retries_transient_final_error(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "task"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("payload")
+    original_verify = workspace.verify_committed_workspace
+    calls = 0
+
+    def transient_then_verify(path, *, allowed_artifacts):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("TRANSIENT_FINAL_VERIFY")
+        return original_verify(path, allowed_artifacts=allowed_artifacts)
+
+    monkeypatch.setattr(
+        workspace,
+        "verify_committed_workspace",
+        transient_then_verify,
+    )
+    try:
+        digest = reservation.commit()
+    finally:
+        reservation.close()
+
+    assert calls == 2
+    assert digest == original_verify(
+        str(target), allowed_artifacts={"task.json"}
+    )["commit_sha256"]
+
+
+def test_persistent_post_marker_verifier_error_converges_from_bound_evidence(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "task"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("payload")
+    original_verify = workspace.verify_committed_workspace
+
+    def persistent_error(path, *, allowed_artifacts):
+        raise RuntimeError("PERSISTENT_FINAL_VERIFY")
+
+    monkeypatch.setattr(workspace, "verify_committed_workspace", persistent_error)
+    try:
+        digest = reservation.commit()
+    finally:
+        reservation.close()
+    monkeypatch.setattr(workspace, "verify_committed_workspace", original_verify)
+
+    assert digest == original_verify(
+        str(target), allowed_artifacts={"task.json"}
+    )["commit_sha256"]
