@@ -59,6 +59,7 @@ from immutable_workspace import (  # noqa: E402
     FORMAT as IMMUTABLE_WORKSPACE_FORMAT,
     ImmutableWorkspace,
     WorkspaceCapabilityError,
+    WorkspaceCommitIndeterminate,
     WorkspaceError,
     WorkspaceExistsError,
     WorkspaceIdentityError,
@@ -84,6 +85,12 @@ SR_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
 SR_PARSER_FAILED = "PARSER_FAILED"
 SR_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
 SR_INTERNAL = "INTERNAL_ERROR"
+
+_INDETERMINATE_EXIT_CODE = 4
+_INDETERMINATE_MESSAGE = (
+    "[INDETERMINATE] 输出目录可能已有可见提交，但持久化或最终验证未确认；"
+    "请保留目录并重新核验"
+)
 
 _DETAIL_FIELDS = ("title", "published_at", "duration_seconds", "hashtags")
 
@@ -1036,6 +1043,9 @@ def _guard_workspace_reservations(function):
         token = _ACTIVE_RESERVATIONS.set(active)
         try:
             return function(*args, **kwargs)
+        except WorkspaceCommitIndeterminate:
+            print(_INDETERMINATE_MESSAGE, file=sys.stderr)
+            return _INDETERMINATE_EXIT_CODE
         except (
             WorkspaceCapabilityError,
             WorkspaceExistsError,
@@ -1324,6 +1334,8 @@ def run(
             )
             reservation.commit()
             return None
+        except WorkspaceCommitIndeterminate:
+            raise
         except (
             WorkspaceCapabilityError,
             WorkspaceExistsError,
@@ -1484,6 +1496,8 @@ def run(
                 f"empty_results={comment_collection['empty_results']} "
                 f"failures={comment_collection['failures']}"
             )
+    except WorkspaceCommitIndeterminate:
+        raise
     except (
         WorkspaceCapabilityError,
         WorkspaceExistsError,
@@ -1547,6 +1561,8 @@ def run(
             reservation=reservation,
         )
         reservation.commit()
+    except WorkspaceCommitIndeterminate:
+        raise
     except (
         WorkspaceCapabilityError,
         WorkspaceExistsError,

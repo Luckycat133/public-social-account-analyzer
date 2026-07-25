@@ -133,7 +133,7 @@ python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 - `normalized-posts.csv` — 遵循统一数据模型的归一化 CSV 表格
 - `collection-report.md` — 采集质量与字段覆盖率说明
 - `task.json` — 任务状态、范围、覆盖账本与续采来源摘要
-- `manifest.json` / `.complete` — 采集阶段白名单产物的大小、SHA-256 与最终提交标记；无有效标记的目录是不完整任务
+- `manifest.json` / `.complete` — 采集阶段白名单产物的大小、SHA-256 与最终提交标记；无有效标记的目录是不完整任务。若采集命令以退出码 `4` 报告提交不确定，即使标记当前可见也不得视为本次成功，须保留目录并重新核验
 - `account-analysis-report.md` — 完整 Markdown 账号分析报告（含具体证据 URL）
 - `dashboard.html` — 可视化 HTML 仪表盘
 - `analysis.json` — 机器可读的统计指标与分类分析 JSON

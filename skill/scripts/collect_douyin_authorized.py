@@ -16,6 +16,7 @@ from collectors.douyin_openapi import DouyinOpenAPIClient, DouyinOpenAPIError
 from immutable_workspace import (
     ImmutableWorkspace,
     WorkspaceCapabilityError,
+    WorkspaceCommitIndeterminate,
     WorkspaceError,
     WorkspaceExistsError,
     WorkspaceIdentityError,
@@ -30,6 +31,11 @@ from immutable_workspace import (
 _BEIJING = timezone(timedelta(hours=8))
 _PROFILE_ENDPOINT = "https://open.douyin.com/oauth/userinfo/"
 _TOKEN_ENV = "DOUYIN_OPENAPI_ACCESS_TOKEN"
+_INDETERMINATE_EXIT_CODE = 4
+_INDETERMINATE_MESSAGE = (
+    "[INDETERMINATE] 输出目录可能已有可见提交，但持久化或最终验证未确认；"
+    "请保留目录并重新核验"
+)
 _AUTHORIZED_ARTIFACTS = frozenset({
     "source/profile.json",
     "source/posts.jsonl",
@@ -268,6 +274,9 @@ def _guard_authorized_entry(function):
     def guarded(*args, **kwargs):
         try:
             return function(*args, **kwargs)
+        except WorkspaceCommitIndeterminate:
+            print(_INDETERMINATE_MESSAGE, file=sys.stderr)
+            return _INDETERMINATE_EXIT_CODE
         except (
             WorkspaceCapabilityError,
             WorkspaceExistsError,

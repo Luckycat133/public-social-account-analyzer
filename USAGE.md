@@ -192,6 +192,16 @@ python skill/scripts/render_report.py --input workspace/douyin-index-<account>-<
 - `ACCOUNT_UNAVAILABLE`：账号不存在、已被封禁或注销。
 - `ADAPTER_UNAVAILABLE`：平台适配器未安装或未启用。
 
+### 采集命令退出码：
+
+- `0`：采集结果可用（可能是按规范保留的 `PARTIAL`）。
+- `2`：参数、平台能力、工作区占用或身份/内容安全校验失败。
+- `3`：采集、序列化或普通提交失败。
+- `4`：工作区提交不确定。命令只输出固定提示
+  `[INDETERMINATE] 输出目录可能已有可见提交，但持久化或最终验证未确认；请保留目录并重新核验`。
+  目录中可能已出现合法 `.complete`，但本次运行不算成功；不要覆盖、删除或复用该目录，
+  后续采集应选择新目录。
+
 ---
 
 ## 常见问题与故障排查
@@ -209,3 +219,9 @@ python skill/scripts/render_report.py --input workspace/douyin-index-<account>-<
 BILIBILI_BROWSER_FALLBACK=1 python skill/scripts/collect.py "https://space.bilibili.com/123456" --browser-fallback
 ```
 系统将通过同机安装的浏览器真实出口网络进行重新重试。
+
+### Q4: macOS 下把 `--out` 指向 `/tmp` 或 `/var` 为什么被拒绝？
+
+POSIX 工作区会从根目录开始绑定每一级 no-follow 目录句柄；路径祖先中的符号链接会安全失败。
+macOS 的 `/tmp` 和 `/var` 是系统符号链接，请传入对应物理路径 `/private/tmp` 或
+`/private/var`。采集器不会自动调用 `realpath` 跟随尚未绑定身份的别名。

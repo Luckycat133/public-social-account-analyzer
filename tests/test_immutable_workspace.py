@@ -476,6 +476,53 @@ def test_commit_rejects_metadata_pathname_swap(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX rename semantics")
+def test_identical_valid_marker_replacement_is_never_converged_to_success(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "task"
+    displaced = tmp_path / "owned-complete"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("payload")
+    original_verify_tree = reservation._verify_committing_tree
+    swapped = False
+
+    def verify_tree_with_identical_final_marker_swap(
+        manifest, manifest_digest, *, marker
+    ):
+        nonlocal swapped
+        if marker and reservation._marker_finalized and not swapped:
+            swapped = True
+            marker_path = target / workspace.COMPLETE_NAME
+            valid_marker = marker_path.read_bytes()
+            marker_path.rename(displaced)
+            marker_path.write_bytes(valid_marker)
+        return original_verify_tree(manifest, manifest_digest, marker=marker)
+
+    monkeypatch.setattr(
+        reservation,
+        "_verify_committing_tree",
+        verify_tree_with_identical_final_marker_swap,
+    )
+    try:
+        with pytest.raises(workspace.WorkspaceIdentityError):
+            reservation.commit()
+    finally:
+        reservation.close()
+
+    assert swapped is True
+    assert displaced.read_bytes() == (
+        target / workspace.COMPLETE_NAME
+    ).read_bytes()
+    verified = workspace.verify_committed_workspace(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    assert verified["commit_sha256"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX rename semantics")
 def test_writer_rejects_complete_ancestor_chain_swap(tmp_path):
     visible_parent = tmp_path / "P"
     displaced_parent = tmp_path / "P-old"
@@ -587,7 +634,7 @@ def test_directory_fsync_failure_leaves_only_an_invalid_marker(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX fsync injection")
-def test_final_marker_fsync_error_converges_to_verified_success(
+def test_final_marker_fsync_retries_before_verified_success(
     monkeypatch, tmp_path
 ):
     target = tmp_path / "task"
@@ -597,10 +644,10 @@ def test_final_marker_fsync_error_converges_to_verified_success(
     with reservation.open_text("task.json") as handle:
         handle.write("payload")
     original_fsync = workspace.os.fsync
-    injected = False
+    final_marker_fsync_calls = 0
 
     def fail_final_marker_fsync_once(descriptor):
-        nonlocal injected
+        nonlocal final_marker_fsync_calls
         marker = target / workspace.COMPLETE_NAME
         metadata = os.fstat(descriptor)
         if marker.exists():
@@ -611,9 +658,10 @@ def test_final_marker_fsync_error_converges_to_verified_success(
             )
         else:
             is_marker = False
-        if not injected and is_marker and metadata.st_size > 0:
-            injected = True
-            raise OSError("MARKER_FSYNC_SENTINEL")
+        if is_marker and metadata.st_size > 0:
+            final_marker_fsync_calls += 1
+            if final_marker_fsync_calls == 1:
+                raise OSError("MARKER_FSYNC_SENTINEL")
         return original_fsync(descriptor)
 
     monkeypatch.setattr(workspace.os, "fsync", fail_final_marker_fsync_once)
@@ -622,11 +670,61 @@ def test_final_marker_fsync_error_converges_to_verified_success(
     finally:
         reservation.close()
 
-    assert injected is True
+    assert final_marker_fsync_calls == 2
     verified = workspace.verify_committed_workspace(
         str(target), allowed_artifacts={"task.json"}
     )
     assert digest == verified["commit_sha256"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX fsync injection")
+def test_persistent_final_marker_fsync_is_indeterminate_and_bounded(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "task"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("payload")
+    original_fsync = workspace.os.fsync
+    final_marker_fsync_calls = 0
+    secret = "SECRET_PERSISTENT_MARKER_FSYNC"
+
+    def fail_final_marker_fsync(descriptor):
+        nonlocal final_marker_fsync_calls
+        marker = target / workspace.COMPLETE_NAME
+        metadata = os.fstat(descriptor)
+        if marker.exists():
+            named = os.lstat(marker)
+            is_marker = (metadata.st_dev, metadata.st_ino) == (
+                named.st_dev,
+                named.st_ino,
+            )
+        else:
+            is_marker = False
+        if is_marker and metadata.st_size > 0:
+            final_marker_fsync_calls += 1
+            raise OSError(secret)
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(workspace.os, "fsync", fail_final_marker_fsync)
+    try:
+        with pytest.raises(workspace.WorkspaceCommitIndeterminate) as exc_info:
+            reservation.commit()
+    finally:
+        reservation.close()
+
+    assert final_marker_fsync_calls == 3
+    assert str(exc_info.value) == (
+        "workspace commit durability or final verification is indeterminate"
+    )
+    assert exc_info.value.__cause__ is None
+    assert secret not in str(exc_info.value)
+    verified = workspace.verify_committed_workspace(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    assert verified["commit_sha256"]
 
 
 def test_commit_uses_user_visible_verifier_and_retries_transient_final_error(
@@ -664,7 +762,7 @@ def test_commit_uses_user_visible_verifier_and_retries_transient_final_error(
     )["commit_sha256"]
 
 
-def test_persistent_post_marker_verifier_error_converges_from_bound_evidence(
+def test_persistent_post_marker_verifier_io_error_is_indeterminate(
     monkeypatch, tmp_path
 ):
     target = tmp_path / "task"
@@ -675,16 +773,56 @@ def test_persistent_post_marker_verifier_error_converges_from_bound_evidence(
         handle.write("payload")
     original_verify = workspace.verify_committed_workspace
 
+    calls = 0
+    secret = "SECRET_PERSISTENT_FINAL_VERIFY"
+
     def persistent_error(path, *, allowed_artifacts):
-        raise RuntimeError("PERSISTENT_FINAL_VERIFY")
+        nonlocal calls
+        calls += 1
+        raise OSError(secret)
 
     monkeypatch.setattr(workspace, "verify_committed_workspace", persistent_error)
     try:
-        digest = reservation.commit()
+        with pytest.raises(workspace.WorkspaceCommitIndeterminate) as exc_info:
+            reservation.commit()
     finally:
         reservation.close()
     monkeypatch.setattr(workspace, "verify_committed_workspace", original_verify)
 
-    assert digest == original_verify(
+    assert calls == 3
+    assert str(exc_info.value) == (
+        "workspace commit durability or final verification is indeterminate"
+    )
+    assert exc_info.value.__cause__ is None
+    assert secret not in str(exc_info.value)
+    assert original_verify(
         str(target), allowed_artifacts={"task.json"}
     )["commit_sha256"]
+
+
+def test_final_workspace_verification_error_is_not_retried_or_converged(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "task"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    with reservation.open_text("task.json") as handle:
+        handle.write("payload")
+    calls = 0
+
+    def reject_content(path, *, allowed_artifacts):
+        nonlocal calls
+        calls += 1
+        raise workspace.WorkspaceVerificationError("CONTENT_REJECTED")
+
+    monkeypatch.setattr(workspace, "verify_committed_workspace", reject_content)
+    try:
+        with pytest.raises(
+            workspace.WorkspaceVerificationError, match="CONTENT_REJECTED"
+        ):
+            reservation.commit()
+    finally:
+        reservation.close()
+
+    assert calls == 1

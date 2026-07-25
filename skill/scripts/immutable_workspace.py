@@ -28,6 +28,10 @@ _MARKER_PREFIX = b"PUBLIC-SOCIAL-ACCOUNT-ANALYZER-COMPLETE-V1\nmanifest-sha256="
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_MARKER_BYTES = len(_MARKER_PREFIX) + 65
+_FINAL_COMMIT_IO_ATTEMPTS = 3
+_COMMIT_INDETERMINATE_MESSAGE = (
+    "workspace commit durability or final verification is indeterminate"
+)
 DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 
 
@@ -53,6 +57,13 @@ class WorkspaceVerificationError(WorkspaceError):
 
 class WorkspaceWriteError(WorkspaceError):
     """A create-only artifact could not be safely persisted."""
+
+
+class WorkspaceCommitIndeterminate(WorkspaceError):
+    """A visible marker may exist, but commit success cannot be confirmed."""
+
+    def __init__(self) -> None:
+        super().__init__(_COMMIT_INDETERMINATE_MESSAGE)
 
 
 def _identity(metadata) -> tuple[int, int]:
@@ -1029,28 +1040,26 @@ class ImmutableWorkspace:
             self._invalid = True
             raise WorkspaceWriteError("workspace commit cannot be synced") from exc
 
-    def _visible_commit(self, manifest_digest: str) -> bool | None:
-        try:
-            verified = verify_committed_workspace(
-                self.path, allowed_artifacts=self.allowed_artifacts
-            )
-        except WorkspaceVerificationError:
-            return False
-        except Exception:
-            return None
-        return verified.get("commit_sha256") == manifest_digest
-
-    def _held_commit_is_complete(
-        self, manifest: dict, manifest_digest: str
-    ) -> bool:
-        try:
+    def _sync_final_marker(self, marker_owned: _OwnedLeaf) -> None:
+        for _ in range(_FINAL_COMMIT_IO_ATTEMPTS):
             self.verify_identity()
-            self._verify_committing_tree(
-                manifest, manifest_digest, marker=True
-            )
-        except Exception:
-            return False
-        return True
+            self._verify_leaf_identity(marker_owned)
+            try:
+                os.fsync(marker_owned.descriptor)
+            except OSError:
+                continue
+            return
+        raise WorkspaceCommitIndeterminate() from None
+
+    def _verify_visible_commit(self) -> dict:
+        for _ in range(_FINAL_COMMIT_IO_ATTEMPTS):
+            try:
+                return verify_committed_workspace(
+                    self.path, allowed_artifacts=self.allowed_artifacts
+                )
+            except OSError:
+                continue
+        raise WorkspaceCommitIndeterminate() from None
 
     def commit(self) -> str:
         """Create manifest then ``.complete``; never repair or roll back."""
@@ -1093,25 +1102,13 @@ class ImmutableWorkspace:
         try:
             self._write_descriptor(marker_owned.descriptor, marker)
             self._marker_finalized = True
-            os.fsync(marker_owned.descriptor)
+            self._sync_final_marker(marker_owned)
             self.verify_identity()
             self._verify_committing_tree(manifest, manifest_digest, marker=True)
-            verified = verify_committed_workspace(
-                self.path, allowed_artifacts=self.allowed_artifacts
-            )
+            verified = self._verify_visible_commit()
             if verified.get("commit_sha256") != manifest_digest:
                 raise WorkspaceIdentityError("workspace commit digest changed")
         except Exception:
-            if self._marker_finalized:
-                visible = self._visible_commit(manifest_digest)
-                if visible is True or (
-                    visible is None
-                    and self._held_commit_is_complete(
-                        manifest, manifest_digest
-                    )
-                ):
-                    self._committed = True
-                    return manifest_digest
             self._invalid = True
             raise
         self._committed = True

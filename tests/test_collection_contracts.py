@@ -614,6 +614,55 @@ def test_serialization_failures_are_sanitized_and_do_not_leak_reservation_fds(
     assert "SECRET_SERIALIZATION_FAILURE" not in captured.out + captured.err
 
 
+@pytest.mark.parametrize("access_failure", [False, True])
+def test_public_indeterminate_commit_has_dedicated_sanitized_exit_and_closes_handles(
+    monkeypatch, tmp_path, capsys, access_failure
+):
+    class Adapter(RecordingBilibiliAdapter):
+        def check_access(self, url):
+            if access_failure:
+                return {
+                    "accessible": False,
+                    "stop_reason": "ACCESS_RESTRICTED",
+                }
+            return super().check_access(url)
+
+    secret = "SECRET_PUBLIC_INDETERMINATE_CAUSE"
+    held_descriptors = []
+
+    def fail_indeterminate(self):
+        held_descriptors.extend(
+            owned.descriptor for owned in self._leaves.values()
+        )
+        if self.posix_chain is not None:
+            held_descriptors.extend(
+                entry.descriptor for entry in self.posix_chain.entries
+            )
+        try:
+            raise OSError(secret)
+        except OSError as cause:
+            raise immutable.WorkspaceCommitIndeterminate() from cause
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [Adapter()])
+    monkeypatch.setattr(immutable.ImmutableWorkspace, "commit", fail_indeterminate)
+    out = tmp_path / "task"
+
+    rc = collect.run(BILIBILI_URL, out_dir=str(out))
+
+    assert rc == 4
+    assert held_descriptors
+    for descriptor in held_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "[INDETERMINATE] 输出目录可能已有可见提交，但持久化或最终验证未确认；"
+        "请保留目录并重新核验\n"
+    )
+    assert secret not in captured.out + captured.err
+    assert out.is_dir()
+
+
 @pytest.mark.parametrize("control_flow", [KeyboardInterrupt, SystemExit])
 def test_public_serialization_preserves_base_exception_control_flow(
     monkeypatch, tmp_path, control_flow

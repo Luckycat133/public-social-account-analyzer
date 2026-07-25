@@ -641,6 +641,50 @@ def test_authorized_ordinary_output_failure_is_sanitized_and_never_cleans_up(
     assert TOKEN not in captured.out + captured.err
 
 
+def test_authorized_indeterminate_commit_has_dedicated_sanitized_exit_and_closes_handles(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    secret = f"SECRET_AUTHORIZED_INDETERMINATE {TOKEN}"
+    held_descriptors = []
+
+    def fail_indeterminate(self):
+        held_descriptors.extend(
+            owned.descriptor for owned in self._leaves.values()
+        )
+        if self.posix_chain is not None:
+            held_descriptors.extend(
+                entry.descriptor for entry in self.posix_chain.entries
+            )
+        try:
+            raise OSError(secret)
+        except OSError as cause:
+            raise immutable.WorkspaceCommitIndeterminate() from cause
+
+    monkeypatch.setattr(immutable.ImmutableWorkspace, "commit", fail_indeterminate)
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=_CompletedAuthorizedClient(),
+    )
+
+    assert rc == 4
+    assert held_descriptors
+    for descriptor in held_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "[INDETERMINATE] 输出目录可能已有可见提交，但持久化或最终验证未确认；"
+        "请保留目录并重新核验\n"
+    )
+    assert secret not in captured.out + captured.err
+    assert TOKEN not in captured.out + captured.err
+    assert out_dir.is_dir()
+
+
 @pytest.mark.parametrize("stage", ["serialization", "commit"])
 @pytest.mark.parametrize("control_flow", [KeyboardInterrupt, SystemExit])
 def test_authorized_control_flow_propagates_after_workspace_handles_close(
