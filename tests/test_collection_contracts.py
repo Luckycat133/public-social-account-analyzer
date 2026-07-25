@@ -795,8 +795,9 @@ def test_resume_rejects_symlinked_posts_before_adapter_loading(
 
 
 @pytest.mark.skipif(not Path("/dev/fd").is_dir(), reason="requires /dev/fd")
+@pytest.mark.parametrize("exception_type", [TypeError, RuntimeError])
 def test_serialization_failures_are_sanitized_and_do_not_leak_reservation_fds(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, exception_type
 ):
     adapter = RecordingBilibiliAdapter()
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
@@ -804,7 +805,7 @@ def test_serialization_failures_are_sanitized_and_do_not_leak_reservation_fds(
 
     def fail_profile_dump(value, handle, *args, **kwargs):
         if isinstance(value, dict) and value.get("platform") == "bilibili":
-            raise TypeError("SECRET_SERIALIZATION_FAILURE")
+            raise exception_type("SECRET_SERIALIZATION_FAILURE")
         return original_dump(value, handle, *args, **kwargs)
 
     monkeypatch.setattr(collect.json, "dump", fail_profile_dump)
@@ -819,7 +820,26 @@ def test_serialization_failures_are_sanitized_and_do_not_leak_reservation_fds(
     captured = capsys.readouterr()
     assert all(result in {2, 3} for result in results)
     assert after <= before + 2
+    assert list(tmp_path.rglob(".*.tmp")) == []
     assert "SECRET_SERIALIZATION_FAILURE" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("control_flow", [KeyboardInterrupt, SystemExit])
+def test_public_serialization_preserves_base_exception_control_flow(
+    monkeypatch, tmp_path, control_flow
+):
+    adapter = RecordingBilibiliAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    def interrupt_profile_dump(value, handle, *args, **kwargs):
+        raise control_flow("CONTROL_FLOW_SENTINEL")
+
+    monkeypatch.setattr(collect.json, "dump", interrupt_profile_dump)
+
+    with pytest.raises(control_flow, match="CONTROL_FLOW_SENTINEL"):
+        collect.run(BILIBILI_URL, out_dir=str(tmp_path / "task"))
+
+    assert list(tmp_path.rglob(".*.tmp")) == []
 
 
 def test_public_reservation_falls_back_when_dir_fd_operations_are_unsupported(

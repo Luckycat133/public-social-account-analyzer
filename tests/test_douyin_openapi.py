@@ -566,8 +566,8 @@ def test_refuses_to_overwrite_existing_workspace_before_api_calls(tmp_path):
     assert transport.requests == []
 
 
-def test_artifact_failure_cleans_staging_and_allows_recovery(
-    monkeypatch, tmp_path
+def test_artifact_failure_is_sanitized_cleans_staging_and_allows_recovery(
+    monkeypatch, tmp_path, capsys
 ):
     out_dir = tmp_path / "authorized"
     original_write_csv = authorized._write_csv
@@ -584,16 +584,17 @@ def test_artifact_failure_cleans_staging_and_allows_recovery(
         ]),
     )
 
-    with pytest.raises(OSError, match="injected serialization failure"):
-        run(
-            out_dir=str(out_dir),
-            collect_all=True,
-            environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-            client=first_client,
-        )
+    assert run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=first_client,
+    ) == 3
 
     assert not out_dir.exists()
     assert list(tmp_path.glob(".authorized.staging-*")) == []
+    captured = capsys.readouterr()
+    assert "injected serialization failure" not in captured.out + captured.err
 
     monkeypatch.setattr(authorized, "_write_csv", original_write_csv)
     recovery_client = DouyinOpenAPIClient(
@@ -610,6 +611,74 @@ def test_artifact_failure_cleans_staging_and_allows_recovery(
         client=recovery_client,
     ) == 0
     assert (out_dir / "task.json").is_file()
+
+
+@pytest.mark.skipif(not Path("/dev/fd").is_dir(), reason="requires /dev/fd")
+def test_authorized_runtime_serialization_failure_is_sanitized_without_leaks(
+    monkeypatch, tmp_path, capsys
+):
+    original_dump = authorized.json.dump
+
+    def fail_profile_dump(value, handle, *args, **kwargs):
+        if isinstance(value, dict) and value.get("platform") == "douyin":
+            raise RuntimeError(f"SECRET_RUNTIME_FAILURE {TOKEN}")
+        return original_dump(value, handle, *args, **kwargs)
+
+    monkeypatch.setattr(authorized.json, "dump", fail_profile_dump)
+    before = len(list(Path("/dev/fd").iterdir()))
+    results = []
+    for index in range(20):
+        client = DouyinOpenAPIClient(
+            TOKEN,
+            transport=FakeTransport([
+                _profile_response(),
+                _page([], cursor=0, has_more=0),
+            ]),
+        )
+        results.append(run(
+            out_dir=str(tmp_path / f"authorized-{index}"),
+            collect_all=True,
+            environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+            client=client,
+        ))
+
+    after = len(list(Path("/dev/fd").iterdir()))
+    captured = capsys.readouterr()
+    assert results == [3] * 20
+    assert after <= before + 2
+    assert list(tmp_path.glob(".authorized-*.staging-*")) == []
+    assert not any((tmp_path / f"authorized-{index}").exists() for index in range(20))
+    assert "SECRET_RUNTIME_FAILURE" not in captured.out + captured.err
+    assert TOKEN not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("control_flow", [KeyboardInterrupt, SystemExit])
+def test_authorized_serialization_preserves_base_exception_control_flow(
+    monkeypatch, tmp_path, control_flow
+):
+    def interrupt_serialization(workspace, **kwargs):
+        raise control_flow("CONTROL_FLOW_SENTINEL")
+
+    monkeypatch.setattr(
+        authorized, "_serialize_artifacts", interrupt_serialization
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    with pytest.raises(control_flow, match="CONTROL_FLOW_SENTINEL"):
+        run(
+            out_dir=str(tmp_path / "authorized"),
+            collect_all=True,
+            environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+            client=client,
+        )
+
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
 
 
 @pytest.mark.parametrize("node_kind", ["symlink", "fifo", "hardlink"])
@@ -809,7 +878,7 @@ def test_authorized_staging_identity_capture_failure_cleans_owned_staging(
 ):
     out_dir = tmp_path / "authorized"
 
-    def fail_staging_capture(path):
+    def fail_staging_capture(path, *args, **kwargs):
         raise OSError(f"injected identity failure {TOKEN}")
 
     monkeypatch.setattr(
@@ -832,6 +901,220 @@ def test_authorized_staging_identity_capture_failure_cleans_owned_staging(
 
     captured = capsys.readouterr()
     assert rc == 3
+    assert not out_dir.exists()
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
+def test_staging_swap_before_identity_capture_never_adopts_replacement(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    displaced = tmp_path / "displaced-original-staging"
+    replacement_task = b"concurrent task\x00must-survive"
+    replacement_marker = b"concurrent marker\x00must-survive"
+
+    def swap_then_fail_capture(staging, *args, **kwargs):
+        Path(staging).rename(displaced)
+        Path(staging).mkdir()
+        (Path(staging) / "task.json").write_bytes(replacement_task)
+        (Path(staging) / "marker.bin").write_bytes(replacement_marker)
+        raise OSError(f"SECRET_CAPTURE_FAILURE {TOKEN}")
+
+    monkeypatch.setattr(
+        authorized, "_open_staging_directory", swap_then_fail_capture
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    assert run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    ) == 3
+
+    captured = capsys.readouterr()
+    replacements = list(tmp_path.glob(".authorized.staging-*"))
+    assert len(replacements) == 1
+    assert (replacements[0] / "task.json").read_bytes() == replacement_task
+    assert (replacements[0] / "marker.bin").read_bytes() == replacement_marker
+    assert displaced.is_dir()
+    assert list(displaced.iterdir()) == []
+    assert "SECRET_CAPTURE_FAILURE" not in captured.out + captured.err
+    assert TOKEN not in captured.out + captured.err
+
+
+def _test_windows_tree_evidence(staging: str) -> dict[str, tuple[int, ...]]:
+    expected_root = {
+        "source",
+        "normalized-posts.csv",
+        "task.json",
+        "collection-report.md",
+    }
+    assert {path.name for path in Path(staging).iterdir()} == expected_root
+    assert {
+        path.name for path in (Path(staging) / "source").iterdir()
+    } == {"profile.json", "posts.jsonl"}
+    evidence: dict[str, tuple[int, ...]] = {}
+    for relative in (
+        "source/profile.json",
+        "source/posts.jsonl",
+        "normalized-posts.csv",
+        "task.json",
+        "collection-report.md",
+    ):
+        metadata = os.lstat(Path(staging) / relative)
+        assert metadata.st_nlink == 1
+        evidence[relative] = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+        )
+    return evidence
+
+
+@pytest.mark.parametrize("concurrent_target", [False, True])
+def test_authorized_windows_backend_is_reachable_and_create_only(
+    monkeypatch, tmp_path, concurrent_target
+):
+    out_dir = tmp_path / "authorized"
+    calls = {"open": 0, "validate": 0, "close": 0, "publish": 0}
+    marker_bytes = b"windows concurrent target\x00must-survive"
+
+    def open_windows_staging(staging, expected_identity):
+        calls["open"] += 1
+        metadata = os.lstat(staging)
+        assert (metadata.st_dev, metadata.st_ino) == expected_identity
+        return object(), expected_identity
+
+    def validate_windows_staging(
+        staging, handle, identity, *, expected=None
+    ):
+        calls["validate"] += 1
+        evidence = _test_windows_tree_evidence(staging)
+        if expected is not None:
+            assert evidence == expected
+        return evidence
+
+    def close_windows_staging(handle):
+        calls["close"] += 1
+
+    def publish_windows_staging(staging, target):
+        calls["publish"] += 1
+        if concurrent_target:
+            Path(target).mkdir()
+            (Path(target) / "marker.bin").write_bytes(marker_bytes)
+            raise FileExistsError("concurrent Windows target")
+        assert not os.path.lexists(target)
+        os.rename(staging, target)
+
+    monkeypatch.setattr(
+        authorized, "_artifact_platform", lambda: "windows", raising=False
+    )
+    monkeypatch.setattr(
+        authorized,
+        "_open_windows_staging_directory",
+        open_windows_staging,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        authorized,
+        "_validate_windows_staging_tree",
+        validate_windows_staging,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        authorized,
+        "_close_windows_staging_directory",
+        close_windows_staging,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        authorized,
+        "_windows_publish_noreplace",
+        publish_windows_staging,
+        raising=False,
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    assert rc == (2 if concurrent_target else 0)
+    assert calls["open"] == 1
+    assert calls["validate"] == (2 if concurrent_target else 3)
+    assert calls["close"] == 1
+    assert calls["publish"] == 1
+    if concurrent_target:
+        assert (out_dir / "marker.bin").read_bytes() == marker_bytes
+        assert sorted(path.name for path in out_dir.iterdir()) == ["marker.bin"]
+    else:
+        assert (out_dir / "task.json").is_file()
+        assert (out_dir / "source" / "profile.json").is_file()
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+
+
+def test_windows_publish_noreplace_preserves_existing_target(tmp_path):
+    staging = tmp_path / "staging"
+    target = tmp_path / "target"
+    staging.mkdir()
+    target.mkdir()
+    marker_bytes = b"existing Windows target\x00must-survive"
+    (target / "marker.bin").write_bytes(marker_bytes)
+
+    with pytest.raises(FileExistsError):
+        authorized._windows_publish_noreplace(str(staging), str(target))
+
+    assert staging.is_dir()
+    assert (target / "marker.bin").read_bytes() == marker_bytes
+
+    publishable = tmp_path / "publishable"
+    published = tmp_path / "published"
+    publishable.mkdir()
+    (publishable / "artifact.bin").write_bytes(b"complete")
+    authorized._windows_publish_noreplace(str(publishable), str(published))
+    assert not publishable.exists()
+    assert (published / "artifact.bin").read_bytes() == b"complete"
+
+
+def test_authorized_unknown_platform_fails_closed(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    monkeypatch.setattr(
+        authorized, "_artifact_platform", lambda: "unsupported", raising=False
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    assert run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    ) == 3
+    captured = capsys.readouterr()
     assert not out_dir.exists()
     assert list(tmp_path.glob(".authorized.staging-*")) == []
     assert TOKEN not in captured.out + captured.err

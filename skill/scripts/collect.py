@@ -1934,7 +1934,7 @@ def _guard_workspace_reservations(function):
         except WorkspaceContractError:
             print("[FAILED] 输出目录身份已改变；拒绝写入", file=sys.stderr)
             return 2
-        except (OSError, TypeError, ValueError, UnicodeError):
+        except Exception:
             print("[FAILED] 产物序列化或发布失败", file=sys.stderr)
             return 3
         finally:
