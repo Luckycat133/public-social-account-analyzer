@@ -165,13 +165,27 @@ def _extract_hashtags(desc: Any, text_extra: Any) -> list[str]:
     if isinstance(text_extra, list):
         for item in text_extra:
             name = (item or {}).get("hashtag_name") if isinstance(item, dict) else None
-            if name and name not in tags:
-                tags.append(name)
+            if isinstance(name, str) and name.strip() and name.strip() not in tags:
+                tags.append(name.strip())
     if isinstance(desc, str):
         for m in re.findall(r"#([^#\s]+)#?", desc):
-            if m and m not in tags:
-                tags.append(m)
+            tag = m.strip()
+            if tag and tag not in tags:
+                tags.append(tag)
     return tags
+
+
+def _text_extra_is_structurally_observed(value: Any) -> bool:
+    """Accept only an explicit, structurally valid public hashtag array."""
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        name = item.get("hashtag_name")
+        if not isinstance(name, str) or not name.strip():
+            return False
+    return True
 
 
 def _extract_render_data(html: str) -> dict | None:
@@ -253,6 +267,9 @@ class DouyinCollector(BaseCollector):
         self._browser_collect = browser_collect
         self._collection_coverage: dict[str, Any] = {}
         self._browser_profile_cache: dict[str, dict[str, Any]] = {}
+        self._detail_provenance: dict[
+            int, tuple[dict[str, Any], tuple[str, ...]]
+        ] = {}
 
     # -- 路由 ---------------------------------------------------------------
     def supports(self, url: str) -> bool:
@@ -503,17 +520,37 @@ class DouyinCollector(BaseCollector):
         items: list[dict[str, Any]],
         default_source: str,
     ) -> list[dict[str, Any]]:
-        return [
-            self.normalize_post(
-                self._build_post_raw(
-                    url, item,
-                    source=_collection_source(
-                        item.get("_collection_source"), default_source
-                    ),
-                )
+        posts: list[dict[str, Any]] = []
+        for item in items:
+            raw = self._build_post_raw(
+                url,
+                item,
+                source=_collection_source(
+                    item.get("_collection_source"), default_source
+                ),
             )
-            for item in items
-        ]
+            trusted_missing = tuple(raw.pop("_trusted_detail_missing_fields", ()))
+            post = self.normalize_post(raw)
+            if trusted_missing:
+                self._detail_provenance[id(post)] = (
+                    post,
+                    trusted_missing,
+                )
+            posts.append(post)
+        return posts
+
+    def _take_trusted_detail_missing_fields(
+        self, post: dict[str, Any]
+    ) -> tuple[str, ...]:
+        """Consume same-process builder provenance for this exact post object."""
+        entry = self._detail_provenance.pop(id(post), None)
+        if entry is None or entry[0] is not post:
+            return ()
+        return entry[1]
+
+    def _clear_detail_provenance(self) -> None:
+        """Drop all non-persistable detail provenance at the output boundary."""
+        self._detail_provenance.clear()
 
     @staticmethod
     def _date_summary(
@@ -1156,12 +1193,13 @@ class DouyinCollector(BaseCollector):
         )
         hashtags = _extract_hashtags(desc, text_extra)
         browser_source = collection_source in {"dom", "network", "network+dom"}
-        observed_detail_fields = (
+        raw_missing_evidence = (
             {"hashtags"}
-            if hashtags or isinstance(text_extra, list)
+            if not hashtags
+            and not _text_extra_is_structurally_observed(text_extra)
             else set()
         )
-        browser_missing_fields = missing_detail_fields(
+        p0_missing_fields = missing_detail_fields(
             {
                 "title": single_text,
                 "published_at": published_at,
@@ -1169,11 +1207,11 @@ class DouyinCollector(BaseCollector):
                 "hashtags": hashtags,
                 "content_type": content_type,
             },
-            observed_fields=observed_detail_fields,
+            trusted_missing_fields=raw_missing_evidence,
         )
         collection_status = (
             "PARTIAL"
-            if browser_source and browser_missing_fields
+            if browser_source and p0_missing_fields
             else "SUCCESS"
         )
         return {
@@ -1200,16 +1238,21 @@ class DouyinCollector(BaseCollector):
             "collection_status": collection_status,
             "collected_at": _now_iso(),
             "source_url": post_url,
+            **(
+                {"_trusted_detail_missing_fields": p0_missing_fields}
+                if p0_missing_fields
+                else {}
+            ),
             "platform_metrics": {
                 "collection_name": collection_name,
                 "aweme_type": aweme.get("aweme_type"),
                 "collection_source": collection_source,
                 **(
                     {
-                        "missing_detail_fields": browser_missing_fields,
+                        "missing_detail_fields": p0_missing_fields,
                         "partial_reasons": (
                             [MISSING_P0_DETAIL]
-                            if browser_missing_fields
+                            if p0_missing_fields
                             else []
                         ),
                     }

@@ -43,6 +43,7 @@ from collectors._douyin_detail_contract import (  # noqa: E402
     P0_DETAIL_FIELDS,
     derive_detail_contract,
     detail_value_is_observed,
+    sanitize_partial_reasons,
     set_detail_contract,
 )
 from collectors._constants import (  # noqa: E402
@@ -536,15 +537,41 @@ def _enrich_douyin_details(
     """Fill only missing public fields; isolate and sanitize item failures."""
     unavailable_count = 0
     for post in posts:
-        if post.get("collection_status") not in {"SUCCESS", "PARTIAL"}:
+        initial_status = post.get("collection_status")
+        if initial_status not in {"SUCCESS", "PARTIAL"}:
             continue
-        missing, reasons = derive_detail_contract(post)
+        trusted_missing: tuple[str, ...] = ()
+        take_provenance = getattr(
+            adapter, "_take_trusted_detail_missing_fields", None
+        )
+        if callable(take_provenance):
+            try:
+                candidate = take_provenance(post)
+            except Exception:
+                candidate = ()
+            if isinstance(candidate, (list, tuple)):
+                trusted_missing = tuple(
+                    field for field in candidate if field in P0_DETAIL_FIELDS
+                )
+        trusted_detail_only_partial = bool(trusted_missing)
+        can_upgrade = initial_status == "SUCCESS" or (
+            initial_status == "PARTIAL" and trusted_detail_only_partial
+        )
+        missing, reasons = derive_detail_contract(
+            post,
+            trusted_missing_fields=trusted_missing,
+            trusted_detail_only_partial=trusted_detail_only_partial,
+        )
         set_detail_contract(post, missing, reasons)
         if missing or reasons:
             post["collection_status"] = "PARTIAL"
         if not missing:
             _set_detail_status(post, "NOT_NEEDED")
-            if not reasons and post.get("collection_status") == "PARTIAL":
+            if (
+                can_upgrade
+                and not reasons
+                and post.get("collection_status") == "PARTIAL"
+            ):
                 post["collection_status"] = "SUCCESS"
             continue
         item_url = _douyin_item_url(post)
@@ -609,7 +636,11 @@ def _enrich_douyin_details(
         ]
         set_detail_contract(post, [], remaining_reasons)
         _set_detail_status(post, "SUCCESS")
-        if not remaining_reasons and post.get("collection_status") == "PARTIAL":
+        if (
+            can_upgrade
+            and not remaining_reasons
+            and post.get("collection_status") == "PARTIAL"
+        ):
             post["collection_status"] = "SUCCESS"
     return unavailable_count
 
@@ -1423,6 +1454,17 @@ def run(
             posts = partial_posts[:requested_count]
         diagnostic_code = getattr(e, "diagnostic_code", None)
         stop_reason = _stop_reason_from_exc(e)
+        if platform == "douyin" and posts:
+            for post in posts:
+                if post.get("collection_status") in {"SUCCESS", "PARTIAL"}:
+                    post["collection_status"] = "PARTIAL"
+                    metrics = post.get("platform_metrics")
+                    metrics = dict(metrics) if isinstance(metrics, dict) else {}
+                    metrics["partial_reasons"] = sanitize_partial_reasons(
+                        sanitize_partial_reasons(metrics.get("partial_reasons"))
+                        + [str(stop_reason).lower()]
+                    )
+                    post["platform_metrics"] = metrics
         # 登录/验证/频控/解析失败 → PARTIAL(已有数据保留)或 FAILED(无已采数据)
         task_status = "PARTIAL" if posts else "FAILED"
         entry = {
@@ -1497,6 +1539,13 @@ def run(
         detail_unavailable_count = _enrich_douyin_details(
             adapter, posts, error_log, collected_at
         )
+
+    clear_detail_provenance = getattr(adapter, "_clear_detail_provenance", None)
+    if callable(clear_detail_provenance):
+        try:
+            clear_detail_provenance()
+        except Exception:
+            pass
 
     # 4) 落盘原始数据与归一化 CSV(已采集数据必须保留,见 exceptions.md §2 规则 3)
     try:

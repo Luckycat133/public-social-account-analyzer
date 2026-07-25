@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import math
+from datetime import datetime
 from typing import Any, Iterable
 
 
@@ -33,19 +33,18 @@ def detail_value_is_observed(
     if field == "title":
         return isinstance(value, str) and bool(value.strip())
     if field == "published_at":
-        return isinstance(value, str) and bool(value.strip())
+        if not isinstance(value, str) or not value.strip():
+            return False
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        return True
     if field == "duration_seconds":
-        if content_type == "image_text":
-            return True
-        return bool(
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value)
-            and value >= 0
-        )
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
     if field == "hashtags":
         return isinstance(value, list) and all(
-            isinstance(tag, str) for tag in value
+            isinstance(tag, str) and bool(tag.strip()) for tag in value
         )
     return False
 
@@ -53,16 +52,18 @@ def detail_value_is_observed(
 def missing_detail_fields(
     post: dict[str, Any],
     *,
-    observed_fields: Iterable[str] = (),
+    trusted_missing_fields: Iterable[str] = (),
 ) -> list[str]:
-    """Compute missing P0 fields, distinguishing known-empty hashtag arrays."""
-    observed = frozenset(observed_fields)
+    """Compute missing P0 fields from values plus ephemeral builder evidence."""
+    trusted_missing = frozenset(
+        field for field in trusted_missing_fields if field in P0_DETAIL_FIELDS
+    )
     missing: list[str] = []
     for field in P0_DETAIL_FIELDS:
-        value = post.get(field)
-        if field == "hashtags" and value == [] and field not in observed:
+        if field in trusted_missing:
             missing.append(field)
             continue
+        value = post.get(field)
         if not detail_value_is_observed(
             field,
             value,
@@ -111,30 +112,31 @@ def sanitize_partial_reasons(value: Any) -> list[str]:
 
 def derive_detail_contract(
     post: dict[str, Any],
+    *,
+    trusted_missing_fields: Iterable[str] = (),
+    trusted_detail_only_partial: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Reconcile declared metadata with actual fields without unsafe upgrades."""
+    """Derive diagnostics without trusting persisted metadata as evidence."""
     metrics = post.get("platform_metrics")
     metrics = metrics if isinstance(metrics, dict) else {}
-    declared_missing = sanitize_missing_detail_fields(
-        metrics.get("missing_detail_fields")
+    actual_missing = missing_detail_fields(
+        post,
+        trusted_missing_fields=trusted_missing_fields,
     )
-    observed = (
-        set(P0_DETAIL_FIELDS) - set(declared_missing)
-        if declared_missing is not None
-        else set()
-    )
-    actual_missing = missing_detail_fields(post, observed_fields=observed)
 
     reasons = sanitize_partial_reasons(metrics.get("partial_reasons"))
-    declared_missing_reason = MISSING_P0_DETAIL in reasons
+    legacy_singular_reason = (
+        metrics.get("partial_reason") or post.get("partial_reason")
+    )
+    if legacy_singular_reason:
+        reasons.append(OTHER_PARTIAL)
     if actual_missing and MISSING_P0_DETAIL not in reasons:
         reasons.insert(0, MISSING_P0_DETAIL)
     if not actual_missing:
         reasons = [reason for reason in reasons if reason != MISSING_P0_DETAIL]
     if (
         post.get("collection_status") == "PARTIAL"
-        and not reasons
-        and not declared_missing_reason
+        and not trusted_detail_only_partial
     ):
         reasons.append(OTHER_PARTIAL)
     reasons = sanitize_partial_reasons(reasons)
@@ -149,6 +151,8 @@ def set_detail_contract(
     """Persist only ordered allowlisted detail metadata on one normalized post."""
     metrics = post.get("platform_metrics")
     clean_metrics = dict(metrics) if isinstance(metrics, dict) else {}
+    post.pop("partial_reason", None)
+    clean_metrics.pop("partial_reason", None)
     clean_metrics["missing_detail_fields"] = sanitize_missing_detail_fields(
         list(missing)
     ) or []
