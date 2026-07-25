@@ -612,6 +612,125 @@ def test_artifact_failure_cleans_staging_and_allows_recovery(
     assert (out_dir / "task.json").is_file()
 
 
+@pytest.mark.parametrize("node_kind", ["symlink", "fifo", "hardlink"])
+def test_authorized_rejects_unsafe_staging_artifact_nodes(
+    monkeypatch, tmp_path, capsys, node_kind
+):
+    if node_kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO requires POSIX")
+    out_dir = tmp_path / "authorized"
+    victim = tmp_path / "victim.bin"
+    victim_bytes = b"victim\x00must-survive"
+    victim.write_bytes(victim_bytes)
+    original_serialize = authorized._serialize_artifacts
+
+    def serialize_then_replace_task(workspace, **kwargs):
+        original_serialize(workspace, **kwargs)
+        task = Path(workspace) / "task.json"
+        task.unlink()
+        if node_kind == "symlink":
+            task.symlink_to(victim)
+        elif node_kind == "fifo":
+            os.mkfifo(task)
+        else:
+            os.link(victim, task)
+
+    monkeypatch.setattr(
+        authorized, "_serialize_artifacts", serialize_then_replace_task
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert not out_dir.exists()
+    assert victim.read_bytes() == victim_bytes
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
+def test_authorized_atomic_publish_unavailable_fails_closed(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+
+    def unavailable(staging, target):
+        raise OSError("atomic no-replace unavailable")
+
+    monkeypatch.setattr(
+        authorized, "_atomic_publish_noreplace", unavailable, raising=False
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert not out_dir.exists()
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
+def test_authorized_atomic_publish_preserves_concurrent_final_marker(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    marker_bytes = b"concurrent final\x00must-survive"
+
+    def competing_publish(staging, target):
+        Path(target).mkdir()
+        (Path(target) / "marker.bin").write_bytes(marker_bytes)
+        raise FileExistsError("concurrent target")
+
+    monkeypatch.setattr(
+        authorized, "_atomic_publish_noreplace", competing_publish, raising=False
+    )
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert (out_dir / "marker.bin").read_bytes() == marker_bytes
+    assert sorted(path.name for path in out_dir.iterdir()) == ["marker.bin"]
+    assert list(tmp_path.glob(".authorized.staging-*")) == []
+    assert TOKEN not in captured.out + captured.err
+
+
 def test_concurrent_target_creation_preserves_marker_and_aborts_promotion(
     monkeypatch, tmp_path, capsys
 ):
@@ -652,15 +771,17 @@ def test_concurrent_target_creation_preserves_marker_and_aborts_promotion(
     assert TOKEN not in captured.out + captured.err
 
 
-def test_child_promotion_failure_cleans_only_owned_reservation(
+def test_atomic_directory_publish_failure_cleans_only_owned_staging(
     monkeypatch, tmp_path, capsys
 ):
     out_dir = tmp_path / "authorized"
 
-    def fail_child_promotion(source, target):
+    def fail_atomic_publish(source, target):
         raise OSError(f"raw promotion failure {TOKEN}")
 
-    monkeypatch.setattr(authorized.os, "rename", fail_child_promotion)
+    monkeypatch.setattr(
+        authorized, "_atomic_publish_noreplace", fail_atomic_publish
+    )
     client = DouyinOpenAPIClient(
         TOKEN,
         transport=FakeTransport([
@@ -683,18 +804,17 @@ def test_child_promotion_failure_cleans_only_owned_reservation(
     assert TOKEN not in captured.out + captured.err
 
 
-def test_stat_after_authorized_mkdir_failure_cleans_empty_owned_target(
+def test_authorized_staging_identity_capture_failure_cleans_owned_staging(
     monkeypatch, tmp_path, capsys
 ):
     out_dir = tmp_path / "authorized"
-    original_stat = authorized.os.stat
 
-    def fail_owned_target_stat(path, *args, **kwargs):
-        if os.fspath(path) == str(out_dir) and kwargs.get("follow_symlinks") is False:
-            raise OSError(f"injected stat failure {TOKEN}")
-        return original_stat(path, *args, **kwargs)
+    def fail_staging_capture(path):
+        raise OSError(f"injected identity failure {TOKEN}")
 
-    monkeypatch.setattr(authorized.os, "stat", fail_owned_target_stat)
+    monkeypatch.setattr(
+        authorized, "_open_staging_directory", fail_staging_capture
+    )
     client = DouyinOpenAPIClient(
         TOKEN,
         transport=FakeTransport([
@@ -717,23 +837,20 @@ def test_stat_after_authorized_mkdir_failure_cleans_empty_owned_target(
     assert TOKEN not in captured.out + captured.err
 
 
-def test_promotion_failure_preserves_concurrent_marker_and_owned_target(
+def test_atomic_publish_failure_preserves_concurrent_final_marker(
     monkeypatch, tmp_path, capsys
 ):
     out_dir = tmp_path / "authorized"
     marker_bytes = b"concurrent marker\x00must survive"
-    original_rename = authorized.os.rename
-    promoted = []
 
-    def promote_one_then_fail(source, target):
-        if not promoted:
-            original_rename(source, target)
-            promoted.append(Path(target).name)
-            return
-        (out_dir / "marker.bin").write_bytes(marker_bytes)
+    def competing_publish_then_fail(source, target):
+        Path(target).mkdir()
+        (Path(target) / "marker.bin").write_bytes(marker_bytes)
         raise OSError(f"raw promotion failure {TOKEN}")
 
-    monkeypatch.setattr(authorized.os, "rename", promote_one_then_fail)
+    monkeypatch.setattr(
+        authorized, "_atomic_publish_noreplace", competing_publish_then_fail
+    )
     client = DouyinOpenAPIClient(
         TOKEN,
         transport=FakeTransport([
@@ -757,28 +874,22 @@ def test_promotion_failure_preserves_concurrent_marker_and_owned_target(
     assert TOKEN not in captured.out + captured.err
 
 
-def test_promotion_failure_leaves_replaced_promoted_child_untouched(
+def test_post_publish_target_swap_leaves_replacement_and_published_tree_untouched(
     monkeypatch, tmp_path, capsys
 ):
     out_dir = tmp_path / "authorized"
-    displaced_source = tmp_path / "displaced-promoted-source"
-    marker_bytes = b"replacement child\x00must survive"
-    original_rename = authorized.os.rename
-    promoted = False
+    displaced_publish = tmp_path / "displaced-published-tree"
+    marker_bytes = b"replacement target\x00must survive"
+    original_publish = authorized._atomic_publish_noreplace
 
-    def replace_first_promoted_child_then_fail(source, target):
-        nonlocal promoted
-        if not promoted:
-            original_rename(source, target)
-            promoted = True
-            return
-        (out_dir / "source").rename(displaced_source)
-        (out_dir / "source").mkdir()
-        (out_dir / "source" / "marker.bin").write_bytes(marker_bytes)
-        raise OSError(f"raw promotion failure {TOKEN}")
+    def publish_then_replace_target(source, target):
+        original_publish(source, target)
+        Path(target).rename(displaced_publish)
+        Path(target).mkdir()
+        (Path(target) / "marker.bin").write_bytes(marker_bytes)
 
     monkeypatch.setattr(
-        authorized.os, "rename", replace_first_promoted_child_then_fail
+        authorized, "_atomic_publish_noreplace", publish_then_replace_target
     )
     client = DouyinOpenAPIClient(
         TOKEN,
@@ -797,8 +908,9 @@ def test_promotion_failure_leaves_replaced_promoted_child_untouched(
 
     captured = capsys.readouterr()
     assert rc == 3
-    assert (out_dir / "source" / "marker.bin").read_bytes() == marker_bytes
-    assert displaced_source.is_dir()
+    assert (out_dir / "marker.bin").read_bytes() == marker_bytes
+    assert (displaced_publish / "source" / "profile.json").is_file()
+    assert (displaced_publish / "task.json").is_file()
     assert list(tmp_path.glob(".authorized.staging-*")) == []
     assert TOKEN not in captured.out + captured.err
 

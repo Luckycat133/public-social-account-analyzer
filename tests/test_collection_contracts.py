@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -447,6 +449,87 @@ def test_resume_validates_existing_target_and_source_without_ownership(tmp_path)
         reservation.close()
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "task.json",
+        "source/profile.json",
+        "source/posts.jsonl",
+        "normalized-posts.csv",
+        "collection-report.md",
+        "source/comments.jsonl",
+    ],
+)
+def test_atomic_artifact_write_replaces_hardlink_without_truncating_victim(
+    tmp_path, relative_path
+):
+    out = tmp_path / "task"
+    (out / "source").mkdir(parents=True)
+    victim = tmp_path / "victim.bin"
+    victim_bytes = b"victim\x00must-not-be-truncated"
+    victim.write_bytes(victim_bytes)
+    final_path = out / relative_path
+    os.link(victim, final_path)
+    reservation = collect._prepare_explicit_workspace(str(out), resume=True)
+    try:
+        with reservation.open_text(relative_path) as handle:
+            handle.write("replacement")
+    finally:
+        reservation.close()
+
+    assert victim.read_bytes() == victim_bytes
+    assert final_path.read_text(encoding="utf-8") == "replacement"
+    assert os.stat(victim).st_ino != os.stat(final_path).st_ino
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "task.json",
+        "source/profile.json",
+        "source/posts.jsonl",
+        "normalized-posts.csv",
+        "collection-report.md",
+        "source/comments.jsonl",
+    ],
+)
+def test_atomic_artifact_write_replaces_fifo_without_blocking(
+    tmp_path, relative_path
+):
+    out = tmp_path / "task"
+    (out / "source").mkdir(parents=True)
+    os.mkfifo(out / relative_path)
+    script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import collect
+reservation = collect._prepare_explicit_workspace(sys.argv[2], resume=True)
+try:
+    with reservation.open_text(sys.argv[3]) as handle:
+        handle.write("replacement")
+finally:
+    reservation.close()
+"""
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(Path(collect.__file__).resolve().parent),
+            str(out),
+            relative_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (out / relative_path).read_text(encoding="utf-8") == "replacement"
+
+
 def test_explicit_reservation_source_failure_removes_empty_owned_target(
     monkeypatch, tmp_path
 ):
@@ -490,7 +573,7 @@ def test_explicit_reservation_source_failure_preserves_concurrent_marker(
     assert adapter.network_calls == []
 
 
-def test_explicit_reservation_stat_failure_removes_empty_owned_target(
+def test_explicit_reservation_retries_transient_stat_capture_failure(
     monkeypatch, tmp_path
 ):
     out = tmp_path / "task"
@@ -514,8 +597,61 @@ def test_explicit_reservation_stat_failure_removes_empty_owned_target(
     monkeypatch.setattr(collect, "_dir_fd_reservations_available", lambda: True)
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
 
-    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 0
     assert failed is True
+    assert (out / "task.json").is_file()
+
+
+def test_explicit_reservation_persistent_stat_failure_cleans_owned_target(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    adapter = RecordingBilibiliAdapter()
+    original_stat = collect.os.stat
+    failures = 0
+
+    def fail_target_stat(path, *args, **kwargs):
+        nonlocal failures
+        if (
+            os.fspath(path) == out.name
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+        ):
+            failures += 1
+            raise OSError("injected persistent target stat failure")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(collect.os, "stat", fail_target_stat)
+    monkeypatch.setattr(collect, "_dir_fd_reservations_available", lambda: True)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert failures >= 3
+    assert not out.exists()
+    assert adapter.network_calls == []
+
+
+def test_explicit_reservation_fstat_capture_failure_cleans_owned_target(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    adapter = RecordingBilibiliAdapter()
+    original_fstat = collect.os.fstat
+    failures = 0
+
+    def fail_initial_identity_captures(descriptor):
+        nonlocal failures
+        if failures < 3:
+            failures += 1
+            raise OSError("injected fstat capture failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(collect.os, "fstat", fail_initial_identity_captures)
+    monkeypatch.setattr(collect, "_dir_fd_reservations_available", lambda: True)
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 2
+    assert failures == 3
     assert not out.exists()
     assert adapter.network_calls == []
 
@@ -575,6 +711,117 @@ def test_public_reservation_identity_swap_aborts_before_artifact_mutation(
     assert displaced.is_dir()
 
 
+def test_portable_temp_open_swap_is_detected_before_any_bytes_are_written(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    displaced = tmp_path / "displaced-owned-task"
+    monkeypatch.setattr(collect, "_dir_fd_reservations_available", lambda: False)
+    reservation = collect._prepare_explicit_workspace(str(out), resume=False)
+    original_open = collect.os.open
+    swapped = False
+    created_temp = None
+
+    def swap_before_portable_temp_open(path, flags, *args, **kwargs):
+        nonlocal swapped, created_temp
+        if not swapped and ".task.json." in os.path.basename(os.fspath(path)):
+            out.rename(displaced)
+            out.mkdir()
+            (out / "source").mkdir()
+            swapped = True
+            created_temp = Path(path)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(collect.os, "open", swap_before_portable_temp_open)
+    try:
+        with pytest.raises(collect.WorkspaceContractError):
+            with reservation.open_text("task.json") as handle:
+                handle.write("must-not-be-written")
+    finally:
+        reservation.close()
+
+    assert swapped is True
+    assert created_temp is not None
+    if created_temp.exists():
+        assert created_temp.read_bytes() == b""
+    assert list(displaced.rglob("*")) == [displaced / "source"]
+    assert not (out / "task.json").exists()
+
+
+def test_resume_swap_between_read_and_mutation_reservations_fails_closed(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    source = out / "source"
+    source.mkdir(parents=True)
+    existing = source / "posts.jsonl"
+    existing_bytes = (
+        b'{"post_id":"BV_KEEP","published_at":"2026-07-20T10:00:00+08:00"}\n'
+    )
+    existing.write_bytes(existing_bytes)
+    displaced = tmp_path / "displaced-original"
+    replacement_marker = b"replacement\x00must-survive"
+    adapter = RecordingBilibiliAdapter()
+
+    def swap_while_loading_adapters():
+        out.rename(displaced)
+        (out / "source").mkdir(parents=True)
+        (out / "marker.bin").write_bytes(replacement_marker)
+        return [adapter]
+
+    monkeypatch.setattr(collect, "_load_adapters", swap_while_loading_adapters)
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out), resume=True) == 2
+    assert (displaced / "source" / "posts.jsonl").read_bytes() == existing_bytes
+    assert (out / "marker.bin").read_bytes() == replacement_marker
+    assert sorted(path.name for path in out.iterdir()) == ["marker.bin", "source"]
+    assert adapter.network_calls == []
+
+
+def test_resume_rejects_symlinked_posts_before_adapter_loading(
+    monkeypatch, tmp_path
+):
+    out = tmp_path / "task"
+    source = out / "source"
+    source.mkdir(parents=True)
+    victim = tmp_path / "victim.jsonl"
+    victim_bytes = b'{"post_id":"OUTSIDE"}\n'
+    victim.write_bytes(victim_bytes)
+    (source / "posts.jsonl").symlink_to(victim)
+    monkeypatch.setattr(collect, "_load_adapters", _must_not_load_adapters)
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out), resume=True) == 2
+    assert victim.read_bytes() == victim_bytes
+
+
+@pytest.mark.skipif(not Path("/dev/fd").is_dir(), reason="requires /dev/fd")
+def test_serialization_failures_are_sanitized_and_do_not_leak_reservation_fds(
+    monkeypatch, tmp_path, capsys
+):
+    adapter = RecordingBilibiliAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    original_dump = collect.json.dump
+
+    def fail_profile_dump(value, handle, *args, **kwargs):
+        if isinstance(value, dict) and value.get("platform") == "bilibili":
+            raise TypeError("SECRET_SERIALIZATION_FAILURE")
+        return original_dump(value, handle, *args, **kwargs)
+
+    monkeypatch.setattr(collect.json, "dump", fail_profile_dump)
+    before = len(list(Path("/dev/fd").iterdir()))
+
+    results = [
+        collect.run(BILIBILI_URL, out_dir=str(tmp_path / f"task-{index}"))
+        for index in range(20)
+    ]
+
+    after = len(list(Path("/dev/fd").iterdir()))
+    captured = capsys.readouterr()
+    assert all(result in {2, 3} for result in results)
+    assert after <= before + 2
+    assert "SECRET_SERIALIZATION_FAILURE" not in captured.out + captured.err
+
+
 def test_public_reservation_falls_back_when_dir_fd_operations_are_unsupported(
     monkeypatch, tmp_path
 ):
@@ -600,10 +847,11 @@ def test_public_reservation_falls_back_when_dir_fd_operations_are_unsupported(
     monkeypatch.setattr(collect, "_dir_fd_reservations_available", lambda: True)
     monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
 
-    assert collect.run(BILIBILI_URL) == 0
+    assert collect.run(BILIBILI_URL) == 2
     tasks = list((repo / "workspace").glob("bilibili-123-*"))
     assert len(tasks) == 1
-    assert (tasks[0] / "source" / "posts.jsonl").is_file()
+    assert list((tasks[0] / "source").iterdir()) == []
+    assert sorted(path.name for path in tasks[0].iterdir()) == ["source"]
 
 
 def test_public_reservation_without_no_follow_fails_closed_on_workspace_symlink(

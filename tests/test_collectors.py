@@ -1211,10 +1211,10 @@ def test_comment_persistence_failure_is_sanitized_and_finalizes_task(
     else:
         original_replace = collect.os.replace
 
-        def fail_comment_only(source, destination):
+        def fail_comment_only(source, destination, *args, **kwargs):
             if str(destination).endswith("comments.jsonl"):
                 raise OSError("secret replace failure")
-            return original_replace(source, destination)
+            return original_replace(source, destination, *args, **kwargs)
 
         monkeypatch.setattr(collect.os, "replace", fail_comment_only)
 
@@ -1267,10 +1267,10 @@ def test_failed_comment_replace_reports_valid_rows_in_preserved_artifact(
     monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
     original_replace = collect.os.replace
 
-    def fail_comment_only(source_path, destination):
+    def fail_comment_only(source_path, destination, *args, **kwargs):
         if str(destination).endswith("comments.jsonl"):
             raise OSError("secret replace failure")
-        return original_replace(source_path, destination)
+        return original_replace(source_path, destination, *args, **kwargs)
 
     monkeypatch.setattr(collect.os, "replace", fail_comment_only)
 
@@ -1313,10 +1313,10 @@ def test_failed_comment_replace_does_not_follow_existing_symlink(
     monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
     original_replace = collect.os.replace
 
-    def fail_comment_only(source_path, destination):
+    def fail_comment_only(source_path, destination, *args, **kwargs):
         if str(destination).endswith("comments.jsonl"):
             raise OSError("secret replace failure")
-        return original_replace(source_path, destination)
+        return original_replace(source_path, destination, *args, **kwargs)
 
     monkeypatch.setattr(collect.os, "replace", fail_comment_only)
 
