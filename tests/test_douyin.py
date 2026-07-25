@@ -3009,7 +3009,15 @@ def test_successful_detail_enrichment_upgrades_browser_partial_only_when_complet
         "duration_seconds": None,
         "hashtags": [],
         "collection_status": "PARTIAL",
-        "platform_metrics": {"collection_source": "dom"},
+        "platform_metrics": {
+            "collection_source": "dom",
+            "partial_reasons": ["missing_p0_detail"],
+            "missing_detail_fields": [
+                "published_at",
+                "duration_seconds",
+                "hashtags",
+            ],
+        },
     }
 
     unavailable = collect._enrich_douyin_details(
@@ -3022,3 +3030,231 @@ def test_successful_detail_enrichment_upgrades_browser_partial_only_when_complet
     assert unavailable == 0
     assert post["collection_status"] == "SUCCESS"
     assert post["platform_metrics"]["detail_status"] == "SUCCESS"
+
+
+def test_incomplete_successful_detail_response_downgrades_row_with_defined_status():
+    import collect
+
+    class IncompleteDetailAdapter:
+        def collect_post_detail(self, _post_url):
+            return {
+                "post_id": "7001",
+                "title": "仅补标题",
+                "published_at": None,
+                "duration_seconds": None,
+                "hashtags": None,
+            }
+
+    post = {
+        "platform": "douyin",
+        "post_id": "7001",
+        "post_url": "https://www.douyin.com/video/7001",
+        "title": None,
+        "published_at": None,
+        "duration_seconds": None,
+        "hashtags": [],
+        "collection_status": "SUCCESS",
+        "platform_metrics": {"collection_source": "list"},
+    }
+    errors = []
+
+    unavailable = collect._enrich_douyin_details(
+        IncompleteDetailAdapter(),
+        [post],
+        errors,
+        "2026-07-25T10:00:00+08:00",
+    )
+
+    assert unavailable == 1
+    assert post["collection_status"] == "PARTIAL"
+    assert post["platform_metrics"]["detail_status"] == "UNAVAILABLE"
+    assert post["platform_metrics"]["partial_reasons"] == ["missing_p0_detail"]
+    assert post["platform_metrics"]["missing_detail_fields"] == [
+        "published_at",
+        "duration_seconds",
+        "hashtags",
+    ]
+    assert errors[-1]["message"] == "作品详情补充不完整"
+
+
+def test_detail_enrichment_never_clears_an_independent_partial_reason():
+    import collect
+
+    class CompleteDetailAdapter:
+        def collect_post_detail(self, _post_url):
+            return {
+                "post_id": "7001",
+                "title": "完整标题",
+                "published_at": "2026-07-20T10:00:00+08:00",
+                "duration_seconds": 9,
+                "hashtags": [],
+            }
+
+    post = {
+        "platform": "douyin",
+        "post_id": "7001",
+        "post_url": "https://www.douyin.com/video/7001",
+        "content_type": "video",
+        "title": None,
+        "published_at": None,
+        "duration_seconds": None,
+        "hashtags": [],
+        "collection_status": "PARTIAL",
+        "platform_metrics": {
+            "collection_source": "network",
+            "partial_reasons": ["missing_p0_detail", "restricted"],
+            "missing_detail_fields": [
+                "title",
+                "published_at",
+                "duration_seconds",
+                "hashtags",
+            ],
+        },
+    }
+
+    unavailable = collect._enrich_douyin_details(
+        CompleteDetailAdapter(),
+        [post],
+        [],
+        "2026-07-25T10:00:00+08:00",
+    )
+
+    assert unavailable == 0
+    assert post["collection_status"] == "PARTIAL"
+    assert post["platform_metrics"]["detail_status"] == "SUCCESS"
+    assert post["platform_metrics"]["partial_reasons"] == ["restricted"]
+    assert post["platform_metrics"]["missing_detail_fields"] == []
+
+
+def test_detail_enrichment_does_not_trust_stale_missing_metadata_over_list_values():
+    import collect
+
+    class MustNotRun:
+        def collect_post_detail(self, _post_url):
+            pytest.fail("complete list evidence must not be overwritten")
+
+    post = {
+        "platform": "douyin",
+        "post_id": "7001",
+        "post_url": "https://www.douyin.com/video/7001",
+        "content_type": "video",
+        "title": "列表可靠标题",
+        "published_at": "2026-07-20T10:00:00+08:00",
+        "duration_seconds": 9,
+        "hashtags": ["列表话题"],
+        "collection_status": "PARTIAL",
+        "platform_metrics": {
+            "collection_source": "network",
+            "partial_reasons": ["missing_p0_detail"],
+            "missing_detail_fields": ["title"],
+        },
+    }
+
+    unavailable = collect._enrich_douyin_details(
+        MustNotRun(),
+        [post],
+        [],
+        "2026-07-25T10:00:00+08:00",
+    )
+
+    assert unavailable == 0
+    assert post["title"] == "列表可靠标题"
+    assert post["collection_status"] == "SUCCESS"
+    assert post["platform_metrics"]["detail_status"] == "NOT_NEEDED"
+    assert post["platform_metrics"]["partial_reasons"] == []
+    assert post["platform_metrics"]["missing_detail_fields"] == []
+
+
+def test_detail_enrichment_does_not_reclassify_terminal_item_status():
+    import collect
+
+    class MustNotRun:
+        def collect_post_detail(self, _post_url):
+            pytest.fail("terminal rows are not eligible for enrichment")
+
+    post = {
+        "platform": "douyin",
+        "post_id": "7001",
+        "post_url": "https://www.douyin.com/video/7001",
+        "title": None,
+        "published_at": None,
+        "duration_seconds": None,
+        "hashtags": [],
+        "collection_status": "RESTRICTED",
+        "platform_metrics": {"collection_source": "network"},
+    }
+
+    assert collect._enrich_douyin_details(
+        MustNotRun(), [post], [], "2026-07-25T10:00:00+08:00"
+    ) == 0
+    assert post["collection_status"] == "RESTRICTED"
+
+
+def test_browser_p0_completeness_distinguishes_missing_from_known_empty_hashtags():
+    from collectors.douyin import DouyinCollector
+
+    empty_title = dict(AWEME, desc="", text_extra=[])
+    known_no_hashtags = dict(AWEME, desc="无话题但完整", text_extra=[])
+    unknown_hashtags = dict(AWEME, desc="无话题且标签字段缺失")
+
+    empty_title_post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(
+            ACCOUNT_URL,
+            dict(empty_title, _collection_source="network"),
+            source="network",
+        )
+    )
+    known_empty_post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(
+            ACCOUNT_URL,
+            dict(known_no_hashtags, _collection_source="network"),
+            source="network",
+        )
+    )
+    unknown_hashtags_post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(
+            ACCOUNT_URL,
+            dict(unknown_hashtags, _collection_source="network"),
+            source="network",
+        )
+    )
+
+    assert empty_title_post["collection_status"] == "PARTIAL"
+    assert empty_title_post["platform_metrics"]["missing_detail_fields"] == [
+        "title"
+    ]
+    assert known_empty_post["collection_status"] == "SUCCESS"
+    assert known_empty_post["hashtags"] == []
+    assert known_empty_post["platform_metrics"]["missing_detail_fields"] == []
+    assert unknown_hashtags_post["collection_status"] == "PARTIAL"
+    assert unknown_hashtags_post["platform_metrics"]["missing_detail_fields"] == [
+        "hashtags"
+    ]
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_post_metrics_become_unknown_without_losing_explicit_zero(nonfinite):
+    from collectors.douyin import DouyinCollector
+
+    aweme = dict(
+        AWEME,
+        text_extra=[],
+        statistics={
+            "play_count": 0,
+            "digg_count": nonfinite,
+            "comment_count": nonfinite,
+            "collect_count": nonfinite,
+            "share_count": nonfinite,
+        },
+        _collection_source="network",
+    )
+
+    post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(ACCOUNT_URL, aweme, source="network")
+    )
+
+    assert post["views"] == 0
+    assert post["likes"] is None
+    assert post["comments"] is None
+    assert post["favorites"] is None
+    assert post["shares"] is None

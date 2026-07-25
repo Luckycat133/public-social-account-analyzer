@@ -38,6 +38,13 @@ for _p in (_COLLECTORS, _HERE):
         sys.path.insert(0, _p)
 
 from collectors.base import BaseCollector  # noqa: E402
+from collectors._douyin_detail_contract import (  # noqa: E402
+    MISSING_P0_DETAIL,
+    P0_DETAIL_FIELDS,
+    derive_detail_contract,
+    detail_value_is_observed,
+    set_detail_contract,
+)
 from collectors._constants import (  # noqa: E402
     PUBLIC_ALL_DEFAULT_MAX_ITEMS,
     PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
@@ -92,7 +99,7 @@ _INDETERMINATE_MESSAGE = (
     "请保留目录并重新核验"
 )
 
-_DETAIL_FIELDS = ("title", "published_at", "duration_seconds", "hashtags")
+_DETAIL_FIELDS = P0_DETAIL_FIELDS
 
 # 适配器异常类 → stop_reason 映射(按异常属性 / 类名兜底)
 # 已知 stop_reason 集合,用于从异常消息前缀 [REASON] 兜底识别
@@ -285,10 +292,6 @@ def _filter_by_date(
             continue
         out.append(p)
     return out
-
-
-def _missing_detail_value(value) -> bool:
-    return value is None or value == "" or value == [] or value == {}
 
 
 def _douyin_item_url(post: dict) -> str | None:
@@ -533,16 +536,21 @@ def _enrich_douyin_details(
     """Fill only missing public fields; isolate and sanitize item failures."""
     unavailable_count = 0
     for post in posts:
-        missing = [field for field in _DETAIL_FIELDS if _missing_detail_value(post.get(field))]
+        if post.get("collection_status") not in {"SUCCESS", "PARTIAL"}:
+            continue
+        missing, reasons = derive_detail_contract(post)
+        set_detail_contract(post, missing, reasons)
+        if missing or reasons:
+            post["collection_status"] = "PARTIAL"
         if not missing:
             _set_detail_status(post, "NOT_NEEDED")
+            if not reasons and post.get("collection_status") == "PARTIAL":
+                post["collection_status"] = "SUCCESS"
             continue
         item_url = _douyin_item_url(post)
         if item_url is None:
             unavailable_count += 1
             _set_detail_status(post, "UNAVAILABLE")
-            if post.get("collection_status") == "SUCCESS":
-                post["collection_status"] = "PARTIAL"
             error_log.append({
                 "url": None,
                 "stage": "collect_post_detail",
@@ -561,8 +569,6 @@ def _enrich_douyin_details(
         except Exception:
             unavailable_count += 1
             _set_detail_status(post, "UNAVAILABLE")
-            if post.get("collection_status") == "SUCCESS":
-                post["collection_status"] = "PARTIAL"
             error_log.append({
                 "url": item_url,
                 "stage": "collect_post_detail",
@@ -572,20 +578,38 @@ def _enrich_douyin_details(
                 "retryable": False,
             })
             continue
+        resolved: set[str] = set()
         for field in missing:
             value = detail.get(field)
-            if not _missing_detail_value(value):
+            if detail_value_is_observed(
+                field,
+                value,
+                content_type=post.get("content_type"),
+            ):
                 post[field] = value
-        still_missing = any(
-            _missing_detail_value(post.get(field)) for field in _DETAIL_FIELDS
-        )
-        _set_detail_status(post, "PARTIAL" if still_missing else "SUCCESS")
-        if (
-            not still_missing
-            and post.get("collection_status") == "PARTIAL"
-            and (post.get("platform_metrics") or {}).get("collection_source")
-            in {"dom", "network", "network+dom"}
-        ):
+                resolved.add(field)
+        remaining = [field for field in missing if field not in resolved]
+        if remaining:
+            unavailable_count += 1
+            post["collection_status"] = "PARTIAL"
+            set_detail_contract(post, remaining, reasons)
+            _set_detail_status(post, "UNAVAILABLE")
+            error_log.append({
+                "url": item_url,
+                "stage": "collect_post_detail",
+                "error_code": "POST_UNAVAILABLE",
+                "message": "作品详情补充不完整",
+                "occurred_at": occurred_at,
+                "retryable": False,
+            })
+            continue
+
+        remaining_reasons = [
+            reason for reason in reasons if reason != MISSING_P0_DETAIL
+        ]
+        set_detail_contract(post, [], remaining_reasons)
+        _set_detail_status(post, "SUCCESS")
+        if not remaining_reasons and post.get("collection_status") == "PARTIAL":
             post["collection_status"] = "SUCCESS"
     return unavailable_count
 

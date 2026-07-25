@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import time
 import urllib.error
@@ -54,6 +55,10 @@ from ._constants import (
     validate_public_limit,
 )
 from .base import BaseCollector
+from ._douyin_detail_contract import (
+    MISSING_P0_DETAIL,
+    missing_detail_fields,
+)
 from .url_policy import (
     canonical_item_url,
     canonical_profile_url,
@@ -120,7 +125,7 @@ def _int(v: Any) -> int | None:
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
-        return int(v)
+        return int(v) if math.isfinite(v) else None
     s = str(v).strip()
     if not s:
         return None
@@ -132,7 +137,7 @@ def _int(v: Any) -> int | None:
     s = s.replace("亿", "").replace("万", "").replace(",", "").replace("+", "").strip()
     try:
         return int(float(s) * mult)
-    except ValueError:
+    except (OverflowError, ValueError):
         return None
 
 
@@ -1149,18 +1154,26 @@ class DouyinCollector(BaseCollector):
             if duration_ms is not None and duration_ms >= 0
             else None
         )
-        browser_detail_complete = bool(
-            isinstance(aweme.get("desc"), str)
-            and published_at is not None
-            and (
-                content_type == "image_text"
-                or duration_seconds is not None
-            )
+        hashtags = _extract_hashtags(desc, text_extra)
+        browser_source = collection_source in {"dom", "network", "network+dom"}
+        observed_detail_fields = (
+            {"hashtags"}
+            if hashtags or isinstance(text_extra, list)
+            else set()
+        )
+        browser_missing_fields = missing_detail_fields(
+            {
+                "title": single_text,
+                "published_at": published_at,
+                "duration_seconds": duration_seconds,
+                "hashtags": hashtags,
+                "content_type": content_type,
+            },
+            observed_fields=observed_detail_fields,
         )
         collection_status = (
             "PARTIAL"
-            if collection_source in {"dom", "network", "network+dom"}
-            and not browser_detail_complete
+            if browser_source and browser_missing_fields
             else "SUCCESS"
         )
         return {
@@ -1172,7 +1185,7 @@ class DouyinCollector(BaseCollector):
             "title": single_text,
             "text": desc,
             "duration_seconds": duration_seconds,
-            "hashtags": _extract_hashtags(desc, text_extra),
+            "hashtags": hashtags,
             "is_pinned": is_top,
             "is_repost": is_repost,
             "is_promoted": is_ad,
@@ -1191,6 +1204,18 @@ class DouyinCollector(BaseCollector):
                 "collection_name": collection_name,
                 "aweme_type": aweme.get("aweme_type"),
                 "collection_source": collection_source,
+                **(
+                    {
+                        "missing_detail_fields": browser_missing_fields,
+                        "partial_reasons": (
+                            [MISSING_P0_DETAIL]
+                            if browser_missing_fields
+                            else []
+                        ),
+                    }
+                    if browser_source
+                    else {}
+                ),
                 "visible_is_pinned": (
                     True
                     if collection_source == "dom" and aweme.get("is_top") is True
