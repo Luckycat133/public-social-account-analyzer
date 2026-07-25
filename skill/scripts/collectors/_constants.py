@@ -1,6 +1,66 @@
-"""Shared public collection stop reasons and ordered Douyin page states."""
+"""Shared public collection limits, stop reasons, and Douyin page states."""
 
+import math
 import re
+
+
+PUBLIC_LIMIT_DEFAULT = 30
+PUBLIC_LIMIT_MAX = 100
+
+PUBLIC_ALL_DEFAULT_MAX_ITEMS = 10_000
+PUBLIC_ALL_DEFAULT_MAX_SECONDS = 1_800.0
+PUBLIC_ALL_DEFAULT_MAX_SCROLLS = 2_000
+
+PUBLIC_ALL_HARD_MAX_ITEMS = 50_000
+PUBLIC_ALL_HARD_MAX_SECONDS = 14_400.0
+PUBLIC_ALL_HARD_MAX_SCROLLS = 20_000
+
+
+def validate_public_limit(value):
+    """Return a valid limited-mode request without coercion or clamping."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > PUBLIC_LIMIT_MAX
+    ):
+        raise ValueError(f"limit must be an integer from 1 to {PUBLIC_LIMIT_MAX}")
+    return value
+
+
+def validate_public_all_budgets(max_items, max_seconds, max_scrolls):
+    """Return accepted public ``--all`` budgets without silently changing them."""
+    if (
+        isinstance(max_items, bool)
+        or not isinstance(max_items, int)
+        or max_items < 1
+        or max_items > PUBLIC_ALL_HARD_MAX_ITEMS
+    ):
+        raise ValueError(
+            f"max_items must be an integer from 1 to {PUBLIC_ALL_HARD_MAX_ITEMS}"
+        )
+    if (
+        isinstance(max_seconds, bool)
+        or not isinstance(max_seconds, (int, float))
+        or not math.isfinite(max_seconds)
+        or max_seconds <= 0
+        or max_seconds > PUBLIC_ALL_HARD_MAX_SECONDS
+    ):
+        raise ValueError(
+            f"max_seconds must be finite, greater than 0, and at most "
+            f"{PUBLIC_ALL_HARD_MAX_SECONDS}"
+        )
+    if (
+        isinstance(max_scrolls, bool)
+        or not isinstance(max_scrolls, int)
+        or max_scrolls < 1
+        or max_scrolls > PUBLIC_ALL_HARD_MAX_SCROLLS
+    ):
+        raise ValueError(
+            f"max_scrolls must be an integer from 1 to "
+            f"{PUBLIC_ALL_HARD_MAX_SCROLLS}"
+        )
+    return max_items, float(max_seconds), max_scrolls
 
 STOP_LOGIN = "LOGIN_REQUIRED"
 STOP_VERIFICATION = "VERIFICATION_REQUIRED"

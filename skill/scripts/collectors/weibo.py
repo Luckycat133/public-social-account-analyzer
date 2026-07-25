@@ -28,6 +28,7 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
+from ._constants import PUBLIC_LIMIT_DEFAULT, validate_public_limit
 from .base import BaseCollector  # 适配 scripts/collectors 作为 sys.path 入口
 from .url_policy import canonical_item_url, canonical_profile_url
 
@@ -339,13 +340,13 @@ class WeiboCollector(BaseCollector):
     def collect_post_list(
         self,
         url: str,
-        limit: int = 30,
+        limit: int = PUBLIC_LIMIT_DEFAULT,
         date_range: tuple[str | None, str | None] | None = None,
     ) -> list[dict[str, Any]]:
         """采集博文摘要列表，并标记置顶 / 转发微博。"""
+        limit = validate_public_limit(limit)
         if not ENABLED:
             self._require_enabled()
-        limit = min(max(limit, 1), 100)
         uid = _resolve_uid(url)
         out: list[dict[str, Any]] = []
         seen: set[str] = set()

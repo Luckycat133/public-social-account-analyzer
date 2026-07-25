@@ -226,7 +226,9 @@ def run(
     if out_dir is None:
         date = datetime.now(_BEIJING).strftime("%Y%m%d")
         out_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            ),
             "workspace",
             f"douyin-authorized-{date}",
         )

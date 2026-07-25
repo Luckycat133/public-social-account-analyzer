@@ -18,7 +18,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from ._constants import DOUYIN_PAGE_STATE_PATTERNS
+from ._constants import (
+    DOUYIN_PAGE_STATE_PATTERNS,
+    PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
+    PUBLIC_ALL_DEFAULT_MAX_SECONDS,
+    validate_public_all_budgets,
+    validate_public_limit,
+)
 from .browser_backend import (
     BrowserError,
     BrowserSession,
@@ -482,9 +488,27 @@ def collect_account_page(
     sleep=time.sleep,
 ) -> DouyinBrowserResult:
     """Observe public response bodies within hard time/scroll/idle boundaries."""
-    requested = max(1, min(int(limit), 10_000 if all_posts else 100))
-    seconds_budget = float(max_seconds) if max_seconds is not None else MAX_SECONDS
-    scroll_budget = int(max_scrolls) if max_scrolls is not None else MAX_SCROLLS
+    if all_posts:
+        seconds_budget = (
+            PUBLIC_ALL_DEFAULT_MAX_SECONDS
+            if max_seconds is None
+            else max_seconds
+        )
+        scroll_budget = (
+            PUBLIC_ALL_DEFAULT_MAX_SCROLLS
+            if max_scrolls is None
+            else max_scrolls
+        )
+        requested, seconds_budget, scroll_budget = validate_public_all_budgets(
+            limit, seconds_budget, scroll_budget
+        )
+    else:
+        requested = validate_public_limit(limit)
+        seconds_budget = MAX_SECONDS if max_seconds is None else max_seconds
+        scroll_budget = MAX_SCROLLS if max_scrolls is None else max_scrolls
+        _, seconds_budget, scroll_budget = validate_public_all_budgets(
+            requested, seconds_budget, scroll_budget
+        )
     started = monotonic()
     deadline = started + seconds_budget
     lower_bound = _date_lower_bound(date_range)
@@ -771,6 +795,7 @@ def collect_account_page(
         },
         coverage={
             "requested_all": bool(all_posts),
+            **({"max_items": requested} if all_posts else {}),
             "is_exhaustive": is_exhaustive,
             "terminal_page_observed": terminal_page_observed,
             "observed_page_count": observed_page_count,

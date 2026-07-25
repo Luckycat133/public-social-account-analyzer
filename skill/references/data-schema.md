@@ -15,7 +15,8 @@
 
 ## 2. 存储与文件命名约定
 
-每个账号 + 分析周期创建独立任务目录，避免不同账号或采集批次混写：
+每个账号 + 分析周期在**仓库根目录**创建独立任务目录，避免不同账号或采集批次混写；
+不得把默认产物写到 `skill/workspace/`：
 
 ```
 workspace/<platform>-<account>-<date>/
@@ -31,7 +32,11 @@ workspace/<platform>-<account>-<date>/
   analysis.json              # 结构化分析结果
 ```
 
-同目录已存在时**不得覆盖**，追加任务 ID 或序号创建新目录（见 `SKILL.md` 任务创建步骤）。
+默认目录名已存在（包括符号链接）时**不得覆盖或跟随**，必须以原子目录创建操作预留追加
+任务 ID 或序号的新目录（见 `SKILL.md` 任务创建步骤）。公开采集的新任务若显式指定
+`--out`，目标目录已存在且非空时必须在任何适配器网络调用或产物写入前以参数错误退出；
+`--resume --out <既有目录>` 是允许写入既有目录的唯一续采路径。授权采集器对最终目标保持
+排他预留和不覆盖语义。
 
 ## 3. Task 数据结构
 
@@ -42,7 +47,7 @@ workspace/<platform>-<account>-<date>/
 | task_id | string | 否 | 是 | bilibili-123-20260723-a1b2 | 任务唯一标识；现有 CLI 未生成时可省略或为 `null` |
 | platform | enum | 是 | 否 | bilibili | bilibili / douyin / weibo |
 | profile_url | string | 是 | 否 | https://space.bilibili.com/123 | 账号主页 URL |
-| requested_limit | integer | 是 | 是 | 30 | 默认 30，最大 100；授权 OpenAPI `--all` 为 `null` |
+| requested_limit | integer | 是 | 是 | 30 | 限量模式默认 30、范围 1–100；公开 `--all` 为接受后的 `max_items`（默认 10,000、硬上限 50,000）；授权 OpenAPI `--all` 为 `null` |
 | date_from | datetime | 否 | 是 | 2026-06-01T00:00:00+08:00 | 采集起始时间 |
 | date_to | datetime | 否 | 是 | 2026-07-23T23:59:59+08:00 | 采集结束时间 |
 | analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | 用户填写的分析目的 |
@@ -68,6 +73,8 @@ workspace/<platform>-<account>-<date>/
 
 约束：
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
+- `--all` 与显式 `--limit` 互斥；`--since` 仅可与 `--resume` 联用；公开全量预算参数仅可与
+  `--all` 联用。参数错误不得触发适配器网络调用或任务目录写入，也不得静默截断或忽略。
 - `--resume` 必须先校验 `--out`、只读加载既有作品并结合 `--since` / 最新作品时间计算有效
   `date_from`；有效 `date_from > date_to` 时以参数错误退出。以上步骤必须发生在创建或修改
   任务目录、`source/` 和任何任务产物之前。
@@ -85,6 +92,7 @@ workspace/<platform>-<account>-<date>/
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `requested_all` | boolean | 本次是否请求公开作品全量观察 |
+| `max_items` | integer | 接受后的公开全量作品预算；必须与 `task.requested_limit` 及传输层请求一致 |
 | `is_exhaustive` | boolean | 是否观察到经验证的作品列表末页 |
 | `terminal_page_observed` | boolean | 是否在拥有已知作品列表键的对象上明确观察到 `has_more=false` |
 | `observed_page_count` | integer | 已验证作品列表载荷数量 |
@@ -102,6 +110,10 @@ workspace/<platform>-<account>-<date>/
 当公开列表已验证到末页、存在有效数字作品 ID，但日期范围过滤后为零条时，任务可以
 `COMPLETED`；此时 `observed_post_count>0`、`range_filter_applied=true`、
 `range_match_count=0`、`range_no_match=true`，不得与账号原始公开作品列表为空混淆。
+
+公开 `--all` 的默认预算固定为 `max_items=10,000`、`max_seconds=1,800`、
+`max_scrolls=2,000`；允许显式上调，但硬上限分别为 `50,000`、`14,400` 秒和
+`20,000` 轮。零值、负值、非有限秒数、类型不符和超过硬上限都必须拒绝，不得静默钳制。
 
 ### 3.2 授权账号 OpenAPI 覆盖账本
 

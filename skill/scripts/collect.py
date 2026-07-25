@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import os
 import re
 import stat
@@ -37,6 +36,18 @@ for _p in (_COLLECTORS, _HERE):
         sys.path.insert(0, _p)
 
 from collectors.base import BaseCollector  # noqa: E402
+from collectors._constants import (  # noqa: E402
+    PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+    PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
+    PUBLIC_ALL_DEFAULT_MAX_SECONDS,
+    PUBLIC_ALL_HARD_MAX_ITEMS,
+    PUBLIC_ALL_HARD_MAX_SCROLLS,
+    PUBLIC_ALL_HARD_MAX_SECONDS,
+    PUBLIC_LIMIT_DEFAULT,
+    PUBLIC_LIMIT_MAX,
+    validate_public_all_budgets,
+    validate_public_limit,
+)
 from collectors.url_policy import (  # noqa: E402
     canonical_item_url,
     canonical_profile_url,
@@ -355,6 +366,97 @@ def _workspace_paths_safe(ws: str) -> bool:
     ):
         return False
     return True
+
+
+class WorkspaceContractError(RuntimeError):
+    """A task directory could not be safely and exclusively prepared."""
+
+
+def _repository_root() -> str:
+    """Resolve the repository root from ``skill/scripts``."""
+    return os.path.dirname(os.path.dirname(_HERE))
+
+
+def _directory_is_empty(path: str) -> bool:
+    try:
+        with os.scandir(path) as entries:
+            return next(entries, None) is None
+    except OSError as exc:
+        raise WorkspaceContractError("output directory cannot be inspected") from exc
+
+
+def _preflight_explicit_workspace(path: str, *, resume: bool) -> None:
+    """Reject unsafe or occupied new-task targets without creating anything."""
+    if not _workspace_paths_safe(path):
+        raise WorkspaceContractError("output directory or source is unsafe")
+    if not resume and os.path.lexists(path) and not _directory_is_empty(path):
+        raise WorkspaceContractError("output directory is not empty")
+
+
+def _prepare_explicit_workspace(path: str, *, resume: bool) -> str:
+    """Prepare an explicit path after validation, detecting intervening races."""
+    target = os.path.abspath(path)
+    if resume:
+        source = os.path.join(target, "source")
+        if not _workspace_paths_safe(target):
+            raise WorkspaceContractError("resume workspace is unsafe")
+        os.makedirs(source, exist_ok=True)
+        return target
+
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    try:
+        os.mkdir(target)
+    except FileExistsError:
+        if not _workspace_paths_safe(target) or not _directory_is_empty(target):
+            raise WorkspaceContractError("output directory became occupied")
+    except OSError as exc:
+        raise WorkspaceContractError("output directory cannot be reserved") from exc
+
+    source = os.path.join(target, "source")
+    try:
+        os.mkdir(source)
+    except OSError as exc:
+        raise WorkspaceContractError("output source cannot be reserved") from exc
+    return target
+
+
+def _reserve_default_workspace(base_name: str) -> str:
+    """Atomically reserve a collision-free directory below root ``workspace/``."""
+    repository_root = _repository_root()
+    open_flags = os.O_RDONLY
+    open_flags |= getattr(os, "O_DIRECTORY", 0)
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        repository_fd = os.open(repository_root, open_flags)
+    except OSError as exc:
+        raise WorkspaceContractError("repository root is unavailable") from exc
+
+    workspace_fd = None
+    try:
+        try:
+            os.mkdir("workspace", dir_fd=repository_fd)
+        except FileExistsError:
+            pass
+        workspace_fd = os.open("workspace", open_flags, dir_fd=repository_fd)
+        for suffix in range(1, 1_000_001):
+            name = base_name if suffix == 1 else f"{base_name}-{suffix}"
+            try:
+                os.mkdir(name, dir_fd=workspace_fd)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise WorkspaceContractError(
+                    "default output directory cannot be reserved"
+                ) from exc
+            return os.path.join(repository_root, "workspace", name)
+    except OSError as exc:
+        raise WorkspaceContractError("workspace root is unsafe") from exc
+    finally:
+        if workspace_fd is not None:
+            os.close(workspace_fd)
+        os.close(repository_fd)
+    raise WorkspaceContractError("no collision-free output directory is available")
 
 
 def _write_comments_atomic(path: str, records: list[dict]) -> bool:
@@ -705,6 +807,7 @@ def _sanitize_collection_coverage(value) -> dict:
     clean["requested_all"] = requested_all
     clean["terminal_page_observed"] = terminal_observed
     for key in (
+        "max_items",
         "observed_page_count",
         "observed_post_count",
         "cursor_fingerprint_count",
@@ -713,7 +816,11 @@ def _sanitize_collection_coverage(value) -> dict:
     ):
         field_value = value.get(key)
         if isinstance(field_value, int) and not isinstance(field_value, bool):
-            clean[key] = max(0, field_value)
+            if key == "max_items":
+                if 1 <= field_value <= PUBLIC_ALL_HARD_MAX_ITEMS:
+                    clean[key] = field_value
+            else:
+                clean[key] = max(0, field_value)
     stop_condition = value.get("stop_condition")
     if isinstance(stop_condition, str) and stop_condition in {
         "terminal_page",
@@ -927,7 +1034,7 @@ def _write_report(
 
 def run(
     url: str,
-    limit: int = 30,
+    limit: int = PUBLIC_LIMIT_DEFAULT,
     out_dir: str | None = None,
     include_comments: bool = False,
     date_from: str | None = None,
@@ -936,20 +1043,64 @@ def run(
     since: str | None = None,
     browser_fallback: bool | None = None,
     collect_all: bool = False,
-    max_items: int = 10_000,
-    max_seconds: float = 1800.0,
-    max_scrolls: int = 2000,
+    max_items: int | None = None,
+    max_seconds: float | None = None,
+    max_scrolls: int | None = None,
     enrich_details: bool = False,
 ) -> int:
     if resume and not out_dir:
         print("[FAILED] 增量续采(--resume)必须配合 --out 指定既有任务目录", file=sys.stderr)
         return 2
-    if out_dir and not _workspace_paths_safe(out_dir):
-        print("[FAILED] 输出目录或 source 不能是符号链接", file=sys.stderr)
+    if since is not None and not resume:
+        print("[FAILED] --since 必须与 --resume 联用", file=sys.stderr)
         return 2
+
+    budget_was_supplied = any(
+        value is not None for value in (max_items, max_seconds, max_scrolls)
+    )
+    try:
+        if collect_all:
+            if validate_public_limit(limit) != PUBLIC_LIMIT_DEFAULT:
+                raise ValueError("--all cannot be combined with a non-default limit")
+            max_items = (
+                PUBLIC_ALL_DEFAULT_MAX_ITEMS if max_items is None else max_items
+            )
+            max_seconds = (
+                PUBLIC_ALL_DEFAULT_MAX_SECONDS if max_seconds is None else max_seconds
+            )
+            max_scrolls = (
+                PUBLIC_ALL_DEFAULT_MAX_SCROLLS if max_scrolls is None else max_scrolls
+            )
+            max_items, max_seconds, max_scrolls = validate_public_all_budgets(
+                max_items, max_seconds, max_scrolls
+            )
+        else:
+            limit = validate_public_limit(limit)
+            if budget_was_supplied:
+                raise ValueError("--all budgets require --all")
+    except ValueError as exc:
+        print(f"[FAILED] 参数无效: {exc}", file=sys.stderr)
+        return 2
+
+    if out_dir:
+        try:
+            _preflight_explicit_workspace(out_dir, resume=resume)
+        except WorkspaceContractError:
+            print("[FAILED] 输出目录不安全或已包含其他任务数据", file=sys.stderr)
+            return 2
 
     user_from = _parse_date(date_from)
     user_to = _default_date_to(date_to)
+    explicit_since = _parse_date(since) if since is not None else None
+    if date_from is not None and user_from is None:
+        print("[FAILED] --date-from 无法解析", file=sys.stderr)
+        return 2
+    if date_to is not None and user_to is None:
+        print("[FAILED] --date-to 无法解析", file=sys.stderr)
+        return 2
+    if since is not None and explicit_since is None:
+        print("[FAILED] --since 无法解析", file=sys.stderr)
+        return 2
     existing_posts: list[dict] = []
     resume_mode = bool(resume)
     if resume_mode:
@@ -959,7 +1110,7 @@ def run(
             resume_mode = False
         else:
             latest = _latest_published_at(existing_posts)
-            since_iso = _parse_date(since) if since else _parse_date(latest)
+            since_iso = explicit_since if since is not None else _parse_date(latest)
             if since_iso and (user_from is None or since_iso > user_from):
                 user_from = since_iso
     if user_from and user_to:
@@ -1010,13 +1161,8 @@ def run(
     if collect_all and platform != "douyin":
         print("[FAILED] --all 目前仅支持抖音账号主页", file=sys.stderr)
         return 2
-    if collect_all and (
-        max_items <= 0
-        or not math.isfinite(max_seconds)
-        or max_seconds <= 0
-        or max_scrolls <= 0
-    ):
-        print("[FAILED] --all 安全预算必须为正数", file=sys.stderr)
+    if enrich_details and platform != "douyin":
+        print("[FAILED] --enrich-details 仅支持抖音账号主页", file=sys.stderr)
         return 2
 
     requested_count = max_items if collect_all else limit
@@ -1024,14 +1170,26 @@ def run(
     m = re.search(r"(\d+)", url)
     account = m.group(1) if m else "account"
     date = datetime.now(_BEIJING).strftime("%Y%m%d")
-    ws = out_dir or os.path.join(
-        os.path.dirname(_HERE), "workspace", f"{platform}-{account}-{date}"
-    )
+    try:
+        if out_dir:
+            ws = _prepare_explicit_workspace(out_dir, resume=resume)
+        else:
+            ws = _reserve_default_workspace(f"{platform}-{account}-{date}")
+    except (OSError, WorkspaceContractError):
+        print("[FAILED] 输出目录无法安全预留", file=sys.stderr)
+        return 2
     src = os.path.join(ws, "source")
     if not _workspace_paths_safe(ws):
         print("[FAILED] 输出目录或 source 不能是符号链接", file=sys.stderr)
         return 2
-    os.makedirs(src, exist_ok=True)
+    if out_dir and resume:
+        os.makedirs(src, exist_ok=True)
+    elif not os.path.isdir(src):
+        try:
+            os.mkdir(src)
+        except OSError:
+            print("[FAILED] source 目录无法安全预留", file=sys.stderr)
+            return 2
 
     # 增量续采:基于既有 posts 的 published_at / bvid 去重续采,避免重复打满配额
     # 规范化日期范围(中国平台默认 +08:00);增量续采时起点取既有最新发布时间
@@ -1064,7 +1222,11 @@ def run(
     error_log: list[dict] = []
     posts: list = []
     profile: dict = {}
-    collection_coverage: dict = {}
+    collection_coverage: dict = (
+        {"requested_all": True, "max_items": max_items}
+        if collect_all
+        else {}
+    )
     comment_collection: dict = {}
     detail_unavailable_count = 0
 
@@ -1156,6 +1318,9 @@ def run(
         )
     except Exception:
         collection_coverage = {}
+    if collect_all:
+        collection_coverage["requested_all"] = True
+        collection_coverage["max_items"] = max_items
     if (
         collect_all
         and stop_reason is None
@@ -1288,11 +1453,37 @@ def run(
 def main() -> None:
     ap = argparse.ArgumentParser(description="公开社交媒体账号采集")
     ap.add_argument("url", help="账号主页 URL,如 https://space.bilibili.com/123")
-    ap.add_argument("--limit", type=int, default=30, help="采集条数(默认30,最大100)")
-    ap.add_argument("--all", dest="collect_all", action="store_true", help="采集抖音公开作品直到明确末页")
-    ap.add_argument("--max-items", type=int, default=10_000, help="--all 最大保留作品数(默认10000)")
-    ap.add_argument("--max-seconds", type=float, default=1800.0, help="--all 最长秒数(默认1800)")
-    ap.add_argument("--max-scrolls", type=int, default=2000, help="--all 最大滚动次数(默认2000)")
+    range_group = ap.add_mutually_exclusive_group()
+    range_group.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="采集条数(默认30,最大100)",
+    )
+    range_group.add_argument(
+        "--all",
+        dest="collect_all",
+        action="store_true",
+        help="采集抖音公开作品直到明确末页",
+    )
+    ap.add_argument(
+        "--max-items",
+        type=int,
+        default=None,
+        help="--all 最大保留作品数(默认10000,硬上限50000)",
+    )
+    ap.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="--all 最长秒数(默认1800,硬上限14400)",
+    )
+    ap.add_argument(
+        "--max-scrolls",
+        type=int,
+        default=None,
+        help="--all 最大滚动次数(默认2000,硬上限20000)",
+    )
     ap.add_argument(
         "--out", default=None, help="输出目录(默认 workspace/<platform>-<account>-<date>/)"
     )
@@ -1324,7 +1515,41 @@ def main() -> None:
     )
     ap.set_defaults(browser_fallback=None)
     args = ap.parse_args()
-    limit = max(1, min(args.limit, 100))
+    if args.since is not None and not args.resume:
+        ap.error("--since 必须与 --resume 联用")
+    custom_all_budget = any(
+        value is not None
+        for value in (args.max_items, args.max_seconds, args.max_scrolls)
+    )
+    if custom_all_budget and not args.collect_all:
+        ap.error("--max-items/--max-seconds/--max-scrolls 必须与 --all 联用")
+    try:
+        limit = validate_public_limit(
+            PUBLIC_LIMIT_DEFAULT if args.limit is None else args.limit
+        )
+        if args.collect_all:
+            max_items = (
+                PUBLIC_ALL_DEFAULT_MAX_ITEMS
+                if args.max_items is None
+                else args.max_items
+            )
+            max_seconds = (
+                PUBLIC_ALL_DEFAULT_MAX_SECONDS
+                if args.max_seconds is None
+                else args.max_seconds
+            )
+            max_scrolls = (
+                PUBLIC_ALL_DEFAULT_MAX_SCROLLS
+                if args.max_scrolls is None
+                else args.max_scrolls
+            )
+            max_items, max_seconds, max_scrolls = validate_public_all_budgets(
+                max_items, max_seconds, max_scrolls
+            )
+        else:
+            max_items = max_seconds = max_scrolls = None
+    except ValueError as exc:
+        ap.error(str(exc))
     date_from_iso = _parse_date(args.date_from)
     date_to_iso = _default_date_to(args.date_to)
     if args.date_from and not date_from_iso:
@@ -1333,17 +1558,11 @@ def main() -> None:
     if args.date_to and not date_to_iso:
         print(f"[FAILED] --date-to 无法解析: {args.date_to}", file=sys.stderr)
         raise SystemExit(2)
-    if args.max_items <= 0:
-        ap.error("--max-items 必须为正数")
-    if not math.isfinite(args.max_seconds) or args.max_seconds <= 0:
-        ap.error("--max-seconds 必须为正数")
-    if args.max_scrolls <= 0:
-        ap.error("--max-scrolls 必须为正数")
     raise SystemExit(run(
         args.url, limit, args.out, args.comments, date_from_iso, date_to_iso,
         resume=args.resume, since=args.since, browser_fallback=args.browser_fallback,
-        collect_all=args.collect_all, max_items=args.max_items,
-        max_seconds=args.max_seconds, max_scrolls=args.max_scrolls,
+        collect_all=args.collect_all, max_items=max_items,
+        max_seconds=max_seconds, max_scrolls=max_scrolls,
         enrich_details=args.enrich_details,
     ))
 

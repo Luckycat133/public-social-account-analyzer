@@ -25,7 +25,6 @@ CDP 客户端驱动独立临时浏览器，观察页面公开响应并读取可�
 from __future__ import annotations
 
 import json
-import math
 import re
 import time
 import urllib.error
@@ -37,6 +36,11 @@ from typing import Any
 
 from ._constants import (
     DOUYIN_PAGE_STATE_PATTERNS,
+    PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+    PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
+    PUBLIC_ALL_DEFAULT_MAX_SECONDS,
+    PUBLIC_ALL_HARD_MAX_ITEMS,
+    PUBLIC_LIMIT_DEFAULT,
     STOP_ACCESS_RESTRICTED,
     STOP_ACCOUNT_UNAVAILABLE,
     STOP_INTERNAL,
@@ -45,6 +49,8 @@ from ._constants import (
     STOP_PARSER_FAILED,
     STOP_UNSUPPORTED,
     STOP_VERIFICATION,
+    validate_public_all_budgets,
+    validate_public_limit,
 )
 from .base import BaseCollector
 from .url_policy import (
@@ -536,6 +542,13 @@ class DouyinCollector(BaseCollector):
             field_value = value.get(key)
             if isinstance(field_value, int) and not isinstance(field_value, bool):
                 clean[key] = max(0, field_value)
+        max_items = value.get("max_items")
+        if (
+            isinstance(max_items, int)
+            and not isinstance(max_items, bool)
+            and 1 <= max_items <= PUBLIC_ALL_HARD_MAX_ITEMS
+        ):
+            clean["max_items"] = max_items
         stop_condition = value.get("stop_condition")
         if isinstance(stop_condition, str) and stop_condition in allowed_stops:
             clean["stop_condition"] = stop_condition
@@ -564,21 +577,21 @@ class DouyinCollector(BaseCollector):
         self,
         url: str,
         date_range: tuple[str | None, str | None] | None = None,
-        max_items: int = 10_000,
-        max_seconds: float = 1800.0,
-        max_scrolls: int = 2000,
+        max_items: int = PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+        max_seconds: float = PUBLIC_ALL_DEFAULT_MAX_SECONDS,
+        max_scrolls: int = PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
     ) -> list[dict[str, Any]]:
         """Passively observe public post-list pages until a verified terminal page."""
         self._collection_coverage = {}
         if not self.supports(url):
             raise DouyinError(STOP_UNSUPPORTED, f"不支持的账号主页 URL: {url}")
-        if (
-            max_items <= 0
-            or not math.isfinite(max_seconds)
-            or max_seconds <= 0
-            or max_scrolls <= 0
-        ):
-            raise ValueError("全量采集安全预算必须为正数")
+        max_items, max_seconds, max_scrolls = validate_public_all_budgets(
+            max_items, max_seconds, max_scrolls
+        )
+        self._collection_coverage = {
+            "requested_all": True,
+            "max_items": max_items,
+        }
         if not self.browser_fallback:
             raise DouyinError(
                 STOP_PARSER_FAILED,
@@ -604,6 +617,7 @@ class DouyinCollector(BaseCollector):
         self._collection_coverage = self._sanitize_collection_coverage(
             getattr(result, "coverage", {})
         )
+        self._collection_coverage["max_items"] = max_items
         valid_items = self._validated_aweme_items(result.aweme_items)
         posts = [
             self.normalize_post(
@@ -668,7 +682,7 @@ class DouyinCollector(BaseCollector):
     def collect_post_list(
         self,
         url: str,
-        limit: int = 30,
+        limit: int = PUBLIC_LIMIT_DEFAULT,
         date_range: tuple[str | None, str | None] | None = None,
     ) -> list[dict[str, Any]]:
         """采集作品摘要列表（标记 is_pinned），归一化后返回。
@@ -677,6 +691,7 @@ class DouyinCollector(BaseCollector):
         命中任务级限制抛 DouyinError；单条缺失不影响整体（保持 null，不臆造）。
         """
         self._collection_coverage = {}
+        limit = validate_public_limit(limit)
         if not self.supports(url):
             raise DouyinError(STOP_UNSUPPORTED, f"不支持的账号主页 URL: {url}")
         html = self._fetch(url)

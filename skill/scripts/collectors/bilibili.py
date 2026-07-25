@@ -32,6 +32,7 @@ from datetime import datetime, timezone, timedelta
 from functools import reduce
 from typing import Any
 
+from ._constants import PUBLIC_LIMIT_DEFAULT, validate_public_limit
 from .base import BaseCollector
 from .url_policy import canonical_item_url
 
@@ -723,7 +724,13 @@ class BilibiliCollector(BaseCollector):
         return self.normalize_profile(_build_profile_raw(mid, card, stat, acc))
 
     # -- 视频列表 --
-    def collect_post_list(self, url: str, limit: int = 30, date_range=None) -> list:
+    def collect_post_list(
+        self,
+        url: str,
+        limit: int = PUBLIC_LIMIT_DEFAULT,
+        date_range=None,
+    ) -> list:
+        limit = validate_public_limit(limit)
         mid = _mid_from_url(url)
         s = self._new_session()
         s.ensure_buvid()

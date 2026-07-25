@@ -391,6 +391,40 @@ def test_base_collector_collection_coverage_defaults_to_empty():
     assert FakeLoginWallCollector().get_collection_coverage() == {}
 
 
+@pytest.mark.parametrize("limit", [0, -1, 101, 1.5, True])
+def test_bilibili_collector_rejects_invalid_limit_before_session(monkeypatch, limit):
+    from collectors.bilibili import BilibiliCollector
+
+    collector = BilibiliCollector()
+    monkeypatch.setattr(
+        collector,
+        "_new_session",
+        lambda: pytest.fail("network session must not be created"),
+    )
+
+    with pytest.raises(ValueError):
+        collector.collect_post_list("https://space.bilibili.com/123", limit=limit)
+
+
+@pytest.mark.parametrize("limit", [0, -1, 101, 1.5, True])
+def test_weibo_collector_rejects_invalid_limit_before_resolution(
+    monkeypatch, limit
+):
+    import collectors.weibo as weibo
+
+    monkeypatch.setattr(weibo, "ENABLED", True)
+    monkeypatch.setattr(
+        weibo,
+        "_resolve_uid",
+        lambda url: pytest.fail("account resolution must not run"),
+    )
+
+    with pytest.raises(ValueError):
+        weibo.WeiboCollector().collect_post_list(
+            "https://weibo.com/u/123456", limit=limit
+        )
+
+
 def test_normalize_post_preserves_unknown_public_booleans():
     normalized = FakeLoginWallCollector().normalize_post({"post_id": "1"})
 
@@ -1144,6 +1178,7 @@ def test_comments_ignore_predictable_temp_symlink(monkeypatch, tmp_path):
         "https://www.douyin.com/user/example",
         out_dir=str(out),
         include_comments=True,
+        resume=True,
     ) == 0
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
     assert predictable.is_symlink()
@@ -1236,6 +1271,7 @@ def test_failed_comment_replace_reports_valid_rows_in_preserved_artifact(
         "https://www.douyin.com/user/example",
         out_dir=str(out),
         include_comments=True,
+        resume=True,
     ) == 0
 
     task = json.loads((out / "task.json").read_text(encoding="utf-8"))
@@ -1281,6 +1317,7 @@ def test_failed_comment_replace_does_not_follow_existing_symlink(
         "https://www.douyin.com/user/example",
         out_dir=str(out),
         include_comments=True,
+        resume=True,
     ) == 0
 
     task = json.loads((out / "task.json").read_text(encoding="utf-8"))

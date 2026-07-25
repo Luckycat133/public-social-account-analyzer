@@ -1281,6 +1281,140 @@ class FakeBrowser:
         return self.cards
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"limit": 0},
+        {"limit": -1},
+        {"limit": 50_001},
+        {"limit": 1.5},
+        {"limit": True},
+        {"limit": 1, "max_seconds": 0},
+        {"limit": 1, "max_seconds": float("nan")},
+        {"limit": 1, "max_seconds": float("inf")},
+        {"limit": 1, "max_seconds": 14_400.1},
+        {"limit": 1, "max_scrolls": 0},
+        {"limit": 1, "max_scrolls": 20_001},
+        {"limit": 1, "max_scrolls": 1.5},
+    ],
+)
+def test_all_transport_rejects_invalid_budgets_without_opening_browser(kwargs):
+    from collectors._douyin_browser_transport import collect_account_page
+
+    with pytest.raises(ValueError):
+        collect_account_page(
+            ACCOUNT_URL,
+            all_posts=True,
+            session_factory=lambda: pytest.fail("browser must not open"),
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_items": 0},
+        {"max_items": 50_001},
+        {"max_items": 1.5},
+        {"max_seconds": float("nan")},
+        {"max_seconds": 14_400.1},
+        {"max_scrolls": 20_001},
+        {"max_scrolls": 1.5},
+    ],
+)
+def test_all_collector_rejects_invalid_budgets_before_transport(kwargs):
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **request: pytest.fail("transport must not run")
+    )
+
+    with pytest.raises(ValueError):
+        collector.collect_all_post_list(ACCOUNT_URL, **kwargs)
+
+
+def test_all_transport_accepts_exact_caps_and_reports_effective_max_items():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    payload = {
+        "aweme_list": [AWEME],
+        "has_more": False,
+        "cursor": "must-not-persist",
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event("cap"),
+            _loading_event("Network.loadingFinished", "cap"),
+        ],
+        bodies={"cap": json.dumps(payload)},
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=50_000,
+        all_posts=True,
+        max_seconds=14_400.0,
+        max_scrolls=20_000,
+        session_factory=lambda: browser,
+        sleep=lambda _: None,
+    )
+
+    assert result.coverage["max_items"] == 50_000
+    assert result.coverage["stop_condition"] == "terminal_page"
+
+
+def test_all_collector_forwards_exact_caps_and_reports_effective_max_items():
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    captured = {}
+
+    def browser_collect(**request):
+        captured.update(request)
+        return DouyinBrowserResult(
+            aweme_items=[AWEME],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "observed_page_count": 1,
+                "observed_post_count": 1,
+                "stop_condition": "terminal_page",
+                "max_items": request["limit"],
+            },
+        )
+
+    collector = DouyinCollector(browser_collect=browser_collect)
+    posts = collector.collect_all_post_list(
+        ACCOUNT_URL,
+        max_items=50_000,
+        max_seconds=14_400.0,
+        max_scrolls=20_000,
+    )
+
+    assert posts[0]["post_id"] == "7001"
+    assert captured["limit"] == 50_000
+    assert captured["max_seconds"] == 14_400.0
+    assert captured["max_scrolls"] == 20_000
+    assert collector.get_collection_coverage()["max_items"] == 50_000
+
+
+def test_all_collector_transport_failure_keeps_accepted_max_items_coverage():
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    def fail_transport(**request):
+        raise RuntimeError("transport failed")
+
+    collector = DouyinCollector(browser_collect=fail_transport)
+
+    with pytest.raises(DouyinError):
+        collector.collect_all_post_list(ACCOUNT_URL, max_items=50_000)
+
+    coverage = collector.get_collection_coverage()
+    assert coverage["requested_all"] is True
+    assert coverage["max_items"] == 50_000
+
+
 RESPONSE_EVENT = {
     "method": "Network.responseReceived",
     "params": {
