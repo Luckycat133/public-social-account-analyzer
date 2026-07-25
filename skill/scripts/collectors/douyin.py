@@ -191,13 +191,26 @@ def _text_extra_is_structurally_observed(value: Any) -> bool:
 
 def _is_trusted_image_text(aweme_type: Any, images: Any) -> bool:
     """Recognize image-text only from the platform's typed image payload."""
+    def has_public_reference(image: Any) -> bool:
+        if not isinstance(image, dict):
+            return False
+        url_list = image.get("url_list")
+        return bool(
+            isinstance(url_list, list)
+            and url_list
+            and all(
+                isinstance(url, str) and bool(url.strip())
+                for url in url_list
+            )
+        )
+
     return bool(
         isinstance(aweme_type, int)
         and not isinstance(aweme_type, bool)
         and aweme_type in _IMAGE_TEXT_AWEME_TYPES
         and isinstance(images, list)
         and images
-        and all(isinstance(image, dict) and image for image in images)
+        and all(has_public_reference(image) for image in images)
     )
 
 

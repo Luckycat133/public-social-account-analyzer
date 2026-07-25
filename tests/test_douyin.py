@@ -3519,6 +3519,50 @@ def test_trusted_raw_image_text_does_not_require_duration_or_detail_request():
     assert post["duration_seconds"] is None
     assert post["collection_status"] == "SUCCESS"
     assert post["platform_metrics"]["detail_status"] == "NOT_NEEDED"
+    assert "p.example" not in json.dumps(post, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "invalid_images",
+    [
+        [{"junk": "x"}],
+        [{"url_list": []}],
+        [{"url_list": [""]}],
+        [{"url_list": [123]}],
+        [{"url_list": ["https://p.example/valid.jpeg", 123]}],
+        [
+            {"url_list": ["https://p.example/valid.jpeg"]},
+            {"junk": "mixed-invalid-item"},
+        ],
+    ],
+)
+def test_malformed_image_evidence_cannot_grant_duration_not_applicable(
+    invalid_images,
+):
+    from collectors.douyin import DouyinCollector
+
+    post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(
+            ACCOUNT_URL,
+            {
+                "aweme_id": "7001",
+                "aweme_type": 68,
+                "desc": "伪图文证据",
+                "create_time": 1700000000,
+                "images": invalid_images,
+                "text_extra": [],
+                "_collection_source": "network",
+            },
+            source="network",
+        )
+    )
+
+    assert post["content_type"] == "video"
+    assert post["duration_seconds"] is None
+    assert post["collection_status"] == "PARTIAL"
+    assert post["platform_metrics"]["missing_detail_fields"] == [
+        "duration_seconds"
+    ]
 
 
 def test_video_aweme_cannot_claim_image_text_from_images_or_external_content_type():
