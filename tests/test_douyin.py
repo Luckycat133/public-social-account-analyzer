@@ -905,6 +905,34 @@ def test_duplicate_merge_fills_empty_containers_but_preserves_zero_and_false():
     }]
 
 
+def test_duplicate_merge_does_not_mutate_input_evidence():
+    from collectors.douyin import DouyinCollector
+
+    first = {
+        "aweme_id": "7001",
+        "statistics": {"digg_count": 0},
+        "video": {},
+    }
+    second = {
+        "aweme_id": "7001",
+        "statistics": {"comment_count": 5},
+        "video": {"duration": 9_000},
+    }
+
+    DouyinCollector._validated_aweme_items([first, second])
+
+    assert first == {
+        "aweme_id": "7001",
+        "statistics": {"digg_count": 0},
+        "video": {},
+    }
+    assert second == {
+        "aweme_id": "7001",
+        "statistics": {"comment_count": 5},
+        "video": {"duration": 9_000},
+    }
+
+
 def test_all_collector_drops_invalid_ids_without_profile_url_fallback():
     from collectors._douyin_browser_transport import DouyinBrowserResult
     from collectors.douyin import DouyinCollector
@@ -2384,3 +2412,613 @@ def test_collector_maps_cleanup_diagnostic_to_parser_failure_with_partial_posts(
     assert [post["post_id"] for post in error.partial_posts] == (
         ["7001"] if items else []
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 3B: bounded public completeness
+# ---------------------------------------------------------------------------
+
+
+def test_limited_ssr_filters_every_valid_item_before_limit_and_counts_unknown_dates(
+    monkeypatch,
+):
+    """Newer/unknown leading rows cannot consume the requested in-range limit."""
+    from collectors.douyin import DouyinCollector
+
+    items = [
+        dict(AWEME, aweme_id="6001", create_time=1_640_995_200),
+        dict(AWEME, aweme_id="6002", create_time=None),
+        dict(AWEME, aweme_id="7001", create_time=1_685_577_600),
+        dict(AWEME, aweme_id="7002", create_time=1_690_000_000),
+    ]
+    collector = DouyinCollector(browser_fallback=False)
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"user": {"post": {"data": items}}}),
+    )
+
+    posts = collector.collect_post_list(
+        ACCOUNT_URL,
+        limit=2,
+        date_range=(
+            "2023-01-01T00:00:00+08:00",
+            "2023-12-31T23:59:59+08:00",
+        ),
+    )
+
+    assert [post["post_id"] for post in posts] == ["7001", "7002"]
+    assert collector.get_collection_coverage() == {
+        "requested_all": False,
+        "terminal_page_observed": False,
+        "is_exhaustive": False,
+        "observed_post_count": 4,
+        "unknown_date_count": 1,
+        "range_filter_applied": True,
+        "range_match_count": 2,
+        "range_no_match": False,
+    }
+
+
+def test_limited_nonempty_ssr_underfill_merges_browser_evidence_first_seen(
+    monkeypatch,
+):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    ssr_item = {
+        "aweme_id": "7001",
+        "desc": "SSR 首见文案",
+        "create_time": 1_700_000_000,
+        "statistics": {"digg_count": 0},
+        "video": {},
+        "is_top": False,
+    }
+    browser_calls = []
+
+    def browser_collect(**request):
+        browser_calls.append(request)
+        return DouyinBrowserResult(
+            aweme_items=[
+                {
+                    "aweme_id": "7001",
+                    "desc": "浏览器冲突文案",
+                    "statistics": {"digg_count": 99, "comment_count": 5},
+                    "video": {"duration": 9_000},
+                    "is_top": True,
+                },
+                dict(AWEME, aweme_id="7002"),
+            ],
+            source="network",
+        )
+
+    collector = DouyinCollector(browser_collect=browser_collect)
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"user": {"post": {"data": [ssr_item]}}}),
+    )
+
+    posts = collector.collect_post_list(ACCOUNT_URL, limit=2)
+
+    assert browser_calls == [{"url": ACCOUNT_URL, "limit": 2, "date_range": None}]
+    assert [post["post_id"] for post in posts] == ["7001", "7002"]
+    assert posts[0]["title"] == "SSR 首见文案"
+    assert posts[0]["likes"] == 0
+    assert posts[0]["comments"] == 5
+    assert posts[0]["duration_seconds"] == 9
+    assert posts[0]["is_pinned"] is False
+
+
+def test_collection_source_is_internal_allowlisted_evidence(monkeypatch):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    ssr = dict(AWEME, _collection_source="SSR_SECRET")
+    ssr_collector = DouyinCollector(browser_fallback=False)
+    monkeypatch.setattr(
+        ssr_collector,
+        "_fetch",
+        lambda _url: _ssr_html({"user": {"post": {"data": [ssr]}}}),
+    )
+    ssr_post = ssr_collector.collect_post_list(ACCOUNT_URL, limit=1)[0]
+    assert ssr_post["platform_metrics"]["collection_source"] == "list"
+
+    browser_collector = DouyinCollector(
+        browser_collect=lambda **_request: DouyinBrowserResult(
+            aweme_items=[dict(AWEME, _collection_source="BROWSER_SECRET")],
+            source="network",
+        )
+    )
+    monkeypatch.setattr(browser_collector, "_fetch", lambda _url: "<html>shell</html>")
+    browser_post = browser_collector.collect_post_list(ACCOUNT_URL, limit=1)[0]
+    assert browser_post["platform_metrics"]["collection_source"] == "network"
+    assert "SECRET" not in json.dumps([ssr_post, browser_post], ensure_ascii=False)
+
+
+def test_limited_ssr_browser_restriction_retains_merged_partial_posts(monkeypatch):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    ssr_item = dict(AWEME, aweme_id="7001", video={})
+    collector = DouyinCollector(
+        browser_collect=lambda **_request: DouyinBrowserResult(
+            aweme_items=[
+                dict(AWEME, aweme_id="7001", video={"duration": 7_000}),
+                dict(AWEME, aweme_id="7002"),
+            ],
+            source="network",
+            restriction=STOP_VERIFICATION,
+            diagnostics={"stop_condition": STOP_VERIFICATION},
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"user": {"post": {"data": [ssr_item]}}}),
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_list(ACCOUNT_URL, limit=3)
+
+    assert exc_info.value.stop_reason == STOP_VERIFICATION
+    assert [post["post_id"] for post in exc_info.value.partial_posts] == [
+        "7001",
+        "7002",
+    ]
+    assert exc_info.value.partial_posts[0]["duration_seconds"] == 7
+
+
+def test_ssr_underfill_keeps_restriction_priority_when_browser_rows_are_invalid(
+    monkeypatch,
+):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(
+        browser_collect=lambda **_request: DouyinBrowserResult(
+            aweme_items=[{"aweme_id": "invalid", "desc": "不可采信"}],
+            restriction=STOP_VERIFICATION,
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"user": {"post": {"data": [AWEME]}}}),
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_list(ACCOUNT_URL, limit=2)
+
+    assert exc_info.value.stop_reason == STOP_VERIFICATION
+    assert [post["post_id"] for post in exc_info.value.partial_posts] == ["7001"]
+
+
+def test_explicit_range_excludes_unknown_dates_and_persists_unknown_count():
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **_request: DouyinBrowserResult(
+            aweme_items=[
+                dict(AWEME, aweme_id="7001", create_time=None),
+                dict(AWEME, aweme_id="7002", create_time=1_700_000_000),
+            ],
+            coverage={
+                "requested_all": True,
+                "is_exhaustive": True,
+                "terminal_page_observed": True,
+                "observed_page_count": 1,
+                "observed_post_count": 2,
+                "stop_condition": "terminal_page",
+            },
+        )
+    )
+
+    posts = collector.collect_all_post_list(
+        ACCOUNT_URL,
+        date_range=("2030-01-01T00:00:00+08:00", None),
+    )
+
+    assert posts == []
+    coverage = collector.get_collection_coverage()
+    assert coverage["unknown_date_count"] == 1
+    assert coverage["range_match_count"] == 0
+    assert coverage["range_filter_applied"] is True
+    assert coverage["range_no_match"] is True
+
+
+def test_workspace_coverage_allowlist_keeps_unknown_date_count():
+    import collect
+
+    clean = collect._sanitize_collection_coverage({
+        "requested_all": False,
+        "unknown_date_count": 3,
+        "range_match_count": 0,
+        "range_filter_applied": True,
+        "range_no_match": True,
+        "observed_post_count": 4,
+        "cookie": "must-not-persist",
+    })
+
+    assert clean["unknown_date_count"] == 3
+    assert "cookie" not in clean
+
+
+def test_workspace_date_intersection_excludes_unknown_rows_when_range_is_explicit():
+    import collect
+
+    posts = [
+        {"post_id": "unknown", "published_at": None},
+        {"post_id": "inside", "published_at": "2023-06-01T10:00:00+08:00"},
+    ]
+
+    filtered = collect._filter_by_date(
+        posts,
+        "2023-01-01T00:00:00+08:00",
+        "2023-12-31T23:59:59+08:00",
+    )
+
+    assert [post["post_id"] for post in filtered] == ["inside"]
+
+
+def test_limited_browser_targets_in_range_unique_posts_with_both_bounds():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    newer = dict(AWEME, aweme_id="8001", create_time=1_704_067_200)
+    unknown = dict(AWEME, aweme_id="8002", create_time=None)
+    in_range_one = dict(AWEME, aweme_id="7001", create_time=1_685_577_600)
+    in_range_two = dict(AWEME, aweme_id="7002", create_time=1_690_000_000)
+    browser = FakeBrowser(
+        events=[
+            _response_event("outside"),
+            _loading_event("Network.loadingFinished", "outside"),
+            _response_event("inside-one"),
+            _loading_event("Network.loadingFinished", "inside-one"),
+            _response_event("inside-two"),
+            _loading_event("Network.loadingFinished", "inside-two"),
+        ],
+        bodies={
+            "outside": json.dumps({"aweme_list": [newer, unknown]}),
+            "inside-one": json.dumps({"aweme_list": [in_range_one]}),
+            "inside-two": json.dumps({"aweme_list": [in_range_two]}),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=2,
+        date_range=(
+            "2023-01-01T00:00:00+08:00",
+            "2023-12-31T23:59:59+08:00",
+        ),
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001", "7002"]
+    assert result.coverage["observed_post_count"] == 4
+    assert result.coverage["unknown_date_count"] == 1
+    assert result.coverage["range_match_count"] == 2
+    assert result.coverage["range_filter_applied"] is True
+    assert result.diagnostics["stop_condition"] == "limit"
+
+
+def test_limited_browser_duplicate_date_enrichment_counts_in_confirmation_round():
+    """A duplicate that fills create_time must cancel a pending lower-bound stop."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    old = dict(AWEME, aweme_id="6001", create_time=1_600_000_000)
+    unknown = dict(AWEME, aweme_id="7001", create_time=None)
+    dated_duplicate = {
+        "aweme_id": "7001",
+        "create_time": 1_685_577_600,
+        "video": {"duration": 9_000},
+    }
+    second_match = dict(AWEME, aweme_id="7002", create_time=1_690_000_000)
+    browser = FakeBrowser(
+        events=[
+            _response_event("old"),
+            _loading_event("Network.loadingFinished", "old"),
+            None,
+            _response_event("unknown"),
+            _loading_event("Network.loadingFinished", "unknown"),
+            _response_event("dated"),
+            _loading_event("Network.loadingFinished", "dated"),
+            None,
+            _response_event("second"),
+            _loading_event("Network.loadingFinished", "second"),
+        ],
+        bodies={
+            "old": json.dumps({"aweme_list": [old]}),
+            "unknown": json.dumps({"aweme_list": [unknown]}),
+            "dated": json.dumps({"aweme_list": [dated_duplicate]}),
+            "second": json.dumps({"aweme_list": [second_match]}),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=2,
+        date_range=("2023-01-01T00:00:00+08:00", None),
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001", "7002"]
+    assert result.coverage["range_match_count"] == 2
+
+
+def test_browser_profile_extraction_is_allowlisted_and_account_bound():
+    from collectors._douyin_browser_transport import extract_profile_raw
+
+    payload = {
+        "data": {
+            "user_info": {
+                "sec_uid": "example",
+                "uid": "42",
+                "unique_id": "public-id",
+                "nickname": "公开昵称",
+                "signature": "公开简介",
+                "follower_count": 0,
+                "aweme_count": 0,
+                "total_favorited": 0,
+                "verified": False,
+                "cookie": "COOKIE_SECRET",
+                "cursor": "CURSOR_SECRET",
+                "avatar": {"url_list": ["https://signed.example/SECRET"]},
+            }
+        }
+    }
+
+    profile = extract_profile_raw(payload, ACCOUNT_URL)
+
+    assert profile["account_id"] == "public-id"
+    assert profile["account_name"] == "公开昵称"
+    assert profile["profile_url"] == ACCOUNT_URL
+    assert profile["bio"] == "公开简介"
+    assert profile["verified"] is False
+    assert profile["followers"] == 0
+    assert profile["post_count"] == 0
+    assert profile["platform_metrics"] == {
+        "total_likes": 0,
+        "sec_uid": "example",
+        "unique_id": "public-id",
+        "uid": "42",
+    }
+    serialized = json.dumps(profile, ensure_ascii=False)
+    assert "COOKIE_SECRET" not in serialized
+    assert "CURSOR_SECRET" not in serialized
+    assert "signed.example" not in serialized
+
+    mismatched = json.loads(json.dumps(payload))
+    mismatched["data"]["user_info"]["sec_uid"] = "another-account"
+    assert extract_profile_raw(mismatched, ACCOUNT_URL) is None
+
+
+def test_browser_profile_sanitizer_rejects_nonfinite_public_counts():
+    from collectors._douyin_browser_transport import sanitize_profile_raw
+
+    profile = sanitize_profile_raw(
+        {
+            "sec_uid": "example",
+            "nickname": "公开昵称",
+            "follower_count": float("inf"),
+            "aweme_count": float("nan"),
+        },
+        ACCOUNT_URL,
+    )
+
+    assert profile["followers"] is None
+    assert profile["post_count"] is None
+
+
+def test_browser_profile_sanitizer_is_idempotent_for_public_verification_text():
+    from collectors._douyin_browser_transport import sanitize_profile_raw
+
+    first = sanitize_profile_raw(
+        {
+            "sec_uid": "example",
+            "nickname": "公开昵称",
+            "enterprise_verify_reason": "机构认证",
+        },
+        ACCOUNT_URL,
+    )
+    second = sanitize_profile_raw(first, ACCOUNT_URL)
+
+    assert first["verified"] == "机构认证"
+    assert second["verified"] == "机构认证"
+
+
+def test_limited_browser_nonfinite_date_does_not_satisfy_range_target():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    invalid_date = dict(AWEME, aweme_id="8001", create_time=float("nan"))
+    valid_date = dict(AWEME, aweme_id="7001", create_time=1_685_577_600)
+    browser = FakeBrowser(
+        events=[
+            _response_event("invalid"),
+            _loading_event("Network.loadingFinished", "invalid"),
+            _response_event("valid"),
+            _loading_event("Network.loadingFinished", "valid"),
+        ],
+        bodies={
+            "invalid": json.dumps({"aweme_list": [invalid_date]}),
+            "valid": json.dumps({"aweme_list": [valid_date]}),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        date_range=("2023-01-01T00:00:00+08:00", None),
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
+    assert result.coverage["unknown_date_count"] == 1
+
+
+def test_browser_profile_cache_falls_back_after_ssr_and_api_profile_fail(monkeypatch):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    browser_profile = {
+        "platform": "douyin",
+        "account_id": "public-id",
+        "account_name": "浏览器公开昵称",
+        "profile_url": ACCOUNT_URL + "?signed=SECRET",
+        "bio": "公开简介",
+        "verified": False,
+        "followers": 0,
+        "post_count": 0,
+        "platform_metrics": {
+            "sec_uid": "example",
+            "unique_id": "public-id",
+            "total_likes": 0,
+            "cookie": "NESTED_SECRET",
+        },
+        "cursor": "TOP_LEVEL_SECRET",
+    }
+    collector = DouyinCollector(
+        browser_collect=lambda **_request: DouyinBrowserResult(
+            aweme_items=[AWEME],
+            profile_raw=browser_profile,
+        )
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+    monkeypatch.setattr(
+        collector,
+        "_fetch_profile_via_iesdouyin_api",
+        lambda _sec_uid, _url: None,
+    )
+
+    collector.collect_post_list(ACCOUNT_URL, limit=1)
+    profile = collector.collect_profile(ACCOUNT_URL)
+
+    assert profile["account_name"] == "浏览器公开昵称"
+    assert profile["followers"] == 0
+    assert profile["verified"] is False
+    assert profile["profile_url"] == ACCOUNT_URL
+    serialized = json.dumps(profile, ensure_ascii=False)
+    assert "SECRET" not in serialized
+    assert "cookie" not in serialized
+    assert "cursor" not in serialized
+
+
+def test_visible_browser_snapshot_can_supply_account_bound_profile():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    class SnapshotBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            return {
+                "cards": [{
+                    "href": "https://www.douyin.com/video/7001",
+                    "text": "公开作品",
+                }],
+                "profile": {
+                    "profile_url": ACCOUNT_URL + "?signed=SECRET",
+                    "sec_uid": "example",
+                    "nickname": "可见昵称",
+                    "follower_count": "0",
+                    "verified": False,
+                    "cookie": "COOKIE_SECRET",
+                },
+            }
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: SnapshotBrowser(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.profile_raw["account_name"] == "可见昵称"
+    assert result.profile_raw["followers"] == 0
+    assert result.profile_raw["verified"] is False
+    assert "SECRET" not in json.dumps(result.profile_raw, ensure_ascii=False)
+
+
+def test_minimal_browser_rows_are_partial_but_complete_rows_are_success():
+    from collectors.douyin import DouyinCollector
+
+    minimal = {
+        "aweme_id": "7001",
+        "desc": "仅有卡片文案",
+        "share_url": "https://www.douyin.com/video/7001",
+        "statistics": {"digg_count": 0},
+        "_collection_source": "dom",
+    }
+    complete = dict(AWEME, _collection_source="network")
+
+    minimal_post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(ACCOUNT_URL, minimal, source="dom")
+    )
+    complete_post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(ACCOUNT_URL, complete, source="network")
+    )
+
+    assert minimal_post["collection_status"] == "PARTIAL"
+    assert complete_post["collection_status"] == "SUCCESS"
+
+
+@pytest.mark.parametrize("duration", ["not-a-duration", -1])
+def test_malformed_browser_detail_fields_remain_partial_without_crashing(duration):
+    from collectors.douyin import DouyinCollector
+
+    malformed = {
+        "aweme_id": "7001",
+        "desc": "公开文案",
+        "create_time": True,
+        "statistics": ["must-not-persist"],
+        "video": {"duration": duration},
+        "_collection_source": "network",
+    }
+
+    post = DouyinCollector().normalize_post(
+        DouyinCollector._build_post_raw(ACCOUNT_URL, malformed, source="network")
+    )
+
+    assert post["published_at"] is None
+    assert post["duration_seconds"] is None
+    assert post["likes"] is None
+    assert post["collection_status"] == "PARTIAL"
+    assert "must-not-persist" not in json.dumps(post, ensure_ascii=False)
+
+
+def test_successful_detail_enrichment_upgrades_browser_partial_only_when_complete():
+    import collect
+
+    class CompleteDetailAdapter:
+        def collect_post_detail(self, _post_url):
+            return {
+                "post_id": "7001",
+                "title": "完整标题",
+                "published_at": "2026-07-20T10:00:00+08:00",
+                "duration_seconds": 9,
+                "hashtags": ["完整话题"],
+            }
+
+    post = {
+        "platform": "douyin",
+        "post_id": "7001",
+        "post_url": "https://www.douyin.com/video/7001",
+        "title": "列表标题",
+        "published_at": None,
+        "duration_seconds": None,
+        "hashtags": [],
+        "collection_status": "PARTIAL",
+        "platform_metrics": {"collection_source": "dom"},
+    }
+
+    unavailable = collect._enrich_douyin_details(
+        CompleteDetailAdapter(),
+        [post],
+        [],
+        "2026-07-25T10:00:00+08:00",
+    )
+
+    assert unavailable == 0
+    assert post["collection_status"] == "SUCCESS"
+    assert post["platform_metrics"]["detail_status"] == "SUCCESS"

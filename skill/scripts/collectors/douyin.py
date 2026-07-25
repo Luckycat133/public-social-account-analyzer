@@ -24,6 +24,7 @@ CDP 客户端驱动独立临时浏览器，观察页面公开响应并读取可�
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import time
@@ -72,6 +73,7 @@ _TIMEOUT = 12
 
 # Shared with the browser transport so both paths use identical priority.
 _RESTRICTION_PATTERNS = DOUYIN_PAGE_STATE_PATTERNS
+_COLLECTION_SOURCES = frozenset({"list", "network", "dom", "network+dom", "detail"})
 
 
 class DouyinError(Exception):
@@ -103,7 +105,7 @@ def _now_iso() -> str:
 
 def _ts_to_iso(ts: Any) -> str | None:
     """Unix 秒 → 北京时间 ISO 8601；失败返回 None。"""
-    if not ts:
+    if not ts or isinstance(ts, bool):
         return None
     try:
         return datetime.fromtimestamp(int(ts), tz=_BEIJING).isoformat()
@@ -142,6 +144,14 @@ def _public_boolean(source: dict[str, Any], *keys: str) -> bool | None:
     if False in values:
         return False
     return None
+
+
+def _collection_source(value: Any, fallback: Any = "unknown") -> str:
+    if isinstance(value, str) and value in _COLLECTION_SOURCES:
+        return value
+    if isinstance(fallback, str) and fallback in _COLLECTION_SOURCES:
+        return fallback
+    return "unknown"
 
 
 def _extract_hashtags(desc: Any, text_extra: Any) -> list[str]:
@@ -237,6 +247,7 @@ class DouyinCollector(BaseCollector):
         self.browser_fallback = bool(browser_fallback)
         self._browser_collect = browser_collect
         self._collection_coverage: dict[str, Any] = {}
+        self._browser_profile_cache: dict[str, dict[str, Any]] = {}
 
     # -- 路由 ---------------------------------------------------------------
     def supports(self, url: str) -> bool:
@@ -426,6 +437,11 @@ class DouyinCollector(BaseCollector):
                 fallback = self._fetch_profile_via_iesdouyin_api(sec_uid, url)
                 if fallback:
                     return fallback
+            cached = self._browser_profile_cache.get(
+                canonical_profile_url("douyin", url) or ""
+            )
+            if cached is not None:
+                return self.normalize_profile(dict(cached))
             raise DouyinError(
                 STOP_PARSER_FAILED, "RENDER_DATA 中未识别到用户结构（可能为 JS 外壳页）"
             )
@@ -433,14 +449,24 @@ class DouyinCollector(BaseCollector):
         raw = self._build_profile_raw(url, user)
         return self.normalize_profile(raw)
 
+    def _cache_browser_profile(self, url: str, profile_raw: Any) -> None:
+        """Re-sanitize browser profile evidence and bind it to one account."""
+        from ._douyin_browser_transport import sanitize_profile_raw
+
+        canonical_url = canonical_profile_url("douyin", url)
+        if canonical_url is None:
+            return
+        clean = sanitize_profile_raw(profile_raw, canonical_url)
+        if clean is not None:
+            self._browser_profile_cache[canonical_url] = clean
+
     # -- 作品列表 -----------------------------------------------------------
-    def _collect_posts_via_browser(
+    def _request_browser_result(
         self,
         url: str,
         limit: int,
         date_range: tuple[str | None, str | None] | None,
-    ) -> list[dict[str, Any]]:
-        """Run the optional browser path and preserve its status semantics."""
+    ):
         if not self.browser_fallback:
             raise DouyinError(
                 STOP_PARSER_FAILED,
@@ -463,23 +489,89 @@ class DouyinCollector(BaseCollector):
                 f"抖音浏览器降级失败: {exc}",
                 diagnostic_code=code,
             ) from exc
+        self._cache_browser_profile(url, getattr(result, "profile_raw", None))
+        return result
 
-        valid_items = self._validated_aweme_items(result.aweme_items)
-        posts = [
+    def _normalized_posts_from_items(
+        self,
+        url: str,
+        items: list[dict[str, Any]],
+        default_source: str,
+    ) -> list[dict[str, Any]]:
+        return [
             self.normalize_post(
                 self._build_post_raw(
-                    url,
-                    item,
-                    source=str(
-                        item.get("_collection_source") or result.source or "network"
+                    url, item,
+                    source=_collection_source(
+                        item.get("_collection_source"), default_source
                     ),
                 )
             )
-            for item in valid_items
+            for item in items
         ]
-        if date_range:
-            posts = self._filter_by_date(posts, date_range)
-        posts = posts[:limit]
+
+    @staticmethod
+    def _date_summary(
+        posts: list[dict[str, Any]],
+        date_range: tuple[str | None, str | None] | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        unknown_count = sum(
+            DouyinCollector._parse_post_date(post.get("published_at")) is None
+            for post in posts
+        )
+        if date_range is None:
+            return list(posts), unknown_count
+        return DouyinCollector._filter_by_date(posts, date_range), unknown_count
+
+    def _record_limited_coverage(
+        self,
+        posts_before_range: list[dict[str, Any]],
+        matched_posts: list[dict[str, Any]],
+        date_range: tuple[str | None, str | None] | None,
+        transport_coverage: Any = None,
+    ) -> None:
+        clean = self._sanitize_collection_coverage(transport_coverage)
+        _, unknown_count = self._date_summary(posts_before_range, date_range)
+        clean.update({
+            "requested_all": False,
+            "terminal_page_observed": False,
+            "is_exhaustive": False,
+            "observed_post_count": max(
+                clean.get("observed_post_count", 0), len(posts_before_range)
+            ),
+            "range_filter_applied": date_range is not None,
+            "range_match_count": len(matched_posts),
+            "range_no_match": bool(
+                date_range is not None and posts_before_range and not matched_posts
+            ),
+        })
+        if date_range is not None:
+            clean["unknown_date_count"] = max(
+                clean.get("unknown_date_count", 0), unknown_count
+            )
+        self._collection_coverage = self._sanitize_collection_coverage(clean)
+
+    def _collect_posts_via_browser(
+        self,
+        url: str,
+        limit: int,
+        date_range: tuple[str | None, str | None] | None,
+    ) -> list[dict[str, Any]]:
+        """Run the optional browser path and preserve its status semantics."""
+        result = self._request_browser_result(url, limit, date_range)
+
+        valid_items = self._validated_aweme_items(result.aweme_items)
+        normalized = self._normalized_posts_from_items(
+            url, valid_items, str(result.source or "network")
+        )
+        matched, _unknown_count = self._date_summary(normalized, date_range)
+        posts = matched[:limit]
+        self._record_limited_coverage(
+            normalized,
+            matched,
+            date_range,
+            getattr(result, "coverage", {}),
+        )
         if result.restriction:
             raise DouyinError(
                 result.restriction,
@@ -522,6 +614,7 @@ class DouyinCollector(BaseCollector):
             "cursor_fingerprint_count",
             "repeated_cursor_count",
             "range_match_count",
+            "unknown_date_count",
         )
         allowed_stops = {
             "terminal_page",
@@ -614,29 +707,28 @@ class DouyinCollector(BaseCollector):
                 diagnostic_code="BROWSER_TRANSPORT_FAILED",
             ) from exc
 
+        self._cache_browser_profile(url, getattr(result, "profile_raw", None))
         self._collection_coverage = self._sanitize_collection_coverage(
             getattr(result, "coverage", {})
         )
         self._collection_coverage["max_items"] = max_items
         valid_items = self._validated_aweme_items(result.aweme_items)
-        posts = [
-            self.normalize_post(
-                self._build_post_raw(
-                    url,
-                    item,
-                    source=str(
-                        item.get("_collection_source") or result.source or "network"
-                    ),
-                )
+        normalized = self._normalized_posts_from_items(
+            url, valid_items, str(result.source or "network")
+        )
+        matched, unknown_count = self._date_summary(normalized, date_range)
+        posts = matched[:max_items]
+        self._collection_coverage["observed_post_count"] = max(
+            self._collection_coverage.get("observed_post_count", 0),
+            len(valid_items),
+        )
+        if date_range is not None:
+            self._collection_coverage["unknown_date_count"] = max(
+                self._collection_coverage.get("unknown_date_count", 0),
+                unknown_count,
             )
-            for item in valid_items
-        ]
-        if date_range:
-            posts = self._filter_by_date(posts, date_range)
-        posts = posts[:max_items]
-        self._collection_coverage["observed_post_count"] = len(valid_items)
         self._collection_coverage["range_filter_applied"] = date_range is not None
-        self._collection_coverage["range_match_count"] = len(posts)
+        self._collection_coverage["range_match_count"] = len(matched)
         self._collection_coverage["range_no_match"] = bool(
             date_range is not None and valid_items and not posts
         )
@@ -718,16 +810,65 @@ class DouyinCollector(BaseCollector):
                 partial_posts=[],
                 diagnostic_code="INVALID_PLATFORM_POST_ID",
             )
-        posts: list[dict[str, Any]] = []
+        ssr_items = []
         for item in valid_items:
-            if len(posts) >= limit:
-                break
-            raw = self._build_post_raw(url, item, source="list")
-            posts.append(self.normalize_post(raw))
+            prepared = dict(item)
+            prepared["_collection_source"] = "list"
+            ssr_items.append(prepared)
+        normalized = self._normalized_posts_from_items(url, ssr_items, "list")
+        matched, _unknown_count = self._date_summary(normalized, date_range)
 
-        if date_range:
-            posts = self._filter_by_date(posts, date_range)
-        return posts[:limit]
+        if len(matched) >= limit or not self.browser_fallback:
+            self._record_limited_coverage(normalized, matched, date_range)
+            return matched[:limit]
+
+        result = self._request_browser_result(url, limit, date_range)
+        browser_items = self._validated_aweme_items(result.aweme_items)
+        browser_payload_invalid = bool(result.aweme_items and not browser_items)
+        prepared_browser_items: list[dict[str, Any]] = []
+        for item in browser_items:
+            prepared = dict(item)
+            prepared["_collection_source"] = _collection_source(
+                prepared.get("_collection_source"),
+                _collection_source(result.source, "network"),
+            )
+            prepared_browser_items.append(prepared)
+        merged_items = self._validated_aweme_items(ssr_items + prepared_browser_items)
+        merged_normalized = self._normalized_posts_from_items(url, merged_items, "list")
+        merged_matched, _unknown_count = self._date_summary(
+            merged_normalized, date_range
+        )
+        posts = merged_matched[:limit]
+        self._record_limited_coverage(
+            merged_normalized,
+            merged_matched,
+            date_range,
+            getattr(result, "coverage", {}),
+        )
+        if result.restriction:
+            raise DouyinError(
+                result.restriction,
+                f"浏览器采集中止: {result.restriction}",
+                raw=result.diagnostics,
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if result.diagnostic_code:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器采集完成，但资源清理失败",
+                raw=result.diagnostics,
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if browser_payload_invalid:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器作品载荷未包含有效的数字平台作品 ID",
+                partial_posts=posts,
+                diagnostic_code="INVALID_PLATFORM_POST_ID",
+            )
+        return posts
 
     @classmethod
     def _validated_aweme_items(cls, items: Any) -> list[dict[str, Any]]:
@@ -742,7 +883,7 @@ class DouyinCollector(BaseCollector):
             if re.fullmatch(r"\d+", post_id) is None:
                 continue
             if post_id not in by_id:
-                by_id[post_id] = dict(item)
+                by_id[post_id] = copy.deepcopy(item)
                 continue
             cls._merge_missing_values(by_id[post_id], item)
         return list(by_id.values())
@@ -754,7 +895,7 @@ class DouyinCollector(BaseCollector):
             if isinstance(current, dict) and isinstance(value, dict):
                 cls._merge_missing_values(current, value)
             elif cls._missing_value(current) and not cls._missing_value(value):
-                target[key] = value
+                target[key] = copy.deepcopy(value)
 
     @staticmethod
     def _missing_value(value: Any) -> bool:
@@ -982,8 +1123,10 @@ class DouyinCollector(BaseCollector):
 
         desc = aweme.get("desc") or ""
         text_extra = aweme.get("text_extra")
-        statistics = aweme.get("statistics") or {}
-        video = aweme.get("video") or {}
+        supplied_statistics = aweme.get("statistics")
+        statistics = supplied_statistics if isinstance(supplied_statistics, dict) else {}
+        supplied_video = aweme.get("video")
+        video = supplied_video if isinstance(supplied_video, dict) else {}
         is_top = _public_boolean(aweme, "is_top", "is_top_aweme")
         is_repost = _public_boolean(aweme, "is_repost", "is_forward")
         is_ad = _public_boolean(aweme, "is_ad", "is_commerce")
@@ -996,18 +1139,39 @@ class DouyinCollector(BaseCollector):
         single_text = (desc or "").split("\n")[0] if isinstance(desc, str) else None
         post_id = str(aweme.get("aweme_id") or aweme.get("aweme_id_str") or "")
         post_url = canonical_post_url_for_item(aweme, post_id)
-        collection_source = str(
-            aweme.get("_collection_source") or source or "unknown"
+        collection_source = _collection_source(
+            aweme.get("_collection_source"), source
+        )
+        published_at = _ts_to_iso(aweme.get("create_time"))
+        duration_ms = _int(video.get("duration"))
+        duration_seconds = (
+            duration_ms // 1000
+            if duration_ms is not None and duration_ms >= 0
+            else None
+        )
+        browser_detail_complete = bool(
+            isinstance(aweme.get("desc"), str)
+            and published_at is not None
+            and (
+                content_type == "image_text"
+                or duration_seconds is not None
+            )
+        )
+        collection_status = (
+            "PARTIAL"
+            if collection_source in {"dom", "network", "network+dom"}
+            and not browser_detail_complete
+            else "SUCCESS"
         )
         return {
             "platform": "douyin",
             "post_id": post_id,
             "post_url": post_url,
-            "published_at": _ts_to_iso(aweme.get("create_time")),
+            "published_at": published_at,
             "content_type": content_type,
             "title": single_text,
             "text": desc,
-            "duration_seconds": (_int(video.get("duration")) // 1000) if video.get("duration") is not None else None,
+            "duration_seconds": duration_seconds,
             "hashtags": _extract_hashtags(desc, text_extra),
             "is_pinned": is_top,
             "is_repost": is_repost,
@@ -1020,7 +1184,7 @@ class DouyinCollector(BaseCollector):
             "shares": _int(statistics.get("share_count")),
             "coins": None,
             "danmaku": None,
-            "collection_status": "SUCCESS",
+            "collection_status": collection_status,
             "collected_at": _now_iso(),
             "source_url": post_url,
             "platform_metrics": {
@@ -1038,29 +1202,30 @@ class DouyinCollector(BaseCollector):
         }
 
     @staticmethod
+    def _parse_post_date(iso: Any) -> datetime | None:
+        if not isinstance(iso, str) or not iso:
+            return None
+        try:
+            parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_BEIJING)
+        return parsed
+
+    @staticmethod
     def _filter_by_date(
         posts: list[dict[str, Any]],
         date_range: tuple[str | None, str | None],
     ) -> list[dict[str, Any]]:
-        """按 published_at（ISO 8601，+08:00）做 best-effort 过滤。"""
+        """Strictly intersect known publication dates with an explicit range."""
         df, dt = date_range
-
-        def parse(iso: str | None) -> datetime | None:
-            if not iso:
-                return None
-            try:
-                return datetime.fromisoformat(iso)
-            except (ValueError, TypeError):
-                return None
-
-        lo = parse(df)
-        hi = parse(dt)
+        lo = DouyinCollector._parse_post_date(df)
+        hi = DouyinCollector._parse_post_date(dt)
         out: list[dict[str, Any]] = []
         for p in posts:
-            pa = parse(p.get("published_at"))
+            pa = DouyinCollector._parse_post_date(p.get("published_at"))
             if pa is None:
-                # 无法判定时间的保留（不臆造排除）。
-                out.append(p)
                 continue
             if lo is not None and pa < lo:
                 continue

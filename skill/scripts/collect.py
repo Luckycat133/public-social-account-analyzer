@@ -260,7 +260,7 @@ def _filter_by_date(
     date_from: str | None,
     date_to: str | None,
 ) -> list[dict]:
-    """按 published_at(ISO 8601)做交集过滤;无法解析时间的条目保留(不臆造排除)。"""
+    """Intersect known publication dates with an explicit requested range."""
     if not date_from and not date_to:
         return posts
 
@@ -278,7 +278,6 @@ def _filter_by_date(
     for p in posts:
         pa = parse(p.get("published_at"))
         if pa is None:
-            out.append(p)
             continue
         if lo is not None and pa < lo:
             continue
@@ -577,7 +576,17 @@ def _enrich_douyin_details(
             value = detail.get(field)
             if not _missing_detail_value(value):
                 post[field] = value
-        _set_detail_status(post, "SUCCESS")
+        still_missing = any(
+            _missing_detail_value(post.get(field)) for field in _DETAIL_FIELDS
+        )
+        _set_detail_status(post, "PARTIAL" if still_missing else "SUCCESS")
+        if (
+            not still_missing
+            and post.get("collection_status") == "PARTIAL"
+            and (post.get("platform_metrics") or {}).get("collection_source")
+            in {"dom", "network", "network+dom"}
+        ):
+            post["collection_status"] = "SUCCESS"
     return unavailable_count
 
 
@@ -789,6 +798,7 @@ def _sanitize_collection_coverage(value) -> dict:
         "cursor_fingerprint_count",
         "repeated_cursor_count",
         "range_match_count",
+        "unknown_date_count",
     ):
         field_value = value.get(key)
         if isinstance(field_value, int) and not isinstance(field_value, bool):
