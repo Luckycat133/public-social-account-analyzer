@@ -27,17 +27,25 @@ workspace/<platform>-<account>-<date>/
   source/index-evidence.json # 仅 Web 索引降级；经过白名单规范化的证据副本
   normalized-posts.csv       # 归一化内容表
   collection-report.md       # 采集质量报告
+  manifest.json              # 已提交采集产物的确定性大小与 SHA-256 清单
+  .complete                  # 固定格式提交标记；最后且排他创建
   account-analysis-report.md # 分析报告（Markdown）
   dashboard.html             # 可视化报告（HTML）
   analysis.json              # 结构化分析结果
 ```
 
-默认目录名已存在（包括符号链接）时**不得覆盖或跟随**，必须以原子目录创建操作预留追加
-任务 ID 或序号的新目录（见 `SKILL.md` 任务创建步骤），并在同一次所有权记录中创建、绑定
-目标与 `source/` 的设备号/inode。公开采集的新任务若显式指定 `--out`，任何已存在目标
-（包括空目录）都必须在适配器加载、网络调用或产物写入前以参数错误退出；
-`--resume --out <既有目录>` 是允许写入既有目录的唯一续采路径，且只验证既有目标与
-`source/` 的目录身份，不取得其所有权。授权采集器对最终目标保持排他预留和不覆盖语义。
+默认目录名已存在（包括符号链接）时**不得覆盖或跟随**。采集器以原子目录创建操作直接
+预留最终目录名，并以排他创建打开每个目录和文件；任何失败都不执行替换、重命名或删除。
+失败时可保留没有有效 `.complete` 的不完整目录，调用方不得把它视为可消费任务。
+成功提交必须先写入并 `fsync` 确定性 `manifest.json`（记录白名单产物、字节数与 SHA-256），
+最后排他创建固定格式 `.complete`；读取新格式任务前必须核验标记、清单、精确目录清单、
+大小和摘要。公开采集的新任务若显式指定 `--out`，任何已存在目标（包括空目录）都必须在
+适配器网络调用或产物写入前退出。授权采集器遵循相同的最终目录预留和不覆盖语义。
+
+`--resume --out <OLD>` 只把 `OLD` 当作只读输入，绝不修改。新产物写到 `--resume-out <NEW>`；
+省略时原子预留同级 `OLD-resume-<date>`（冲突时追加数字后缀）。带 `.complete` 的新格式
+输入必须完整通过上述校验；无标记的旧格式可在目录身份绑定的安全读取后导入。续采任务在
+`task.json.resume_source` 记录来源格式、`sha256` 算法和来源提交/内容摘要。
 
 ## 3. Task 数据结构
 
@@ -61,6 +69,7 @@ workspace/<platform>-<account>-<date>/
 | incremental | boolean | 否 | 否 | false | 是否为增量续采 |
 | existing_count | integer | 否 | 否 | 0 | 增量前已有条数 |
 | new_count | integer | 否 | 否 | 20 | 本次新增条数 |
+| resume_source | object | 否 | 是 | `{format, digest_algorithm, digest}` | 只读续采来源的格式和提交/内容 SHA-256；非续采为 `null` |
 | diagnostic_code | string | 否 | 是 | SANDBOX_INDEX_FALLBACK | 安全诊断码；不是 `stop_reason` |
 | collection_source | string | 否 | 是 | douyin_search_index | 实际采集/证据来源 |
 | source_kind | string | 否 | 是 | douyin_search_index | 索引证据类型；当前与 `collection_source` 同值 |
@@ -76,9 +85,10 @@ workspace/<platform>-<account>-<date>/
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
 - `--all` 与显式 `--limit` 互斥；`--since` 仅可与 `--resume` 联用；公开全量预算参数仅可与
   `--all` 联用。参数错误不得触发适配器网络调用或任务目录写入，也不得静默截断或忽略。
-- `--resume` 必须先校验 `--out`、只读加载既有作品并结合 `--since` / 最新作品时间计算有效
-  `date_from`；有效 `date_from > date_to` 时以参数错误退出。以上步骤必须发生在创建或修改
-  任务目录、`source/` 和任何任务产物之前。
+- `--resume` 必须先校验并只读加载 `--out` 既有作品，再结合 `--since` / 最新作品时间计算
+  有效 `date_from`；有效 `date_from > date_to` 时以参数错误退出。`--resume-out` 只能与
+  `--resume` 联用且不得等于来源。以上校验发生在适配器网络调用和新输出目录创建之前；
+  来源目录在所有成功、失败和控制流异常下都保持只读。
 - 执行前向用户回显 `platform`、`requested_limit`、`date_from`/`date_to`、`include_comments`。
 - Web 索引降级必须设置 `task_status=PARTIAL`、保留真实上游 `stop_reason`，并填写来源与
   快照字段；未知快照时间保持 `null`，可单独保存来源显示的 `snapshot_age_label`。
@@ -304,10 +314,10 @@ workspace/<platform>-<account>-<date>/
 `parent_post_id + comment_id` 稳定保留第一条并去重；非空响应中的畸形记录按失败记录，不能
 伪装为空结果。每个父作品最多持久化 20 条，`comments_collected` 等于最终有效唯一行数。
 
-评论文件使用与目标同目录的不可预测、排他创建临时文件并原子替换；无论序列化或替换成功
-与否都清理临时文件。任务目录或 `source/` 为符号链接时必须在读取/写入前拒绝；不得使用
-可预测临时文件名或跟随预置临时符号链接。写入失败只落固定清洗错误，随后仍须生成
-`task.json` 与 `collection-report.md`。
+评论文件与其他采集产物一样在已绑定的 `source/` 目录中排他创建，绝不打开、截断或替换
+预先存在的普通文件、硬链接、FIFO 或符号链接。写入失败只输出固定清洗错误，并使工作区
+保持没有有效 `.complete` 的不完整状态；不删除任何已创建节点，也不把部分评论文件计为
+已提交数据。
 
 作品父 URL 在详情调用、评论调用、报告和数据落盘前必须完成平台级主机、路径与作品 ID
 关联校验，并规范化为无凭据、query 和 fragment 的公开 URL。报告与终端输出中的访问原因、
@@ -322,10 +332,6 @@ workspace/<platform>-<account>-<date>/
 只把移除 query/fragment 后的安全 host/path 候选交给适配器。抖音 `v.douyin.com` 短链只允许
 以该安全候选解析一次重定向，落点仍须通过抖音账号主页策略，随后所有账号调用只使用规范化
 的 `https://www.douyin.com/user/...` URL。
-
-原子替换失败后的既有评论重计必须使用 `O_NONBLOCK` 与有效的 `O_NOFOLLOW` 打开最终路径，
-再以 `fstat` 仅接受已打开的普通文件，并限制最大读取字节数。FIFO、设备、socket、符号链接及
-超限文件均按 0 处理；平台没有有效 `O_NOFOLLOW` 时也保守按 0 处理，不能退回先检查再打开。
 
 ## 7. Analysis 数据结构
 

@@ -1169,238 +1169,85 @@ def test_weibo_comment_parent_requires_matching_public_post_url(
     assert task["comment_collection"]["failures"] == 1
 
 
-def test_comments_ignore_predictable_temp_symlink(monkeypatch, tmp_path):
+def test_resume_comments_leave_legacy_temp_symlink_read_only(
+    monkeypatch, tmp_path
+):
     import collect
 
-    out = tmp_path / "out"
-    source = out / "source"
+    old = tmp_path / "old"
+    source = old / "source"
     source.mkdir(parents=True)
     victim = tmp_path / "victim.txt"
     victim.write_text("do-not-touch", encoding="utf-8")
     predictable = source / "comments.jsonl.tmp"
     predictable.symlink_to(victim)
+    new = tmp_path / "new"
     monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
 
     assert collect.run(
         "https://www.douyin.com/user/example",
-        out_dir=str(out),
+        out_dir=str(old),
         include_comments=True,
         resume=True,
+        resume_out=str(new),
     ) == 0
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
     assert predictable.is_symlink()
-    assert (source / "comments.jsonl").is_file()
+    assert (new / "source" / "comments.jsonl").is_file()
+    assert (new / ".complete").is_file()
 
 
-@pytest.mark.parametrize("failure_kind", ["serialize", "replace"])
-def test_comment_persistence_failure_is_sanitized_and_finalizes_task(
-    monkeypatch, tmp_path, failure_kind
+def test_comment_serialization_failure_leaves_sanitized_incomplete_workspace(
+    monkeypatch, tmp_path, capsys
 ):
     import collect
 
+    original_dumps = collect.json.dumps
+
+    def fail_comment_only(value, *args, **kwargs):
+        if isinstance(value, dict) and value.get("comment_id") == "c1":
+            raise TypeError("SECRET_COMMENT_SERIALIZATION")
+        return original_dumps(value, *args, **kwargs)
+
     monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
-    if failure_kind == "serialize":
-        original_dumps = collect.json.dumps
-
-        def fail_comment_only(value, *args, **kwargs):
-            if isinstance(value, dict) and value.get("comment_id") == "c1":
-                raise TypeError("secret serialization failure")
-            return original_dumps(value, *args, **kwargs)
-
-        monkeypatch.setattr(collect.json, "dumps", fail_comment_only)
-    else:
-        original_replace = collect.os.replace
-
-        def fail_comment_only(source, destination, *args, **kwargs):
-            if str(destination).endswith("comments.jsonl"):
-                raise OSError("secret replace failure")
-            return original_replace(source, destination, *args, **kwargs)
-
-        monkeypatch.setattr(collect.os, "replace", fail_comment_only)
-
+    monkeypatch.setattr(collect.json, "dumps", fail_comment_only)
     out = tmp_path / "out"
-    assert collect.run(
-        "https://www.douyin.com/user/example",
-        out_dir=str(out),
-        include_comments=True,
-    ) == 0
-
-    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
-    assert task["comment_collection"]["comments_collected"] == 0
-    assert task["comment_collection"]["failures"] == 1
-    assert (out / "collection-report.md").is_file()
-    assert "secret" not in (out / "collection-report.md").read_text(encoding="utf-8")
-    assert not (out / "source" / "comments.jsonl").exists()
-    assert list((out / "source").glob(".comments.jsonl.*.tmp")) == []
-
-
-@pytest.mark.parametrize(
-    ("existing_text", "expected_count"),
-    [
-        (
-            json.dumps({
-                "comment_id": "old1",
-                "parent_post_id": "7001",
-                "parent_post_url": "https://www.douyin.com/video/7001",
-                "author": None,
-                "text": "persisted comment",
-                "likes": None,
-                "published_at": None,
-                "collected_at": "2026-07-24T10:00:00+08:00",
-            }) + "\n",
-            1,
-        ),
-        ("{malformed persisted row\n", 0),
-    ],
-)
-def test_failed_comment_replace_reports_valid_rows_in_preserved_artifact(
-    monkeypatch, tmp_path, existing_text, expected_count
-):
-    import collect
-
-    out = tmp_path / "out"
-    source = out / "source"
-    source.mkdir(parents=True)
-    comments_path = source / "comments.jsonl"
-    comments_path.write_text(existing_text, encoding="utf-8")
-    before = comments_path.read_bytes()
-    monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
-    original_replace = collect.os.replace
-
-    def fail_comment_only(source_path, destination, *args, **kwargs):
-        if str(destination).endswith("comments.jsonl"):
-            raise OSError("secret replace failure")
-        return original_replace(source_path, destination, *args, **kwargs)
-
-    monkeypatch.setattr(collect.os, "replace", fail_comment_only)
 
     assert collect.run(
         "https://www.douyin.com/user/example",
         out_dir=str(out),
         include_comments=True,
-        resume=True,
-    ) == 0
-
-    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
-    assert task["comment_collection"]["comments_collected"] == expected_count
-    assert task["comment_collection"]["failures"] == 1
-    assert comments_path.read_bytes() == before
-    assert list(source.glob(".comments.jsonl.*.tmp")) == []
+    ) == 3
+    captured = capsys.readouterr()
+    assert out.is_dir()
+    assert not (out / ".complete").exists()
+    assert "SECRET_COMMENT_SERIALIZATION" not in captured.out + captured.err
 
 
-def test_failed_comment_replace_does_not_follow_existing_symlink(
+def test_concurrent_comment_leaf_is_preserved_and_commit_fails(
     monkeypatch, tmp_path
 ):
     import collect
 
     out = tmp_path / "out"
-    source = out / "source"
-    source.mkdir(parents=True)
-    victim = tmp_path / "victim.jsonl"
-    victim.write_text(json.dumps({
-        "comment_id": "victim-row",
-        "parent_post_id": "7001",
-        "parent_post_url": "https://www.douyin.com/video/7001",
-        "author": None,
-        "text": "must not be counted through a symlink",
-        "likes": None,
-        "published_at": None,
-        "collected_at": "2026-07-24T10:00:00+08:00",
-    }) + "\n", encoding="utf-8")
-    comments_path = source / "comments.jsonl"
-    comments_path.symlink_to(victim)
-    victim_before = victim.read_bytes()
-    monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
-    original_replace = collect.os.replace
+    concurrent_bytes = b"concurrent comments\x00must-survive"
 
-    def fail_comment_only(source_path, destination, *args, **kwargs):
-        if str(destination).endswith("comments.jsonl"):
-            raise OSError("secret replace failure")
-        return original_replace(source_path, destination, *args, **kwargs)
+    class ConflictingCommentAdapter(_SafeCommentAdapter):
+        def collect_comments(self, post_url, limit=20):
+            (out / "source" / "comments.jsonl").write_bytes(concurrent_bytes)
+            return super().collect_comments(post_url, limit=limit)
 
-    monkeypatch.setattr(collect.os, "replace", fail_comment_only)
+    monkeypatch.setattr(
+        collect, "_load_adapters", lambda: [ConflictingCommentAdapter()]
+    )
 
     assert collect.run(
         "https://www.douyin.com/user/example",
         out_dir=str(out),
         include_comments=True,
-        resume=True,
-    ) == 0
-
-    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
-    assert task["comment_collection"]["comments_collected"] == 0
-    assert comments_path.is_symlink()
-    assert victim.read_bytes() == victim_before
-    assert list(source.glob(".comments.jsonl.*.tmp")) == []
-
-
-@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
-def test_comment_artifact_recount_returns_without_blocking_on_fifo(tmp_path):
-    import collect
-
-    fifo = tmp_path / "comments.jsonl"
-    os.mkfifo(fifo)
-    script = """
-import sys
-sys.path.insert(0, sys.argv[1])
-import collect
-posts = [{
-    "post_id": "7001",
-    "post_url": "https://www.douyin.com/video/7001",
-}]
-print(collect._count_valid_comments_artifact(
-    sys.argv[2], "douyin", posts, "2026-07-24T10:00:00+08:00"
-))
-"""
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            script,
-            os.path.dirname(collect.__file__),
-            str(fifo),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=2,
-    )
-
-    assert completed.stdout.strip() == "0"
-
-
-@pytest.mark.parametrize("no_follow_value", [None, 0])
-def test_comment_artifact_recount_without_effective_no_follow_is_conservative(
-    monkeypatch, tmp_path, no_follow_value
-):
-    import collect
-
-    artifact = tmp_path / "comments.jsonl"
-    artifact.write_text(json.dumps({
-        "comment_id": "old1",
-        "parent_post_id": "7001",
-        "parent_post_url": "https://www.douyin.com/video/7001",
-        "author": None,
-        "text": "persisted comment",
-        "likes": None,
-        "published_at": None,
-        "collected_at": "2026-07-24T10:00:00+08:00",
-    }) + "\n", encoding="utf-8")
-    if no_follow_value is None:
-        monkeypatch.delattr(collect.os, "O_NOFOLLOW", raising=False)
-    else:
-        monkeypatch.setattr(collect.os, "O_NOFOLLOW", no_follow_value)
-
-    assert collect._count_valid_comments_artifact(
-        str(artifact),
-        "douyin",
-        [{
-            "post_id": "7001",
-            "post_url": "https://www.douyin.com/video/7001",
-        }],
-        "2026-07-24T10:00:00+08:00",
-    ) == 0
+    ) == 2
+    assert (out / "source" / "comments.jsonl").read_bytes() == concurrent_bytes
+    assert not (out / ".complete").exists()
 
 
 def test_normalize_post_preserves_explicit_public_booleans():

@@ -19,17 +19,14 @@ from __future__ import annotations
 import argparse
 import contextvars
 import csv
-import errno
 import functools
 import io
 import json
 import os
 import re
-import secrets
 import stat
 import sys
 import urllib.parse
-from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 # 让脚本可直接运行:把 scripts/collectors/ 与 scripts/ 都加入 sys.path,
@@ -57,6 +54,20 @@ from collectors.url_policy import (  # noqa: E402
     canonical_item_url,
     canonical_profile_url,
     sanitize_routing_url,
+)
+from immutable_workspace import (  # noqa: E402
+    FORMAT as IMMUTABLE_WORKSPACE_FORMAT,
+    ImmutableWorkspace,
+    WorkspaceCapabilityError,
+    WorkspaceError,
+    WorkspaceExistsError,
+    WorkspaceIdentityError,
+    WorkspaceVerificationError,
+    WorkspaceWriteError,
+    ensure_container,
+    preflight_backend,
+    read_resume_artifact,
+    verify_committed_workspace,
 )
 
 # 北京时间为中国平台默认时区(见 references/data-schema.md §1)
@@ -376,487 +387,22 @@ def _normalize_comment_record(
     }
 
 
-def _workspace_paths_safe(ws: str) -> bool:
-    try:
-        target_stat = os.lstat(ws)
-    except FileNotFoundError:
-        target_stat = None
-    except OSError:
-        return False
-    if target_stat is not None and not stat.S_ISDIR(target_stat.st_mode):
-        return False
-    source = os.path.join(ws, "source")
-    try:
-        source_stat = os.lstat(source)
-    except FileNotFoundError:
-        source_stat = None
-    except OSError:
-        return False
-    if source_stat is not None and not stat.S_ISDIR(source_stat.st_mode):
-        return False
-    return True
+WorkspaceContractError = WorkspaceError
+ArtifactWriteError = WorkspaceWriteError
+_WorkspaceReservation = ImmutableWorkspace
+
+_PUBLIC_ARTIFACTS = frozenset({
+    "source/profile.json",
+    "source/posts.jsonl",
+    "source/comments.jsonl",
+    "normalized-posts.csv",
+    "task.json",
+    "collection-report.md",
+})
 
 
-class WorkspaceContractError(RuntimeError):
-    """A task directory could not be safely and exclusively prepared."""
-
-
-class ArtifactWriteError(WorkspaceContractError):
-    """An owned artifact could not be serialized or atomically published."""
-
-
-def _directory_identity(metadata) -> tuple[int, int]:
-    return metadata.st_dev, metadata.st_ino
-
-
-def _lstat_directory(path: str, message: str) -> tuple[int, int]:
-    last_error: OSError | None = None
-    for _ in range(3):
-        try:
-            metadata = os.lstat(path)
-        except OSError as exc:
-            last_error = exc
-            continue
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise WorkspaceContractError(message)
-        return _directory_identity(metadata)
-    raise WorkspaceContractError(message) from last_error
-
-
-def _remove_exact_empty_directory(path: str, identity: tuple[int, int] | None) -> None:
-    """Remove only the unchanged empty directory identified by ``identity``."""
-    if identity is None:
-        return
-    descriptor = -1
-    try:
-        try:
-            metadata = os.lstat(path)
-        except OSError:
-            descriptor = os.open(path, _directory_open_flags())
-            metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or _directory_identity(metadata) != identity
-        ):
-            return
-        os.rmdir(path)
-    except OSError:
-        return
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-
-
-def _remove_exact_empty_directory_at(
-    parent_fd: int,
-    name: str,
-    identity: tuple[int, int] | None,
-) -> None:
-    if identity is None:
-        return
-    descriptor = -1
-    try:
-        try:
-            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except (OSError, NotImplementedError, TypeError):
-            descriptor = os.open(
-                name, _directory_open_flags(), dir_fd=parent_fd
-            )
-            metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or _directory_identity(metadata) != identity
-        ):
-            return
-        os.rmdir(name, dir_fd=parent_fd)
-    except (OSError, NotImplementedError, TypeError):
-        return
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-
-
-class _WorkspaceReservation:
-    """An identity-bound target/source pair held through artifact persistence."""
-
-    def __init__(
-        self,
-        path: str,
-        *,
-        target_identity: tuple[int, int],
-        source_identity: tuple[int, int],
-        owned_target: bool,
-        owned_source: bool,
-        parent_fd: int = -1,
-        target_fd: int = -1,
-        source_fd: int = -1,
-        target_name: str | None = None,
-    ) -> None:
-        self.path = os.path.abspath(path)
-        self.source_path = os.path.join(self.path, "source")
-        self.target_identity = target_identity
-        self.source_identity = source_identity
-        self.owned_target = owned_target
-        self.owned_source = owned_source
-        self.parent_fd = parent_fd
-        self.target_fd = target_fd
-        self.source_fd = source_fd
-        self.target_name = target_name
-        self._closed = False
-
-    def __fspath__(self) -> str:
-        return self.path
-
-    @property
-    def uses_dir_fd(self) -> bool:
-        return self.parent_fd >= 0 and self.target_fd >= 0 and self.source_fd >= 0
-
-    def verify(self) -> None:
-        """Prove both pathname entries still name the held directories."""
-        if self._closed:
-            raise WorkspaceContractError("workspace reservation is closed")
-        try:
-            if self.uses_dir_fd:
-                held_target = os.fstat(self.target_fd)
-                held_source = os.fstat(self.source_fd)
-                named_target = os.stat(
-                    str(self.target_name),
-                    dir_fd=self.parent_fd,
-                    follow_symlinks=False,
-                )
-                named_source = os.stat(
-                    "source", dir_fd=self.target_fd, follow_symlinks=False
-                )
-                checks = (
-                    (held_target, self.target_identity),
-                    (held_source, self.source_identity),
-                    (named_target, self.target_identity),
-                    (named_source, self.source_identity),
-                )
-                if any(
-                    not stat.S_ISDIR(metadata.st_mode)
-                    or _directory_identity(metadata) != identity
-                    for metadata, identity in checks
-                ):
-                    raise WorkspaceContractError("workspace identity changed")
-                return
-            target_identity = _lstat_directory(
-                self.path, "workspace target identity changed"
-            )
-            source_identity = _lstat_directory(
-                self.source_path, "workspace source identity changed"
-            )
-            if (
-                target_identity != self.target_identity
-                or source_identity != self.source_identity
-            ):
-                raise WorkspaceContractError("workspace identity changed")
-        except WorkspaceContractError:
-            raise
-        except (OSError, NotImplementedError, TypeError) as exc:
-            raise WorkspaceContractError("workspace identity cannot be verified") from exc
-
-    def _artifact_location(
-        self, relative_path: str
-    ) -> tuple[int, str, str]:
-        normalized = relative_path.replace("\\", "/")
-        parts = normalized.split("/")
-        if len(parts) == 1:
-            directory_fd = self.target_fd
-            directory_path = self.path
-            leaf = parts[0]
-        elif len(parts) == 2 and parts[0] == "source":
-            directory_fd = self.source_fd
-            directory_path = self.source_path
-            leaf = parts[1]
-        else:
-            raise WorkspaceContractError("invalid workspace artifact path")
-        if not leaf or leaf in {".", ".."}:
-            raise WorkspaceContractError("invalid workspace artifact name")
-        return directory_fd, directory_path, leaf
-
-    @staticmethod
-    def _regular_single_link(metadata) -> bool:
-        return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
-
-    @staticmethod
-    def _same_node(metadata, identity: tuple[int, int]) -> bool:
-        return _directory_identity(metadata) == identity
-
-    def _unlink_exact_temporary(
-        self,
-        *,
-        directory_fd: int,
-        directory_path: str,
-        temporary_name: str,
-        identity: tuple[int, int] | None,
-    ) -> None:
-        if identity is None:
-            return
-        try:
-            if self.uses_dir_fd:
-                metadata = os.stat(
-                    temporary_name,
-                    dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
-                if not self._same_node(metadata, identity):
-                    return
-                os.unlink(temporary_name, dir_fd=directory_fd)
-                return
-            temporary_path = os.path.join(directory_path, temporary_name)
-            metadata = os.lstat(temporary_path)
-            if not self._same_node(metadata, identity):
-                return
-            os.unlink(temporary_path)
-        except (OSError, NotImplementedError, TypeError):
-            return
-
-    @contextmanager
-    def open_text(
-        self,
-        relative_path: str,
-        *,
-        newline: str | None = None,
-    ):
-        """Serialize to an owned sibling and atomically replace the final entry."""
-        directory_fd, directory_path, leaf = self._artifact_location(relative_path)
-        no_follow = getattr(os, "O_NOFOLLOW", 0)
-        nonblock = getattr(os, "O_NONBLOCK", 0)
-        if (
-            not isinstance(no_follow, int)
-            or no_follow == 0
-            or not isinstance(nonblock, int)
-            or nonblock == 0
-        ):
-            raise ArtifactWriteError("safe temporary output open is unavailable")
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | no_follow
-            | nonblock
-        )
-        descriptor = -1
-        temporary_name: str | None = None
-        temporary_identity: tuple[int, int] | None = None
-        published = False
-        try:
-            for _ in range(128):
-                candidate = f".{leaf}.{secrets.token_hex(16)}.tmp"
-                try:
-                    if self.uses_dir_fd:
-                        descriptor = os.open(
-                            candidate, flags, 0o600, dir_fd=directory_fd
-                        )
-                    else:
-                        descriptor = os.open(
-                            os.path.join(directory_path, candidate), flags, 0o600
-                        )
-                    temporary_name = candidate
-                    break
-                except FileExistsError:
-                    continue
-                except (OSError, NotImplementedError, TypeError) as exc:
-                    raise ArtifactWriteError(
-                        "workspace temporary cannot be reserved"
-                    ) from exc
-            if descriptor < 0 or temporary_name is None:
-                raise ArtifactWriteError(
-                    "workspace temporary cannot be reserved"
-                )
-
-            try:
-                metadata = os.fstat(descriptor)
-            except OSError as exc:
-                raise ArtifactWriteError(
-                    "workspace temporary identity cannot be captured"
-                ) from exc
-            if not self._regular_single_link(metadata):
-                raise ArtifactWriteError("workspace temporary is unsafe")
-            temporary_identity = _directory_identity(metadata)
-
-            # This proof deliberately happens after the exclusive open and before
-            # the caller receives a stream, closing the portable swap/write gap.
-            self.verify()
-            if not self.uses_dir_fd:
-                raise WorkspaceContractError(
-                    "identity-bound artifact replacement is unavailable"
-                )
-
-            try:
-                handle = os.fdopen(
-                    descriptor, "w", encoding="utf-8", newline=newline
-                )
-            except OSError as exc:
-                raise ArtifactWriteError(
-                    "workspace temporary cannot be opened"
-                ) from exc
-            descriptor = -1
-            try:
-                yield handle
-                handle.flush()
-                os.fsync(handle.fileno())
-            finally:
-                handle.close()
-
-            self.verify()
-            try:
-                named_temporary = os.stat(
-                    temporary_name,
-                    dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    not self._regular_single_link(named_temporary)
-                    or not self._same_node(named_temporary, temporary_identity)
-                ):
-                    raise WorkspaceContractError(
-                        "workspace temporary identity changed"
-                    )
-                os.replace(
-                    temporary_name,
-                    leaf,
-                    src_dir_fd=directory_fd,
-                    dst_dir_fd=directory_fd,
-                )
-                published = True
-                named_final = os.stat(
-                    leaf, dir_fd=directory_fd, follow_symlinks=False
-                )
-                if (
-                    not self._regular_single_link(named_final)
-                    or not self._same_node(named_final, temporary_identity)
-                ):
-                    raise WorkspaceContractError(
-                        "published artifact identity changed"
-                    )
-            except (OSError, NotImplementedError, TypeError) as exc:
-                raise ArtifactWriteError(
-                    "workspace artifact cannot be published"
-                ) from exc
-        finally:
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            if temporary_name is not None and not published:
-                self._unlink_exact_temporary(
-                    directory_fd=directory_fd,
-                    directory_path=directory_path,
-                    temporary_name=temporary_name,
-                    identity=temporary_identity,
-                )
-
-    def read_bytes(
-        self,
-        relative_path: str,
-        *,
-        max_bytes: int = _MAX_RESUME_ARTIFACT_BYTES,
-    ) -> bytes | None:
-        """Read a regular, single-link artifact through the held directory fd."""
-        directory_fd, _, leaf = self._artifact_location(relative_path)
-        if not self.uses_dir_fd:
-            raise WorkspaceContractError(
-                "identity-bound resume reads are unavailable"
-            )
-        no_follow = getattr(os, "O_NOFOLLOW", 0)
-        nonblock = getattr(os, "O_NONBLOCK", 0)
-        if not no_follow or not nonblock:
-            raise WorkspaceContractError("safe resume input open is unavailable")
-        descriptor = -1
-        try:
-            self.verify()
-            try:
-                descriptor = os.open(
-                    leaf,
-                    os.O_RDONLY
-                    | getattr(os, "O_CLOEXEC", 0)
-                    | no_follow
-                    | nonblock,
-                    dir_fd=directory_fd,
-                )
-            except FileNotFoundError:
-                return None
-            except (OSError, NotImplementedError, TypeError) as exc:
-                raise WorkspaceContractError(
-                    "resume artifact cannot be opened safely"
-                ) from exc
-            metadata = os.fstat(descriptor)
-            if (
-                not self._regular_single_link(metadata)
-                or metadata.st_size > max_bytes
-            ):
-                raise WorkspaceContractError("resume artifact is unsafe")
-            identity = _directory_identity(metadata)
-            self.verify()
-            named = os.stat(
-                leaf, dir_fd=directory_fd, follow_symlinks=False
-            )
-            if (
-                not self._regular_single_link(named)
-                or not self._same_node(named, identity)
-            ):
-                raise WorkspaceContractError("resume artifact identity changed")
-            chunks: list[bytes] = []
-            remaining = max_bytes + 1
-            while remaining > 0:
-                chunk = os.read(descriptor, min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            payload = b"".join(chunks)
-            if len(payload) > max_bytes:
-                raise WorkspaceContractError("resume artifact is too large")
-            self.verify()
-            named_after = os.stat(
-                leaf, dir_fd=directory_fd, follow_symlinks=False
-            )
-            if not self._same_node(named_after, identity):
-                raise WorkspaceContractError("resume artifact identity changed")
-            return payload
-        except FileNotFoundError:
-            raise WorkspaceContractError("resume artifact identity changed")
-        except WorkspaceContractError:
-            raise
-        except (OSError, NotImplementedError, TypeError) as exc:
-            raise WorkspaceContractError("resume artifact cannot be read") from exc
-        finally:
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-
-    def __enter__(self) -> _WorkspaceReservation:
-        if self._closed:
-            raise WorkspaceContractError("workspace reservation is closed")
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> bool:
-        self.close()
-        return False
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        for descriptor in (self.source_fd, self.target_fd, self.parent_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-        self.source_fd = self.target_fd = self.parent_fd = -1
+def _repository_root() -> str:
+    return os.path.dirname(os.path.dirname(_HERE))
 
 
 def _track_reservation(
@@ -868,467 +414,85 @@ def _track_reservation(
     return reservation
 
 
-def _require_reservation_identities(
-    reservation: _WorkspaceReservation,
-    expected: tuple[tuple[int, int], tuple[int, int]] | None,
-) -> _WorkspaceReservation:
-    if expected is not None and (
-        reservation.target_identity,
-        reservation.source_identity,
-    ) != expected:
-        reservation.close()
-        raise WorkspaceContractError("workspace identity changed since resume read")
-    return reservation
-
-
-def _repository_root() -> str:
-    """Resolve the repository root from ``skill/scripts``."""
-    return os.path.dirname(os.path.dirname(_HERE))
-
-
 def _preflight_explicit_workspace(path: str, *, resume: bool) -> None:
-    """Apply the read-only explicit-path contract before adapter loading."""
+    """Validate an explicit pathname without creating or changing it."""
     target = os.path.abspath(path)
     if resume:
-        if (
-            not os.path.lexists(target)
-            or not os.path.lexists(os.path.join(target, "source"))
-            or not _workspace_paths_safe(target)
-        ):
-            raise WorkspaceContractError("resume workspace is unsafe")
+        if not os.path.lexists(target):
+            raise WorkspaceVerificationError("resume workspace does not exist")
         return
     if os.path.lexists(target):
-        raise WorkspaceContractError("new output directory already exists")
-
-
-def _dir_fd_reservations_available() -> bool:
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    supported = getattr(os, "supports_dir_fd", ())
-    return bool(
-        isinstance(no_follow, int)
-        and no_follow != 0
-        and os.mkdir in supported
-        and os.open in supported
-        and os.stat in supported
-        and os.rmdir in supported
-    )
-
-
-def _directory_open_flags() -> int:
-    return (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-
-
-def _capture_directory(
-    path: str,
-    message: str,
-    *,
-    parent_fd: int | None = None,
-) -> tuple[int, tuple[int, int]]:
-    """Open then fstat a directory, retrying transient identity capture errors."""
-    last_error: BaseException | None = None
-    for _ in range(3):
-        descriptor = -1
-        captured = False
-        try:
-            if parent_fd is None:
-                descriptor = os.open(path, _directory_open_flags())
-            else:
-                descriptor = os.open(
-                    path, _directory_open_flags(), dir_fd=parent_fd
-                )
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise WorkspaceContractError(message)
-            captured = True
-            return descriptor, _directory_identity(metadata)
-        except WorkspaceContractError:
-            raise
-        except (OSError, NotImplementedError, TypeError) as exc:
-            last_error = exc
-        finally:
-            if descriptor >= 0 and not captured:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-    raise WorkspaceContractError(message) from last_error
-
-
-def _creation_identity_at(
-    parent_fd: int, name: str, message: str
-) -> tuple[int, int]:
-    """Capture an anchored cleanup token for a just-created directory."""
-    last_error: BaseException | None = None
-    for _ in range(3):
-        try:
-            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise WorkspaceContractError(message)
-            return _directory_identity(metadata)
-        except WorkspaceContractError:
-            raise
-        except (OSError, NotImplementedError, TypeError) as exc:
-            last_error = exc
-    raise WorkspaceContractError(message) from last_error
-
-
-def _unsupported_directory_operation(exc: BaseException) -> bool:
-    return isinstance(exc, (NotImplementedError, TypeError)) or (
-        isinstance(exc, OSError)
-        and exc.errno in {
-            getattr(errno, "ENOSYS", -1),
-            getattr(errno, "ENOTSUP", -1),
-            getattr(errno, "EOPNOTSUPP", -1),
-        }
-    )
-
-
-def _acquire_created_workspace_dirfd(
-    target: str,
-    *,
-    parent_fd: int,
-    name: str,
-) -> _WorkspaceReservation:
-    """Create and bind a new target/source pair below an open parent."""
-    target_fd = source_fd = -1
-    target_identity = source_identity = None
+        raise WorkspaceExistsError("new output directory already exists")
+    parent = os.path.dirname(target)
     try:
-        os.mkdir(name, dir_fd=parent_fd)
-        try:
-            target_identity = _creation_identity_at(
-                parent_fd, name, "reserved target identity cannot be captured"
-            )
-        except WorkspaceContractError:
-            # The held descriptor remains authoritative; the path identity is
-            # retained only as an exact cleanup token if descriptor capture fails.
-            target_identity = None
-        target_fd, opened_target_identity = _capture_directory(
-            name,
-            "reserved target identity cannot be captured",
-            parent_fd=parent_fd,
-        )
-        target_identity = opened_target_identity
-        named_target_identity = _creation_identity_at(
-            parent_fd, name, "reserved target identity cannot be verified"
-        )
-        if named_target_identity != target_identity:
-            raise WorkspaceContractError("workspace target identity changed")
-
-        os.mkdir("source", dir_fd=target_fd)
-        try:
-            source_identity = _creation_identity_at(
-                target_fd,
-                "source",
-                "reserved source identity cannot be captured",
-            )
-        except WorkspaceContractError:
-            source_identity = None
-        source_fd, opened_source_identity = _capture_directory(
-            "source",
-            "reserved source identity cannot be captured",
-            parent_fd=target_fd,
-        )
-        source_identity = opened_source_identity
-        named_source_identity = _creation_identity_at(
-            target_fd, "source", "reserved source identity cannot be verified"
-        )
-        if named_source_identity != source_identity:
-            raise WorkspaceContractError("workspace source identity changed")
-
-        reservation = _WorkspaceReservation(
-            target,
-            target_identity=target_identity,
-            source_identity=source_identity,
-            owned_target=True,
-            owned_source=True,
-            parent_fd=parent_fd,
-            target_fd=target_fd,
-            source_fd=source_fd,
-            target_name=name,
-        )
-        reservation.verify()
-        return reservation
-    except BaseException:
-        if target_fd >= 0:
-            _remove_exact_empty_directory_at(target_fd, "source", source_identity)
-        else:
-            _remove_exact_empty_directory(
-                os.path.join(target, "source"), source_identity
-            )
-        _remove_exact_empty_directory_at(parent_fd, name, target_identity)
-        for descriptor in (source_fd, target_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-        raise
-
-
-def _prepare_explicit_workspace_dirfd(
-    target: str, *, resume: bool
-) -> _WorkspaceReservation:
-    parent_fd = target_fd = source_fd = -1
-    name = os.path.basename(target)
-    try:
-        parent_fd = os.open(os.path.dirname(target), _directory_open_flags())
-        if not resume:
-            return _acquire_created_workspace_dirfd(
-                target, parent_fd=parent_fd, name=name
-            )
-        target_fd, target_identity = _capture_directory(
-            name, "resume workspace is unsafe", parent_fd=parent_fd
-        )
-        source_fd, source_identity = _capture_directory(
-            "source", "resume source is unsafe", parent_fd=target_fd
-        )
-        reservation = _WorkspaceReservation(
-            target,
-            target_identity=target_identity,
-            source_identity=source_identity,
-            owned_target=False,
-            owned_source=False,
-            parent_fd=parent_fd,
-            target_fd=target_fd,
-            source_fd=source_fd,
-            target_name=name,
-        )
-        reservation.verify()
-        return reservation
-    except BaseException:
-        for descriptor in (source_fd, target_fd, parent_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-        raise
-
-
-def _acquire_created_workspace_portable(target: str) -> _WorkspaceReservation:
-    source = os.path.join(target, "source")
-    target_identity = source_identity = None
-    target_fd = source_fd = -1
-    try:
-        os.mkdir(target)
-        try:
-            target_identity = _lstat_directory(
-                target, "reserved workspace is unsafe"
-            )
-        except WorkspaceContractError:
-            target_identity = None
-        target_fd, opened_target_identity = _capture_directory(
-            target, "reserved workspace identity cannot be captured"
-        )
-        target_identity = opened_target_identity
-        if _lstat_directory(
-            target, "reserved workspace identity cannot be verified"
-        ) != target_identity:
-            raise WorkspaceContractError("workspace target identity changed")
-        os.mkdir(source)
-        try:
-            source_identity = _lstat_directory(
-                source, "reserved source is unsafe"
-            )
-        except WorkspaceContractError:
-            source_identity = None
-        source_fd, opened_source_identity = _capture_directory(
-            source, "reserved source identity cannot be captured"
-        )
-        source_identity = opened_source_identity
-        if _lstat_directory(
-            source, "reserved source identity cannot be verified"
-        ) != source_identity:
-            raise WorkspaceContractError("workspace source identity changed")
-        reservation = _WorkspaceReservation(
-            target,
-            target_identity=target_identity,
-            source_identity=source_identity,
-            owned_target=True,
-            owned_source=True,
-        )
-        reservation.verify()
-        return reservation
-    except BaseException:
-        for descriptor in (source_fd, target_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-        source_fd = target_fd = -1
-        _remove_exact_empty_directory(source, source_identity)
-        _remove_exact_empty_directory(target, target_identity)
-        raise
-    finally:
-        for descriptor in (source_fd, target_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-
-
-def _prepare_explicit_workspace_portable(
-    target: str, *, resume: bool
-) -> _WorkspaceReservation:
-    if not resume:
-        return _acquire_created_workspace_portable(target)
-    source = os.path.join(target, "source")
-    target_fd = source_fd = -1
-    try:
-        target_fd, target_identity = _capture_directory(
-            target, "resume workspace is unsafe"
-        )
-        source_fd, source_identity = _capture_directory(
-            source, "resume source is unsafe"
-        )
-        reservation = _WorkspaceReservation(
-            target,
-            target_identity=target_identity,
-            source_identity=source_identity,
-            owned_target=False,
-            owned_source=False,
-        )
-        reservation.verify()
-        return reservation
-    finally:
-        for descriptor in (source_fd, target_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+        metadata = os.lstat(parent)
+    except OSError as exc:
+        raise WorkspaceWriteError("workspace parent does not exist") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WorkspaceWriteError("workspace parent is unsafe")
 
 
 def _prepare_explicit_workspace(
     path: str,
     *,
-    resume: bool,
-    expected_identities: tuple[tuple[int, int], tuple[int, int]] | None = None,
+    resume: bool = False,
+    expected_identities=None,
 ) -> _WorkspaceReservation:
-    """Acquire and identity-bind an explicit target and its source child."""
-    target = os.path.abspath(path)
-    parent = os.path.dirname(target)
-    os.makedirs(parent, exist_ok=True)
-    if _dir_fd_reservations_available():
-        try:
-            reservation = _prepare_explicit_workspace_dirfd(
-                target, resume=resume
-            )
-            return _track_reservation(
-                _require_reservation_identities(
-                    reservation, expected_identities
-                )
-            )
-        except BaseException as exc:
-            if not _unsupported_directory_operation(exc):
-                if isinstance(exc, WorkspaceContractError):
-                    raise
-                raise WorkspaceContractError(
-                    "output directory cannot be reserved"
-                ) from exc
-    try:
-        reservation = _prepare_explicit_workspace_portable(
-            target, resume=resume
+    """Atomically acquire a new final-name workspace.
+
+    Resume sources use :func:`read_resume_artifact` and are never returned as a
+    writable reservation.  The legacy parameters remain only to give callers a
+    stable, fail-closed error during the CLI transition.
+    """
+    if resume or expected_identities is not None:
+        raise WorkspaceVerificationError("resume workspace is read-only")
+    preflight_backend()
+    return _track_reservation(
+        ImmutableWorkspace.reserve(
+            os.path.abspath(path), allowed_artifacts=_PUBLIC_ARTIFACTS
         )
-        return _track_reservation(
-            _require_reservation_identities(reservation, expected_identities)
-        )
-    except WorkspaceContractError:
-        raise
-    except (OSError, NotImplementedError, TypeError) as exc:
-        raise WorkspaceContractError("output directory cannot be reserved") from exc
+    )
 
 
-def _reserve_default_workspace_dirfd(
-    repository_root: str, base_name: str
-) -> _WorkspaceReservation:
-    repository_fd = workspace_fd = -1
-    try:
-        repository_fd = os.open(repository_root, _directory_open_flags())
-        try:
-            os.mkdir("workspace", dir_fd=repository_fd)
-        except FileExistsError:
-            pass
-        workspace_fd = os.open(
-            "workspace", _directory_open_flags(), dir_fd=repository_fd
-        )
-        os.close(repository_fd)
-        repository_fd = -1
-        workspace_path = os.path.join(repository_root, "workspace")
-        for suffix in range(1, 1_000_001):
-            name = base_name if suffix == 1 else f"{base_name}-{suffix}"
-            target_path = os.path.join(workspace_path, name)
-            try:
-                reservation = _acquire_created_workspace_dirfd(
-                    target_path, parent_fd=workspace_fd, name=name
-                )
-            except FileExistsError:
-                continue
-            workspace_fd = -1
-            return reservation
-        raise WorkspaceContractError(
-            "no collision-free output directory is available"
-        )
-    finally:
-        for descriptor in (workspace_fd, repository_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-
-
-def _reserve_default_workspace_portable(
-    repository_root: str, base_name: str
-) -> _WorkspaceReservation:
-    workspace = os.path.join(repository_root, "workspace")
-    try:
-        os.mkdir(workspace)
-    except FileExistsError:
-        pass
-    _lstat_directory(workspace, "workspace root is unsafe")
+def _reserve_unique_workspace(parent: str, base_name: str) -> _WorkspaceReservation:
     for suffix in range(1, 1_000_001):
         name = base_name if suffix == 1 else f"{base_name}-{suffix}"
-        target = os.path.join(workspace, name)
         try:
-            return _acquire_created_workspace_portable(target)
-        except FileExistsError:
+            return _track_reservation(
+                ImmutableWorkspace.reserve(
+                    os.path.join(parent, name),
+                    allowed_artifacts=_PUBLIC_ARTIFACTS,
+                )
+            )
+        except WorkspaceExistsError:
             continue
-    raise WorkspaceContractError("no collision-free output directory is available")
+    raise WorkspaceWriteError("no collision-free output directory is available")
 
 
 def _reserve_default_workspace(base_name: str) -> _WorkspaceReservation:
-    """Acquire a collision-free target/source pair below root ``workspace/``."""
     repository_root = _repository_root()
-    if _dir_fd_reservations_available():
-        try:
-            return _track_reservation(
-                _reserve_default_workspace_dirfd(repository_root, base_name)
-            )
-        except BaseException as exc:
-            if not _unsupported_directory_operation(exc):
-                if isinstance(exc, WorkspaceContractError):
-                    raise
-                raise WorkspaceContractError(
-                    "default output directory cannot be reserved"
-                ) from exc
-    try:
-        return _track_reservation(
-            _reserve_default_workspace_portable(repository_root, base_name)
-        )
-    except WorkspaceContractError:
-        raise
-    except (OSError, NotImplementedError, TypeError) as exc:
-        raise WorkspaceContractError(
-            "default output directory cannot be reserved"
-        ) from exc
+    workspace = ensure_container(os.path.join(repository_root, "workspace"))
+    return _reserve_unique_workspace(workspace, base_name)
+
+
+def _reserve_resume_workspace(
+    source_workspace: str,
+    *,
+    resume_out: str | None,
+    date: str,
+) -> _WorkspaceReservation:
+    if resume_out is not None:
+        return _prepare_explicit_workspace(resume_out)
+    source = os.path.abspath(source_workspace)
+    return _reserve_unique_workspace(
+        os.path.dirname(source), f"{os.path.basename(source)}-resume-{date}"
+    )
+
+
+def _verify_public_workspace(path: str) -> dict:
+    return verify_committed_workspace(
+        path, allowed_artifacts=_PUBLIC_ARTIFACTS
+    )
 
 
 def _write_comments_atomic(
@@ -1351,88 +515,6 @@ def _write_comments_atomic(
         raise
     except Exception:
         return False
-
-
-def _count_valid_comments_artifact(
-    path: str,
-    platform: str,
-    posts: list[dict],
-    occurred_at: str,
-) -> int:
-    """Count valid current-parent rows without following an untrusted link."""
-    parents = {
-        parent[0]: parent[1]
-        for post in posts
-        if (parent := _valid_comment_parent(platform, post)) is not None
-    }
-    if not parents:
-        return 0
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    nonblock = getattr(os, "O_NONBLOCK", None)
-    if (
-        not isinstance(no_follow, int)
-        or no_follow == 0
-        or not isinstance(nonblock, int)
-        or nonblock == 0
-    ):
-        return 0
-    descriptor = -1
-    try:
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | no_follow
-            | nonblock
-        )
-        descriptor = os.open(path, flags)
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_size > _MAX_COMMENT_ARTIFACT_BYTES
-        ):
-            return 0
-
-        chunks: list[bytes] = []
-        total = 0
-        while total <= _MAX_COMMENT_ARTIFACT_BYTES:
-            chunk = os.read(
-                descriptor,
-                min(64 * 1024, _MAX_COMMENT_ARTIFACT_BYTES + 1 - total),
-            )
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-        if total > _MAX_COMMENT_ARTIFACT_BYTES:
-            return 0
-        content = b"".join(chunks).decode("utf-8")
-        seen: set[tuple[str, str]] = set()
-        for line in content.splitlines():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(value, dict):
-                continue
-            parent_id = str(value.get("parent_post_id") or "").strip()
-            parent_url = parents.get(parent_id)
-            if parent_url is None:
-                continue
-            normalized = _normalize_comment_record(
-                value, parent_id, parent_url, occurred_at
-            )
-            if normalized is None or normalized != value:
-                continue
-            seen.add((parent_id, normalized["comment_id"]))
-        return len(seen)
-    except (OSError, UnicodeError):
-        return 0
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
 
 
 def _enrich_douyin_details(
@@ -1569,15 +651,13 @@ def _collect_and_persist_comments(
                 "retryable": False,
             })
     if reservation is not None:
-        reservation.verify()
+        reservation.verify_identity()
     if _write_comments_atomic(path, records, reservation=reservation):
         outcome["comments_collected"] = len(records)
     else:
         affected = {record["parent_post_id"] for record in records}
         outcome["failures"] += len(affected - failed_parents)
-        outcome["comments_collected"] = _count_valid_comments_artifact(
-            path, str(adapter.platform), posts, occurred_at
-        )
+        outcome["comments_collected"] = 0
         error_log.append({
             "url": None,
             "stage": "persist_comments",
@@ -1594,16 +674,20 @@ def _post_key(p: dict) -> str:
     return str(p.get("post_id") or p.get("bvid") or p.get("post_url") or "")
 
 
-def _load_existing_posts(
-    ws: str, *, reservation: _WorkspaceReservation
-) -> list[dict]:
+def _load_existing_posts(ws: str) -> tuple[list[dict], str, str]:
     """读取既有采集产物中的帖子,用于增量续采去重。
 
     优先 source/posts.jsonl(无损 JSONL),回退 normalized-posts.csv(字段可能经 CSV 字符串化)。
     """
     posts: list[dict] = []
+    snapshot = read_resume_artifact(
+        ws,
+        "source/posts.jsonl",
+        allowed_artifacts=_PUBLIC_ARTIFACTS,
+        max_bytes=_MAX_RESUME_ARTIFACT_BYTES,
+    )
     try:
-        posts_payload = reservation.read_bytes("source/posts.jsonl")
+        posts_payload = snapshot.payload
         if posts_payload is not None:
             for line in posts_payload.decode("utf-8").splitlines():
                 line = line.strip()
@@ -1616,8 +700,14 @@ def _load_existing_posts(
     except UnicodeDecodeError as exc:
         raise WorkspaceContractError("resume artifact encoding is invalid") from exc
     if not posts:
+        csv_snapshot = read_resume_artifact(
+            ws,
+            "normalized-posts.csv",
+            allowed_artifacts=_PUBLIC_ARTIFACTS,
+            max_bytes=_MAX_RESUME_ARTIFACT_BYTES,
+        )
         try:
-            csv_payload = reservation.read_bytes("normalized-posts.csv")
+            csv_payload = csv_snapshot.payload
             if csv_payload is not None:
                 with io.StringIO(
                     csv_payload.decode("utf-8"), newline=""
@@ -1628,7 +718,9 @@ def _load_existing_posts(
             raise WorkspaceContractError(
                 "resume artifact encoding is invalid"
             ) from exc
-    return posts
+        if csv_payload is not None:
+            snapshot = csv_snapshot
+    return posts, snapshot.source_format, snapshot.source_digest
 
 
 def _latest_published_at(posts: list[dict]) -> str | None:
@@ -1807,6 +899,8 @@ def _write_task_json(
     incremental: bool = False,
     existing_count: int = 0,
     new_count: int = 0,
+    resume_source_format: str | None = None,
+    resume_source_digest: str | None = None,
     collection_coverage: dict | None = None,
     comment_collection: dict | None = None,
     reservation: _WorkspaceReservation | None = None,
@@ -1829,6 +923,16 @@ def _write_task_json(
         "incremental": incremental,
         "existing_count": existing_count,
         "new_count": new_count,
+        "resume_source": (
+            {
+                "format": resume_source_format,
+                "digest_algorithm": "sha256",
+                "digest": resume_source_digest,
+            }
+            if resume_source_format is not None
+            and resume_source_digest is not None
+            else None
+        ),
         "collection_coverage": _sanitize_collection_coverage(collection_coverage),
         "comment_collection": comment_collection or {},
     }
@@ -1931,9 +1035,17 @@ def _guard_workspace_reservations(function):
         token = _ACTIVE_RESERVATIONS.set(active)
         try:
             return function(*args, **kwargs)
-        except WorkspaceContractError:
-            print("[FAILED] 输出目录身份已改变；拒绝写入", file=sys.stderr)
+        except (
+            WorkspaceCapabilityError,
+            WorkspaceExistsError,
+            WorkspaceIdentityError,
+            WorkspaceVerificationError,
+        ):
+            print("[FAILED] 输出目录不安全、已占用或身份已改变", file=sys.stderr)
             return 2
+        except WorkspaceError:
+            print("[FAILED] 产物序列化或提交失败", file=sys.stderr)
+            return 3
         except Exception:
             print("[FAILED] 产物序列化或发布失败", file=sys.stderr)
             return 3
@@ -1954,6 +1066,7 @@ def run(
     date_from: str | None = None,
     date_to: str | None = None,
     resume: bool = False,
+    resume_out: str | None = None,
     since: str | None = None,
     browser_fallback: bool | None = None,
     collect_all: bool = False,
@@ -1964,6 +1077,16 @@ def run(
 ) -> int:
     if resume and not out_dir:
         print("[FAILED] 增量续采(--resume)必须配合 --out 指定既有任务目录", file=sys.stderr)
+        return 2
+    if resume_out is not None and not resume:
+        print("[FAILED] --resume-out 必须与 --resume 联用", file=sys.stderr)
+        return 2
+    if (
+        resume
+        and resume_out is not None
+        and os.path.abspath(str(out_dir)) == os.path.abspath(resume_out)
+    ):
+        print("[FAILED] --resume-out 必须不同于只读的 --out", file=sys.stderr)
         return 2
     if since is not None and not resume:
         print("[FAILED] --since 必须与 --resume 联用", file=sys.stderr)
@@ -2002,6 +1125,12 @@ def run(
         except WorkspaceContractError:
             print("[FAILED] 输出目录不安全或已包含其他任务数据", file=sys.stderr)
             return 2
+    if resume_out is not None:
+        try:
+            _preflight_explicit_workspace(resume_out, resume=False)
+        except WorkspaceContractError:
+            print("[FAILED] 续采输出目录不安全或已被占用", file=sys.stderr)
+            return 2
 
     user_from = _parse_date(date_from)
     user_to = _default_date_to(date_to)
@@ -2016,20 +1145,16 @@ def run(
         print("[FAILED] --since 无法解析", file=sys.stderr)
         return 2
     existing_posts: list[dict] = []
-    resume_identities: tuple[tuple[int, int], tuple[int, int]] | None = None
+    resume_source_format: str | None = None
+    resume_source_digest: str | None = None
     resume_mode = bool(resume)
     if resume_mode:
         try:
-            with _prepare_explicit_workspace(
-                str(out_dir), resume=True
-            ) as read_reservation:
-                existing_posts = _load_existing_posts(
-                    str(out_dir), reservation=read_reservation
-                )
-                resume_identities = (
-                    read_reservation.target_identity,
-                    read_reservation.source_identity,
-                )
+            (
+                existing_posts,
+                resume_source_format,
+                resume_source_digest,
+            ) = _load_existing_posts(str(out_dir))
         except (OSError, WorkspaceContractError):
             print("[FAILED] 增量续采目录无法安全读取", file=sys.stderr)
             return 2
@@ -2100,12 +1225,12 @@ def run(
     date = datetime.now(_BEIJING).strftime("%Y%m%d")
     reservation: _WorkspaceReservation
     try:
-        if out_dir:
-            reservation = _prepare_explicit_workspace(
-                out_dir,
-                resume=resume,
-                expected_identities=resume_identities,
+        if resume:
+            reservation = _reserve_resume_workspace(
+                str(out_dir), resume_out=resume_out, date=date
             )
+        elif out_dir:
+            reservation = _prepare_explicit_workspace(out_dir)
         else:
             reservation = _reserve_default_workspace(
                 f"{platform}-{account}-{date}"
@@ -2155,7 +1280,7 @@ def run(
     comment_collection: dict = {}
     detail_unavailable_count = 0
 
-    def persist_access_failure(reason: str) -> bool:
+    def persist_access_failure(reason: str) -> int | None:
         error = {
             "url": safe_url,
             "stage": "check_access",
@@ -2178,6 +1303,8 @@ def run(
                 stop_reason=reason,
                 collected_count=0,
                 collected_at=collected_at,
+                resume_source_format=resume_source_format,
+                resume_source_digest=resume_source_digest,
                 collection_coverage=collection_coverage,
                 reservation=reservation,
             )
@@ -2193,32 +1320,39 @@ def run(
                 error_log=[error],
                 reservation=reservation,
             )
-            return True
-        except WorkspaceContractError:
-            return False
+            reservation.commit()
+            return None
+        except (
+            WorkspaceCapabilityError,
+            WorkspaceExistsError,
+            WorkspaceIdentityError,
+            WorkspaceVerificationError,
+        ):
+            return 2
+        except WorkspaceError:
+            return 3
 
     # 1) check_access:不绕过任何保护(见 base.py / exceptions.md §2)
+    access_failed = False
     try:
         access = adapter.check_access(url)
-        if not access.get("accessible"):
-            stop_reason = _safe_stop_reason(access.get("stop_reason"))
-            # check_access 阶段尚无已采数据,所有受阻场景统一 FAILED(见 exceptions.md §1)
-            task_status = "FAILED"
-            if not persist_access_failure(stop_reason):
-                reservation.close()
-                print("[FAILED] 输出目录身份已改变；拒绝写入", file=sys.stderr)
-                return 2
-            print(f"[STOP] task_status={task_status} stop_reason={stop_reason} stage=check_access")
-            reservation.close()
-            return 3
     except Exception as e:
         # 适配器未启用(WeiboCollector._require_enabled 抛 RuntimeError 携 ADAPTER_UNAVAILABLE)
         stop_reason = _stop_reason_from_exc(e)
         task_status = "FAILED"
-        if not persist_access_failure(stop_reason):
+        access_failed = True
+    else:
+        if not access.get("accessible"):
+            stop_reason = _safe_stop_reason(access.get("stop_reason"))
+            # check_access 阶段尚无已采数据,所有受阻场景统一 FAILED(见 exceptions.md §1)
+            task_status = "FAILED"
+            access_failed = True
+    if access_failed:
+        persistence_failure = persist_access_failure(stop_reason)
+        if persistence_failure is not None:
             reservation.close()
-            print("[FAILED] 输出目录身份已改变；拒绝写入", file=sys.stderr)
-            return 2
+            print("[FAILED] 输出产物无法安全提交", file=sys.stderr)
+            return persistence_failure
         print(f"[STOP] task_status={task_status} stop_reason={stop_reason} stage=check_access")
         reservation.close()
         return 3
@@ -2348,10 +1482,19 @@ def run(
                 f"empty_results={comment_collection['empty_results']} "
                 f"failures={comment_collection['failures']}"
             )
-    except WorkspaceContractError:
+    except (
+        WorkspaceCapabilityError,
+        WorkspaceExistsError,
+        WorkspaceIdentityError,
+        WorkspaceVerificationError,
+    ):
         reservation.close()
         print("[FAILED] 输出目录身份已改变；拒绝写入", file=sys.stderr)
         return 2
+    except WorkspaceError:
+        reservation.close()
+        print("[FAILED] 输出产物序列化失败", file=sys.stderr)
+        return 3
 
     # 6) 最终任务状态:无 stop_reason → COMPLETED;有 stop_reason 但有数据 → PARTIAL
     exhaustive_range_no_match = bool(
@@ -2385,6 +1528,8 @@ def run(
             collected_at=collected_at,
             incremental=resume_mode, existing_count=len(existing_posts),
             new_count=new_count,
+            resume_source_format=resume_source_format,
+            resume_source_digest=resume_source_digest,
             collection_coverage=collection_coverage,
             comment_collection=comment_collection,
             reservation=reservation,
@@ -2399,10 +1544,20 @@ def run(
             comment_collection=comment_collection,
             reservation=reservation,
         )
-    except WorkspaceContractError:
+        reservation.commit()
+    except (
+        WorkspaceCapabilityError,
+        WorkspaceExistsError,
+        WorkspaceIdentityError,
+        WorkspaceVerificationError,
+    ):
         reservation.close()
         print("[FAILED] 输出目录身份已改变；拒绝写入", file=sys.stderr)
         return 2
+    except WorkspaceError:
+        reservation.close()
+        print("[FAILED] 输出产物提交失败", file=sys.stderr)
+        return 3
 
     print(
         f"[OK] 平台={platform} 资料可见字段={_vis_count(profile)} "
@@ -2462,7 +1617,12 @@ def main() -> None:
     ap.add_argument(
         "--resume", action="store_true",
         help="增量续采:读取 --out 目录既有 source/posts.jsonl,以其最新 published_at 为起点续采,"
-             "按 post_id/bvid 去重合并(新覆盖旧)。必须配合 --out 指定既有任务目录。",
+             "按 post_id/bvid 去重合并(新覆盖旧),并写入新的不可变任务目录。必须配合 --out。",
+    )
+    ap.add_argument(
+        "--resume-out",
+        default=None,
+        help="增量续采的新输出目录；省略时原子预留 OLD-resume-<date> 及数字后缀。",
     )
     ap.add_argument(
         "--since", default=None,
@@ -2481,6 +1641,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.since is not None and not args.resume:
         ap.error("--since 必须与 --resume 联用")
+    if args.resume_out is not None and not args.resume:
+        ap.error("--resume-out 必须与 --resume 联用")
     custom_all_budget = any(
         value is not None
         for value in (args.max_items, args.max_seconds, args.max_scrolls)
@@ -2524,7 +1686,8 @@ def main() -> None:
         raise SystemExit(2)
     raise SystemExit(run(
         args.url, limit, args.out, args.comments, date_from_iso, date_to_iso,
-        resume=args.resume, since=args.since, browser_fallback=args.browser_fallback,
+        resume=args.resume, resume_out=args.resume_out, since=args.since,
+        browser_fallback=args.browser_fallback,
         collect_all=args.collect_all, max_items=max_items,
         max_seconds=max_seconds, max_scrolls=max_scrolls,
         enrich_details=args.enrich_details,

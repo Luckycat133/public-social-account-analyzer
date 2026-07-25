@@ -132,6 +132,8 @@ python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 - `source/posts.jsonl` — 原始公开内容列表
 - `normalized-posts.csv` — 遵循统一数据模型的归一化 CSV 表格
 - `collection-report.md` — 采集质量与字段覆盖率说明
+- `task.json` — 任务状态、范围、覆盖账本与续采来源摘要
+- `manifest.json` / `.complete` — 采集阶段白名单产物的大小、SHA-256 与最终提交标记；无有效标记的目录是不完整任务
 - `account-analysis-report.md` — 完整 Markdown 账号分析报告（含具体证据 URL）
 - `dashboard.html` — 可视化 HTML 仪表盘
 - `analysis.json` — 机器可读的统计指标与分类分析 JSON

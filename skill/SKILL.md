@@ -30,7 +30,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 1. **任务初始化**
    - 规范化参数：账号主页 URL、采集数量（默认 30，上限 100）、日期范围（可选）、分析目的（可选）、评论采样（默认关闭）。
-   - 创建任务独立目录：`workspace/<platform>-<account>-<date>/`（如已存在则追加后缀或 ID，防止覆盖）。
+   - 以最终名称排他创建任务独立目录：`workspace/<platform>-<account>-<date>/`（如已存在则追加后缀或 ID，防止覆盖）。每个产物只创建一次；`manifest.json` 与最后创建的 `.complete` 共同证明任务已提交。异常可留下无有效标记的不完整目录，禁止删除或覆盖它。
    - 设置初始状态 `task_status = CREATED`。
 
 2. **平台识别与合规检查**
@@ -40,7 +40,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 3. **数据采集**
    - 调用平台适配器（`scripts/collect.py`），采集账号资料与内容列表。
    - 记录 `source_url` 与 `collected_at`。置顶内容单独标记，不混入近期原创列表。
-   - **增量续采**：加 `--resume --out <既有任务目录>` 时，读取既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧），避免重复打满配额；`--since` 可显式指定续采起点。必须配合 `--out`。
+   - **增量续采**：加 `--resume --out <既有任务目录>` 时，只读核验并读取既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧）。来源目录永不修改；新结果写入 `--resume-out <新目录>`，省略时原子预留同级 `OLD-resume-<date>` 数字后缀目录。`--since` 可显式指定续采起点。
    - 平台降级逻辑与数据映射详见 [references/platform-bilibili.md](references/platform-bilibili.md) / [platform-douyin.md](references/platform-douyin.md) / [platform-weibo.md](references/platform-weibo.md)。
    - 抖音直连以既有受限原因停止且 Web 连接器可用时，按 [references/douyin-index-evidence.md](references/douyin-index-evidence.md) 由 Agent 核验公开来源/作品区，再用离线脚本校验结构与字段一致性并导入；无连接器则保留原失败结果。
 
@@ -96,7 +96,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 必须通过项目脚本执行真实采集与分析，严禁虚构或推测数据：
 
-1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--no-browser-fallback] [--resume --out <dir> [--since ...]]`
+1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--no-browser-fallback] [--resume --out <old-dir> [--resume-out <new-dir>] [--since ...]]`
 2. `python scripts/normalize.py --input <workspace_path>`
 3. `python scripts/analyze.py --input <workspace_path> [--with-llm-tax | --llm-tax-results <file>]`
 4. `python scripts/render_report.py --input <workspace_path>`

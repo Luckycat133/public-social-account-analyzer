@@ -1,0 +1,1473 @@
+"""Create-only collection workspaces with an identity-bound commit marker.
+
+The protocol deliberately never rolls output back.  A failed run can leave the
+directory and any files it created, but without a valid ``.complete`` marker.
+That makes failure recovery race-free: this module never deletes, replaces, or
+renames a pathname that another process could have exchanged concurrently.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import ctypes
+import errno
+import json
+import os
+import re
+import stat
+import sys
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Iterable, Iterator
+
+
+FORMAT = "public-social-account-analyzer/immutable-workspace-v1"
+MANIFEST_NAME = "manifest.json"
+COMPLETE_NAME = ".complete"
+_MARKER_PREFIX = b"PUBLIC-SOCIAL-ACCOUNT-ANALYZER-COMPLETE-V1\nmanifest-sha256="
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_MAX_MANIFEST_BYTES = 1024 * 1024
+_MAX_MARKER_BYTES = len(_MARKER_PREFIX) + 65
+DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+
+
+class WorkspaceError(RuntimeError):
+    """Base class for stable immutable-workspace failures."""
+
+
+class WorkspaceExistsError(WorkspaceError):
+    """A create-only workspace or artifact name was already occupied."""
+
+
+class WorkspaceCapabilityError(WorkspaceError):
+    """The host cannot provide the primitives required by the protocol."""
+
+
+class WorkspaceIdentityError(WorkspaceError):
+    """A held workspace or artifact no longer matches its pathname."""
+
+
+class WorkspaceVerificationError(WorkspaceError):
+    """A committed workspace did not satisfy the manifest contract."""
+
+
+class WorkspaceWriteError(WorkspaceError):
+    """A create-only artifact could not be safely persisted."""
+
+
+def _identity(metadata) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _backend_kind() -> str:
+    if os.name == "nt":
+        return "windows"
+    if sys.platform == "darwin" or sys.platform.startswith("linux"):
+        return "posix"
+    return "unsupported"
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _read_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _create_flags() -> int:
+    return (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _preflight_posix() -> None:
+    required_constants = ("O_NOFOLLOW", "O_NONBLOCK", "O_DIRECTORY")
+    if any(not getattr(os, name, 0) for name in required_constants):
+        raise WorkspaceCapabilityError("safe POSIX output primitives are unavailable")
+    dir_fd = getattr(os, "supports_dir_fd", ())
+    fd_paths = getattr(os, "supports_fd", ())
+    if not all(operation in dir_fd for operation in (os.mkdir, os.open, os.stat)):
+        raise WorkspaceCapabilityError("safe POSIX output primitives are unavailable")
+    if os.listdir not in fd_paths:
+        raise WorkspaceCapabilityError("safe POSIX output primitives are unavailable")
+
+
+def _preflight_windows() -> None:
+    try:
+        import msvcrt  # noqa: F401
+
+        win_dll = getattr(__import__("ctypes"), "WinDLL", None)
+        if win_dll is None:
+            raise RuntimeError
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        for name in ("CreateFileW", "GetFileInformationByHandle", "CloseHandle"):
+            if getattr(kernel32, name, None) is None:
+                raise RuntimeError
+    except Exception as exc:
+        raise WorkspaceCapabilityError(
+            "safe Windows output primitives are unavailable"
+        ) from exc
+
+
+class _WindowsFileTime(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+
+class _WindowsHandleInformation(ctypes.Structure):
+    _fields_ = [
+        ("attributes", ctypes.c_uint32),
+        ("creation_time", _WindowsFileTime),
+        ("access_time", _WindowsFileTime),
+        ("write_time", _WindowsFileTime),
+        ("volume_serial", ctypes.c_uint32),
+        ("size_high", ctypes.c_uint32),
+        ("size_low", ctypes.c_uint32),
+        ("links", ctypes.c_uint32),
+        ("index_high", ctypes.c_uint32),
+        ("index_low", ctypes.c_uint32),
+    ]
+
+
+def _windows_kernel32():
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        raise WorkspaceCapabilityError("safe Windows output primitives are unavailable")
+    return win_dll("kernel32", use_last_error=True)
+
+
+def _windows_error(message: str) -> OSError:
+    get_error = getattr(ctypes, "get_last_error", lambda: errno.EIO)
+    number = get_error() or errno.EIO
+    return OSError(number, message)
+
+
+def _windows_handle_metadata(handle: int) -> dict[str, object]:
+    kernel32 = _windows_kernel32()
+    function = kernel32.GetFileInformationByHandle
+    function.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsHandleInformation),
+    ]
+    function.restype = ctypes.c_int
+    information = _WindowsHandleInformation()
+    if not function(ctypes.c_void_p(handle), ctypes.byref(information)):
+        raise _windows_error("Windows handle identity is unavailable")
+    return {
+        "identity": (
+            information.volume_serial,
+            (information.index_high << 32) | information.index_low,
+        ),
+        "directory": bool(information.attributes & 0x00000010),
+        "reparse": bool(information.attributes & 0x00000400),
+        "links": information.links,
+        "size": (information.size_high << 32) | information.size_low,
+    }
+
+
+def _close_windows_handle(handle: object) -> None:
+    if int(handle) < 0:
+        return
+    kernel32 = _windows_kernel32()
+    function = kernel32.CloseHandle
+    function.argtypes = [ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    function(ctypes.c_void_p(int(handle)))
+
+
+def _open_windows_path(
+    path: str,
+    *,
+    create_new: bool,
+    directory: bool,
+) -> tuple[int, dict[str, object]]:
+    """Open without FILE_SHARE_DELETE so owned names cannot be exchanged."""
+    kernel32 = _windows_kernel32()
+    function = kernel32.CreateFileW
+    function.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    function.restype = ctypes.c_void_p
+    if create_new:
+        desired_access = 0x80000000 | 0x40000000
+    elif directory:
+        desired_access = 0x00000080
+    else:
+        desired_access = 0x80000000
+    share_without_delete = 0x00000001 | 0x00000002
+    disposition = 1 if create_new else 3
+    flags = 0x00200000
+    if directory:
+        flags |= 0x02000000
+    else:
+        flags |= 0x00000080
+    raw = function(
+        os.path.abspath(path),
+        desired_access,
+        share_without_delete,
+        None,
+        disposition,
+        flags,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if raw in {None, invalid}:
+        error = _windows_error("Windows path cannot be opened safely")
+        if create_new and error.errno in {80, 183}:
+            raise WorkspaceExistsError("workspace artifact already exists") from error
+        raise error
+    handle = int(raw)
+    try:
+        metadata = _windows_handle_metadata(handle)
+        if bool(metadata["directory"]) is not directory or metadata["reparse"]:
+            raise OSError("unsafe Windows path type")
+        return handle, metadata
+    except BaseException:
+        _close_windows_handle(handle)
+        raise
+
+
+def _windows_file_handle_to_fd(handle: int, *, writable: bool) -> int:
+    try:
+        import msvcrt
+
+        return msvcrt.open_osfhandle(
+            handle,
+            (os.O_RDWR if writable else os.O_RDONLY)
+            | getattr(os, "O_BINARY", 0),
+        )
+    except Exception:
+        _close_windows_handle(handle)
+        raise
+
+
+def _open_windows_regular_fd(path: str, *, create_new: bool) -> tuple[int, tuple[int, int]]:
+    handle, metadata = _open_windows_path(
+        path, create_new=create_new, directory=False
+    )
+    if metadata["links"] != 1:
+        _close_windows_handle(handle)
+        raise WorkspaceVerificationError("workspace artifact is unsafe")
+    descriptor = _windows_file_handle_to_fd(handle, writable=create_new)
+    return descriptor, metadata["identity"]
+
+
+def preflight_backend() -> str:
+    """Validate the full backend before any output directory is created."""
+    backend = _backend_kind()
+    if backend == "posix":
+        _preflight_posix()
+    elif backend == "windows":
+        _preflight_windows()
+    else:
+        raise WorkspaceCapabilityError("immutable workspace backend is unavailable")
+    return backend
+
+
+def _normalize_artifacts(values: Iterable[str]) -> frozenset[str]:
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("artifact path must be text")
+        relative = value.replace("\\", "/")
+        parts = relative.split("/")
+        if (
+            len(parts) not in {1, 2}
+            or (len(parts) == 2 and parts[0] != "source")
+            or any(part in {"", ".", ".."} for part in parts)
+            or relative in {MANIFEST_NAME, COMPLETE_NAME, "source"}
+        ):
+            raise ValueError("invalid artifact path")
+        normalized.add(relative)
+    return frozenset(normalized)
+
+
+def _regular_single_link(metadata) -> bool:
+    return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+
+
+def _read_descriptor(descriptor: int, max_bytes: int) -> bytes:
+    metadata = os.fstat(descriptor)
+    if not _regular_single_link(metadata):
+        raise WorkspaceVerificationError("workspace artifact is unsafe")
+    if metadata.st_size > max_bytes:
+        raise WorkspaceVerificationError("workspace artifact is too large")
+    try:
+        offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise WorkspaceVerificationError("workspace artifact is unreadable") from exc
+    chunks: list[bytes] = []
+    remaining = max_bytes + 1
+    try:
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        try:
+            os.lseek(descriptor, offset, os.SEEK_SET)
+        except OSError:
+            pass
+    payload = b"".join(chunks)
+    if len(payload) > max_bytes:
+        raise WorkspaceVerificationError("workspace artifact is too large")
+    return payload
+
+
+@dataclass
+class _OwnedLeaf:
+    relative_path: str
+    descriptor: int
+    identity: tuple[int, int]
+
+
+class ImmutableWorkspace:
+    """A final-name reservation whose artifacts and commit are create-only."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        allowed_artifacts: frozenset[str],
+        backend: str,
+        parent_handle: object,
+        target_handle: object,
+        source_handle: object,
+        target_identity: tuple[int, int],
+        source_identity: tuple[int, int],
+        target_name: str,
+    ) -> None:
+        self.path = os.path.abspath(path)
+        self.source_path = os.path.join(self.path, "source")
+        self.allowed_artifacts = allowed_artifacts
+        self.backend = backend
+        self.parent_handle = parent_handle
+        self.target_handle = target_handle
+        self.source_handle = source_handle
+        self.target_identity = target_identity
+        self.source_identity = source_identity
+        self.target_name = target_name
+        self._leaves: dict[str, _OwnedLeaf] = {}
+        self._invalid = False
+        self._committed = False
+        self.closed = False
+
+    def __fspath__(self) -> str:
+        return self.path
+
+    @classmethod
+    def reserve(
+        cls, path: str, *, allowed_artifacts: Iterable[str]
+    ) -> "ImmutableWorkspace":
+        allowed = _normalize_artifacts(allowed_artifacts)
+        backend = preflight_backend()
+        target = os.path.abspath(path)
+        parent = os.path.dirname(target)
+        name = os.path.basename(target)
+        if not name or name in {".", ".."}:
+            raise WorkspaceWriteError("invalid workspace target")
+        if not os.path.isdir(parent):
+            raise WorkspaceWriteError("workspace parent does not exist")
+        if backend == "posix":
+            return cls._reserve_posix(target, parent, name, allowed)
+        return cls._reserve_windows(target, parent, name, allowed)
+
+    @classmethod
+    def _reserve_posix(
+        cls,
+        target: str,
+        parent: str,
+        name: str,
+        allowed: frozenset[str],
+    ) -> "ImmutableWorkspace":
+        parent_fd = target_fd = source_fd = -1
+        transferred = False
+        try:
+            parent_fd = os.open(parent, _directory_flags())
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise WorkspaceExistsError("workspace target already exists") from exc
+            target_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+            target_metadata = os.fstat(target_fd)
+            named_target = os.stat(
+                name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(target_metadata.st_mode)
+                or not stat.S_ISDIR(named_target.st_mode)
+                or _identity(target_metadata) != _identity(named_target)
+            ):
+                raise WorkspaceIdentityError("workspace target identity changed")
+            os.mkdir("source", 0o700, dir_fd=target_fd)
+            source_fd = os.open("source", _directory_flags(), dir_fd=target_fd)
+            source_metadata = os.fstat(source_fd)
+            named_source = os.stat(
+                "source", dir_fd=target_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(source_metadata.st_mode)
+                or not stat.S_ISDIR(named_source.st_mode)
+                or _identity(source_metadata) != _identity(named_source)
+            ):
+                raise WorkspaceIdentityError("workspace source identity changed")
+            reservation = cls(
+                target,
+                allowed_artifacts=allowed,
+                backend="posix",
+                parent_handle=parent_fd,
+                target_handle=target_fd,
+                source_handle=source_fd,
+                target_identity=_identity(target_metadata),
+                source_identity=_identity(source_metadata),
+                target_name=name,
+            )
+            transferred = True
+            return reservation
+        except WorkspaceError:
+            raise
+        except FileExistsError as exc:
+            raise WorkspaceExistsError("workspace child already exists") from exc
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise WorkspaceWriteError("workspace cannot be reserved") from exc
+        finally:
+            if not transferred:
+                for descriptor in (source_fd, target_fd, parent_fd):
+                    if descriptor >= 0:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+
+    @classmethod
+    def _reserve_windows(
+        cls,
+        target: str,
+        parent: str,
+        name: str,
+        allowed: frozenset[str],
+    ) -> "ImmutableWorkspace":
+        parent_handle = target_handle = source_handle = -1
+        transferred = False
+        try:
+            parent_handle, _ = _open_windows_path(
+                parent, create_new=False, directory=True
+            )
+            try:
+                os.mkdir(target, 0o700)
+            except FileExistsError as exc:
+                raise WorkspaceExistsError(
+                    "workspace target already exists"
+                ) from exc
+            created_target = os.lstat(target)
+            if (
+                not stat.S_ISDIR(created_target.st_mode)
+                or stat.S_ISLNK(created_target.st_mode)
+            ):
+                raise WorkspaceIdentityError("workspace target identity changed")
+            target_handle, target_metadata = _open_windows_path(
+                target, create_new=False, directory=True
+            )
+            if created_target.st_ino != target_metadata["identity"][1]:
+                raise WorkspaceIdentityError("workspace target identity changed")
+            source = os.path.join(target, "source")
+            os.mkdir(source, 0o700)
+            created_source = os.lstat(source)
+            if (
+                not stat.S_ISDIR(created_source.st_mode)
+                or stat.S_ISLNK(created_source.st_mode)
+            ):
+                raise WorkspaceIdentityError("workspace source identity changed")
+            source_handle, source_metadata = _open_windows_path(
+                source, create_new=False, directory=True
+            )
+            if created_source.st_ino != source_metadata["identity"][1]:
+                raise WorkspaceIdentityError("workspace source identity changed")
+            reservation = cls(
+                target,
+                allowed_artifacts=allowed,
+                backend="windows",
+                parent_handle=parent_handle,
+                target_handle=target_handle,
+                source_handle=source_handle,
+                target_identity=target_metadata["identity"],
+                source_identity=source_metadata["identity"],
+                target_name=name,
+            )
+            transferred = True
+            return reservation
+        except WorkspaceError:
+            raise
+        except FileExistsError as exc:
+            raise WorkspaceExistsError("workspace child already exists") from exc
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise WorkspaceWriteError("workspace cannot be reserved") from exc
+        finally:
+            if not transferred:
+                for handle in (source_handle, target_handle, parent_handle):
+                    if handle >= 0:
+                        try:
+                            _close_windows_handle(handle)
+                        except OSError:
+                            pass
+
+    @property
+    def _target_fd(self) -> int:
+        if self.backend != "posix":
+            raise WorkspaceCapabilityError("POSIX directory descriptor is unavailable")
+        return int(self.target_handle)
+
+    @property
+    def _source_fd(self) -> int:
+        if self.backend != "posix":
+            raise WorkspaceCapabilityError("POSIX directory descriptor is unavailable")
+        return int(self.source_handle)
+
+    @property
+    def _parent_fd(self) -> int:
+        if self.backend != "posix":
+            raise WorkspaceCapabilityError("POSIX directory descriptor is unavailable")
+        return int(self.parent_handle)
+
+    def _artifact_location(self, relative_path: str) -> tuple[int, str]:
+        parts = relative_path.split("/")
+        if len(parts) == 1:
+            return self._target_fd, parts[0]
+        return self._source_fd, parts[1]
+
+    def _artifact_path(self, relative_path: str) -> str:
+        return os.path.join(self.path, *relative_path.split("/"))
+
+    def verify_identity(self) -> None:
+        if self.closed:
+            raise WorkspaceIdentityError("workspace is closed")
+        if self.backend == "windows":
+            try:
+                held_target = _windows_handle_metadata(int(self.target_handle))
+                held_source = _windows_handle_metadata(int(self.source_handle))
+                named_target_handle, named_target = _open_windows_path(
+                    self.path, create_new=False, directory=True
+                )
+                try:
+                    named_source_handle, named_source = _open_windows_path(
+                        self.source_path, create_new=False, directory=True
+                    )
+                    try:
+                        if (
+                            held_target["identity"] != self.target_identity
+                            or named_target["identity"] != self.target_identity
+                            or held_source["identity"] != self.source_identity
+                            or named_source["identity"] != self.source_identity
+                        ):
+                            raise WorkspaceIdentityError(
+                                "workspace identity changed"
+                            )
+                    finally:
+                        _close_windows_handle(named_source_handle)
+                finally:
+                    _close_windows_handle(named_target_handle)
+                return
+            except WorkspaceError:
+                raise
+            except (OSError, NotImplementedError, TypeError) as exc:
+                raise WorkspaceIdentityError(
+                    "workspace identity cannot be verified"
+                ) from exc
+        try:
+            held_target = os.fstat(self._target_fd)
+            named_target = os.stat(
+                self.target_name,
+                dir_fd=self._parent_fd,
+                follow_symlinks=False,
+            )
+            held_source = os.fstat(self._source_fd)
+            named_source = os.stat(
+                "source", dir_fd=self._target_fd, follow_symlinks=False
+            )
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise WorkspaceIdentityError("workspace identity cannot be verified") from exc
+        checks = (
+            (held_target, self.target_identity),
+            (named_target, self.target_identity),
+            (held_source, self.source_identity),
+            (named_source, self.source_identity),
+        )
+        if any(
+            not stat.S_ISDIR(metadata.st_mode)
+            or _identity(metadata) != expected
+            for metadata, expected in checks
+        ):
+            raise WorkspaceIdentityError("workspace identity changed")
+
+    def _create_leaf(self, relative_path: str) -> _OwnedLeaf:
+        if relative_path in self._leaves:
+            raise WorkspaceExistsError("workspace artifact already created")
+        if self.backend == "posix":
+            directory_fd, leaf = self._artifact_location(relative_path)
+        else:
+            directory_fd, leaf = -1, ""
+        descriptor = -1
+        try:
+            self.verify_identity()
+            try:
+                if self.backend == "posix":
+                    descriptor = os.open(
+                        leaf, _create_flags(), 0o600, dir_fd=directory_fd
+                    )
+                    metadata = os.fstat(descriptor)
+                    identity = _identity(metadata)
+                else:
+                    descriptor, identity = _open_windows_regular_fd(
+                        self._artifact_path(relative_path), create_new=True
+                    )
+            except FileExistsError as exc:
+                raise WorkspaceExistsError(
+                    "workspace artifact already exists"
+                ) from exc
+            metadata = os.fstat(descriptor)
+            if not _regular_single_link(metadata):
+                raise WorkspaceWriteError("workspace artifact is unsafe")
+            owned = _OwnedLeaf(relative_path, descriptor, identity)
+            self._leaves[relative_path] = owned
+            descriptor = -1
+            self.verify_identity()
+            self._verify_leaf_identity(owned)
+            return owned
+        except WorkspaceError:
+            raise
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise WorkspaceWriteError("workspace artifact cannot be created") from exc
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    @contextmanager
+    def open_text(
+        self, relative_path: str, *, newline: str | None = None
+    ) -> Iterator[object]:
+        normalized = _normalize_artifacts((relative_path,))
+        relative = next(iter(normalized))
+        if relative not in self.allowed_artifacts:
+            raise WorkspaceWriteError("workspace artifact is not allowlisted")
+        if self._committed:
+            raise WorkspaceWriteError("workspace is already committed")
+        owned = self._create_leaf(relative)
+        handle = None
+        try:
+            handle = os.fdopen(
+                os.dup(owned.descriptor),
+                "w",
+                encoding="utf-8",
+                newline=newline,
+            )
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            self._invalid = True
+            raise
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    self._invalid = True
+
+    def _verify_leaf_identity(self, owned: _OwnedLeaf) -> os.stat_result:
+        if self.backend == "windows":
+            try:
+                held = os.fstat(owned.descriptor)
+                named_handle, named = _open_windows_path(
+                    self._artifact_path(owned.relative_path),
+                    create_new=False,
+                    directory=False,
+                )
+                try:
+                    if (
+                        not _regular_single_link(held)
+                        or named["reparse"]
+                        or named["directory"]
+                        or named["links"] != 1
+                        or named["identity"] != owned.identity
+                    ):
+                        raise WorkspaceIdentityError(
+                            "workspace artifact identity changed"
+                        )
+                finally:
+                    _close_windows_handle(named_handle)
+                return held
+            except WorkspaceError:
+                raise
+            except (OSError, NotImplementedError, TypeError) as exc:
+                raise WorkspaceIdentityError(
+                    "workspace artifact identity changed"
+                ) from exc
+        directory_fd, leaf = self._artifact_location(owned.relative_path)
+        try:
+            held = os.fstat(owned.descriptor)
+            named = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise WorkspaceIdentityError("workspace artifact identity changed") from exc
+        if (
+            not _regular_single_link(held)
+            or not _regular_single_link(named)
+            or _identity(held) != owned.identity
+            or _identity(named) != owned.identity
+        ):
+            raise WorkspaceIdentityError("workspace artifact identity changed")
+        return held
+
+    def _inventory_names(self, paths: Iterable[str]) -> tuple[set[str], set[str]]:
+        root = {"source"}
+        source: set[str] = set()
+        for relative in paths:
+            parts = relative.split("/")
+            if len(parts) == 1:
+                root.add(parts[0])
+            else:
+                source.add(parts[1])
+        return root, source
+
+    def _verify_inventory(self, paths: Iterable[str]) -> None:
+        expected_root, expected_source = self._inventory_names(paths)
+        if self.backend == "posix":
+            actual_root = set(os.listdir(self._target_fd))
+            actual_source = set(os.listdir(self._source_fd))
+        else:
+            actual_root = set(os.listdir(self.path))
+            actual_source = set(os.listdir(self.source_path))
+        if COMPLETE_NAME in actual_root or MANIFEST_NAME in actual_root:
+            raise WorkspaceExistsError("workspace commit metadata already exists")
+        if actual_root != expected_root or actual_source != expected_source:
+            raise WorkspaceIdentityError("workspace inventory changed")
+
+    def _artifact_evidence(self) -> list[dict[str, object]]:
+        evidence: list[dict[str, object]] = []
+        for relative in sorted(self._leaves):
+            if relative in {MANIFEST_NAME, COMPLETE_NAME}:
+                continue
+            owned = self._leaves[relative]
+            metadata = self._verify_leaf_identity(owned)
+            payload = _read_descriptor(
+                owned.descriptor, DEFAULT_MAX_ARTIFACT_BYTES
+            )
+            if len(payload) != metadata.st_size:
+                raise WorkspaceIdentityError("workspace artifact size changed")
+            evidence.append(
+                {
+                    "path": relative,
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+        return evidence
+
+    def _write_metadata(self, relative_path: str, payload: bytes) -> _OwnedLeaf:
+        owned = self._create_leaf(relative_path)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(owned.descriptor, view)
+                if written <= 0:
+                    raise OSError("short workspace metadata write")
+                view = view[written:]
+            os.fsync(owned.descriptor)
+            self._verify_leaf_identity(owned)
+            return owned
+        except BaseException:
+            self._invalid = True
+            raise
+
+    def commit(self) -> str:
+        """Create manifest then ``.complete``; never repair or roll back."""
+        if self.closed:
+            raise WorkspaceIdentityError("workspace is closed")
+        if self._committed:
+            raise WorkspaceWriteError("workspace is already committed")
+        if self._invalid:
+            raise WorkspaceWriteError("workspace serialization did not complete")
+        self.verify_identity()
+        application_paths = set(self._leaves)
+        if not application_paths.issubset(self.allowed_artifacts):
+            raise WorkspaceWriteError("workspace contains unallowlisted artifacts")
+        self._verify_inventory(application_paths)
+        artifacts = self._artifact_evidence()
+        manifest = {"artifacts": artifacts, "format": FORMAT}
+        manifest_bytes = (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        self._write_metadata(MANIFEST_NAME, manifest_bytes)
+        self.verify_identity()
+        self._verify_committing_tree(manifest, manifest_digest, marker=False)
+        marker = _MARKER_PREFIX + manifest_digest.encode("ascii") + b"\n"
+        self._write_metadata(COMPLETE_NAME, marker)
+        if self.backend == "posix":
+            try:
+                os.fsync(self._source_fd)
+                os.fsync(self._target_fd)
+                os.fsync(self._parent_fd)
+            except OSError as exc:
+                self._invalid = True
+                raise WorkspaceWriteError("workspace commit cannot be synced") from exc
+        self.verify_identity()
+        self._verify_committing_tree(manifest, manifest_digest, marker=True)
+        self._committed = True
+        return manifest_digest
+
+    def _verify_committing_tree(
+        self, manifest: dict, manifest_digest: str, *, marker: bool
+    ) -> None:
+        paths = [item["path"] for item in manifest["artifacts"]]
+        expected_root, expected_source = self._inventory_names(paths)
+        expected_root.add(MANIFEST_NAME)
+        if marker:
+            expected_root.add(COMPLETE_NAME)
+        actual_root = set(
+            os.listdir(self._target_fd)
+            if self.backend == "posix"
+            else os.listdir(self.path)
+        )
+        actual_source = set(
+            os.listdir(self._source_fd)
+            if self.backend == "posix"
+            else os.listdir(self.source_path)
+        )
+        if actual_root != expected_root:
+            raise WorkspaceIdentityError("workspace inventory changed")
+        if actual_source != expected_source:
+            raise WorkspaceIdentityError("workspace inventory changed")
+        for relative in paths:
+            self._verify_leaf_identity(self._leaves[relative])
+        manifest_payload = _read_descriptor(
+            self._leaves[MANIFEST_NAME].descriptor, _MAX_MANIFEST_BYTES
+        )
+        if hashlib.sha256(manifest_payload).hexdigest() != manifest_digest:
+            raise WorkspaceIdentityError("workspace manifest changed")
+        if marker:
+            marker_payload = _read_descriptor(
+                self._leaves[COMPLETE_NAME].descriptor, _MAX_MARKER_BYTES
+            )
+            if marker_payload != _MARKER_PREFIX + manifest_digest.encode("ascii") + b"\n":
+                raise WorkspaceIdentityError("workspace marker changed")
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for owned in reversed(tuple(self._leaves.values())):
+            try:
+                os.close(owned.descriptor)
+            except OSError:
+                pass
+        self._leaves.clear()
+        if self.backend == "posix":
+            for descriptor in (
+                int(self.source_handle),
+                int(self.target_handle),
+                int(self.parent_handle),
+            ):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+        elif self.backend == "windows":
+            for handle in (
+                self.source_handle,
+                self.target_handle,
+                self.parent_handle,
+            ):
+                if int(handle) >= 0:
+                    try:
+                        _close_windows_handle(handle)
+                    except OSError:
+                        pass
+        self.source_handle = self.target_handle = self.parent_handle = -1
+
+    def __enter__(self) -> "ImmutableWorkspace":
+        if self.closed:
+            raise WorkspaceIdentityError("workspace is closed")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        self.close()
+        return False
+
+
+def _open_posix_workspace(path: str) -> tuple[int, int, int, str, tuple[int, int], tuple[int, int]]:
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    name = os.path.basename(target)
+    parent_fd = target_fd = source_fd = -1
+    transferred = False
+    try:
+        parent_fd = os.open(parent, _directory_flags())
+        target_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        target_metadata = os.fstat(target_fd)
+        named_target = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        source_fd = os.open("source", _directory_flags(), dir_fd=target_fd)
+        source_metadata = os.fstat(source_fd)
+        named_source = os.stat("source", dir_fd=target_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(target_metadata.st_mode)
+            or not stat.S_ISDIR(named_target.st_mode)
+            or _identity(target_metadata) != _identity(named_target)
+            or not stat.S_ISDIR(source_metadata.st_mode)
+            or not stat.S_ISDIR(named_source.st_mode)
+            or _identity(source_metadata) != _identity(named_source)
+        ):
+            raise WorkspaceVerificationError("workspace identity changed")
+        handles = (
+            parent_fd,
+            target_fd,
+            source_fd,
+            name,
+            _identity(target_metadata),
+            _identity(source_metadata),
+        )
+        transferred = True
+        return handles
+    except WorkspaceError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise WorkspaceVerificationError("workspace cannot be opened safely") from exc
+    finally:
+        if not transferred:
+            for descriptor in (source_fd, target_fd, parent_fd):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+
+
+def _read_named_regular(
+    directory_fd: int, leaf: str, *, max_bytes: int
+) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(leaf, _read_flags(), dir_fd=directory_fd)
+        opened = os.fstat(descriptor)
+        named = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not _regular_single_link(opened)
+            or not _regular_single_link(named)
+            or _identity(opened) != _identity(named)
+        ):
+            raise WorkspaceVerificationError("workspace artifact is unsafe")
+        payload = _read_descriptor(descriptor, max_bytes)
+        named_after = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+        if _identity(named_after) != _identity(opened):
+            raise WorkspaceVerificationError("workspace artifact identity changed")
+        return payload
+    except WorkspaceError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise WorkspaceVerificationError("workspace artifact cannot be read") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _parse_manifest(payload: bytes, allowed: frozenset[str]) -> dict:
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkspaceVerificationError("workspace manifest is invalid") from exc
+    if not isinstance(value, dict) or set(value) != {"format", "artifacts"}:
+        raise WorkspaceVerificationError("workspace manifest is invalid")
+    if value.get("format") != FORMAT or not isinstance(value.get("artifacts"), list):
+        raise WorkspaceVerificationError("workspace manifest is invalid")
+    paths: list[str] = []
+    for item in value["artifacts"]:
+        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+            raise WorkspaceVerificationError("workspace manifest is invalid")
+        path = item.get("path")
+        size = item.get("size")
+        digest = item.get("sha256")
+        if (
+            not isinstance(path, str)
+            or path not in allowed
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(digest, str)
+            or _SHA256_PATTERN.fullmatch(digest) is None
+        ):
+            raise WorkspaceVerificationError("workspace manifest is invalid")
+        paths.append(path)
+    if paths != sorted(set(paths)):
+        raise WorkspaceVerificationError("workspace manifest is not deterministic")
+    canonical = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if canonical != payload:
+        raise WorkspaceVerificationError("workspace manifest is not deterministic")
+    return value
+
+
+def _verify_posix_handles(
+    handles: tuple[int, int, int, str, tuple[int, int], tuple[int, int]],
+    allowed: frozenset[str],
+    *,
+    capture_path: str | None = None,
+) -> tuple[dict, bytes | None]:
+    parent_fd, target_fd, source_fd, name, target_identity, source_identity = handles
+    marker = _read_named_regular(
+        target_fd, COMPLETE_NAME, max_bytes=_MAX_MARKER_BYTES
+    )
+    if (
+        not marker.startswith(_MARKER_PREFIX)
+        or not marker.endswith(b"\n")
+        or len(marker) != _MAX_MARKER_BYTES
+    ):
+        raise WorkspaceVerificationError("workspace marker is invalid")
+    digest_bytes = marker[len(_MARKER_PREFIX) : -1]
+    try:
+        manifest_digest = digest_bytes.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise WorkspaceVerificationError("workspace marker is invalid") from exc
+    if _SHA256_PATTERN.fullmatch(manifest_digest) is None:
+        raise WorkspaceVerificationError("workspace marker is invalid")
+    manifest_payload = _read_named_regular(
+        target_fd, MANIFEST_NAME, max_bytes=_MAX_MANIFEST_BYTES
+    )
+    if hashlib.sha256(manifest_payload).hexdigest() != manifest_digest:
+        raise WorkspaceVerificationError("workspace manifest digest changed")
+    manifest = _parse_manifest(manifest_payload, allowed)
+    paths = [item["path"] for item in manifest["artifacts"]]
+    expected_root = {"source", MANIFEST_NAME, COMPLETE_NAME}
+    expected_source: set[str] = set()
+    for relative in paths:
+        parts = relative.split("/")
+        if len(parts) == 1:
+            expected_root.add(parts[0])
+        else:
+            expected_source.add(parts[1])
+    if set(os.listdir(target_fd)) != expected_root:
+        raise WorkspaceVerificationError("workspace inventory is invalid")
+    if set(os.listdir(source_fd)) != expected_source:
+        raise WorkspaceVerificationError("workspace inventory is invalid")
+    captured: bytes | None = None
+    for item in manifest["artifacts"]:
+        relative = item["path"]
+        parts = relative.split("/")
+        directory_fd = target_fd if len(parts) == 1 else source_fd
+        payload = _read_named_regular(
+            directory_fd,
+            parts[-1],
+            max_bytes=DEFAULT_MAX_ARTIFACT_BYTES,
+        )
+        if len(payload) != item["size"]:
+            raise WorkspaceVerificationError("workspace artifact size changed")
+        if hashlib.sha256(payload).hexdigest() != item["sha256"]:
+            raise WorkspaceVerificationError("workspace artifact digest changed")
+        if relative == capture_path:
+            captured = payload
+    held_target = os.fstat(target_fd)
+    named_target = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    held_source = os.fstat(source_fd)
+    named_source = os.stat("source", dir_fd=target_fd, follow_symlinks=False)
+    if any(
+        _identity(metadata) != expected
+        for metadata, expected in (
+            (held_target, target_identity),
+            (named_target, target_identity),
+            (held_source, source_identity),
+            (named_source, source_identity),
+        )
+    ):
+        raise WorkspaceVerificationError("workspace identity changed")
+    result = dict(manifest)
+    result["commit_sha256"] = manifest_digest
+    return result, captured
+
+
+def _close_posix_handles(
+    handles: tuple[int, int, int, str, tuple[int, int], tuple[int, int]]
+) -> None:
+    for descriptor in (handles[2], handles[1], handles[0]):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _open_windows_workspace(
+    path: str,
+) -> tuple[int, int, int, tuple[int, int], tuple[int, int]]:
+    target = os.path.abspath(path)
+    parent_handle = target_handle = source_handle = -1
+    transferred = False
+    try:
+        parent_handle, _ = _open_windows_path(
+            os.path.dirname(target), create_new=False, directory=True
+        )
+        target_handle, target_metadata = _open_windows_path(
+            target, create_new=False, directory=True
+        )
+        source_handle, source_metadata = _open_windows_path(
+            os.path.join(target, "source"), create_new=False, directory=True
+        )
+        handles = (
+            parent_handle,
+            target_handle,
+            source_handle,
+            target_metadata["identity"],
+            source_metadata["identity"],
+        )
+        transferred = True
+        return handles
+    except WorkspaceError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise WorkspaceVerificationError("workspace cannot be opened safely") from exc
+    finally:
+        if not transferred:
+            for handle in (source_handle, target_handle, parent_handle):
+                if handle >= 0:
+                    try:
+                        _close_windows_handle(handle)
+                    except OSError:
+                        pass
+
+
+def _close_windows_workspace(
+    handles: tuple[int, int, int, tuple[int, int], tuple[int, int]]
+) -> None:
+    for handle in (handles[2], handles[1], handles[0]):
+        try:
+            _close_windows_handle(handle)
+        except OSError:
+            pass
+
+
+def _read_windows_named_regular(path: str, *, max_bytes: int) -> bytes:
+    descriptor = -1
+    try:
+        descriptor, _ = _open_windows_regular_fd(path, create_new=False)
+        return _read_descriptor(descriptor, max_bytes)
+    except WorkspaceError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise WorkspaceVerificationError("workspace artifact cannot be read") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _verify_windows_handles(
+    path: str,
+    handles: tuple[int, int, int, tuple[int, int], tuple[int, int]],
+    allowed: frozenset[str],
+    *,
+    capture_path: str | None = None,
+) -> tuple[dict, bytes | None]:
+    target = os.path.abspath(path)
+    marker = _read_windows_named_regular(
+        os.path.join(target, COMPLETE_NAME), max_bytes=_MAX_MARKER_BYTES
+    )
+    if (
+        not marker.startswith(_MARKER_PREFIX)
+        or not marker.endswith(b"\n")
+        or len(marker) != _MAX_MARKER_BYTES
+    ):
+        raise WorkspaceVerificationError("workspace marker is invalid")
+    try:
+        manifest_digest = marker[len(_MARKER_PREFIX) : -1].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise WorkspaceVerificationError("workspace marker is invalid") from exc
+    if _SHA256_PATTERN.fullmatch(manifest_digest) is None:
+        raise WorkspaceVerificationError("workspace marker is invalid")
+    manifest_payload = _read_windows_named_regular(
+        os.path.join(target, MANIFEST_NAME), max_bytes=_MAX_MANIFEST_BYTES
+    )
+    if hashlib.sha256(manifest_payload).hexdigest() != manifest_digest:
+        raise WorkspaceVerificationError("workspace manifest digest changed")
+    manifest = _parse_manifest(manifest_payload, allowed)
+    paths = [item["path"] for item in manifest["artifacts"]]
+    expected_root = {"source", MANIFEST_NAME, COMPLETE_NAME}
+    expected_source: set[str] = set()
+    for relative in paths:
+        parts = relative.split("/")
+        if len(parts) == 1:
+            expected_root.add(parts[0])
+        else:
+            expected_source.add(parts[1])
+    if set(os.listdir(target)) != expected_root:
+        raise WorkspaceVerificationError("workspace inventory is invalid")
+    source = os.path.join(target, "source")
+    if set(os.listdir(source)) != expected_source:
+        raise WorkspaceVerificationError("workspace inventory is invalid")
+    captured: bytes | None = None
+    for item in manifest["artifacts"]:
+        payload = _read_windows_named_regular(
+            os.path.join(target, *item["path"].split("/")),
+            max_bytes=DEFAULT_MAX_ARTIFACT_BYTES,
+        )
+        if len(payload) != item["size"]:
+            raise WorkspaceVerificationError("workspace artifact size changed")
+        if hashlib.sha256(payload).hexdigest() != item["sha256"]:
+            raise WorkspaceVerificationError("workspace artifact digest changed")
+        if item["path"] == capture_path:
+            captured = payload
+    held_target = _windows_handle_metadata(handles[1])
+    held_source = _windows_handle_metadata(handles[2])
+    if (
+        held_target["identity"] != handles[3]
+        or held_source["identity"] != handles[4]
+    ):
+        raise WorkspaceVerificationError("workspace identity changed")
+    result = dict(manifest)
+    result["commit_sha256"] = manifest_digest
+    return result, captured
+
+
+def verify_committed_workspace(
+    path: str, *, allowed_artifacts: Iterable[str]
+) -> dict:
+    """Verify marker, manifest, exact inventory, sizes, and SHA-256 hashes."""
+    allowed = _normalize_artifacts(allowed_artifacts)
+    backend = preflight_backend()
+    if backend == "posix":
+        handles = _open_posix_workspace(path)
+        try:
+            result, _ = _verify_posix_handles(handles, allowed)
+            return result
+        except WorkspaceError:
+            raise
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise WorkspaceVerificationError("workspace verification failed") from exc
+        finally:
+            _close_posix_handles(handles)
+    handles_windows = _open_windows_workspace(path)
+    try:
+        result, _ = _verify_windows_handles(
+            path, handles_windows, allowed
+        )
+        return result
+    finally:
+        _close_windows_workspace(handles_windows)
+
+
+@dataclass(frozen=True)
+class ResumeArtifact:
+    payload: bytes | None
+    source_format: str
+    source_digest: str
+
+
+def read_resume_artifact(
+    path: str,
+    relative_path: str,
+    *,
+    allowed_artifacts: Iterable[str],
+    max_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
+) -> ResumeArtifact:
+    """Read one legacy or committed artifact without ever mutating its tree."""
+    allowed = _normalize_artifacts(allowed_artifacts)
+    relative = next(iter(_normalize_artifacts((relative_path,))))
+    if relative not in allowed:
+        raise WorkspaceVerificationError("resume artifact is not allowlisted")
+    backend = preflight_backend()
+    if backend == "windows":
+        handles_windows = _open_windows_workspace(path)
+        target = os.path.abspath(path)
+        try:
+            marker = os.path.join(target, COMPLETE_NAME)
+            if os.path.lexists(marker):
+                manifest, payload = _verify_windows_handles(
+                    path,
+                    handles_windows,
+                    allowed,
+                    capture_path=relative,
+                )
+                return ResumeArtifact(
+                    payload=payload,
+                    source_format=FORMAT,
+                    source_digest=manifest["commit_sha256"],
+                )
+            if os.path.lexists(os.path.join(target, MANIFEST_NAME)):
+                raise WorkspaceVerificationError(
+                    "incomplete immutable workspace cannot be resumed"
+                )
+            artifact_path = os.path.join(target, *relative.split("/"))
+            try:
+                payload = _read_windows_named_regular(
+                    artifact_path, max_bytes=max_bytes
+                )
+            except WorkspaceVerificationError as exc:
+                cause = exc.__cause__
+                if isinstance(cause, FileNotFoundError):
+                    payload = None
+                else:
+                    raise
+            return ResumeArtifact(
+                payload=payload,
+                source_format="legacy-read-only",
+                source_digest=hashlib.sha256(payload or b"").hexdigest(),
+            )
+        finally:
+            _close_windows_workspace(handles_windows)
+    handles = _open_posix_workspace(path)
+    parent_fd, target_fd, source_fd, _, _, _ = handles
+    try:
+        try:
+            os.stat(COMPLETE_NAME, dir_fd=target_fd, follow_symlinks=False)
+            has_marker = True
+        except FileNotFoundError:
+            has_marker = False
+        if has_marker:
+            manifest, payload = _verify_posix_handles(
+                handles, allowed, capture_path=relative
+            )
+            return ResumeArtifact(
+                payload=payload,
+                source_format=FORMAT,
+                source_digest=manifest["commit_sha256"],
+            )
+        try:
+            os.stat(MANIFEST_NAME, dir_fd=target_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise WorkspaceVerificationError(
+                "incomplete immutable workspace cannot be resumed"
+            )
+        parts = relative.split("/")
+        directory_fd = target_fd if len(parts) == 1 else source_fd
+        try:
+            payload = _read_named_regular(
+                directory_fd, parts[-1], max_bytes=max_bytes
+            )
+        except WorkspaceVerificationError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, FileNotFoundError):
+                payload = None
+            else:
+                raise
+        digest_payload = payload if payload is not None else b""
+        held_target = os.fstat(target_fd)
+        named_target = os.stat(
+            handles[3], dir_fd=parent_fd, follow_symlinks=False
+        )
+        if _identity(held_target) != _identity(named_target):
+            raise WorkspaceVerificationError("resume workspace identity changed")
+        return ResumeArtifact(
+            payload=payload,
+            source_format="legacy-read-only",
+            source_digest=hashlib.sha256(digest_payload).hexdigest(),
+        )
+    finally:
+        _close_posix_handles(handles)
+
+
+def ensure_container(path: str) -> str:
+    """Create one non-output container beneath an existing parent, if absent."""
+    backend = preflight_backend()
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    name = os.path.basename(target)
+    if not name or not os.path.isdir(parent):
+        raise WorkspaceWriteError("workspace container parent does not exist")
+    if backend == "windows":
+        parent_handle = child_handle = -1
+        try:
+            parent_handle, _ = _open_windows_path(
+                parent, create_new=False, directory=True
+            )
+            try:
+                os.mkdir(target, 0o700)
+            except FileExistsError:
+                pass
+            child_handle, _ = _open_windows_path(
+                target, create_new=False, directory=True
+            )
+            return target
+        except WorkspaceError:
+            raise
+        except (OSError, NotImplementedError, TypeError) as exc:
+            raise WorkspaceWriteError(
+                "workspace container cannot be prepared"
+            ) from exc
+        finally:
+            for handle in (child_handle, parent_handle):
+                if handle >= 0:
+                    try:
+                        _close_windows_handle(handle)
+                    except OSError:
+                        pass
+    parent_fd = child_fd = -1
+    try:
+        parent_fd = os.open(parent, _directory_flags())
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        child_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        held = os.fstat(child_fd)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(held.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or _identity(held) != _identity(named)
+        ):
+            raise WorkspaceIdentityError("workspace container is unsafe")
+        return target
+    except WorkspaceError:
+        raise
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise WorkspaceWriteError("workspace container cannot be prepared") from exc
+    finally:
+        for descriptor in (child_fd, parent_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
