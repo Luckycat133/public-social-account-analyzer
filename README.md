@@ -154,8 +154,8 @@ python skill/scripts/run_pipeline.py \
 - `source/collection-provenance.json` — 来源格式、来源任务 ID、采集提交 SHA-256 与清单摘要
 - `source/classification-results.json` — 可选；已严格核验并按原字节封存的完整语义分类输入
 - `normalized-posts.csv` / `normalized-coverage.json` — 从 `source/posts.jsonl` 重新生成的归一化结果
-- `account-analysis-report.md` — 完整 Markdown 账号分析报告（含具体证据 URL）
-- `dashboard.html` — 可视化 HTML 仪表盘
+- `account-analysis-report.md` — 完整 Markdown 账号分析报告（含分类覆盖、高/低表现完整证据与核心洞察来源）
+- `dashboard.html` — 与 Markdown 同口径的可视化 HTML 仪表盘
 - `analysis.json` — 机器可读的统计指标与分类分析 JSON
 - `task.json` / `pipeline-report.md` — 派生任务状态与各阶段结果
 - `manifest.json` / `.complete` — 分析产物的独立、create-only 提交

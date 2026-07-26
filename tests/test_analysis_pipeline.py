@@ -166,8 +166,9 @@ def _legacy_analysis_dir(tmp_path: Path, *, bad_link: bool = False) -> Path:
         _sample_profile(), rows, {"task_id": "legacy", "platform": "douyin"}
     )
     if bad_link:
+        analysis_result.analysis["posts"][0]["post_id"] = "2"
         analysis_result.analysis["posts"][0]["post_url"] = (
-            "https://www.douyin.com/video/not-in-csv"
+            "https://www.douyin.com/video/2"
         )
     (target / "source" / "profile.json").write_text(
         json.dumps(_sample_profile(), ensure_ascii=False), encoding="utf-8"
@@ -872,8 +873,9 @@ def test_render_in_memory_fails_closed_on_bad_post_link():
     analysis_result = analyze.analyze_in_memory(
         _sample_profile(), rows, {"task_id": "source", "platform": "douyin"}
     )
+    analysis_result.analysis["posts"][0]["post_id"] = "2"
     analysis_result.analysis["posts"][0]["post_url"] = (
-        "https://www.douyin.com/video/not-in-csv"
+        "https://www.douyin.com/video/2"
     )
 
     with pytest.raises(render_report.RenderError, match="bad_link"):
@@ -891,7 +893,8 @@ def test_render_diagnostics_are_reset_between_calls():
         _sample_profile(), rows, {"task_id": "source", "platform": "douyin"}
     )
     bad = json.loads(json.dumps(analysis_result.analysis))
-    bad["posts"][0]["post_url"] = "https://www.douyin.com/video/bad"
+    bad["posts"][0]["post_id"] = "2"
+    bad["posts"][0]["post_url"] = "https://www.douyin.com/video/2"
     with pytest.raises(render_report.RenderError):
         render_report.render_in_memory(
             profile=_sample_profile(),

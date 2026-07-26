@@ -2,6 +2,8 @@
 
 离线、确定性，直接调用 render_report 纯函数。
 """
+import pytest
+
 import render_report
 
 
@@ -194,3 +196,594 @@ def test_non_exhaustive_index_skips_cadence_based_scheduling_advice():
     assert html == render_report.EMPTY_HTML
     assert "优先排播" not in md
     assert "稳定更新锚点" not in md
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected", "unexpected"),
+    [
+        (
+            {
+                "platform": "bilibili",
+                "account_id": "42",
+                "account_name": "B 站账号",
+                "verified": False,
+                "level": 6,
+                "platform_metrics": {},
+            },
+            ("认证信息", "否", "账号等级", "6"),
+            (),
+        ),
+        (
+            {
+                "platform": "douyin",
+                "account_id": "sec-id",
+                "account_name": "抖音账号",
+                "verified": True,
+                "platform_metrics": {
+                    "douyin_id": "public-douyin-id",
+                    "unique_id": "legacy-id",
+                    "total_likes": 12345,
+                },
+            },
+            ("认证信息", "是", "抖音号", "public-douyin-id", "获赞总量", "12,345"),
+            ("legacy-id",),
+        ),
+        (
+            {
+                "platform": "weibo",
+                "account_id": "wb-1",
+                "account_name": "微博账号",
+                "verified": None,
+                "platform_metrics": {"following": 88},
+            },
+            ("认证信息", "—", "关注数", "88"),
+            (),
+        ),
+    ],
+)
+def test_account_card_renders_platform_fields_and_tri_state_verified(
+    profile, expected, unexpected
+):
+    md, html = render_report.build_account_card(profile)
+
+    for rendered in (md, html):
+        for value in expected:
+            assert value in rendered
+        for value in unexpected:
+            assert value not in rendered
+
+
+def test_account_card_uses_douyin_unique_id_fallback_and_dashes_for_nulls():
+    profile = {
+        "platform": "douyin",
+        "account_id": None,
+        "account_name": None,
+        "verified": None,
+        "followers": None,
+        "post_count": None,
+        "bio": None,
+        "profile_url": None,
+        "platform_metrics": {"unique_id": "fallback-id", "total_likes": None},
+    }
+
+    md, html = render_report.build_account_card(profile)
+
+    assert "| 抖音号 | fallback-id |" in md
+    assert "| 获赞总量 | — |" in md
+    assert "| 认证信息 | — |" in md
+    assert "<td>抖音号</td><td>fallback-id</td>" in html
+    assert "<td>获赞总量</td><td>—</td>" in html
+    assert "<td>认证信息</td><td>—</td>" in html
+    assert "None" not in md
+    assert "None" not in html
+
+
+def test_account_card_escapes_certification_text_in_both_formats():
+    profile = {
+        "platform": "weibo",
+        "account_name": "安全测试",
+        "verified": "<script>alert('verified')</script>|[link](javascript:x)",
+        "platform_metrics": {"following": None},
+    }
+
+    md, html = render_report.build_account_card(profile)
+
+    assert "<script>" not in md
+    assert "[link](javascript:x)" not in md
+    assert "&lt;script&gt;" in md
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+    assert "<td>关注数</td><td>—</td>" in html
+
+
+def test_sample_quality_and_limits_render_all_status_counts_with_zero_defaults():
+    analysis = {
+        "sample_boundary": {
+            "requested": 4,
+            "collected": 4,
+            "valid": 3,
+            "missing": 1,
+            "restricted": 0,
+            "excluded_flagged": 0,
+            "status_counts": {"SUCCESS": 2, "PARTIAL": 1},
+            "time_range": {},
+        }
+    }
+    expected_rows = (
+        ("SUCCESS", "2"),
+        ("PARTIAL", "1"),
+        ("FAILED", "0"),
+        ("DELETED", "0"),
+        ("RESTRICTED", "0"),
+    )
+
+    quality = render_report.build_quality_summary(analysis)
+    limits = render_report.build_sample_limits(analysis, {})
+
+    for md, html in (quality, limits):
+        for status, count in expected_rows:
+            assert f"| 采集状态 {status} | {count} |" in md
+            assert f"<td>采集状态 {status}</td><td>{count}</td>" in html
+
+
+@pytest.mark.parametrize(
+    ("status", "version", "coverage", "status_label", "version_label"),
+    [
+        (
+            "pending-model",
+            None,
+            {
+                "total_count": 4,
+                "classified_count": 0,
+                "pending_count": 4,
+                "rate": 0.0,
+            },
+            "pending-model（待分类）",
+            "—",
+        ),
+        (
+            "completed",
+            "llm-1",
+            {
+                "total_count": 4,
+                "classified_count": 4,
+                "pending_count": 0,
+                "rate": 1.0,
+            },
+            "completed（已完成）",
+            "llm-1",
+        ),
+    ],
+)
+def test_task_info_renders_complete_classification_lifecycle_in_both_formats(
+    status, version, coverage, status_label, version_label
+):
+    analysis = {
+        "meta": {
+            "classification_status": status,
+            "classification_version": version,
+            "classification_coverage": coverage,
+        },
+        "classification_status": status,
+        "classification_version": version,
+        "classification_coverage": coverage,
+    }
+
+    md, html = render_report.build_task_info(analysis, {}, [])
+
+    expected = (
+        status_label,
+        version_label,
+        "分类总数 (total_count)",
+        "4",
+        "已分类数 (classified_count)",
+        "待分类数 (pending_count)",
+        "分类覆盖率 (rate)",
+        "0.0000" if status == "pending-model" else "1.0000",
+    )
+    for rendered in (md, html):
+        for value in expected:
+            assert value in rendered
+    if status == "pending-model":
+        assert "classification_version = pending-model" not in md
+        assert "classification_version = pending-model" not in html
+
+
+def test_content_patterns_separate_pending_from_model_unknown_and_other():
+    analysis = {
+        "posts": [
+            {"topic": None, "format": None, "funnel_stage": None, "hook_type": None},
+            {
+                "topic": "unknown",
+                "format": "other",
+                "funnel_stage": "unknown",
+                "hook_type": "unknown",
+            },
+            {
+                "topic": "<script>topic</script>|[x](javascript:y)",
+                "format": "tutorial",
+                "funnel_stage": "education",
+                "hook_type": "question",
+            },
+        ]
+    }
+
+    md, html = render_report.build_content_patterns(analysis)
+
+    for rendered in (md, html):
+        assert "待分类" in rendered
+        assert "unknown（模型无法判断）" in rendered
+        assert "other" in rendered
+        assert "未分类/unknown" not in rendered
+        assert "<script>" not in rendered
+    assert "&lt;script&gt;topic&lt;/script&gt;" in md
+    assert "&lt;script&gt;topic&lt;/script&gt;" in html
+
+
+def _auditable_performance_item(**overrides):
+    item = {
+        "platform": "douyin",
+        "post_id": "1001",
+        "title": "审计样本",
+        "post_url": "https://www.douyin.com/video/1001",
+        "evidence_url": "https://www.douyin.com/video/1001",
+        "item_url_known": True,
+        "url_kind": "item",
+        "published_at": "2026-07-01T12:30:00+08:00",
+        "main_metric": "likes",
+        "value": 42,
+        "relative_to_main_median": 1.25,
+        "metrics": {
+            "views": 1000,
+            "likes": 42,
+            "comments": 3,
+            "favorites": 4,
+            "shares": 5,
+            "coins": None,
+            "danmaku": None,
+        },
+        "collected_at": "2026-07-02T09:00:00+08:00",
+        "collection_source": None,
+        "rank": 1,
+    }
+    item.update(overrides)
+    return item
+
+
+def test_performance_rows_render_complete_audit_contract_in_both_formats():
+    analysis = {
+        "meta": {"main_sort_metric": "likes"},
+        "high_performance": [_auditable_performance_item()],
+        "low_performance": [],
+    }
+
+    md, html = render_report.build_high_performance(analysis)
+
+    expected = (
+        "1001",
+        "审计样本",
+        "item（作品链接）",
+        "2026-07-01T12:30:00+08:00",
+        "likes",
+        "点赞: 42",
+        "1.2500",
+        "views=1,000",
+        "likes=42",
+        "comments=3",
+        "favorites=4",
+        "shares=5",
+        "coins=—",
+        "danmaku=—",
+        "2026-07-02T09:00:00+08:00",
+    )
+    for rendered in (md, html):
+        for value in expected:
+            assert value in rendered
+    assert "[作品链接](https://www.douyin.com/video/1001)" in md
+    assert 'href="https://www.douyin.com/video/1001"' in html
+
+
+def test_profile_index_evidence_is_never_rendered_as_an_item_link():
+    profile_anchor = "https://www.douyin.com/user/profile-owner"
+    item = _auditable_performance_item(
+        post_id="idx-1",
+        title="索引样本",
+        post_url=None,
+        evidence_url=profile_anchor,
+        item_url_known=False,
+        url_kind="profile_index",
+    )
+    analysis = {
+        "meta": {"main_sort_metric": "likes"},
+        "high_performance": [item],
+        "low_performance": [],
+    }
+
+    md, html = render_report.build_high_performance(analysis)
+
+    for rendered in (md, html):
+        assert "profile_index" in rendered
+        assert "主页证据锚点" in rendered
+        assert "不是作品链接" in rendered
+    assert f"[索引样本]({profile_anchor})" not in md
+    assert f'<a href="{profile_anchor}">索引样本</a>' not in html
+    assert "item（作品链接）" not in md
+    assert "item（作品链接）" not in html
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "https://outside.example/video/1001",
+        "https://www.douyin.com/user/1001",
+        "https://www.douyin.com/video/9999",
+    ],
+)
+def test_safe_https_without_platform_path_and_parent_binding_is_not_an_item_link(
+    candidate
+):
+    item = _auditable_performance_item(
+        post_url=candidate,
+        evidence_url=candidate,
+    )
+    analysis = {
+        "meta": {"platform": "douyin", "main_sort_metric": "likes"},
+        "high_performance": [item],
+        "low_performance": [],
+        "posts": [],
+    }
+    template = "<html><body>" + "".join(
+        f"{{{{{name}}}}}" for name in render_report.PLACEHOLDERS
+    ) + "</body></html>"
+
+    result = render_report.render_in_memory(
+        profile={"platform": "douyin"},
+        posts_csv=[],
+        analysis=analysis,
+        template=template,
+    )
+
+    assert "item（无安全作品链接）" in result.markdown
+    assert "item（无安全作品链接）" in result.html
+    assert f"]({candidate})" not in result.markdown
+    assert f'href="{candidate}"' not in result.html
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "https://outside.example/user/profile-owner",
+        "https://www.douyin.com/video/1001",
+    ],
+)
+def test_profile_index_anchor_requires_a_canonical_douyin_profile(candidate):
+    item = _auditable_performance_item(
+        post_id="idx-1",
+        post_url=None,
+        evidence_url=candidate,
+        item_url_known=False,
+        url_kind="profile_index",
+    )
+    analysis = {
+        "meta": {"platform": "douyin", "main_sort_metric": "likes"},
+        "high_performance": [item],
+        "low_performance": [],
+    }
+
+    md, html = render_report.build_high_performance(analysis)
+
+    assert "profile_index（主页证据锚点，不是作品链接）" in md
+    assert "profile_index（主页证据锚点，不是作品链接）" in html
+    assert f"]({candidate})" not in md
+    assert f'href="{candidate}"' not in html
+
+
+def test_core_insights_render_source_statements_and_every_evidence_row():
+    item = _auditable_performance_item()
+    analysis = {
+        "meta": {"platform": "douyin", "main_sort_metric": "likes"},
+        "high_performance": [item],
+        "low_performance": [],
+        "core_insights": [
+            {
+                "id": "performance-high",
+                "kind": "high_performance",
+                "statement": "高表现组按 likes 确定性排名。",
+                "main_metric": "likes",
+                "evidence": [
+                    {
+                        "post_id": "1002",
+                        "url": "https://www.douyin.com/video/1002",
+                        "url_kind": "item",
+                        "collected_at": "2026-07-03T10:00:00+08:00",
+                        "metrics": item["metrics"],
+                        "rank": 2,
+                        "value": 41,
+                    }
+                ],
+            }
+        ],
+    }
+
+    md, html = render_report.build_high_performance(analysis)
+
+    expected = (
+        "performance-high",
+        "高表现组按 likes 确定性排名。",
+        "1002",
+        "item（作品链接）",
+        "rank=2",
+        "likes=41",
+        "2026-07-03T10:00:00+08:00",
+    )
+    for rendered in (md, html):
+        for value in expected:
+            assert value in rendered
+
+
+def test_performance_and_insight_fields_escape_markup_and_reject_unsafe_urls():
+    malicious_url = "javascript:alert(1)"
+    item = _auditable_performance_item(
+        title="<script>alert('title')</script>|[x](javascript:y)",
+        post_url=malicious_url,
+        evidence_url=malicious_url,
+        metrics={
+            "views": "<img src=x onerror=alert(1)>",
+            "likes": 42,
+            "comments": 3,
+            "favorites": 4,
+            "shares": 5,
+            "coins": None,
+            "danmaku": None,
+        },
+    )
+    analysis = {
+        "meta": {"main_sort_metric": "likes"},
+        "high_performance": [item],
+        "low_performance": [],
+        "core_insights": [
+            {
+                "id": "performance-high",
+                "kind": "high_performance",
+                "statement": "<svg onload=alert('statement')>",
+                "main_metric": "likes",
+                "evidence": [
+                    {
+                        "post_id": "1001",
+                        "url": malicious_url,
+                        "url_kind": "item",
+                        "collected_at": item["collected_at"],
+                        "metrics": item["metrics"],
+                        "rank": 1,
+                        "value": 42,
+                    }
+                ],
+            }
+        ],
+    }
+
+    md, html = render_report.build_high_performance(analysis)
+
+    assert "<script>" not in md
+    assert "<img" not in md
+    assert "<svg" not in md
+    assert "](javascript:alert" not in md
+    assert "javascript:alert%281%29" not in md
+    assert "<script>" not in html
+    assert "<img" not in html
+    assert "<svg" not in html
+    assert 'href="javascript:' not in html
+    assert "&lt;script&gt;" in md
+    assert "&lt;script&gt;" in html
+
+
+def _template_with_existing_placeholders():
+    return "<html><body>" + "".join(
+        f"{{{{{name}}}}}" for name in render_report.PLACEHOLDERS
+    ) + "</body></html>"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "https://outside.example/video/1001",
+        "https://www.douyin.com/video/9999",
+        "https://www.douyin.com/user/1001",
+    ],
+)
+def test_sources_do_not_link_or_reference_unbound_https_item_candidates(candidate):
+    analysis = {
+        "meta": {"platform": "douyin"},
+        "posts": [
+            {
+                "platform": "douyin",
+                "post_id": "1001",
+                "post_url": candidate,
+                "item_url_known": True,
+                "url_kind": "item",
+            }
+        ],
+        "high_performance": [],
+        "low_performance": [],
+    }
+
+    result = render_report.render_in_memory(
+        profile={"platform": "douyin"},
+        posts_csv=[],
+        analysis=analysis,
+        template=_template_with_existing_placeholders(),
+    )
+
+    assert f"]({candidate})" not in result.markdown
+    assert f'href="{candidate}"' not in result.html
+
+
+def test_sources_keep_canonical_jingxuan_item_link_bound_to_parent_id():
+    post_id = "7646342441319408036"
+    url = f"https://jingxuan.douyin.com/m/video/{post_id}"
+    analysis = {
+        "meta": {
+            "platform": "douyin",
+            "collection_source": "douyin_jingxuan",
+        },
+        "posts": [
+            {
+                "platform": "douyin",
+                "post_id": post_id,
+                "post_url": url,
+                "item_url_known": True,
+                "url_kind": "item",
+                "collection_source": "douyin_jingxuan",
+            }
+        ],
+        "high_performance": [],
+        "low_performance": [],
+    }
+
+    result = render_report.render_in_memory(
+        profile={"platform": "douyin"},
+        posts_csv=[{"post_url": url}],
+        analysis=analysis,
+        template=_template_with_existing_placeholders(),
+    )
+
+    assert f"[{post_id}]({url})" in result.markdown
+    assert f'href="{url}"' in result.html
+
+
+def test_sources_keep_profile_index_homepage_only_as_account_source():
+    profile_url = "https://www.douyin.com/user/profile-owner"
+    analysis = {
+        "meta": {
+            "platform": "douyin",
+            "collection_source": "douyin_search_index",
+        },
+        "posts": [
+            {
+                "platform": "douyin",
+                "post_id": "idx-1",
+                "post_url": None,
+                "evidence_url": profile_url,
+                "item_url_known": False,
+                "url_kind": "profile_index",
+                "collection_source": "douyin_search_index",
+            }
+        ],
+        "high_performance": [],
+        "low_performance": [],
+    }
+
+    result = render_report.render_in_memory(
+        profile={"platform": "douyin", "profile_url": profile_url},
+        posts_csv=[],
+        analysis=analysis,
+        template=_template_with_existing_placeholders(),
+    )
+    sources_md, sources_html = render_report.build_sources(
+        analysis, {"profile_url": profile_url}
+    )
+
+    assert result.diagnostics == ()
+    assert sources_md.count(f"]({profile_url})") == 1
+    assert sources_html.count(f'href="{profile_url}"') == 1
+    assert "idx-1" not in sources_md

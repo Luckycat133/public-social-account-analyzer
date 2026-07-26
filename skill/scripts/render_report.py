@@ -34,8 +34,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from immutable_workspace import WorkspaceError, reject_sealed_workspace
+from collectors.url_policy import canonical_item_url, canonical_profile_url
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +55,7 @@ METRIC_LABELS = {
     "coins": "投币",
     "danmaku": "弹幕",
 }
+COLLECTION_STATUSES = ("SUCCESS", "PARTIAL", "FAILED", "DELETED", "RESTRICTED")
 
 # 12 个占位符 -> 报告节标题（顺序固定，对应模板 SECTION 标记）
 SECTION_DEFS = [
@@ -214,6 +217,28 @@ def md_escape_text(value) -> str:
     return s
 
 
+def _is_safe_public_url(url) -> bool:
+    """Accept only canonical HTTPS report links without ambiguous authority."""
+    if not isinstance(url, str) or not url or url != url.strip():
+        return False
+    if any(char.isspace() or ord(char) < 32 for char in url) or "\\" in url:
+        return False
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
 def _md_link_destination(url: str) -> str:
     """转义可信 URL 中会提前结束 Markdown link destination 的字符。"""
     return (
@@ -230,10 +255,14 @@ def _md_link_destination(url: str) -> str:
 
 
 def link_md(url: str, text: str) -> MdRaw:
+    if not _is_safe_public_url(url):
+        return MdRaw(md_escape_text(text))
     return MdRaw(f"[{md_escape_text(text)}]({_md_link_destination(url)})")
 
 
 def link_html(url: str, text: str) -> Raw:
+    if not _is_safe_public_url(url):
+        return Raw(h_esc(text))
     return Raw(f'<a href="{h_esc(url)}">{h_esc(text)}</a>')
 
 
@@ -553,6 +582,45 @@ def _safe_get(d, *keys, default=None):
     return cur
 
 
+def _classification_lifecycle_rows(analysis) -> list[list[str]]:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+
+    def lifecycle_value(key):
+        if isinstance(analysis, dict) and key in analysis:
+            return analysis.get(key)
+        return meta.get(key) if isinstance(meta, dict) else None
+
+    status = lifecycle_value("classification_status")
+    status_labels = {
+        "pending-model": "pending-model（待分类）",
+        "partial-model": "partial-model（部分分类）",
+        "completed": "completed（已完成）",
+    }
+    coverage = lifecycle_value("classification_coverage")
+    if not isinstance(coverage, dict):
+        coverage = {}
+    rate = coverage.get("rate")
+    rate_label = "—" if rate is None else fmt_float(rate, 4)
+    return [
+        ["分类状态 (classification_status)", status_labels.get(status, status or "—")],
+        ["分类版本 (classification_version)", lifecycle_value("classification_version") or "—"],
+        ["分类总数 (total_count)", fmt_int(coverage.get("total_count"))],
+        ["已分类数 (classified_count)", fmt_int(coverage.get("classified_count"))],
+        ["待分类数 (pending_count)", fmt_int(coverage.get("pending_count"))],
+        ["分类覆盖率 (rate)", rate_label],
+    ]
+
+
+def _status_count_rows(sample_boundary) -> list[list[str]]:
+    counts = sample_boundary.get("status_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+    return [
+        [f"采集状态 {status}", fmt_int(counts.get(status, 0))]
+        for status in COLLECTION_STATUSES
+    ]
+
+
 def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
     meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
     account_name = meta.get("account_name") or (profile or {}).get("account_name") or "未知账号"
@@ -583,8 +651,8 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
             else ("是" if meta.get("evidence_is_exhaustive") is True else "—")
         )],
         ["主排序指标", meta.get("main_sort_metric") or "—"],
-        ["分类状态", meta.get("classification_status") or "—"],
     ]
+    rows.extend(_classification_lifecycle_rows(analysis))
     md = md_table(["字段", "值"], rows)
 
     # 账号主页行需要渲染为链接
@@ -615,6 +683,7 @@ def build_quality_summary(analysis) -> tuple[str, str]:
         ["被排除标记内容 (excluded_flagged)", fmt_int(sb.get("excluded_flagged"))],
         ["有效内容时间范围", time_range],
     ]
+    rows.extend(_status_count_rows(sb))
     md = md_table(["样本边界指标", "数值"], rows)
 
     # 字段覆盖率子表
@@ -638,17 +707,55 @@ def build_quality_summary(analysis) -> tuple[str, str]:
 def build_account_card(profile) -> tuple[str, str]:
     if not profile:
         return EMPTY_MD, EMPTY_HTML
+    verified = profile.get("verified")
+    if verified is True:
+        verified_label = "是"
+    elif verified is False:
+        verified_label = "否"
+    elif verified is None or verified == "":
+        verified_label = "—"
+    else:
+        verified_label = str(verified)
+    platform = profile.get("platform") or "—"
+    platform_key = str(platform).casefold()
+    platform_metrics = profile.get("platform_metrics")
+    if not isinstance(platform_metrics, dict):
+        platform_metrics = {}
     rows = [
-        ["平台", profile.get("platform") or "—"],
+        ["平台", platform],
         ["账号 ID", profile.get("account_id") or "—"],
         ["账号名称", profile.get("account_name") or "—"],
-        ["认证信息", profile.get("verified") or "—"],
+        ["认证信息", verified_label],
         ["粉丝数", fmt_int(profile.get("followers"))],
         ["作品数", fmt_int(profile.get("post_count"))],
-        ["简介", (profile.get("bio") or "—")],
-        ["主页", link_md(profile.get("profile_url") or "", profile.get("profile_url") or "—")
-         if profile.get("profile_url") else "—"],
     ]
+    if platform_key == "bilibili":
+        rows.append(["账号等级", fmt_int(profile.get("level"))])
+    elif platform_key == "douyin":
+        douyin_id = (
+            platform_metrics.get("douyin_id")
+            or platform_metrics.get("unique_id")
+            or profile.get("unique_id")
+        )
+        rows.extend(
+            [
+                ["抖音号", douyin_id or "—"],
+                ["获赞总量", fmt_int(platform_metrics.get("total_likes"))],
+            ]
+        )
+    elif platform_key == "weibo":
+        rows.append(["关注数", fmt_int(platform_metrics.get("following"))])
+    rows.extend(
+        [
+            ["简介", profile.get("bio") or "—"],
+            [
+                "主页",
+                link_md(profile.get("profile_url") or "", profile.get("profile_url") or "—")
+                if profile.get("profile_url")
+                else "—",
+            ],
+        ]
+    )
     md = md_table(["字段", "值"], rows)
 
     html_rows = []
@@ -842,43 +949,282 @@ def build_metrics_dashboard(analysis) -> tuple[str, str]:
     return md, html
 
 
+def _metrics_contract_text(metrics) -> str:
+    values = metrics if isinstance(metrics, dict) else {}
+    return "; ".join(
+        f"{metric}={fmt_metric(values.get(metric))}"
+        for metric in METRIC_FIELDS
+    )
+
+
+def _canonical_jingxuan_report_item(url, post_id, platform) -> str | None:
+    expected = str(post_id or "").strip()
+    if platform != "douyin" or not expected.isdigit() or not _is_safe_public_url(url):
+        return None
+    parsed = urlsplit(url)
+    if parsed.hostname != "jingxuan.douyin.com":
+        return None
+    if parsed.path != f"/m/video/{expected}":
+        return None
+    return f"https://jingxuan.douyin.com/m/video/{expected}"
+
+
+def _canonical_report_item_url(
+    record, url, default_platform, default_collection_source
+) -> str | None:
+    platform = record.get("platform") or default_platform
+    post_id = record.get("post_id")
+    if not isinstance(platform, str) or not str(post_id or "").strip():
+        return None
+    collection_source = (
+        record.get("collection_source") or default_collection_source
+    )
+    if collection_source == "douyin_jingxuan":
+        return _canonical_jingxuan_report_item(url, post_id, platform)
+    return canonical_item_url(platform, url, post_id)
+
+
+def _report_reference(
+    record,
+    *,
+    url_field: str,
+    require_item_known: bool,
+    default_platform=None,
+    default_collection_source=None,
+) -> tuple[MdRaw, Raw]:
+    kind = record.get("url_kind") if isinstance(record, dict) else None
+    if kind == "item":
+        url = record.get(url_field)
+        item_known = not require_item_known or record.get("item_url_known") is True
+        canonical_url = _canonical_report_item_url(
+            record, url, default_platform, default_collection_source
+        )
+        if item_known and canonical_url is not None and canonical_url == url:
+            ref_post(canonical_url)
+            label = "item（作品链接）"
+            md_link = link_md(canonical_url, "作品链接")
+            html_link = link_html(canonical_url, "作品链接")
+            return (
+                MdRaw(f"{md_escape_text(label)}：{md_link.s}"),
+                Raw(f"{h_esc(label)}：{html_link.s}"),
+            )
+        label = "item（无安全作品链接）"
+        return MdRaw(md_escape_text(label)), Raw(h_esc(label))
+
+    if kind == "profile_index":
+        url = record.get(url_field)
+        label = "profile_index（主页证据锚点，不是作品链接）"
+        platform = record.get("platform") or default_platform
+        canonical_url = (
+            canonical_profile_url("douyin", url)
+            if platform == "douyin"
+            else None
+        )
+        if canonical_url is not None and canonical_url == url:
+            md_link = link_md(canonical_url, "主页证据锚点")
+            html_link = link_html(canonical_url, "主页证据锚点")
+            return (
+                MdRaw(f"{md_escape_text(label)}：{md_link.s}"),
+                Raw(f"{h_esc(label)}：{html_link.s}"),
+            )
+        return MdRaw(md_escape_text(label)), Raw(h_esc(label))
+
+    kind_label = str(kind) if kind not in (None, "") else "missing"
+    label = f"{kind_label}（无单条作品链接）"
+    return MdRaw(md_escape_text(label)), Raw(h_esc(label))
+
+
+def _performance_reference(
+    record, default_platform=None, default_collection_source=None
+) -> tuple[MdRaw, Raw]:
+    if record.get("url_kind") == "profile_index":
+        return _report_reference(
+            record,
+            url_field="evidence_url",
+            require_item_known=True,
+            default_platform=default_platform,
+            default_collection_source=default_collection_source,
+        )
+    return _report_reference(
+        record,
+        url_field="post_url",
+        require_item_known=True,
+        default_platform=default_platform,
+        default_collection_source=default_collection_source,
+    )
+
+
+def _main_metric_text(record, main_metric, metric_label) -> str:
+    metric = record.get("main_metric") or main_metric
+    label = metric_label or (METRIC_LABELS.get(metric, metric) if metric else "—")
+    metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+    raw_value = record.get("value") if "value" in record else metrics.get(metric)
+    metric_name = str(metric) if metric else "—"
+    return f"{label}: {fmt_metric(raw_value)} ({metric_name})"
+
+
+def _relative_to_main_median(record, main_metric) -> str:
+    value = record.get("relative_to_main_median")
+    if value is None:
+        relative_performance = record.get("relative_performance")
+        if isinstance(relative_performance, dict) and main_metric:
+            value = relative_performance.get(main_metric)
+    return fmt_float(value, 4)
+
+
 def _render_perf_group(
     group,
     main_metric: str | None = None,
     metric_label: str | None = None,
+    default_platform=None,
+    default_collection_source=None,
 ) -> tuple[str, str]:
     if not isinstance(group, list) or not group:
         return EMPTY_MD, EMPTY_HTML
 
-    headers = ["内容", "发布时间", "主指标值", "相对中位表现", "播放互动率"]
+    headers = [
+        "排名",
+        "post_id",
+        "内容",
+        "URL 类型 / 证据",
+        "发布时间",
+        "主指标名称与值",
+        "relative_to_main_median",
+        "完整 metrics",
+        "collected_at",
+    ]
     rows_md, rows_html = [], []
     for p in group:
         if not isinstance(p, dict):
             continue
         pid = p.get("post_id") or "—"
         display = p.get("title") or pid
-        url = p.get("post_url") or ""
         pub = p.get("published_at") or "—"
-        metrics = p.get("metrics", {}) or {}
-        rp = p.get("relative_performance", {}) or {}
-        mm = main_metric
-        mm_label = metric_label or (METRIC_LABELS.get(mm, mm) if mm else "—")
-        raw_mm_value = p.get("value") if "value" in p else metrics.get(mm)
-        mm_val = fmt_metric(raw_mm_value) if mm else "—"
-        rp_val = fmt_float(rp.get(mm)) if (mm and mm in rp and rp.get(mm) is not None) else "—"
-        vber = fmt_pct(p.get("view_based_engagement_rate"))
-        if url:
-            ref_post(url)
-            md_link = link_md(url, display)
-            html_link = link_html(url, display)
-        else:
-            md_link, html_link = display, Raw(h_esc(display))
-        rows_md.append([md_link, pub, f"{mm_label}: {mm_val}", rp_val, vber])
-        rows_html.append([html_link, Raw(h_esc(pub)),
-                          Raw(h_esc(f"{mm_label}: {mm_val}")), Raw(h_esc(rp_val)), Raw(h_esc(vber))])
+        md_reference, html_reference = _performance_reference(
+            p, default_platform, default_collection_source
+        )
+        main_metric_text = _main_metric_text(p, main_metric, metric_label)
+        relative = _relative_to_main_median(p, p.get("main_metric") or main_metric)
+        metrics_text = _metrics_contract_text(p.get("metrics"))
+        collected_at = p.get("collected_at") or "—"
+        rows_md.append(
+            [
+                fmt_int(p.get("rank")),
+                pid,
+                display,
+                md_reference,
+                pub,
+                main_metric_text,
+                relative,
+                metrics_text,
+                collected_at,
+            ]
+        )
+        rows_html.append(
+            [
+                fmt_int(p.get("rank")),
+                pid,
+                display,
+                html_reference,
+                pub,
+                main_metric_text,
+                relative,
+                metrics_text,
+                collected_at,
+            ]
+        )
     if not rows_md:
         return EMPTY_MD, EMPTY_HTML
     return md_table(headers, rows_md), html_table(headers, rows_html)
+
+
+def _render_core_insights(
+    analysis,
+    kind: str,
+    default_platform=None,
+    default_collection_source=None,
+) -> tuple[str, str]:
+    insights = analysis.get("core_insights") if isinstance(analysis, dict) else None
+    if not isinstance(insights, list):
+        return "", ""
+    md_blocks: list[str] = []
+    html_blocks: list[str] = []
+    for insight in insights:
+        if not isinstance(insight, dict) or insight.get("kind") != kind:
+            continue
+        insight_id = insight.get("id") or "—"
+        statement = insight.get("statement") or "—"
+        main_metric = insight.get("main_metric") or "—"
+        evidence_rows_md = []
+        evidence_rows_html = []
+        evidence_items = insight.get("evidence")
+        if not isinstance(evidence_items, list):
+            evidence_items = []
+        for evidence in evidence_items:
+            if not isinstance(evidence, dict):
+                continue
+            md_reference, html_reference = _report_reference(
+                evidence,
+                url_field="url",
+                require_item_known=False,
+                default_platform=default_platform,
+                default_collection_source=default_collection_source,
+            )
+            metric_value = f"{main_metric}={fmt_metric(evidence.get('value'))}"
+            rank = f"rank={fmt_int(evidence.get('rank'))}"
+            metrics_text = _metrics_contract_text(evidence.get("metrics"))
+            collected_at = evidence.get("collected_at") or "—"
+            evidence_rows_md.append(
+                [
+                    evidence.get("post_id") or "—",
+                    md_reference,
+                    rank,
+                    metric_value,
+                    metrics_text,
+                    collected_at,
+                ]
+            )
+            evidence_rows_html.append(
+                [
+                    evidence.get("post_id") or "—",
+                    html_reference,
+                    rank,
+                    metric_value,
+                    metrics_text,
+                    collected_at,
+                ]
+            )
+        headers = [
+            "post_id",
+            "URL 类型 / 证据",
+            "全局排名",
+            "主指标名称与值",
+            "完整 metrics",
+            "collected_at",
+        ]
+        md_blocks.append(
+            f"**核心洞察 {md_escape_text(insight_id)}**\n\n"
+            f"- statement: {md_escape_text(statement)}\n\n"
+            + md_table(headers, evidence_rows_md)
+        )
+        html_blocks.append(
+            '<div class="core-insight">'
+            f"<p><strong>核心洞察 {h_esc(insight_id)}</strong></p>"
+            f"<p>statement: {h_esc(statement)}</p>"
+            + html_table(headers, evidence_rows_html)
+            + "</div>"
+        )
+    return "\n\n".join(md_blocks), "".join(html_blocks)
+
+
+def _append_report_block(
+    md: str, html: str, extra_md: str, extra_html: str
+) -> tuple[str, str]:
+    if not extra_md and not extra_html:
+        return md, html
+    combined_md = extra_md if md == EMPTY_MD else md + "\n\n" + extra_md
+    combined_html = extra_html if html == EMPTY_HTML else html + extra_html
+    return combined_md, combined_html
 
 
 def _performance_metric_context(analysis) -> tuple[str | None, str | None, str | None]:
@@ -896,6 +1242,11 @@ def _performance_metric_context(analysis) -> tuple[str | None, str | None, str |
     return main_metric, metric_label, metric_note
 
 
+def _performance_provenance_context(analysis) -> tuple[object, object]:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    return meta.get("platform"), meta.get("collection_source")
+
+
 def _append_performance_note(md: str, html: str, note: str | None) -> tuple[str, str]:
     if note is None:
         return md, html
@@ -907,9 +1258,23 @@ def _append_performance_note(md: str, html: str, note: str | None) -> tuple[str,
 
 def build_high_performance(analysis) -> tuple[str, str]:
     main_metric, metric_label, metric_note = _performance_metric_context(analysis)
+    platform, collection_source = _performance_provenance_context(analysis)
     high = analysis.get("high_performance")
     low = analysis.get("low_performance")
-    md, html = _render_perf_group(high, main_metric, metric_label)
+    md, html = _render_perf_group(
+        high,
+        main_metric,
+        metric_label,
+        platform,
+        collection_source,
+    )
+    insight_md, insight_html = _render_core_insights(
+        analysis,
+        "high_performance",
+        platform,
+        collection_source,
+    )
+    md, html = _append_report_block(md, html, insight_md, insight_html)
     # 高低表现雷达图：对比两组在各指标上的均值形态（仅作形态对比，不构成因果）
     radar = svg_high_low_radar(high, low, METRIC_FIELDS)
     if radar:
@@ -921,8 +1286,22 @@ def build_high_performance(analysis) -> tuple[str, str]:
 
 def build_low_performance(analysis) -> tuple[str, str]:
     main_metric, metric_label, metric_note = _performance_metric_context(analysis)
+    platform, collection_source = _performance_provenance_context(analysis)
     group = analysis.get("low_performance")
-    md, html = _render_perf_group(group, main_metric, metric_label)
+    md, html = _render_perf_group(
+        group,
+        main_metric,
+        metric_label,
+        platform,
+        collection_source,
+    )
+    insight_md, insight_html = _render_core_insights(
+        analysis,
+        "low_performance",
+        platform,
+        collection_source,
+    )
+    md, html = _append_report_block(md, html, insight_md, insight_html)
     return _append_performance_note(md, html, metric_note)
 
 
@@ -930,8 +1309,10 @@ def _dist_table(posts, key, label) -> tuple[str, str]:
     counter = Counter()
     for p in posts:
         v = p.get(key)
-        if v in (None, "", "unknown"):
-            counter["未分类/unknown"] += 1
+        if v in (None, ""):
+            counter["待分类"] += 1
+        elif v == "unknown":
+            counter["unknown（模型无法判断）"] += 1
         else:
             counter[str(v)] += 1
     if not counter:
@@ -1047,6 +1428,7 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
         ["受限内容", fmt_int(sb.get("restricted"))],
         ["被排除标记内容", fmt_int(sb.get("excluded_flagged"))],
     ]
+    rows.extend(_status_count_rows(sb))
     # 字段可见性（来自 profile）
     fv = (profile or {}).get("field_visibility", {}) or {}
     hidden = [k for k, v in fv.items() if v in ("hidden", "partial")]
@@ -1090,18 +1472,36 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
 
 def build_sources(analysis, profile) -> tuple[str, str]:
     urls = []
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    default_platform = (
+        meta.get("platform") or (profile or {}).get("platform")
+    )
+    default_collection_source = meta.get("collection_source")
     prof_url = (profile or {}).get("profile_url")
-    if prof_url:
-        urls.append(("账号主页", prof_url))
+    canonical_profile = (
+        canonical_profile_url(default_platform, prof_url)
+        if isinstance(default_platform, str)
+        else None
+    )
+    if canonical_profile is not None and canonical_profile == prof_url:
+        urls.append(("账号主页", canonical_profile))
     posts = analysis.get("posts", []) if isinstance(analysis, dict) else []
     for p in posts:
-        if (
-            isinstance(p, dict)
-            and p.get("post_url")
-            and p.get("item_url_known") is not False
-        ):
-            ref_post(p["post_url"])
-            urls.append((p.get("post_id") or p["post_url"], p["post_url"]))
+        if not isinstance(p, dict):
+            continue
+        if p.get("url_kind") != "item" or p.get("item_url_known") is not True:
+            continue
+        post_url = p.get("post_url")
+        canonical_post = _canonical_report_item_url(
+            p,
+            post_url,
+            default_platform,
+            default_collection_source,
+        )
+        if canonical_post is None or canonical_post != post_url:
+            continue
+        ref_post(canonical_post)
+        urls.append((p.get("post_id") or canonical_post, canonical_post))
 
     if not urls:
         return EMPTY_MD, EMPTY_HTML

@@ -61,6 +61,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 6. **报告渲染与独立提交**
    - 流水线在内存中生成 `account-analysis-report.md`、`dashboard.html` 与 `analysis.json`；缺输入、任一章节异常、坏链接或输出校验失败均为致命错误。
+   - Markdown 与 HTML 在既有 12 个章节中同步显示平台账号字段、五类采集状态、分类生命周期、高/低表现完整证据及 `core_insights`；待分类不与模型 `unknown`/`other` 混用，主页锚点不渲染为作品链接。
    - 校验通过后才排他预留分析目录，create-only 写入精确白名单并创建新的 `manifest.json` / `.complete`。`.complete` 表示持久提交；`task.json.task_status` 表示业务完整性。
    - 报告中显著标记声明：“公开页面快照，不代表账号后台真实曝光和转化”。
 

@@ -275,6 +275,12 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 | followers | 粉丝 | 粉丝 | 粉丝 |
 | post_count | 视频数 | 作品数 | 微博数 |
 
+报告账号卡在通用字段之外固定显示：B站 `level`；抖音
+`platform_metrics.douyin_id`（缺失时回退 `platform_metrics.unique_id`）与
+`platform_metrics.total_likes`；微博 `platform_metrics.following`。`verified=true/false/null`
+分别显示“是/否/—”，认证文本原样显示但必须按报告格式转义；其他 `null`
+字段统一显示“—”。
+
 ## 5. Post 数据结构
 
 单条内容基础信息。`platform` + `post_id` 唯一；时间统一为 ISO 8601。
@@ -498,6 +504,8 @@ selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
 根级 `core_insights` 只输出高/低组事实。每项固定包含 `id`、`kind`、
 `statement`、`main_metric`、`evidence`；每条 evidence 固定包含
 `post_id`、`url`、`url_kind`、`collected_at`、`metrics`、`rank`、`value`。
+正式 Markdown/HTML 渲染器必须在既有 12 个章节占位符内完整呈现上述高/低条目与
+`core_insights`，不增加模板占位符，也不以主页 `profile_index` 冒充作品链接。
 证据顺序必须与确定性高/低组选取顺序一致，不得引用组外记录或补充因果解释。
 
 ## 8. 空值规则（field_visibility）

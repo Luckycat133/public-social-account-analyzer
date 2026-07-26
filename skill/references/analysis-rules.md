@@ -44,6 +44,9 @@
 计算与呈现要求：
 
 - **指标字段覆盖率** = 该字段在有效样本中取值非 `null` 的条数 ÷ 有效样本总数；
+- Markdown 与 HTML 报告的样本质量/边界章节必须按固定顺序显示
+  `SUCCESS`、`PARTIAL`、`FAILED`、`DELETED`、`RESTRICTED` 五类计数；
+  `status_counts` 缺失的键显示为 `0`，不得省略。
 - 当 `field_visibility` 标注某字段为 `hidden` / `partial` 时，该字段覆盖率应相应下调并在报告中说明受限来源；
 - 任何指标若覆盖率过低（建议 < 50%）应在对应模块顶部标注"分母不足，结论仅供参考"；
 - 禁止将样本边界数字与默认统计数字混写，须各自独立成表。
@@ -247,6 +250,9 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
   `classification_version` 是版本，无已分类内容时为 `null`，否则为 `llm-1`。两者不得混用。
 - `classification_coverage` 以作品级 `classification_version=llm-1` 作为唯一已分类判据，
   记录总数、已分类数、待分类数与四位小数覆盖率；零样本覆盖率为 `null`。
+- Markdown 与 HTML 报告必须同时显示分类状态、版本及覆盖的总数/已分类数/
+  待分类数/比率。内容模式分布将 `null` 显示为“待分类”；模型已输出的
+  `unknown` 和 `other` 必须单独显示，不得与待分类合并。
 - 根对象与 `meta` 中的上述三项必须完全一致。分析阶段只在
   `classification_status=completed` 且 `evidence_coverage.status=COMPLETE` 时完成。
 - 待分类、部分分类与证据不完整分别记录 `PENDING_CLASSIFICATION`、
@@ -305,6 +311,14 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
 - `core_insights` 仅可陈述高/低组的确定性排名事实；其中每条 evidence 必须逐条对应
   被选记录，保留 URL 类型、采集时间、公开指标、全局排名和主指标值。不得基于标题、
   主题或相关性生成原因、策略或语义推断。
+- Markdown 与 HTML 的每条高/低表现记录必须显示 `url_kind`、`published_at`、
+  主指标名与值、`relative_to_main_median`、七个固定公开 `metrics` 字段及
+  `collected_at`。`profile_index` 只能标记为主页证据锚点，不得渲染为作品链接。
+- 报告必须逐字渲染每项 `core_insights.statement` 及其全部 evidence 行，不得新生成结论。
+  所有公开文本与指标值按 Markdown/HTML 上下文转义；只有规范 HTTPS 链接才可成为链接。
+- “来源链接”章节与高/低表现章节复用同一作品 URL 合同：平台、路径和
+  `post_id` 必须精确绑定。站外、错路径、错 ID 和主页候选不生成作品链接，也不登记为
+  作品引用；合法 Jingxuan 作品仍遵守严格官方路径例外。
 
 ---
 
