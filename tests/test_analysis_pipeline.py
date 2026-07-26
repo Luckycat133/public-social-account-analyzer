@@ -1240,6 +1240,18 @@ def test_complete_classification_and_item_evidence_complete_pipeline(tmp_path):
         "rate": 1.0,
         "status": "COMPLETE",
     }
+    assert analysis_payload["classification_breakdown"]["status"] == "completed"
+    assert analysis_payload["classification_breakdown"]["schema_version"] == 1
+    assert analysis_payload["high_low_feature_comparison"]["status"] == (
+        "completed"
+    )
+    assert analysis_payload["high_low_feature_comparison"]["schema_version"] == 1
+    markdown = (output / "account-analysis-report.md").read_text(encoding="utf-8")
+    html = (output / "dashboard.html").read_text(encoding="utf-8")
+    for rendered in (markdown, html):
+        assert "主题 × 形式计数矩阵" in rendered
+        assert "分类维度主指标表现" in rendered
+        assert "高低组结构化特征对比" in rendered
 
 
 @pytest.mark.parametrize(
@@ -1355,6 +1367,8 @@ def test_legacy_cli_complete_classification_matches_in_memory_contract(tmp_path)
         "classification_status",
         "classification_version",
         "classification_coverage",
+        "classification_breakdown",
+        "high_low_feature_comparison",
         "posts",
     ):
         assert actual[field] == expected[field]
@@ -1698,6 +1712,146 @@ def test_comment_semantic_status_does_not_change_global_analysis_completion():
     )
 
     assert pipeline._analysis_status(result) == "COMPLETED"
+
+
+def test_inconsistent_completed_feature_contract_fails_before_output_reservation(
+    monkeypatch, tmp_path
+):
+    pipeline = _pipeline_module()
+    posts = _performance_posts()
+    collection, _ = _collection(
+        tmp_path,
+        task_status="COMPLETED",
+        posts=posts,
+    )
+    output = tmp_path / "analysis"
+    classification_path = tmp_path / "classification-results.json"
+    classification_path.write_text(
+        json.dumps(
+            [_classification(post["post_id"]) for post in posts],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        analyze,
+        "compute_high_low_feature_comparison",
+        lambda *args, **kwargs: {
+            "schema_version": 1,
+            "status": "insufficient-sample",
+            "main_metric": "views",
+            "measured_count": 15,
+            "groups": {
+                "high": {"count": 0, "post_ids": []},
+                "low": {"count": 0, "post_ids": []},
+            },
+            "duration_buckets": [],
+            "features": [],
+            "limitations": [],
+        },
+    )
+    reserve_calls = []
+    original_reserve = pipeline.ImmutableWorkspace.reserve
+
+    def recording_reserve(*args, **kwargs):
+        reserve_calls.append(args[0])
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline.ImmutableWorkspace, "reserve", recording_reserve)
+
+    with pytest.raises(
+        pipeline.PipelineError,
+        match="deterministic analysis contract is inconsistent",
+    ):
+        pipeline.run_pipeline(
+            str(collection),
+            str(output),
+            template_text=_minimal_template(),
+            classification_results_path=str(classification_path),
+        )
+
+    assert reserve_calls == []
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("mutation", ["metric-metadata", "matrix-cells"])
+def test_inconsistent_breakdown_contract_fails_before_output_reservation(
+    monkeypatch, tmp_path, mutation
+):
+    pipeline = _pipeline_module()
+    posts = _performance_posts()
+    collection, _ = _collection(
+        tmp_path,
+        task_status="COMPLETED",
+        posts=posts,
+    )
+    output = tmp_path / "analysis"
+    classification_path = tmp_path / "classification-results.json"
+    classification_path.write_text(
+        json.dumps(
+            [
+                _classification(
+                    post["post_id"],
+                    topic=(
+                        "主题甲"
+                        if int(post["post_id"]) % 2
+                        else "主题乙"
+                    ),
+                    format=(
+                        "tutorial"
+                        if int(post["post_id"]) % 2
+                        else "vlog"
+                    ),
+                )
+                for post in posts
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    original_compute = analyze.compute_classification_breakdown
+
+    def inconsistent_breakdown(*args, **kwargs):
+        result = original_compute(*args, **kwargs)
+        if mutation == "metric-metadata":
+            result["main_metric"] = "likes"
+        else:
+            row = next(
+                item
+                for item in result["topic_format_matrix"]["rows"]
+                if item["counts"][0] > 0
+            )
+            row["counts"][0] -= 1
+            row["counts"][1] += 1
+        return result
+
+    monkeypatch.setattr(
+        analyze,
+        "compute_classification_breakdown",
+        inconsistent_breakdown,
+    )
+    reserve_calls = []
+    original_reserve = pipeline.ImmutableWorkspace.reserve
+
+    def recording_reserve(*args, **kwargs):
+        reserve_calls.append(args[0])
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline.ImmutableWorkspace, "reserve", recording_reserve)
+
+    with pytest.raises(
+        pipeline.PipelineError,
+        match="deterministic analysis contract is inconsistent",
+    ):
+        pipeline.run_pipeline(
+            str(collection),
+            str(output),
+            template_text=_minimal_template(),
+            classification_results_path=str(classification_path),
+        )
+
+    assert reserve_calls == []
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(

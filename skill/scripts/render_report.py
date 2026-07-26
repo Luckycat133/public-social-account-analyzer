@@ -1324,6 +1324,207 @@ def _dist_table(posts, key, label) -> tuple[str, str]:
     return md, html
 
 
+def _contract_limitations(contract: dict) -> tuple[str, str]:
+    values = contract.get("limitations")
+    limitations = (
+        [value for value in values if isinstance(value, str) and value]
+        if isinstance(values, list)
+        else []
+    )
+    if not limitations:
+        return "", ""
+    return (
+        "\n".join(f"> {md_escape_text(value)}" for value in limitations),
+        "".join(f'<p class="note">{h_esc(value)}</p>' for value in limitations),
+    )
+
+
+def _analysis_html_text(value) -> str:
+    """Escape HTML plus Markdown-link delimiters in untrusted analysis labels."""
+    escaped = h_esc(value)
+    for char, entity in (
+        ("!", "&#33;"),
+        ("[", "&#91;"),
+        ("]", "&#93;"),
+        ("(", "&#40;"),
+        (")", "&#41;"),
+    ):
+        escaped = escaped.replace(char, entity)
+    return escaped
+
+
+def _analysis_html_rows(rows: list[list[object]]) -> list[list[Raw]]:
+    return [
+        [Raw(_analysis_html_text(value)) for value in row]
+        for row in rows
+    ]
+
+
+def _classification_breakdown_block(analysis: dict) -> tuple[str, str]:
+    contract = analysis.get("classification_breakdown")
+    if not isinstance(contract, dict):
+        return "", ""
+    status = contract.get("status")
+    if status != "completed":
+        return _contract_limitations(contract)
+
+    matrix = contract.get("topic_format_matrix")
+    performance = contract.get("dimension_performance")
+    if not isinstance(matrix, dict) or not isinstance(performance, dict):
+        return "", ""
+    formats = matrix.get("formats") if isinstance(matrix.get("formats"), list) else []
+    matrix_rows = matrix.get("rows") if isinstance(matrix.get("rows"), list) else []
+    md_parts = ["### 主题 × 形式计数矩阵"]
+    html_parts = ['<h3 class="subsection">主题 × 形式计数矩阵</h3>']
+    rendered_matrix_rows = []
+    for row in matrix_rows:
+        if not isinstance(row, dict):
+            continue
+        counts = row.get("counts") if isinstance(row.get("counts"), list) else []
+        rendered_matrix_rows.append(
+            [row.get("topic"), fmt_int(row.get("post_count"))]
+            + [fmt_int(value) for value in counts]
+        )
+    matrix_headers = ["主题", "合计"] + [str(value) for value in formats]
+    if rendered_matrix_rows:
+        md_parts.extend(["", md_table(matrix_headers, rendered_matrix_rows)])
+        html_parts.append(
+            html_table(matrix_headers, _analysis_html_rows(rendered_matrix_rows))
+        )
+
+    main_metric = contract.get("main_metric")
+    md_parts.extend(["", "### 分类维度主指标表现"])
+    html_parts.append('<h3 class="subsection">分类维度主指标表现</h3>')
+    perf_headers = [
+        "维度",
+        "值",
+        "作品数",
+        "实测数",
+        "缺失数",
+        "实测率",
+        f"{main_metric} 中位数",
+    ]
+    perf_rows = []
+    for field in ("topic", "format"):
+        values = performance.get(field)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            perf_rows.append(
+                [
+                    field,
+                    item.get("value"),
+                    fmt_int(item.get("post_count")),
+                    fmt_int(item.get("measured_count")),
+                    fmt_int(item.get("missing_count")),
+                    fmt_float(item.get("measurement_rate"), 4),
+                    fmt_metric(item.get("main_metric_median")),
+                ]
+            )
+    if perf_rows:
+        md_parts.extend(["", md_table(perf_headers, perf_rows)])
+        html_parts.append(html_table(perf_headers, _analysis_html_rows(perf_rows)))
+
+    limitation_md, limitation_html = _contract_limitations(contract)
+    if limitation_md:
+        md_parts.extend(["", limitation_md])
+        html_parts.append(limitation_html)
+    return "\n".join(md_parts), "".join(html_parts)
+
+
+def _feature_value_text(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "—"
+    return str(value)
+
+
+def _feature_values_text(values) -> str:
+    if not isinstance(values, list) or not values:
+        return "—"
+    return "、".join(_feature_value_text(value) for value in values)
+
+
+def _high_low_feature_block(analysis: dict) -> tuple[str, str]:
+    contract = analysis.get("high_low_feature_comparison")
+    if not isinstance(contract, dict):
+        return "", ""
+    if contract.get("status") != "completed":
+        return _contract_limitations(contract)
+
+    features = contract.get("features")
+    if not isinstance(features, list):
+        return "", ""
+    md_parts = ["### 高低组结构化特征对比"]
+    html_parts = ['<h3 class="subsection">高低组结构化特征对比</h3>']
+
+    coverage_headers = [
+        "字段",
+        "高组已知/缺失",
+        "低组已知/缺失",
+        "共同值",
+        "高组独有",
+        "低组独有",
+    ]
+    coverage_rows = []
+    comparison_headers = [
+        "字段",
+        "值",
+        "高组 count/rate",
+        "低组 count/rate",
+        "rate_delta",
+    ]
+    comparison_rows = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        field = feature.get("field")
+        coverage_rows.append(
+            [
+                field,
+                f"{fmt_int(feature.get('high_known_count'))}/{fmt_int(feature.get('high_missing_count'))}",
+                f"{fmt_int(feature.get('low_known_count'))}/{fmt_int(feature.get('low_missing_count'))}",
+                _feature_values_text(feature.get("common_values")),
+                _feature_values_text(feature.get("high_only_values")),
+                _feature_values_text(feature.get("low_only_values")),
+            ]
+        )
+        values = feature.get("values")
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            comparison_rows.append(
+                [
+                    field,
+                    _feature_value_text(item.get("value")),
+                    f"{fmt_int(item.get('high_count'))}/{fmt_float(item.get('high_rate'), 4)}",
+                    f"{fmt_int(item.get('low_count'))}/{fmt_float(item.get('low_rate'), 4)}",
+                    fmt_float(item.get("rate_delta"), 4),
+                ]
+            )
+    if coverage_rows:
+        md_parts.extend(["", md_table(coverage_headers, coverage_rows)])
+        html_parts.append(
+            html_table(coverage_headers, _analysis_html_rows(coverage_rows))
+        )
+    if comparison_rows:
+        md_parts.extend(["", md_table(comparison_headers, comparison_rows)])
+        html_parts.append(
+            html_table(comparison_headers, _analysis_html_rows(comparison_rows))
+        )
+
+    limitation_md, limitation_html = _contract_limitations(contract)
+    if limitation_md:
+        md_parts.extend(["", limitation_md])
+        html_parts.append(limitation_html)
+    return "\n".join(md_parts), "".join(html_parts)
+
+
 def _comment_scalar(value) -> str:
     if value is None or value == "":
         return "—"
@@ -1593,6 +1794,14 @@ def build_content_patterns(analysis) -> tuple[str, str]:
             html = '<p class="note">栏目 / 合集 分布</p>' + html_table(
                 ["栏目", "数量"], [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
             blocks.append((md, html))
+
+    breakdown_md, breakdown_html = _classification_breakdown_block(analysis)
+    if breakdown_md:
+        blocks.append((breakdown_md, breakdown_html))
+
+    feature_md, feature_html = _high_low_feature_block(analysis)
+    if feature_md:
+        blocks.append((feature_md, feature_html))
 
     comment_md, comment_html = _comment_evidence_block(analysis)
     if comment_md:

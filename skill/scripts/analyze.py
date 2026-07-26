@@ -1500,11 +1500,41 @@ def build_post_records(
 # §5 LLM 协同分类（确定性计算 + LLM 语义标注 标准接口）
 # ---------------------------------------------------------------------------
 
-_TAX_FORMAT = {"talking_head", "tutorial", "commentary", "interview", "vlog", "news",
-               "review", "compilation", "image_text", "live_clip", "other"}
+_TAX_FORMAT_ORDER = (
+    "talking_head",
+    "tutorial",
+    "commentary",
+    "interview",
+    "vlog",
+    "news",
+    "review",
+    "compilation",
+    "image_text",
+    "live_clip",
+    "other",
+)
+_TAX_FORMAT = frozenset(_TAX_FORMAT_ORDER)
 _TAX_FUNNEL = {"awareness", "education", "engagement", "conversion", "retention", "unknown"}
 _TAX_HOOK = {"question", "contradiction", "result_first", "pain_point", "controversy",
              "list", "curiosity", "authority", "story", "none", "unknown"}
+_HIGH_LOW_FEATURE_FIELDS = (
+    "topic",
+    "format",
+    "funnel_stage",
+    "hook_type",
+    "series_name",
+    "is_original",
+    "has_product_placement",
+    "hashtags",
+    "duration_bucket",
+)
+_DURATION_BUCKETS = (
+    "lt_15s",
+    "15_29s",
+    "30_59s",
+    "60_179s",
+    "gte_180s",
+)
 _CLASSIFICATION_REQUIRED_FIELDS = frozenset(
     {
         "post_id",
@@ -1555,6 +1585,585 @@ def classification_contract(
             ),
         },
     }
+
+
+def _empty_topic_format_matrix() -> Dict[str, Any]:
+    return {"topics": [], "formats": [], "rows": []}
+
+
+def _empty_performance_groups() -> Dict[str, Any]:
+    return {
+        "high": {"count": 0, "post_ids": []},
+        "low": {"count": 0, "post_ids": []},
+    }
+
+
+def _metric_values_by_post_id(
+    valid: List[Dict[str, Any]], main_metric: str
+) -> Tuple[Dict[str, Optional[float]], int]:
+    values: Dict[str, Optional[float]] = {}
+    measured_count = 0
+    for post in valid:
+        value = post_metric_value(post, main_metric)
+        values[str(post.get("post_id"))] = value
+        measured_count += value is not None
+    return values, measured_count
+
+
+def _dimension_performance_rows(
+    values: List[str],
+    aggregates: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for value in values:
+        bucket = aggregates[value]
+        measured = bucket["metric_values"]
+        post_count = bucket["post_count"]
+        measured_count = len(measured)
+        rows.append(
+            {
+                "value": value,
+                "post_count": post_count,
+                "measured_count": measured_count,
+                "missing_count": post_count - measured_count,
+                "measurement_rate": rnd(measured_count / post_count, 4),
+                "main_metric_median": (
+                    rnd(percentile(sorted(measured), 0.5), 4)
+                    if measured
+                    else None
+                ),
+            }
+        )
+    return rows
+
+
+def compute_classification_breakdown(
+    post_records: List[Dict[str, Any]],
+    valid: List[Dict[str, Any]],
+    main_metric: str,
+    classification: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build the FR-011 matrix only from a complete taxonomy result."""
+    metric_values, measured_count = _metric_values_by_post_id(valid, main_metric)
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "status": "pending-model",
+        "classification_version": classification.get("classification_version"),
+        "main_metric": main_metric,
+        "total_post_count": len(post_records),
+        "measured_post_count": measured_count,
+        "missing_metric_count": len(post_records) - measured_count,
+        "topic_format_matrix": _empty_topic_format_matrix(),
+        "dimension_performance": {"topic": [], "format": []},
+        "limitations": [
+            "完整分类结果缺失；主题-形式矩阵与分类维度表现未计算。"
+        ],
+    }
+    if classification.get("classification_status") != "completed":
+        return result
+
+    topic_aggregates: Dict[str, Dict[str, Any]] = {}
+    format_aggregates: Dict[str, Dict[str, Any]] = {}
+    matrix_counts: Dict[str, Dict[str, int]] = {}
+    for record in post_records:
+        post_id = str(record.get("post_id"))
+        topic = str(record.get("topic"))
+        format_value = str(record.get("format"))
+        metric_value = metric_values.get(post_id)
+
+        topic_bucket = topic_aggregates.setdefault(
+            topic, {"post_count": 0, "metric_values": []}
+        )
+        topic_bucket["post_count"] += 1
+        format_bucket = format_aggregates.setdefault(
+            format_value, {"post_count": 0, "metric_values": []}
+        )
+        format_bucket["post_count"] += 1
+        if metric_value is not None:
+            numeric_value = float(metric_value)
+            topic_bucket["metric_values"].append(numeric_value)
+            format_bucket["metric_values"].append(numeric_value)
+
+        topic_counts = matrix_counts.setdefault(topic, {})
+        topic_counts[format_value] = topic_counts.get(format_value, 0) + 1
+
+    topics = sorted(topic_aggregates)
+    formats = [
+        value for value in _TAX_FORMAT_ORDER if value in format_aggregates
+    ]
+    matrix_rows = [
+        {
+            "topic": topic,
+            "post_count": topic_aggregates[topic]["post_count"],
+            "counts": [matrix_counts[topic].get(value, 0) for value in formats],
+        }
+        for topic in topics
+    ]
+
+    result.update(
+        {
+            "status": "completed",
+            "topic_format_matrix": {
+                "topics": topics,
+                "formats": formats,
+                "rows": matrix_rows,
+            },
+            "dimension_performance": {
+                "topic": _dimension_performance_rows(
+                    topics, topic_aggregates
+                ),
+                "format": _dimension_performance_rows(
+                    formats, format_aggregates
+                ),
+            },
+            "limitations": [],
+        }
+    )
+    return result
+
+
+def _duration_bucket(value: Any) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    if value < 15:
+        return "lt_15s"
+    if value < 30:
+        return "15_29s"
+    if value < 60:
+        return "30_59s"
+    if value < 180:
+        return "60_179s"
+    return "gte_180s"
+
+
+def _feature_values(record: Dict[str, Any], field: str) -> List[Any]:
+    if field == "duration_bucket":
+        bucket = _duration_bucket(record.get("duration_seconds"))
+        return [] if bucket is None else [bucket]
+    value = record.get(field)
+    if field == "hashtags":
+        if not isinstance(value, list):
+            return []
+        return sorted(
+            {
+                item
+                for item in value
+                if isinstance(item, str) and item != ""
+            }
+        )
+    if value is None or value == "":
+        return []
+    return [value]
+
+
+def _feature_sort_key(field: str, value: Any) -> Tuple[int, Any]:
+    if field == "duration_bucket":
+        return (0, _DURATION_BUCKETS.index(value))
+    if isinstance(value, bool):
+        return (0, int(value))
+    return (1, str(value))
+
+
+def _feature_comparison(
+    field: str,
+    high_records: List[Dict[str, Any]],
+    low_records: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    high_sets = [set(_feature_values(record, field)) for record in high_records]
+    low_sets = [set(_feature_values(record, field)) for record in low_records]
+    high_known = sum(bool(values) for values in high_sets)
+    low_known = sum(bool(values) for values in low_sets)
+    high_values = set().union(*high_sets) if high_sets else set()
+    low_values = set().union(*low_sets) if low_sets else set()
+    common_values = high_values & low_values
+
+    def value_key(value: Any) -> Tuple[int, int, Any]:
+        return (
+            0 if value in common_values else 1,
+            *_feature_sort_key(field, value),
+        )
+
+    all_values = sorted(high_values | low_values, key=value_key)
+    value_rows = []
+    for value in all_values:
+        high_count = sum(value in values for values in high_sets)
+        low_count = sum(value in values for values in low_sets)
+        high_rate = rnd(high_count / high_known, 4) if high_known else None
+        low_rate = rnd(low_count / low_known, 4) if low_known else None
+        value_rows.append(
+            {
+                "value": value,
+                "high_count": high_count,
+                "high_rate": high_rate,
+                "low_count": low_count,
+                "low_rate": low_rate,
+                "rate_delta": (
+                    rnd(high_rate - low_rate, 4)
+                    if high_rate is not None and low_rate is not None
+                    else None
+                ),
+            }
+        )
+
+    scalar_key = lambda value: _feature_sort_key(field, value)
+    return {
+        "field": field,
+        "value_mode": "multi" if field == "hashtags" else "single",
+        "high_known_count": high_known,
+        "high_missing_count": len(high_records) - high_known,
+        "low_known_count": low_known,
+        "low_missing_count": len(low_records) - low_known,
+        "common_values": sorted(common_values, key=scalar_key),
+        "high_only_values": sorted(high_values - low_values, key=scalar_key),
+        "low_only_values": sorted(low_values - high_values, key=scalar_key),
+        "values": value_rows,
+    }
+
+
+def compute_high_low_feature_comparison(
+    post_records: List[Dict[str, Any]],
+    high_performance: Any,
+    low_performance: Any,
+    performance_meta: Dict[str, Any],
+    classification: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compare only already-structured fields on the selected FR-012 groups."""
+    measured_count = int(performance_meta.get("measured_count") or 0)
+    base: Dict[str, Any] = {
+        "schema_version": 1,
+        "status": "pending-model",
+        "main_metric": performance_meta.get("main_metric"),
+        "measured_count": measured_count,
+        "groups": _empty_performance_groups(),
+        "duration_buckets": list(_DURATION_BUCKETS),
+        "features": [],
+        "limitations": ["完整分类结果缺失；高低组结构化特征未计算。"],
+    }
+    if classification.get("classification_status") != "completed":
+        return base
+    if performance_meta.get("status") != "ok":
+        base.update(
+            {
+                "status": "insufficient-sample",
+                "limitations": [
+                    f"主指标实测样本 {measured_count} < {MIN_SAMPLE_FOR_HIGH_LOW}；"
+                    "未生成高低组结构化特征。"
+                ],
+            }
+        )
+        return base
+
+    by_id = {str(record.get("post_id")): record for record in post_records}
+    high_ids = [str(item.get("post_id")) for item in high_performance]
+    low_ids = [str(item.get("post_id")) for item in low_performance]
+    try:
+        high_records = [by_id[post_id] for post_id in high_ids]
+        low_records = [by_id[post_id] for post_id in low_ids]
+    except KeyError as exc:
+        raise ValueError("high-low feature parent post is missing") from exc
+
+    return {
+        **base,
+        "status": "completed",
+        "groups": {
+            "high": {"count": len(high_ids), "post_ids": high_ids},
+            "low": {"count": len(low_ids), "post_ids": low_ids},
+        },
+        "features": [
+            _feature_comparison(field, high_records, low_records)
+            for field in _HIGH_LOW_FEATURE_FIELDS
+        ],
+        "limitations": [
+            "仅描述样本内结构化特征及占比差异，不表示统计显著性或因果关系。"
+        ],
+    }
+
+
+def _is_nonnegative_int(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    )
+
+
+def _rate_matches(count: int, denominator: int, actual: Any) -> bool:
+    expected = rnd(count / denominator, 4) if denominator else None
+    return actual == expected
+
+
+def _classification_breakdown_is_coherent(
+    contract: Dict[str, Any], classification: Dict[str, Any]
+) -> bool:
+    total = contract.get("total_post_count")
+    measured = contract.get("measured_post_count")
+    missing = contract.get("missing_metric_count")
+    coverage = classification.get("classification_coverage")
+    if not (
+        _is_nonnegative_int(total)
+        and _is_nonnegative_int(measured)
+        and _is_nonnegative_int(missing)
+        and measured + missing == total
+        and isinstance(coverage, dict)
+        and coverage.get("total_count") == total
+        and contract.get("classification_version")
+        == classification.get("classification_version")
+    ):
+        return False
+
+    matrix = contract.get("topic_format_matrix")
+    performance = contract.get("dimension_performance")
+    if (
+        not isinstance(matrix, dict)
+        or not isinstance(performance, dict)
+        or set(performance) != {"topic", "format"}
+    ):
+        return False
+    topics = matrix.get("topics")
+    formats = matrix.get("formats")
+    matrix_rows = matrix.get("rows")
+    if not all(isinstance(value, list) for value in (topics, formats, matrix_rows)):
+        return False
+    if contract.get("status") == "pending-model":
+        return (
+            topics == []
+            and formats == []
+            and matrix_rows == []
+            and performance == {"topic": [], "format": []}
+        )
+    if (
+        not all(isinstance(value, str) for value in topics + formats)
+        or len(set(topics)) != len(topics)
+        or len(set(formats)) != len(formats)
+        or topics != sorted(topics)
+        or formats != [value for value in _TAX_FORMAT_ORDER if value in formats]
+        or len(matrix_rows) != len(topics)
+    ):
+        return False
+    for topic, row in zip(topics, matrix_rows):
+        if not isinstance(row, dict) or row.get("topic") != topic:
+            return False
+        counts = row.get("counts")
+        post_count = row.get("post_count")
+        if not (
+            isinstance(counts, list)
+            and len(counts) == len(formats)
+            and all(_is_nonnegative_int(value) for value in counts)
+            and _is_nonnegative_int(post_count)
+            and sum(counts) == post_count
+        ):
+            return False
+    if sum(row["post_count"] for row in matrix_rows) != total:
+        return False
+
+    performance_rows: Dict[str, List[Dict[str, Any]]] = {}
+    for field, expected_values in (("topic", topics), ("format", formats)):
+        rows = performance.get(field)
+        if not (
+            isinstance(rows, list)
+            and all(isinstance(row, dict) for row in rows)
+            and [row.get("value") for row in rows] == expected_values
+        ):
+            return False
+        if sum(row.get("post_count", -1) for row in rows) != total:
+            return False
+        if sum(row.get("measured_count", -1) for row in rows) != measured:
+            return False
+        for row in rows:
+            post_count = row.get("post_count")
+            measured_count = row.get("measured_count")
+            missing_count = row.get("missing_count")
+            if not (
+                _is_nonnegative_int(post_count)
+                and _is_nonnegative_int(measured_count)
+                and _is_nonnegative_int(missing_count)
+                and measured_count + missing_count == post_count
+                and _rate_matches(
+                    measured_count,
+                    post_count,
+                    row.get("measurement_rate"),
+                )
+                and (
+                    (measured_count == 0 and row.get("main_metric_median") is None)
+                    or (
+                        measured_count > 0
+                        and isinstance(row.get("main_metric_median"), (int, float))
+                        and not isinstance(row.get("main_metric_median"), bool)
+                        and math.isfinite(row["main_metric_median"])
+                    )
+                )
+            ):
+                return False
+        performance_rows[field] = rows
+
+    topic_rows = performance_rows["topic"]
+    format_rows = performance_rows["format"]
+    if any(
+        matrix_row["post_count"] != topic_row["post_count"]
+        for matrix_row, topic_row in zip(matrix_rows, topic_rows)
+    ):
+        return False
+    column_totals = [
+        sum(row["counts"][index] for row in matrix_rows)
+        for index in range(len(formats))
+    ]
+    if column_totals != [row["post_count"] for row in format_rows]:
+        return False
+    return True
+
+
+def _feature_contract_is_coherent(
+    contract: Dict[str, Any], expected_high_ids: List[str], expected_low_ids: List[str]
+) -> bool:
+    groups = contract.get("groups")
+    features = contract.get("features")
+    if groups != {
+        "high": {"count": len(expected_high_ids), "post_ids": expected_high_ids},
+        "low": {"count": len(expected_low_ids), "post_ids": expected_low_ids},
+    }:
+        return False
+    if not (
+        contract.get("duration_buckets") == list(_DURATION_BUCKETS)
+        and isinstance(features, list)
+        and [feature.get("field") for feature in features]
+        == list(_HIGH_LOW_FEATURE_FIELDS)
+    ):
+        return False
+
+    group_counts = {"high": len(expected_high_ids), "low": len(expected_low_ids)}
+    for feature in features:
+        if not isinstance(feature, dict):
+            return False
+        high_known = feature.get("high_known_count")
+        high_missing = feature.get("high_missing_count")
+        low_known = feature.get("low_known_count")
+        low_missing = feature.get("low_missing_count")
+        if not (
+            all(
+                _is_nonnegative_int(value)
+                for value in (high_known, high_missing, low_known, low_missing)
+            )
+            and high_known + high_missing == group_counts["high"]
+            and low_known + low_missing == group_counts["low"]
+        ):
+            return False
+        values = feature.get("values")
+        if not isinstance(values, list):
+            return False
+        seen = set()
+        common = []
+        high_only = []
+        low_only = []
+        for row in values:
+            if not isinstance(row, dict):
+                return False
+            value = row.get("value")
+            identity = (type(value).__name__, str(value))
+            if identity in seen:
+                return False
+            seen.add(identity)
+            high_count = row.get("high_count")
+            low_count = row.get("low_count")
+            if not (
+                _is_nonnegative_int(high_count)
+                and _is_nonnegative_int(low_count)
+                and high_count <= high_known
+                and low_count <= low_known
+                and _rate_matches(high_count, high_known, row.get("high_rate"))
+                and _rate_matches(low_count, low_known, row.get("low_rate"))
+            ):
+                return False
+            high_rate = row.get("high_rate")
+            low_rate = row.get("low_rate")
+            expected_delta = (
+                rnd(high_rate - low_rate, 4)
+                if high_rate is not None and low_rate is not None
+                else None
+            )
+            if row.get("rate_delta") != expected_delta:
+                return False
+            if high_count and low_count:
+                common.append(value)
+            elif high_count:
+                high_only.append(value)
+            elif low_count:
+                low_only.append(value)
+            else:
+                return False
+        key = lambda value: _feature_sort_key(feature.get("field"), value)
+        if not (
+            feature.get("common_values") == sorted(common, key=key)
+            and feature.get("high_only_values") == sorted(high_only, key=key)
+            and feature.get("low_only_values") == sorted(low_only, key=key)
+        ):
+            return False
+    return True
+
+
+def validate_deterministic_analysis_contracts(
+    classification_breakdown: Dict[str, Any],
+    high_low_feature_comparison: Dict[str, Any],
+    classification: Dict[str, Any],
+    performance_meta: Dict[str, Any],
+    high_performance: Any,
+    low_performance: Any,
+) -> None:
+    """Reject impossible derived states before an output workspace is reserved."""
+    classification_complete = (
+        classification.get("classification_status") == "completed"
+    )
+    expected_breakdown_status = (
+        "completed" if classification_complete else "pending-model"
+    )
+    if classification_complete and performance_meta.get("status") == "ok":
+        expected_comparison_status = "completed"
+    elif classification_complete:
+        expected_comparison_status = "insufficient-sample"
+    else:
+        expected_comparison_status = "pending-model"
+
+    expected_main_metric = performance_meta.get("main_metric")
+    expected_measured_count = performance_meta.get("measured_count")
+
+    coherent = (
+        isinstance(expected_main_metric, str)
+        and bool(expected_main_metric)
+        and _is_nonnegative_int(expected_measured_count)
+        and classification_breakdown.get("schema_version") == 1
+        and high_low_feature_comparison.get("schema_version") == 1
+        and classification_breakdown.get("main_metric") == expected_main_metric
+        and high_low_feature_comparison.get("main_metric") == expected_main_metric
+        and classification_breakdown.get("measured_post_count")
+        == expected_measured_count
+        and high_low_feature_comparison.get("measured_count")
+        == expected_measured_count
+        and classification_breakdown.get("status") == expected_breakdown_status
+        and high_low_feature_comparison.get("status")
+        == expected_comparison_status
+        and _classification_breakdown_is_coherent(
+            classification_breakdown, classification
+        )
+    )
+    if expected_comparison_status == "completed":
+        expected_high_ids = [str(item.get("post_id")) for item in high_performance]
+        expected_low_ids = [str(item.get("post_id")) for item in low_performance]
+        coherent = coherent and _feature_contract_is_coherent(
+            high_low_feature_comparison,
+            expected_high_ids,
+            expected_low_ids,
+        )
+    else:
+        coherent = coherent and (
+            high_low_feature_comparison.get("groups")
+            == _empty_performance_groups()
+            and high_low_feature_comparison.get("features") == []
+            and high_low_feature_comparison.get("duration_buckets")
+            == list(_DURATION_BUCKETS)
+        )
+    if not coherent:
+        raise ValueError("deterministic analysis contract is inconsistent")
 
 
 def build_taxonomy_prompt(valid: List[Dict[str, Any]], followers: Optional[int]) -> str:
@@ -2070,6 +2679,27 @@ def analyze_in_memory(
         )
         post_records = apply_taxonomy(post_records, classification_results)
     classification = classification_contract(post_records)
+    classification_breakdown = compute_classification_breakdown(
+        post_records,
+        valid,
+        main_metric,
+        classification,
+    )
+    high_low_feature_comparison = compute_high_low_feature_comparison(
+        post_records,
+        high_performance,
+        low_performance,
+        performance_meta,
+        classification,
+    )
+    validate_deterministic_analysis_contracts(
+        classification_breakdown,
+        high_low_feature_comparison,
+        classification,
+        performance_meta,
+        high_performance,
+        low_performance,
+    )
     taxonomy_prompt = (
         build_taxonomy_prompt(valid, followers) if with_taxonomy_prompt else None
     )
@@ -2127,6 +2757,8 @@ def analyze_in_memory(
         "evidence_coverage": copy.deepcopy(evidence_coverage),
         "core_insights": core_insights,
         "comment_analysis": comment_analysis,
+        "classification_breakdown": classification_breakdown,
+        "high_low_feature_comparison": high_low_feature_comparison,
         "posts": post_records,
         **copy.deepcopy(classification),
     }

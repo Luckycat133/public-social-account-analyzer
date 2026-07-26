@@ -260,6 +260,23 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
 - `--classification-results` 与 `--llm-tax-results` 均要求一次性覆盖全部有效作品；
   任一结构、类型、枚举、父作品或覆盖错误都必须整体失败且不写入产物。
 
+### 5.7 主题-形式矩阵与分类维度主指标表现
+
+- `classification_breakdown.schema_version=1` 始终存在。只有
+  `classification_status=completed` 时状态才为 `completed` 并生成聚合；其余状态统一为
+  `pending-model`，矩阵和分组表现必须为空，禁止展示部分分类形成的偏置结果。
+- 主题-形式矩阵覆盖全部有效作品。主题按 Unicode 字符顺序排列；形式按 data-schema
+  §9.5 的固定枚举顺序排列；每个单元格是作品计数，行合计与全部作品数必须一致。
+  模型实际输出的 `unknown` / `other` 是已分类值，不得并入待分类。
+- topic / format 分组表现只使用当前 `main_sort_metric`。每桶同时记录 `post_count`、
+  `measured_count`、`missing_count`、四位小数 `measurement_rate` 和
+  `main_metric_median`。真实 `0` 计入实测与中位数；`null` 只计缺失；整桶无实测值时
+  中位数为 `null`，不得填 `0`。
+- 实现必须单次遍历作品记录，同时累积 topic、format、指标数组与矩阵单元格；不得针对每个
+  topic 重新扫描全部作品。完成后按固定顺序物化结果，以支持公开作品上限 50,000 条。
+- JSON、Markdown 与 HTML 使用同一个根级合同。报告必须完整展示矩阵和两个维度的全部桶，
+  不得按 top-N 截断；所有模型字符串按输出上下文转义。
+
 ---
 
 ## 6. 高低表现内容
@@ -319,6 +336,30 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
 - “来源链接”章节与高/低表现章节复用同一作品 URL 合同：平台、路径和
   `post_id` 必须精确绑定。站外、错路径、错 ID 和主页候选不生成作品链接，也不登记为
   作品引用；合法 Jingxuan 作品仍遵守严格官方路径例外。
+
+### 6.6 高低组结构化特征对比
+
+- `high_low_feature_comparison.schema_version=1` 始终存在。分类未完成时为
+  `pending-model`；主指标实测样本少于 15 时为 `insufficient-sample`；只有完整分类且既有
+  高低组已生成时才为 `completed`。样本不足是数据限制，不新增全局业务降级原因。
+- 完成状态按既有 `high_performance` / `low_performance` 的 `post_id` 精确连接分类记录，
+  不修改高低条目冻结字段，也不修改 `core_insights`。连接缺失、组 ID/计数不一致或状态
+  矛盾必须在预留输出目录前失败。
+- 两个合同的 `main_metric`、高低比较的 `measured_count` 必须与 `performance_meta` 精确
+  一致；矩阵每行合计必须等于对应 topic 桶作品数，每列合计必须等于对应 format 桶作品数。
+  任一元数据或交叉合计矛盾同样必须在预留输出目录前失败。
+- 固定比较字段及顺序为：`topic`、`format`、`funnel_stage`、`hook_type`、
+  `series_name`、`is_original`、`has_product_placement`、`hashtags`、
+  `duration_bucket`。不得解析标题、正文或开头文案来补造选题、结构、互动引导等结论。
+- `false` 是已知布尔值；`null` / 空字符串为缺失。hashtags 以“包含该标签的作品数”计数，
+  单篇先去重，空数组按缺失处理。各组 rate 的分母是该字段在该组的已知作品数；分母为 0
+  时 rate 与 rate delta 为 `null`。
+- 时长桶固定为 `[0,15)`=`lt_15s`、`[15,30)`=`15_29s`、
+  `[30,60)`=`30_59s`、`[60,180)`=`60_179s`、`[180,+∞)`=`gte_180s`；
+  负值与 `null` 按缺失处理，输出始终按上述顺序。
+- 每个字段输出共同值、高组独有值、低组独有值，以及逐值的高/低 count、rate 与
+  `rate_delta=high_rate-low_rate`。这些只是不带显著性检验的样本内描述，不得写成因果、
+  策略优劣或泛化结论。Markdown 与 HTML 必须同口径并转义所有外部字符串。
 
 ---
 

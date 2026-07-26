@@ -3,15 +3,15 @@
 本文件是 **public-social-account-analyzer** 的**完整验收规范（acceptance spec）**。
 它分三层：
 
-1. **MVP 验收标准 + 11 条端到端用例摘要**（见 `evals/evals.json` 机器可读子集）。
-2. **单元测试（§单元测试）**：16 条确定性、可自动化、离线的单元用例，对应脚本
+1. **MVP 验收标准 + 12 条端到端用例摘要**（见 `evals/evals.json` 机器可读子集）。
+2. **单元测试（§单元测试）**：17 条确定性、可自动化、离线的单元用例，对应脚本
    `scripts/normalize.py` 与 `scripts/analyze.py` 的纯函数，以及 `scripts/collectors/*.py`
    的路由/降级行为。每条均给出 **输入** 与 **预期**，可直接映射为 pytest 用例
    （见 `tests/`）。
 3. **端到端验收（§B站端到端 / §抖音端到端）**：每平台必须完成的真实账号抽查，
    并保存可复测证据。
 
-> 机器可读的 11 条端到端用例子集位于 `evals/evals.json`（prompt + expected_output +
+> 机器可读的 12 条端到端用例子集位于 `evals/evals.json`（prompt + expected_output +
 > assertions）。**不要覆盖 `evals.json`**——本文件只描述与扩展验收规范，二者互补。
 
 ---
@@ -35,9 +35,9 @@
 - 测试账号必须公开可访问，不使用测试人员私人登录态
 - 保存测试日期、账号 URL、样本数量和当时页面可见字段，便于复测
 
-## 自动化评估用例（11 条摘要）
+## 自动化评估用例（12 条摘要）
 
-端到端行为评估用例见 [evals.json](evals.json)，共 11 个用例，覆盖：
+端到端行为评估用例见 [evals.json](evals.json)，共 12 个用例，覆盖：
 
 | ID | 用例 | 验证点 |
 |----|------|--------|
@@ -52,12 +52,13 @@
 | 9 | 评论采样与确定性证据 | 每篇≤20条、四状态、代表评论、语义待模型处理 |
 | 10 | 拒绝虚假完成 | 无采集不出报告 |
 | 11 | 抖音无登录沙箱索引降级 | Agent 来源核验 + 脚本字段一致性校验、PARTIAL、本地键披露、不伪造链接 |
+| 12 | 分类矩阵与结构化高低特征 | 完整分类门、全矩阵、透明实测分母、固定字段/时长桶、双格式转义 |
 
 ---
 
 # 单元测试
 
-> 以下 16 条用例为 **确定性、离线、可自动化** 的单元测试，覆盖 `scripts/normalize.py`、
+> 以下 17 条用例为 **确定性、离线、可自动化** 的单元测试，覆盖 `scripts/normalize.py`、
 > `scripts/analyze.py` 的纯函数与 `scripts/collectors/*.py` 的路由/降级逻辑。
 > 每条用例给出「输入（Input）」与「预期（Expected）」，已落地为 `tests/` 下的 pytest
 > 用例并全部通过（见报告 `.workbuddy/sdd/task-13-report.md`）。
@@ -189,6 +190,25 @@
   - `semantic.status=pending-model`、`model_version=null`、`insights=null`；确定性脚本不生成
     高频问题、争议点、需求或情绪结论，且该 pending 状态不改变全局完成门。
 
+### CASE-017 分类矩阵与高低组结构化特征
+
+- **输入**：完整分类结果覆盖全部有效作品；主指标同时包含真实 `0`、`null` 和正数；有效
+  实测样本达到 15，既有高/低组各 3 条，taxonomy、布尔字段、重复/空 hashtags 与时长边界
+  均有覆盖。
+- **预期**：
+  - `classification_breakdown.schema_version=1` 且状态为 `completed`；topic×format 矩阵覆盖
+    全部作品，行列顺序及计数不依赖输入顺序。
+  - topic / format 每桶保留 `post_count/measured_count/missing_count/measurement_rate/
+    main_metric_median`；真实 `0` 参与中位数，`null` 排除，全空桶中位数为 `null`。
+  - 聚合对作品记录只做一次遍历；合同的主指标/实测数与 `performance_meta` 精确绑定，矩阵
+    topic 行、format 列的交叉合计与对应维度桶逐项一致，篡改时在预留输出目录前失败。
+  - 高低特征按既有组 `post_id` 精确连接；`false` 是已知值，hashtags 单篇去重且空数组按
+    missing，时长严格进入五个固定桶；不修改高低条目或 `core_insights`。
+  - 分类未完成时两个合同均为 `pending-model` 且不输出部分聚合；实测样本不足时高低特征为
+    `insufficient-sample` 且不使全局任务额外降级。
+  - JSON、Markdown、HTML 展示同一组计数/中位数/rate delta，所有外部字符串均转义；旧版
+    JSON 缺少新键时仍可渲染，不生成虚假占位内容。
+
 ---
 
 # B站端到端
@@ -249,5 +269,5 @@
 - 每次页面结构变化后，优先复用 `tests/` 离线单元用例（不依赖网络、秒级回归）。
 - 端到端用例的「复测证据」用于人工/脚本抽查字段准确率（目标 ≥ 95%），并在页面改版后
   快速定位映射失效。
-- `evals/evals.json` 持有机器可读的 11 条端到端子集，本规范与其保持一致、互为补充，
+- `evals/evals.json` 持有机器可读的 12 条端到端子集，本规范与其保持一致、互为补充，
   **不被本文件覆盖**。

@@ -594,6 +594,81 @@ selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
 父覆盖、账本、字段覆盖、代表评论、语义状态与限制；空值显示 `—`，父作品只有通过平台与
 ID 精确绑定后才能成为链接。
 
+### 7.3 FR-011 / FR-012 确定性结构化聚合
+
+`analysis.json` 根对象始终增加两个 schema v1 合同：
+
+```json
+{
+  "classification_breakdown": {
+    "schema_version": 1,
+    "status": "pending-model | completed",
+    "classification_version": null,
+    "main_metric": "views",
+    "total_post_count": 0,
+    "measured_post_count": 0,
+    "missing_metric_count": 0,
+    "topic_format_matrix": {
+      "topics": [],
+      "formats": [],
+      "rows": []
+    },
+    "dimension_performance": {"topic": [], "format": []},
+    "limitations": []
+  },
+  "high_low_feature_comparison": {
+    "schema_version": 1,
+    "status": "pending-model | insufficient-sample | completed",
+    "main_metric": "views",
+    "measured_count": 0,
+    "groups": {
+      "high": {"count": 0, "post_ids": []},
+      "low": {"count": 0, "post_ids": []}
+    },
+    "duration_buckets": [
+      "lt_15s", "15_29s", "30_59s", "60_179s", "gte_180s"
+    ],
+    "features": [],
+    "limitations": []
+  }
+}
+```
+
+分类未完成时，`classification_breakdown` 保留总作品数与主指标实测/缺失数，但矩阵与
+两个维度表现数组必须为空。完成状态的矩阵行固定为
+`{topic, post_count, counts}`；`counts` 与 `formats` 按索引对应。topic / format 的表现桶
+固定为：
+
+```text
+value, post_count, measured_count, missing_count,
+measurement_rate, main_metric_median
+```
+
+`measured_count` 只计主指标不为 `null` 的作品；真实 `0` 计入，中位数可以为 `0.0`；无实测
+值的中位数为 `null`。
+
+`high_low_feature_comparison.features` 按固定字段顺序输出。每项固定包含：
+
+```text
+field, value_mode, high_known_count, high_missing_count,
+low_known_count, low_missing_count, common_values,
+high_only_values, low_only_values, values
+```
+
+`values` 每行固定为
+`{value, high_count, high_rate, low_count, low_rate, rate_delta}`。hashtags 的
+`value_mode=multi`，其他字段为 `single`；空 hashtags 不构造“无标签”值。布尔值保持 JSON
+boolean。样本不足时 groups/features 为空且状态为 `insufficient-sample`，但不增加全局
+`partial_reasons`。完整分类且已有高低组时，任何组 ID、计数、字段顺序或状态不一致都必须
+在输出目录预留前失败。既有高低条目与 `core_insights` schema 不变。
+
+两个根合同的 `main_metric` 必须与 `performance_meta.main_metric` 完全相同；
+`high_low_feature_comparison.measured_count` 与
+`classification_breakdown.measured_post_count` 必须等于 `performance_meta.measured_count`。
+矩阵 topic 行顺序、format 列顺序必须分别与 `dimension_performance.topic/format` 的值顺序
+一致；行合计与对应 topic `post_count`、列合计与对应 format `post_count` 必须逐项相等。
+校验在分析输出目录预留前执行。
+
 ## 8. 空值规则（field_visibility）
 
 `field_visibility` 记录每个顶层字段是否对当前采集可见，便于计算字段覆盖率与诚实报告。示例：

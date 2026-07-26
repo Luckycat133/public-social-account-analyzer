@@ -135,6 +135,21 @@
         "搜索索引没有真实作品 ID/URL 时使用明确标记的 idx-* 本地键，账号主页未渲染成单条作品链接",
         "没有 Web 连接器或无合格证据时未虚构成功"
       ]
+    },
+    {
+      "id": 12,
+      "name": "classification-matrix-and-structured-high-low-features",
+      "prompt": "对已完成语义分类的公开内容生成主题-形式矩阵、按主题/形式的主指标表现，并对高低表现组做可复核的共同/差异特征对比。",
+      "expected_output": "完整分类后，analysis.json、Markdown 和 HTML 同步输出全量 topic×format 计数矩阵、topic/format 的主指标作品数/实测数/缺失数/实测率/中位数，以及只基于既有结构化字段的高低组 count/rate/rate delta。分类未完成或样本不足时明确降级，不输出部分聚合或自然语言猜测。",
+      "assertions": [
+        "classification_breakdown.schema_version=1；只有完整分类时状态为 completed，pending-model 时矩阵和桶统计为空",
+        "矩阵以单次作品遍历完成聚合并覆盖全部已分类作品；topic/format 桶区分真实 0 与 null，中位数及实测分母透明",
+        "两个合同的主指标/实测数绑定 performance_meta，矩阵行列合计绑定对应 topic/format 桶；矛盾在预留输出目录前失败",
+        "high_low_feature_comparison 仅使用 taxonomy、series_name、is_original、has_product_placement、hashtags 和固定时长桶，并按既有高低组 post_id 连接",
+        "hashtags 单篇去重且空数组按 missing；false 保留为已知；时长边界与输出顺序固定",
+        "样本不足为 insufficient-sample 且不新增全局降级；没有解析标题/正文或输出因果、显著性、策略优劣结论",
+        "JSON、Markdown、HTML 数值同口径且外部字符串已转义；旧 analysis.json 缺少新键仍可渲染"
+      ]
     }
   ]
 }

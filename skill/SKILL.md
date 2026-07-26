@@ -57,13 +57,15 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
    - **季节性 / 学期检测**：输出 `monthly_distribution`、`seasonal_intensity`（月变异系数）、`break_month_share`（寒暑假月份 1/2/7/8 占比）。
    - **内联可视化**：报告含发布时间-播放量散点图、高低表现雷达图、字段覆盖率徽章、发布时段分布（24 小时）柱状图（零依赖 SVG/HTML）。
    - **LLM 协同分类（可选）**：`--with-llm-tax` 在分析工作区生成分类 Prompt 模版（`taxonomy-prompt.md`）。`--classification-results <json>` 仅接受覆盖全部有效父作品的严格 JSON 数组；逐条核验 `post_id`、字段类型、枚举与置信度后，把原字节封存为 `source/classification-results.json`。没有经过校验的完整分类时保持 `classification_status = pending-model` 且 `classification_version = null`，分析任务为 `PARTIAL`，不得臆造分类。
+   - **分类矩阵与维度表现**：完整分类后确定性输出 `classification_breakdown`，包含全部 topic×format 计数矩阵，以及 topic / format 按主指标的作品数、实测数、缺失数、实测率和中位数。真实 0 参与计算，`null` 排除；分类未完成时保持 `pending-model` 且不输出部分聚合。
+   - **高低组结构化特征**：`high_low_feature_comparison` 只按既有高低组作品 ID 对比 taxonomy 字段、栏目、原创/产品露出、hashtags 与固定时长桶，输出共同值、组内独有值及 count/rate/rate delta；不解析标题/正文，不生成因果、显著性或策略优劣结论。样本不足明确为 `insufficient-sample`，不改变全局完成门。
    - **评论证据（可选采集、确定性分析）**：`--comments` 开启后，流水线从同一已核验提交读取严格 8 字段 `source/comments.jsonl`；仅未明确置顶/转载/推广的 `SUCCESS` / `PARTIAL` 规范父作品可进入采集与分析。记录只以物理 LF 分隔（接受 CRLF，字符串内 U+2028 / U+2029 不分行），并校验父作品、账本、每父 20 条上限与四种状态（`not_requested` / `empty` / `unavailable` / `collected_pending_model`），再按可见点赞数与源行号最多选择 3 个父作品的代表评论。原始评论字节只复制、不重写。
    - **评论语义待模型处理**：确定性脚本只输出状态、覆盖、账本、字段覆盖和代表评论；`semantic.status=pending-model`、版本与洞察为 `null`，不得自动生成高频问题、争议点、需求或情绪结论。该状态不改变全局分析完成门。
    - 标注主题、形式、钩子类型等策略维度，提取高低表现对比特征。
 
 6. **报告渲染与独立提交**
    - 流水线在内存中生成 `account-analysis-report.md`、`dashboard.html` 与 `analysis.json`；缺输入、任一章节异常、坏链接或输出校验失败均为致命错误。
-   - Markdown 与 HTML 在既有 12 个章节中同步显示平台账号字段、五类采集状态、分类生命周期、高/低表现完整证据、`core_insights` 及评论证据状态/覆盖/账本/代表样本；待分类不与模型 `unknown`/`other` 混用，主页锚点不渲染为作品链接。
+   - Markdown 与 HTML 在既有 12 个章节中同步显示平台账号字段、五类采集状态、分类生命周期、主题-形式矩阵、分类维度主指标表现、高低组结构化特征、高/低表现完整证据、`core_insights` 及评论证据状态/覆盖/账本/代表样本；待分类不与模型 `unknown`/`other` 混用，主页锚点不渲染为作品链接。
    - 校验通过后才排他预留分析目录，create-only 写入精确白名单并创建新的 `manifest.json` / `.complete`。`.complete` 表示持久提交；`task.json.task_status` 表示业务完整性。
    - 报告中显著标记声明：“公开页面快照，不代表账号后台真实曝光和转化”。
 
@@ -126,6 +128,7 @@ legacy 目录；不得用它们原地修改已提交的采集或分析工作区�
 - [ ] `source/collection-provenance.json` 记录采集 commit SHA-256，且不含本机绝对路径
 - [ ] 索引降级的来源、快照年龄、ID/链接语义与非穷尽限制已进入最终报告
 - [ ] `comment_analysis` 四状态、父覆盖、账本与代表评论已同步进入 Markdown/HTML；评论语义明确为 `pending-model`，未由脚本补造结论
+- [ ] 完整分类时 `classification_breakdown` 的矩阵/桶统计与 `high_low_feature_comparison` 已同步进入 JSON、Markdown 和 HTML；主指标、实测数及矩阵行列合计已在预留输出前交叉校验；待分类/样本不足没有补造聚合或特征
 
 ## 参考文件索引
 
