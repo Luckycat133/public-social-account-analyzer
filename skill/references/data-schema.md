@@ -113,9 +113,14 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 尚未绑定身份的符号链接并扩大可写目标范围。
 
 `--resume --out <OLD>` 只把 `OLD` 当作只读输入，绝不修改。新产物写到 `--resume-out <NEW>`；
-省略时原子预留同级 `OLD-resume-<date>`（冲突时追加数字后缀）。带 `.complete` 的新格式
-输入必须完整通过上述校验；无标记的旧格式可在目录身份绑定的安全读取后导入。续采任务在
-`task.json.resume_source` 记录来源格式、`sha256` 算法和来源提交/内容摘要。
+省略时原子预留同级 `OLD-resume-<date>`（冲突时追加数字后缀）。续采输入必须同时具有有效
+`.complete` 与 `manifest.json`，并通过 identity-bound immutable reader 的完整清单、摘要和
+路径身份校验；未密封 legacy 目录一律在适配器加载、网络和新输出预留前以参数错误拒绝。
+manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件合法表示 0 条，非空文件的
+每条记录都必须是严格 UTF-8 JSON 对象，任一畸形、空白或非对象记录均拒绝整个来源，不能
+降级到 CSV。只有 JSONL artifact 未出现在 manifest 时，才允许严格读取已 manifest 的
+`normalized-posts.csv`；两者都缺失时拒绝续采，不能退化为全量采集。续采任务在
+`task.json.resume_source` 记录不可变格式、`sha256` 算法和来源提交摘要。
 
 ## 3. Task 数据结构
 
@@ -158,7 +163,7 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 - `--resume` 必须先校验并只读加载 `--out` 既有作品，再结合 `--since` / 最新作品时间计算
   有效 `date_from`；有效 `date_from > date_to` 时以参数错误退出。`--resume-out` 只能与
   `--resume` 联用，且不得与来源相同、互为祖先/后代或经现有祖先目录身份发生重叠。以上
-  校验发生在适配器网络调用和新输出目录创建之前；
+  校验发生在适配器加载、网络调用和新输出目录创建之前；
   来源目录在所有成功、失败和控制流异常下都保持只读。
 - 执行前向用户回显 `platform`、`requested_limit`、`date_from`/`date_to`、`include_comments`。
 - Web 索引降级必须设置 `task_status=PARTIAL`、保留真实上游 `stop_reason`，并填写来源与
@@ -237,7 +242,7 @@ userinfo 响应精确回证。账本不得保存请求头、原始游标、查�
 | `empty_results` | integer | 适配器明确返回空列表的作品数；不得描述为已采到评论 |
 | `failures` | integer | 适配器报告不可用或抛错的作品数 |
 | `per_post_limit` | integer | 固定为 20 |
-| `stop_reason` | enum | 可选；评论请求遇到 `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `ACCESS_RESTRICTED` 时记录，未中止时省略 |
+| `stop_reason` | enum | 可选；评论请求自身遇到 `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `RATE_LIMITED` / `ACCESS_RESTRICTED` 时记录，未中止时省略 |
 
 空结果与失败必须分开计数。评论失败只写清洗后的 `COMMENTS_UNAVAILABLE` 内容级错误，不能
 改变账号任务状态或写入任务级 `stop_reason`。只有适配器确认上游请求成功且明确返回空评论
@@ -245,6 +250,11 @@ userinfo 响应精确回证。账本不得保存请求头、原始游标、查�
 `failures`。持久化失败时 `comments_collected` 必须按最终文件中通过当前父锚点与字段校验的
 有效唯一行数记录；既有文件为畸形内容、符号链接或其他非普通文件时按 0 记录，且不得跟随、
 删除或改写其目标。
+
+列表、资料或详情阶段一旦已有上述四类任务级平台保护原因，`--comments` 不得再调用任何评论
+端点，但仍须安全写入显式空 `source/comments.jsonl`。此时账本固定为
+`attempted_posts=0`、`comments_collected=0`、`empty_results=0`、`failures=0`、
+`per_post_limit=20`，且不在评论账本伪造第二个 `stop_reason`；任务级原因保留在 `task.json`。
 
 ## 4. Profile 数据结构
 
@@ -327,7 +337,9 @@ userinfo 响应精确回证。账本不得保存请求头、原始游标、查�
   （详情请求成功）、`UNAVAILABLE`（详情不可用）或 `NOT_NEEDED`（所需字段完整）。
   详情结果的 `post_id` 还必须与列表父作品 ID 完全一致；缺失或不一致均按 `UNAVAILABLE`
   处理，不能合并任何详情证据。详情 SSR 解析只能检查已知作品详情路径，不能从任意嵌套
-  对象中搜索 ID 后当成作品。
+  对象中搜索 ID 后当成作品。列表或资料阶段已有任务级平台保护时不得请求详情；详情请求
+  首次返回 `LOGIN_REQUIRED`、`VERIFICATION_REQUIRED`、`RATE_LIMITED` 或
+  `ACCESS_RESTRICTED` 后，剩余详情与全部评论请求立即断路，保护原因上提到任务级。
 
 ### 5.1 抖音搜索索引降级的显式例外
 
@@ -718,8 +730,9 @@ boolean。样本不足时 groups/features 为空且状态为 `insufficient-sampl
 
 - `LOGIN_REQUIRED`：页面要求登录
 - `VERIFICATION_REQUIRED`：出现验证码 / 滑块
+- `RATE_LIMITED`：平台明确触发频控
 - `ACCOUNT_UNAVAILABLE`：账号不存在、封禁或无法访问
-- `ACCESS_RESTRICTED`：其他访问限制（含频控）
+- `ACCESS_RESTRICTED`：其他访问限制
 - `PARSER_FAILED`：页面可访问但解析失败
 - `NO_PUBLIC_CONTENT`：账号确实没有公开内容
 - `UNSUPPORTED_PLATFORM`：URL 不属于支持平台

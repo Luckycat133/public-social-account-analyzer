@@ -343,6 +343,276 @@ def test_detail_enrichment_rejects_mismatched_detail_post_id():
     assert errors[0]["message"] == "作品详情补充不可用"
 
 
+@pytest.mark.parametrize(
+    "stop_reason",
+    [
+        "LOGIN_REQUIRED",
+        "VERIFICATION_REQUIRED",
+        "RATE_LIMITED",
+        "ACCESS_RESTRICTED",
+    ],
+)
+def test_detail_enrichment_circuit_breaks_on_platform_protection(stop_reason):
+    import collect
+    from collectors.douyin import DouyinError
+
+    class ProtectedDetailAdapter:
+        def __init__(self):
+            self.calls = []
+
+        def collect_post_detail(self, post_url):
+            self.calls.append(post_url)
+            raise DouyinError(stop_reason, "unsafe upstream protection text")
+
+    posts = [
+        {
+            "platform": "douyin",
+            "post_id": post_id,
+            "post_url": f"https://www.douyin.com/video/{post_id}",
+            "title": None,
+            "published_at": None,
+            "duration_seconds": None,
+            "hashtags": [],
+            "collection_status": "SUCCESS",
+            "platform_metrics": {"collection_source": "list"},
+        }
+        for post_id in ("7001", "7002")
+    ]
+    errors = []
+    adapter = ProtectedDetailAdapter()
+
+    unavailable = collect._enrich_douyin_details(
+        adapter,
+        posts,
+        errors,
+        "2026-07-27T10:00:00+08:00",
+    )
+
+    assert unavailable == 2
+    assert adapter.calls == ["https://www.douyin.com/video/7001"]
+    assert len(errors) == 1
+    assert errors[0]["stage"] == "collect_post_detail"
+    assert errors[0]["error_code"] == stop_reason
+    assert "unsafe upstream protection text" not in json.dumps(errors)
+    assert posts[0]["platform_metrics"]["detail_status"] == "UNAVAILABLE"
+    assert posts[0]["platform_metrics"]["detail_attempted"] is True
+    assert posts[0]["platform_metrics"]["detail_stop_reason"] == stop_reason
+    assert posts[1]["platform_metrics"]["detail_status"] == "UNAVAILABLE"
+    assert posts[1]["platform_metrics"]["detail_attempted"] is False
+    assert posts[1]["platform_metrics"]["detail_stop_reason"] == stop_reason
+
+
+@pytest.mark.parametrize(
+    "stop_reason",
+    [
+        "LOGIN_REQUIRED",
+        "VERIFICATION_REQUIRED",
+        "RATE_LIMITED",
+        "ACCESS_RESTRICTED",
+    ],
+)
+def test_detail_protection_stops_later_details_and_all_comments(
+    monkeypatch, tmp_path, stop_reason
+):
+    import collect
+    from collectors.douyin import DouyinError
+
+    class ProtectedRunAdapter:
+        platform = "douyin"
+
+        def __init__(self):
+            self.detail_calls = []
+            self.comment_calls = []
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_profile(self, url):
+            return {"platform": "douyin", "field_visibility": {}}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            return [
+                {
+                    "platform": "douyin",
+                    "post_id": post_id,
+                    "post_url": f"https://www.douyin.com/video/{post_id}",
+                    "title": None,
+                    "published_at": None,
+                    "duration_seconds": None,
+                    "hashtags": [],
+                    "collection_status": "SUCCESS",
+                    "platform_metrics": {"collection_source": "list"},
+                }
+                for post_id in ("7001", "7002")
+            ]
+
+        def collect_post_detail(self, post_url):
+            self.detail_calls.append(post_url)
+            raise DouyinError(stop_reason, "unsafe protection response")
+
+        def collect_comments(self, post_url, limit=20):
+            self.comment_calls.append((post_url, limit))
+            return [{"comment_id": "must-not-collect", "text": "unsafe"}]
+
+        def get_collection_coverage(self):
+            return {}
+
+    adapter = ProtectedRunAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
+
+    assert collect.run(
+        ACCOUNT_URL,
+        out_dir=str(out),
+        enrich_details=True,
+        include_comments=True,
+    ) == 0
+
+    assert adapter.detail_calls == ["https://www.douyin.com/video/7001"]
+    assert adapter.comment_calls == []
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] == stop_reason
+    assert task["comment_collection"] == {
+        "attempted_posts": 0,
+        "comments_collected": 0,
+        "empty_results": 0,
+        "failures": 0,
+        "per_post_limit": 20,
+    }
+    assert (out / "source" / "comments.jsonl").read_text(encoding="utf-8") == ""
+    posts = [
+        json.loads(line)
+        for line in (out / "source" / "posts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert posts[0]["platform_metrics"]["detail_attempted"] is True
+    assert posts[1]["platform_metrics"]["detail_attempted"] is False
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
+    assert f"error_code={stop_reason}" in report
+    assert "unsafe protection response" not in report
+
+
+@pytest.mark.parametrize(
+    "profile_stop_reason",
+    [
+        "LOGIN_REQUIRED",
+        "VERIFICATION_REQUIRED",
+        "RATE_LIMITED",
+        "ACCESS_RESTRICTED",
+    ],
+)
+def test_profile_protection_dominates_list_parser_failure_and_blocks_followups(
+    monkeypatch, tmp_path, profile_stop_reason
+):
+    import collect
+    from collectors.douyin import DouyinError
+
+    partial_posts = [
+        {
+            "platform": "douyin",
+            "post_id": post_id,
+            "post_url": f"https://www.douyin.com/video/{post_id}",
+            "title": None,
+            "published_at": None,
+            "duration_seconds": None,
+            "hashtags": [],
+            "collection_status": "SUCCESS",
+            "platform_metrics": {"collection_source": "list"},
+        }
+        for post_id in ("7001", "7002")
+    ]
+
+    class ParserThenProtectedProfileAdapter:
+        platform = "douyin"
+
+        def __init__(self):
+            self.detail_calls = []
+            self.comment_calls = []
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            raise DouyinError(
+                "PARSER_FAILED",
+                "unsafe list parser response",
+                partial_posts=partial_posts,
+            )
+
+        def collect_profile(self, url):
+            raise DouyinError(
+                profile_stop_reason,
+                "unsafe profile protection response",
+            )
+
+        def collect_post_detail(self, post_url):
+            self.detail_calls.append(post_url)
+            return {
+                "post_id": post_url.rsplit("/", 1)[-1],
+                "title": "must not fetch",
+                "published_at": "2026-07-20T10:00:00+08:00",
+                "duration_seconds": 1,
+                "hashtags": [],
+            }
+
+        def collect_comments(self, post_url, limit=20):
+            self.comment_calls.append((post_url, limit))
+            return []
+
+        def get_collection_coverage(self):
+            return {}
+
+    adapter = ParserThenProtectedProfileAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "profile-protection"
+
+    assert collect.run(
+        ACCOUNT_URL,
+        out_dir=str(out),
+        enrich_details=True,
+        include_comments=True,
+    ) == 0
+
+    assert adapter.detail_calls == []
+    assert adapter.comment_calls == []
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] == profile_stop_reason
+    assert task["comment_collection"] == {
+        "attempted_posts": 0,
+        "comments_collected": 0,
+        "empty_results": 0,
+        "failures": 0,
+        "per_post_limit": 20,
+    }
+    assert (out / "source" / "comments.jsonl").read_text(encoding="utf-8") == ""
+    posts = [
+        json.loads(line)
+        for line in (out / "source" / "posts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert all(
+        post["platform_metrics"]["detail_attempted"] is False
+        and post["platform_metrics"]["detail_stop_reason"]
+        == profile_stop_reason
+        for post in posts
+    )
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
+    assert "error_code=PARSER_FAILED" in report
+    assert f"error_code={profile_stop_reason}" in report
+    assert "unsafe list parser response" not in report
+    assert "unsafe profile protection response" not in report
+
+
 def test_douyin_detail_rejects_candidate_whose_id_does_not_match_url():
     from collectors.douyin import DouyinCollector, DouyinError
 
@@ -4415,7 +4685,7 @@ def test_limited_ssr_browser_restriction_retains_merged_partial_posts(monkeypatc
     assert exc_info.value.partial_posts[0]["duration_seconds"] == 7
 
 
-def test_restriction_batch_keeps_current_provenance_through_orchestration_enrichment(
+def test_restriction_batch_circuit_breaks_detail_enrichment_and_keeps_provenance(
     monkeypatch, tmp_path
 ):
     import collect
@@ -4438,13 +4708,13 @@ def test_restriction_batch_keeps_current_provenance_through_orchestration_enrich
         "platform": "douyin",
         "field_visibility": {},
     }
-    collector.collect_post_detail = lambda _url: {
-        "post_id": "7001",
-        "title": "详情标题",
-        "published_at": "2026-07-20T10:00:00+08:00",
-        "duration_seconds": 1,
-        "hashtags": [],
-    }
+    detail_calls = []
+
+    def collect_post_detail(post_url):
+        detail_calls.append(post_url)
+        pytest.fail("detail collection must stop after a task protection reason")
+
+    collector.collect_post_detail = collect_post_detail
     monkeypatch.setattr(collect, "_load_adapters", lambda: [collector])
     out = tmp_path / "restricted"
 
@@ -4458,10 +4728,17 @@ def test_restriction_batch_keeps_current_provenance_through_orchestration_enrich
     post = json.loads(
         (out / "source" / "posts.jsonl").read_text(encoding="utf-8")
     )
-    assert post["title"] == "详情标题"
+    assert detail_calls == []
+    assert post["title"] == ""
     assert post["collection_status"] == "PARTIAL"
-    assert post["platform_metrics"]["detail_status"] == "SUCCESS"
+    assert post["platform_metrics"]["detail_status"] == "UNAVAILABLE"
+    assert post["platform_metrics"]["detail_attempted"] is False
+    assert (
+        post["platform_metrics"]["detail_stop_reason"]
+        == "VERIFICATION_REQUIRED"
+    )
     assert post["platform_metrics"]["partial_reasons"] == [
+        "missing_p0_detail",
         "verification_required"
     ]
     assert collector._detail_provenance == {}

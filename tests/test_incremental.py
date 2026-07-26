@@ -8,6 +8,7 @@
 """
 import json
 import hashlib
+import io
 import os
 import stat
 import sys
@@ -23,6 +24,9 @@ for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT
 import collect  # noqa: E402
 import analyze  # noqa: E402
 from collectors.base import BaseCollector  # noqa: E402
+
+
+BILIBILI_URL = "https://space.bilibili.com/123"
 
 
 class FakeAdapter(BaseCollector):
@@ -52,12 +56,79 @@ class FakeAdapter(BaseCollector):
         return {}
 
 
+def _resume_identity_artifacts(
+    *,
+    task_platform="bilibili",
+    task_profile_url=BILIBILI_URL,
+    profile_platform=None,
+    profile_profile_url=None,
+):
+    profile_platform = profile_platform or task_platform
+    profile_profile_url = profile_profile_url or task_profile_url
+    return {
+        "task.json": json.dumps(
+            {
+                "platform": task_platform,
+                "profile_url": task_profile_url,
+            },
+            ensure_ascii=False,
+        ),
+        "source/profile.json": json.dumps(
+            {
+                "platform": profile_platform,
+                "profile_url": profile_profile_url,
+                "account_id": profile_profile_url.rstrip("/").rsplit("/", 1)[-1],
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
+def _commit_resume_artifacts(out_dir, artifacts):
+    reservation = collect.ImmutableWorkspace.reserve(
+        os.fspath(out_dir), allowed_artifacts=collect._PUBLIC_ARTIFACTS
+    )
+    try:
+        for relative_path, payload in artifacts.items():
+            newline = "" if relative_path.endswith(".csv") else None
+            with reservation.open_text(relative_path, newline=newline) as handle:
+                handle.write(payload)
+        reservation.commit()
+    finally:
+        reservation.close()
+
+
+def _csv_payload(row, *, historical_repr=False):
+    stream = io.StringIO(newline="")
+    fieldnames = list(row)
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerow(
+        row
+        if historical_repr
+        else collect.serialize_csv_row(row, fieldnames)
+    )
+    return stream.getvalue()
+
+
 def _setup_existing(out_dir, posts):
-    src = os.path.join(out_dir, "source")
-    os.makedirs(src, exist_ok=True)
-    with open(os.path.join(src, "posts.jsonl"), "w", encoding="utf-8") as f:
-        for p in posts:
-            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+    artifacts = _resume_identity_artifacts()
+    artifacts["source/posts.jsonl"] = "".join(
+        json.dumps(post, ensure_ascii=False) + "\n" for post in posts
+    )
+    _commit_resume_artifacts(out_dir, artifacts)
+
+
+def _setup_legacy_existing(out_dir, posts):
+    artifacts = _resume_identity_artifacts()
+    artifacts["source/posts.jsonl"] = "".join(
+        json.dumps(post, ensure_ascii=False) + "\n" for post in posts
+    )
+    for relative_path, payload in artifacts.items():
+        path = os.path.join(out_dir, relative_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(payload)
 
 
 def _exact_tree_digest(root):
@@ -200,7 +271,7 @@ def test_resume_end_to_end_creates_distinct_outputs_and_never_mutates_old(
     assert task["existing_count"] == 3
     assert task["new_count"] == 1
     assert task["collected_count"] == 4
-    assert task["resume_source"]["format"] == "legacy-read-only"
+    assert task["resume_source"]["format"] == collect.IMMUTABLE_WORKSPACE_FORMAT
     assert len(task["resume_source"]["digest"]) == 64
     assert all((output / ".complete").is_file() for output in outputs)
     assert {
@@ -217,8 +288,6 @@ def test_csv_only_resume_restores_cell_types_in_new_jsonl(
     monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
     monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
     old = tmp_path / "csv-only"
-    old.mkdir()
-    (old / "source").mkdir()
     row = {
         "platform": "bilibili",
         "post_id": "BV_CSV",
@@ -234,14 +303,11 @@ def test_csv_only_resume_restores_cell_types_in_new_jsonl(
         "collection_status": "SUCCESS",
         "collection_status_source": "declared",
     }
-    csv_path = old / "normalized-posts.csv"
-    if historical_repr:
-        with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(row))
-            writer.writeheader()
-            writer.writerow(row)
-    else:
-        collect._write_csv([row], str(csv_path))
+    artifacts = _resume_identity_artifacts()
+    artifacts["normalized-posts.csv"] = _csv_payload(
+        row, historical_repr=historical_repr
+    )
+    _commit_resume_artifacts(old, artifacts)
 
     assert collect.run(
         "https://space.bilibili.com/123",
@@ -284,6 +350,210 @@ def test_resume_without_out_returns_error_before_adapter_or_workspace(
     assert not (tmp_path / "skill" / "workspace").exists()
 
 
+def test_resume_rejects_unsealed_legacy_before_adapter_or_output(
+    monkeypatch, tmp_path
+):
+    old = tmp_path / "legacy"
+    _setup_legacy_existing(
+        str(old),
+        [{"post_id": "BV_OLD1", "bvid": "BV_OLD1"}],
+    )
+    before = _exact_tree_digest(old)
+    adapter_loads = 0
+
+    def load_adapters(*_args, **_kwargs):
+        nonlocal adapter_loads
+        adapter_loads += 1
+        return [FakeAdapter()]
+
+    monkeypatch.setattr(collect, "_load_adapters", load_adapters)
+
+    assert collect.run(BILIBILI_URL, out_dir=str(old), resume=True) == 2
+    assert adapter_loads == 0
+    assert _exact_tree_digest(old) == before
+    assert list(tmp_path.glob("legacy-resume-*")) == []
+
+
+@pytest.mark.parametrize(
+    "invalid_posts",
+    ["not-json\n", "[]\n"],
+    ids=["malformed-json", "non-object-json"],
+)
+def test_committed_resume_rejects_invalid_nonempty_jsonl_without_csv_fallback(
+    monkeypatch, tmp_path, invalid_posts
+):
+    old = tmp_path / "invalid-jsonl"
+    csv_row = {
+        "platform": "bilibili",
+        "post_id": "BV_CSV_VALID",
+        "bvid": "BV_CSV_VALID",
+        "published_at": "2026-07-15T10:00:00+08:00",
+    }
+    artifacts = _resume_identity_artifacts()
+    artifacts["source/posts.jsonl"] = invalid_posts
+    artifacts["normalized-posts.csv"] = _csv_payload(csv_row)
+    _commit_resume_artifacts(old, artifacts)
+    before = _exact_tree_digest(old)
+    adapter_loads = 0
+
+    def load_adapters(*_args, **_kwargs):
+        nonlocal adapter_loads
+        adapter_loads += 1
+        return [FakeAdapter()]
+
+    monkeypatch.setattr(collect, "_load_adapters", load_adapters)
+
+    assert collect.run(BILIBILI_URL, out_dir=str(old), resume=True) == 2
+    assert adapter_loads == 0
+    assert _exact_tree_digest(old) == before
+    assert list(tmp_path.glob("invalid-jsonl-resume-*")) == []
+
+
+def test_committed_resume_rejects_missing_post_artifacts_before_adapter_or_output(
+    monkeypatch, tmp_path
+):
+    old = tmp_path / "missing-posts"
+    _commit_resume_artifacts(old, _resume_identity_artifacts())
+    before = _exact_tree_digest(old)
+    adapter_loads = 0
+
+    def load_adapters(*_args, **_kwargs):
+        nonlocal adapter_loads
+        adapter_loads += 1
+        return [FakeAdapter()]
+
+    monkeypatch.setattr(collect, "_load_adapters", load_adapters)
+
+    assert collect.run(BILIBILI_URL, out_dir=str(old), resume=True) == 2
+    assert adapter_loads == 0
+    assert _exact_tree_digest(old) == before
+    assert list(tmp_path.glob("missing-posts-resume-*")) == []
+
+
+def test_committed_empty_jsonl_does_not_fallback_to_manifested_csv(tmp_path):
+    old = tmp_path / "explicit-empty-jsonl"
+    csv_row = {
+        "platform": "bilibili",
+        "post_id": "BV_CSV_MUST_NOT_LOAD",
+        "bvid": "BV_CSV_MUST_NOT_LOAD",
+    }
+    artifacts = _resume_identity_artifacts()
+    artifacts["source/posts.jsonl"] = ""
+    artifacts["normalized-posts.csv"] = _csv_payload(csv_row)
+    _commit_resume_artifacts(old, artifacts)
+
+    posts, source_format, source_digest = collect._load_existing_posts(
+        str(old),
+        expected_platform="bilibili",
+        expected_profile_url=BILIBILI_URL,
+    )
+
+    assert posts == []
+    assert source_format == collect.IMMUTABLE_WORKSPACE_FORMAT
+    assert len(source_digest) == 64
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+@pytest.mark.parametrize("terminator", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_committed_resume_jsonl_preserves_unicode_separator_inside_string(
+    tmp_path, separator, terminator
+):
+    old = tmp_path / "unicode-jsonl"
+    post = {
+        "platform": "bilibili",
+        "post_id": "BV_UNICODE",
+        "title": f"before{separator}after",
+    }
+    artifacts = _resume_identity_artifacts()
+    artifacts["source/posts.jsonl"] = (
+        json.dumps(post, ensure_ascii=False) + terminator
+    )
+    _commit_resume_artifacts(old, artifacts)
+
+    posts, _, _ = collect._load_existing_posts(
+        str(old),
+        expected_platform="bilibili",
+        expected_profile_url=BILIBILI_URL,
+    )
+
+    assert posts == [post]
+
+
+@pytest.mark.parametrize(
+    "invalid_identity",
+    [
+        "missing-task",
+        "missing-profile",
+        "foreign-account",
+        "foreign-platform",
+        "task-profile-conflict",
+    ],
+)
+def test_resume_rejects_unbound_source_before_network_or_output(
+    monkeypatch, tmp_path, invalid_identity
+):
+    class RecordingAdapter(FakeAdapter):
+        def __init__(self):
+            self.network_calls = []
+
+        def check_access(self, url):
+            self.network_calls.append(("check_access", url))
+            return {"accessible": True}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            self.network_calls.append(("collect_post_list", url))
+            return super().collect_post_list(url, limit, date_range)
+
+        def collect_profile(self, url):
+            self.network_calls.append(("collect_profile", url))
+            return super().collect_profile(url)
+
+    old = tmp_path / "unbound"
+    artifacts = _resume_identity_artifacts()
+    artifacts["source/posts.jsonl"] = json.dumps(
+        {"post_id": "BV_OLD1", "bvid": "BV_OLD1"}
+    ) + "\n"
+    if invalid_identity == "missing-task":
+        artifacts.pop("task.json")
+    elif invalid_identity == "missing-profile":
+        artifacts.pop("source/profile.json")
+    elif invalid_identity == "foreign-account":
+        artifacts = _resume_identity_artifacts(
+            task_profile_url="https://space.bilibili.com/999"
+        )
+        artifacts["source/posts.jsonl"] = json.dumps(
+            {"post_id": "BV_OLD1", "bvid": "BV_OLD1"}
+        ) + "\n"
+    elif invalid_identity == "foreign-platform":
+        artifacts = _resume_identity_artifacts(
+            task_platform="douyin",
+            task_profile_url="https://www.douyin.com/user/example",
+        )
+        artifacts["source/posts.jsonl"] = json.dumps(
+            {"post_id": "BV_OLD1", "bvid": "BV_OLD1"}
+        ) + "\n"
+    else:
+        artifacts = _resume_identity_artifacts(
+            profile_profile_url="https://space.bilibili.com/999"
+        )
+        artifacts["source/posts.jsonl"] = json.dumps(
+            {"post_id": "BV_OLD1", "bvid": "BV_OLD1"}
+        ) + "\n"
+    _commit_resume_artifacts(old, artifacts)
+
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
+
+    assert collect.run(
+        BILIBILI_URL,
+        out_dir=str(old),
+        resume=True,
+    ) == 2
+    assert adapter.network_calls == []
+    assert list(tmp_path.glob("unbound-resume-*")) == []
+
+
 def test_resume_effective_since_after_date_to_rejects_without_mutation(
     monkeypatch, tmp_path
 ):
@@ -294,7 +564,7 @@ def test_resume_effective_since_after_date_to_rejects_without_mutation(
         "published_at": "2026-07-20T10:00:00+08:00",
     }
     _setup_existing(str(out), [original])
-    before = (out / "source" / "posts.jsonl").read_bytes()
+    before = _exact_tree_digest(out)
     monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
     monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
 
@@ -307,18 +577,17 @@ def test_resume_effective_since_after_date_to_rejects_without_mutation(
     )
 
     assert rc == 2
-    assert (out / "source" / "posts.jsonl").read_bytes() == before
-    assert sorted(path.relative_to(out).as_posix() for path in out.rglob("*")) == [
-        "source",
-        "source/posts.jsonl",
-    ]
+    assert _exact_tree_digest(out) == before
 
 
-def test_resume_degrade_when_empty_writes_new_workspace(monkeypatch, tmp_path):
+def test_committed_resume_degrades_when_jsonl_is_explicitly_empty(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
     monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
-    old = tmp_path / "legacy-empty"
-    (old / "source").mkdir(parents=True)
+    old = tmp_path / "committed-empty"
+    _setup_existing(str(old), [])
+    before = _exact_tree_digest(old)
     rc = collect.run(
         "https://space.bilibili.com/123",
         limit=30,
@@ -326,13 +595,13 @@ def test_resume_degrade_when_empty_writes_new_workspace(monkeypatch, tmp_path):
         resume=True,
     )
     assert rc == 0
-    outputs = list(tmp_path.glob("legacy-empty-resume-*"))
+    outputs = list(tmp_path.glob("committed-empty-resume-*"))
     assert len(outputs) == 1
     task = json.loads((outputs[0] / "task.json").read_text(encoding="utf-8"))
     assert task["incremental"] is False
     assert task["existing_count"] == 0
     assert task["collected_count"] == 2
-    assert list(old.iterdir()) == [old / "source"]
+    assert _exact_tree_digest(old) == before
 
 
 def test_resume_from_committed_workspace_records_exact_commit_digest(

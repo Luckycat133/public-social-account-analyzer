@@ -82,7 +82,12 @@ COMMENT_LEDGER_FIELDS = (
     "per_post_limit",
 )
 COMMENT_STOP_REASONS = frozenset(
-    {"LOGIN_REQUIRED", "VERIFICATION_REQUIRED", "ACCESS_RESTRICTED"}
+    {
+        "LOGIN_REQUIRED",
+        "VERIFICATION_REQUIRED",
+        "RATE_LIMITED",
+        "ACCESS_RESTRICTED",
+    }
 )
 COMMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 COMMENT_PER_POST_LIMIT = 20

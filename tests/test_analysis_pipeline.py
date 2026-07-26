@@ -1515,6 +1515,85 @@ def test_comment_collection_first_wins_duplicate_parent_before_pipeline_analysis
     }
 
 
+def test_rate_limited_comment_collection_commits_partial_unavailable_analysis(
+    monkeypatch, tmp_path
+):
+    import collect
+    from collectors.douyin import DouyinError
+
+    pipeline = _pipeline_module()
+
+    class RateLimitedCommentAdapter:
+        platform = "douyin"
+
+        def __init__(self):
+            self.comment_calls = []
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_profile(self, url):
+            return {
+                "platform": "douyin",
+                "account_name": "频控账号",
+                "field_visibility": {},
+            }
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            return [_sample_post()]
+
+        def collect_comments(self, post_url, limit=20):
+            self.comment_calls.append((post_url, limit))
+            raise DouyinError("RATE_LIMITED", "unsafe rate-limit response")
+
+    adapter = RateLimitedCommentAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    collection = tmp_path / "rate-limited-collection"
+
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(collection),
+        include_comments=True,
+    ) == 0
+    assert adapter.comment_calls == [("https://www.douyin.com/video/1", 20)]
+    assert (collection / ".complete").is_file()
+    source_task = json.loads(
+        (collection / "task.json").read_text(encoding="utf-8")
+    )
+    assert source_task["task_status"] == "PARTIAL"
+    assert source_task["stop_reason"] == "RATE_LIMITED"
+    assert source_task["comment_collection"] == {
+        "attempted_posts": 1,
+        "comments_collected": 0,
+        "empty_results": 0,
+        "failures": 1,
+        "per_post_limit": 20,
+        "stop_reason": "RATE_LIMITED",
+    }
+
+    output = tmp_path / "rate-limited-analysis"
+    result = pipeline.run_pipeline(
+        str(collection), str(output), template_text=_minimal_template()
+    )
+
+    assert result.task_status == "PARTIAL"
+    assert (output / ".complete").is_file()
+    analysis_payload = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )
+    assert analysis_payload["comment_analysis"]["status"] == "unavailable"
+    assert (
+        analysis_payload["comment_analysis"]["collection_ledger"]["stop_reason"]
+        == "RATE_LIMITED"
+    )
+    assert "unsafe rate-limit response" not in json.dumps(
+        analysis_payload, ensure_ascii=False
+    )
+
+
 def test_pipeline_copies_only_verified_optional_source_evidence(tmp_path):
     pipeline = _pipeline_module()
     comments = (

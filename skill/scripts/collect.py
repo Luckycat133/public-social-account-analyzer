@@ -73,9 +73,9 @@ from immutable_workspace import (  # noqa: E402
     WorkspaceIdentityError,
     WorkspaceVerificationError,
     WorkspaceWriteError,
+    VerifiedWorkspaceReader,
     ensure_container,
     preflight_backend,
-    read_resume_artifact,
     reject_workspace_overlap,
     verify_committed_workspace,
 )
@@ -98,6 +98,7 @@ SR_LOGIN = "LOGIN_REQUIRED"
 SR_VERIFICATION = "VERIFICATION_REQUIRED"
 SR_ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
 SR_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
+SR_RATE_LIMITED = "RATE_LIMITED"
 SR_PARSER_FAILED = "PARSER_FAILED"
 SR_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
 SR_INTERNAL = "INTERNAL_ERROR"
@@ -114,13 +115,15 @@ _DETAIL_FIELDS = P0_DETAIL_FIELDS
 # 已知 stop_reason 集合,用于从异常消息前缀 [REASON] 兜底识别
 _KNOWN_STOP_REASONS = frozenset({
     SR_UNSUPPORTED, SR_ADAPTER_UNAVAILABLE, SR_LOGIN, SR_VERIFICATION,
-    SR_ACCOUNT_UNAVAILABLE, SR_ACCESS_RESTRICTED, SR_PARSER_FAILED,
+    SR_ACCOUNT_UNAVAILABLE, SR_ACCESS_RESTRICTED, SR_RATE_LIMITED,
+    SR_PARSER_FAILED,
     SR_NO_PUBLIC_CONTENT, SR_INTERNAL,
 })
 _TASK_PROTECTION_REASONS = frozenset({
     SR_LOGIN,
     SR_VERIFICATION,
     SR_ACCESS_RESTRICTED,
+    SR_RATE_LIMITED,
 })
 
 _ERROR_STAGE_MESSAGES = {
@@ -339,6 +342,17 @@ def _set_detail_status(post: dict, status: str) -> None:
     post["platform_metrics"]["detail_status"] = status
 
 
+def _set_detail_protection(
+    post: dict,
+    *,
+    attempted: bool,
+    stop_reason: str,
+) -> None:
+    _set_detail_status(post, "UNAVAILABLE")
+    post["platform_metrics"]["detail_attempted"] = attempted
+    post["platform_metrics"]["detail_stop_reason"] = stop_reason
+
+
 def _comment_parent_is_analysis_eligible(platform: str, post: dict) -> bool:
     if not isinstance(post, dict) or post.get("platform") != platform:
         return False
@@ -499,9 +513,9 @@ def _prepare_explicit_workspace(
 ) -> _WorkspaceReservation:
     """Atomically acquire a new final-name workspace.
 
-    Resume sources use :func:`read_resume_artifact` and are never returned as a
-    writable reservation.  The legacy parameters remain only to give callers a
-    stable, fail-closed error during the CLI transition.
+    Resume sources use :class:`VerifiedWorkspaceReader` and are never returned
+    as a writable reservation. The legacy parameters remain only to give
+    callers a stable, fail-closed error during the CLI transition.
     """
     if resume or expected_identities is not None:
         raise WorkspaceVerificationError("resume workspace is read-only")
@@ -581,9 +595,16 @@ def _enrich_douyin_details(
     posts: list[dict],
     error_log: list[dict],
     occurred_at: str,
+    *,
+    blocked_reason: str | None = None,
 ) -> int:
     """Fill only missing public fields; isolate and sanitize item failures."""
     unavailable_count = 0
+    protection_reason = (
+        blocked_reason
+        if blocked_reason in _TASK_PROTECTION_REASONS
+        else None
+    )
     for post in posts:
         initial_status = post.get("collection_status")
         if initial_status not in {"SUCCESS", "PARTIAL"}:
@@ -631,6 +652,14 @@ def _enrich_douyin_details(
             ):
                 post["collection_status"] = "SUCCESS"
             continue
+        if protection_reason is not None:
+            unavailable_count += 1
+            _set_detail_protection(
+                post,
+                attempted=False,
+                stop_reason=protection_reason,
+            )
+            continue
         item_url = _douyin_item_url(post)
         if item_url is None:
             unavailable_count += 1
@@ -650,8 +679,25 @@ def _enrich_douyin_details(
                 raise ValueError("invalid detail result")
             if str(detail.get("post_id") or "") != str(post.get("post_id") or ""):
                 raise ValueError("mismatched detail post id")
-        except Exception:
+        except Exception as error:
             unavailable_count += 1
+            reason = _stop_reason_from_exc(error)
+            if reason in _TASK_PROTECTION_REASONS:
+                protection_reason = reason
+                _set_detail_protection(
+                    post,
+                    attempted=True,
+                    stop_reason=reason,
+                )
+                error_log.append({
+                    "url": item_url,
+                    "stage": "collect_post_detail",
+                    "error_code": reason,
+                    "message": _ERROR_STAGE_MESSAGES["collect_post_detail"],
+                    "occurred_at": occurred_at,
+                    "retryable": False,
+                })
+                continue
             _set_detail_status(post, "UNAVAILABLE")
             error_log.append({
                 "url": item_url,
@@ -709,6 +755,8 @@ def _collect_and_persist_comments(
     error_log: list[dict],
     occurred_at: str,
     reservation: _WorkspaceReservation | None = None,
+    *,
+    blocked_reason: str | None = None,
 ) -> dict:
     per_post_limit = 20
     records: list[dict] = []
@@ -723,7 +771,10 @@ def _collect_and_persist_comments(
     failed_parents: set[str] = set()
     eligible_parents: dict[str, str] = {}
     ambiguous_parents: set[str] = set()
-    first_wins_posts, _ = dedup_posts(posts)
+    eligible_posts = (
+        [] if blocked_reason in _TASK_PROTECTION_REASONS else posts
+    )
+    first_wins_posts, _ = dedup_posts(eligible_posts)
     for post in first_wins_posts:
         platform = str(adapter.platform)
         if not _comment_parent_is_analysis_eligible(platform, post):
@@ -840,53 +891,194 @@ def _post_key(p: dict) -> str:
     return str(p.get("post_id") or p.get("bvid") or p.get("post_url") or "")
 
 
-def _load_existing_posts(ws: str) -> tuple[list[dict], str, str]:
-    """读取既有采集产物中的帖子,用于增量续采去重。
-
-    优先 source/posts.jsonl(无损 JSONL),回退 normalized-posts.csv(字段可能经 CSV 字符串化)。
-    """
-    posts: list[dict] = []
-    snapshot = read_resume_artifact(
-        ws,
-        "source/posts.jsonl",
-        allowed_artifacts=_PUBLIC_ARTIFACTS,
-        max_bytes=_MAX_RESUME_ARTIFACT_BYTES,
-    )
+def _resume_json_object(payload: bytes | None, label: str) -> dict:
+    if payload is None:
+        raise WorkspaceVerificationError(f"resume {label} is missing")
     try:
-        posts_payload = snapshot.payload
-        if posts_payload is not None:
-            for line in posts_payload.decode("utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    posts.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except UnicodeDecodeError as exc:
-        raise WorkspaceContractError("resume artifact encoding is invalid") from exc
-    if not posts:
-        csv_snapshot = read_resume_artifact(
-            ws,
-            "normalized-posts.csv",
-            allowed_artifacts=_PUBLIC_ARTIFACTS,
-            max_bytes=_MAX_RESUME_ARTIFACT_BYTES,
-        )
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkspaceVerificationError(
+            f"resume {label} is invalid"
+        ) from exc
+    if not isinstance(value, dict):
+        raise WorkspaceVerificationError(f"resume {label} is invalid")
+    return value
+
+
+def _validate_resume_identity(
+    task_payload: bytes | None,
+    profile_payload: bytes | None,
+    *,
+    expected_platform: str,
+    expected_profile_url: str,
+) -> None:
+    task = _resume_json_object(task_payload, "task.json")
+    profile = _resume_json_object(profile_payload, "source/profile.json")
+    for value in (task, profile):
+        if value.get("platform") != expected_platform:
+            raise WorkspaceVerificationError("resume platform identity mismatch")
+        profile_url = value.get("profile_url")
+        if (
+            profile_url != expected_profile_url
+            or canonical_profile_url(expected_platform, profile_url)
+            != expected_profile_url
+        ):
+            raise WorkspaceVerificationError(
+                "resume profile identity mismatch"
+            )
+
+
+def _parse_resume_posts(
+    posts_payload: bytes | None,
+    csv_payload: bytes | None,
+) -> list[dict]:
+    def reject_constant(value: str):
+        raise ValueError(f"non-standard numeric constant {value}")
+
+    def reject_duplicate_keys(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    if posts_payload is not None:
         try:
-            csv_payload = csv_snapshot.payload
-            if csv_payload is not None:
-                with io.StringIO(
-                    csv_payload.decode("utf-8"), newline=""
-                ) as handle:
-                    for row in csv.DictReader(handle):
-                        posts.append(deserialize_csv_row(row))
+            text = posts_payload.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise WorkspaceContractError(
-                "resume artifact encoding is invalid"
+            raise WorkspaceVerificationError(
+                "resume posts JSONL encoding is invalid"
             ) from exc
-        if csv_payload is not None:
-            snapshot = csv_snapshot
-    return posts, snapshot.source_format, snapshot.source_digest
+        if not text:
+            return []
+        posts: list[dict] = []
+        lines = text.split("\n")
+        if lines[-1] == "":
+            lines.pop()
+        for line_number, line in enumerate(lines, start=1):
+            if line.endswith("\r"):
+                line = line[:-1]
+            if not line.strip():
+                raise WorkspaceVerificationError(
+                    f"resume posts JSONL line {line_number} is invalid"
+                )
+            try:
+                value = json.loads(
+                    line,
+                    parse_constant=reject_constant,
+                    object_pairs_hook=reject_duplicate_keys,
+                )
+            except (
+                json.JSONDecodeError,
+                MemoryError,
+                RecursionError,
+                ValueError,
+            ) as exc:
+                raise WorkspaceVerificationError(
+                    f"resume posts JSONL line {line_number} is invalid"
+                ) from exc
+            if not isinstance(value, dict):
+                raise WorkspaceVerificationError(
+                    f"resume posts JSONL line {line_number} is not an object"
+                )
+            posts.append(value)
+        return posts
+
+    if csv_payload is None:
+        raise WorkspaceVerificationError("resume posts artifact is missing")
+    try:
+        text = csv_payload.decode("utf-8")
+        if "\x00" in text:
+            raise ValueError("NUL is not valid CSV text")
+        with io.StringIO(text, newline="") as handle:
+            reader = csv.DictReader(handle, strict=True)
+            fieldnames = reader.fieldnames
+            if (
+                not fieldnames
+                or any(
+                    not isinstance(field, str) or not field
+                    for field in fieldnames
+                )
+                or len(set(fieldnames)) != len(fieldnames)
+            ):
+                raise ValueError("resume CSV header is invalid")
+            rows = []
+            for row in reader:
+                if None in row or any(value is None for value in row.values()):
+                    raise ValueError("resume CSV row shape is invalid")
+                rows.append(deserialize_csv_row(row))
+            return rows
+    except (UnicodeDecodeError, csv.Error, TypeError, ValueError) as exc:
+        raise WorkspaceVerificationError("resume CSV artifact is invalid") from exc
+
+
+def _load_committed_resume(
+    ws: str,
+    *,
+    expected_platform: str,
+    expected_profile_url: str,
+) -> tuple[list[dict], str, str]:
+    with VerifiedWorkspaceReader.open(
+        ws, allowed_artifacts=_PUBLIC_ARTIFACTS
+    ) as reader:
+        manifested = {
+            item["path"] for item in reader.manifest.get("artifacts", [])
+        }
+        task = reader.read("task.json")
+        profile = reader.read("source/profile.json")
+        _validate_resume_identity(
+            task.payload,
+            profile.payload,
+            expected_platform=expected_platform,
+            expected_profile_url=expected_profile_url,
+        )
+        posts_payload = None
+        csv_payload = None
+        if "source/posts.jsonl" in manifested:
+            posts_payload = reader.read(
+                "source/posts.jsonl", max_bytes=_MAX_RESUME_ARTIFACT_BYTES
+            ).payload
+        elif "normalized-posts.csv" in manifested:
+            csv_payload = reader.read(
+                "normalized-posts.csv", max_bytes=_MAX_RESUME_ARTIFACT_BYTES
+            ).payload
+        reader.verify_unchanged()
+        return (
+            _parse_resume_posts(posts_payload, csv_payload),
+            reader.source_format,
+            reader.source_digest,
+        )
+
+
+def _load_existing_posts(
+    ws: str,
+    *,
+    expected_platform: str,
+    expected_profile_url: str,
+) -> tuple[list[dict], str, str]:
+    """Read posts from one identity-bound committed resume workspace."""
+    return _load_committed_resume(
+        os.path.abspath(ws),
+        expected_platform=expected_platform,
+        expected_profile_url=expected_profile_url,
+    )
+
+
+def _canonical_resume_identity(url: str) -> tuple[str, str]:
+    routing_url = sanitize_routing_url(url)
+    if routing_url is None:
+        raise WorkspaceVerificationError("resume URL is invalid")
+    matches = [
+        (platform, canonical)
+        for platform in ("bilibili", "douyin", "weibo")
+        if (canonical := canonical_profile_url(platform, routing_url)) is not None
+    ]
+    if len(matches) != 1:
+        raise WorkspaceVerificationError(
+            "resume requires one canonical account profile URL"
+        )
+    return matches[0]
 
 
 def _latest_published_at(posts: list[dict]) -> str | None:
@@ -935,7 +1127,7 @@ def _ensure_post_collection_status_contract(posts: list[dict]) -> None:
     """Make directly persisted or resumed rows obey the status contract.
 
     Normal collectors already pass rows through ``BaseCollector.normalize_post``.
-    This boundary guard also covers legacy resume artifacts and third-party
+    This boundary guard also covers committed resume artifacts and third-party
     adapters that return raw rows directly, without silently promoting an
     absent or invalid status to success.
     """
@@ -1360,14 +1552,21 @@ def run(
     existing_posts: list[dict] = []
     resume_source_format: str | None = None
     resume_source_digest: str | None = None
+    resume_platform: str | None = None
+    resume_profile_url: str | None = None
     resume_mode = bool(resume)
     if resume_mode:
         try:
+            resume_platform, resume_profile_url = _canonical_resume_identity(url)
             (
                 existing_posts,
                 resume_source_format,
                 resume_source_digest,
-            ) = _load_existing_posts(str(out_dir))
+            ) = _load_existing_posts(
+                str(out_dir),
+                expected_platform=resume_platform,
+                expected_profile_url=resume_profile_url,
+            )
         except (OSError, WorkspaceContractError):
             print("[FAILED] 增量续采目录无法安全读取", file=sys.stderr)
             return 2
@@ -1422,6 +1621,11 @@ def run(
     )
     if canonical_url is None:
         print("[FAILED] 账号主页 URL 不符合平台公开路径规范", file=sys.stderr)
+        return 2
+    if resume and (
+        platform != resume_platform or canonical_url != resume_profile_url
+    ):
+        print("[FAILED] 增量续采账号身份与来源不一致", file=sys.stderr)
         return 2
     url = canonical_url
     safe_url = canonical_url
@@ -1663,12 +1867,12 @@ def run(
             raise ValueError("invalid profile result")
         profile["profile_url"] = url
     except Exception as e:
-        if stop_reason is None:
-            stop_reason = _stop_reason_from_exc(e)
-            task_status = "PARTIAL" if posts else "FAILED"
+        profile_reason = _stop_reason_from_exc(e)
+        stop_reason = _dominant_stop_reason(stop_reason, profile_reason)
+        task_status = "PARTIAL" if posts else "FAILED"
         error_log.append({
             "url": safe_url, "stage": "collect_profile",
-            "error_code": _stop_reason_from_exc(e),
+            "error_code": profile_reason,
             "message": _ERROR_STAGE_MESSAGES["collect_profile"],
             "occurred_at": collected_at, "retryable": False,
         })
@@ -1677,8 +1881,22 @@ def run(
 
     if enrich_details and platform == "douyin" and posts:
         detail_unavailable_count = _enrich_douyin_details(
-            adapter, posts, error_log, collected_at
+            adapter,
+            posts,
+            error_log,
+            collected_at,
+            blocked_reason=stop_reason,
         )
+        detail_protection = next(
+            (
+                error.get("error_code")
+                for error in reversed(error_log)
+                if error.get("stage") == "collect_post_detail"
+                and error.get("error_code") in _TASK_PROTECTION_REASONS
+            ),
+            None,
+        )
+        stop_reason = _dominant_stop_reason(stop_reason, detail_protection)
 
     clear_detail_provenance = getattr(adapter, "_clear_detail_provenance", None)
     if callable(clear_detail_provenance):
@@ -1711,6 +1929,7 @@ def run(
                 error_log,
                 collected_at,
                 reservation=reservation,
+                blocked_reason=stop_reason,
             )
             comment_stop_reason = comment_collection.get("stop_reason")
             if comment_stop_reason in _TASK_PROTECTION_REASONS:

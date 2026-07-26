@@ -16,7 +16,7 @@
 | 适配器未启用 | FAILED | ADAPTER_UNAVAILABLE | 否 | 否 |
 | 页面要求登录 | PARTIAL/FAILED | LOGIN_REQUIRED | 是 | 否 |
 | 出现验证码 | PARTIAL/FAILED | VERIFICATION_REQUIRED | 是 | 否 |
-| 访问频控 | PARTIAL/FAILED | ACCESS_RESTRICTED | 是 | 否 |
+| 访问频控 | PARTIAL/FAILED | RATE_LIMITED | 是 | 否 |
 | 账号不存在 | FAILED | ACCOUNT_UNAVAILABLE | 否 | 否 |
 | 单条内容失效 | PARTIAL | POST_UNAVAILABLE | 是 | 是 |
 | 字段缺失 | 状态不变 | null | 是 | 是 |
@@ -42,10 +42,15 @@
   `COMMENTS_UNAVAILABLE`，不得携带上游正文或异常文本。启用但尚未实现评论采样的微博适配器
   也必须抛该固定原因，不能返回 `[]` 伪装为真实空结果。
 - **评论端点的平台保护响应**：如果评论采集明确收到登录、验证或访问限制，必须保留准确的
-  `LOGIN_REQUIRED`、`VERIFICATION_REQUIRED` 或 `ACCESS_RESTRICTED`，立即停止当前任务的
-  剩余评论与网络请求，并写入任务级 `stop_reason`。该原因优先于此前的非平台保护原因；如果
-  此前已有平台保护原因，则保留先出现的原因。此前的普通解析或内容错误仍保留在错误日志和
-  评论采集元数据中，不得改写为平台保护，也不得把平台保护降格为 `COMMENTS_UNAVAILABLE`。
+  `LOGIN_REQUIRED`、`VERIFICATION_REQUIRED`、`RATE_LIMITED` 或 `ACCESS_RESTRICTED`，立即
+  停止当前任务的剩余评论与网络请求，并写入任务级 `stop_reason`。该原因
+  优先于此前的非平台保护原因；如果此前已有平台保护原因，则保留先出现的原因。此前的普通
+  解析或内容错误仍保留在错误日志和评论采集元数据中，不得改写为平台保护，也不得把平台
+  保护降格为 `COMMENTS_UNAVAILABLE`。
+- **任务级平台保护断路**：列表、资料或详情阶段确认上述四类平台保护后，后续详情和评论端点
+  均不得调用。较晚发现的平台保护必须优先于此前普通 `PARSER_FAILED` 等原因上提；若已经有
+  平台保护则保留先出现者。请求了评论时仍排他写入空 `comments.jsonl`，账本五项计数全为 0
+  （`per_post_limit=20`），且不另写评论级 `stop_reason`。
 - **评论记录失败**：父锚点不一致或评论 ID/字段畸形作为内容级
   `COMMENTS_UNAVAILABLE` 写固定错误；其余有效评论和账号/作品采集继续处理，且任务级
   `stop_reason` 保持 `null`。
@@ -62,7 +67,7 @@
 
 执行任何采集、归一化、分析步骤时，必须遵循以下 6 条规则：
 
-1. **不绕过登录、验证码、滑块或频控。** 一旦平台要求登录或触发验证，必须立即停止对应请求，绝不尝试伪造、绕过或自动化破解这些保护措施。
+1. **不绕过登录、验证码、滑块或频控。** 一旦平台要求登录、触发验证或明确频控，必须立即停止对应请求，绝不尝试伪造、绕过或自动化破解这些保护措施。
 2. **单条失败不能导致整个任务直接失败。** 单条内容采集/解析失败应隔离为内容级错误，任务整体状态仅据此降级为 `PARTIAL`，而非直接 `FAILED`。
 3. **已提交采集数据必须保持只读。** 无论后续步骤是否失败，采集工作区的目录树与字节均不得删除或覆盖；归一化、分析和报告写入独立分析工作区。
 4. **错误指标不得写入正常数据。** 失败、受限或缺失的字段一律写 `null` 或记录于错误日志，禁止用 `0`、占位值或猜测值污染正常数据行。
@@ -107,7 +112,18 @@
 - 身份、所有权、清单、摘要或精确目录清单不一致时，立即按安全/验证错误失败。即使攻击者
   放回字节完全相同的合法 `.complete`，也不得吞掉已发现的路径节点身份替换。
 
-### 2.3 派生分析工作区
+### 2.3 不可变续采输入
+
+- `collect.py --resume --out <OLD>` 只接受同时具有有效 `.complete` 和 `manifest.json` 的已
+  提交采集工作区，并在加载适配器、发起网络请求或预留新输出前完成 identity-bound 验证。
+  未密封 legacy 目录、缺少任一提交元数据或验证失败均以参数错误关闭，来源保持逐字节只读。
+- manifest 中存在 `source/posts.jsonl` 时，它是唯一帖子来源：显式空文件表示 0 条；非空
+  JSONL 的任一畸形、空白或非对象记录都拒绝整个续采，绝不以 CSV 掩盖。只有 JSONL artifact
+  缺失时才可读取已 manifest 的严格 CSV；JSONL 与 CSV 都缺失时拒绝，不能退化为全量采集。
+- 成功续采始终写入另一个新不可变工作区，`resume_source.digest` 记录来源 commit SHA-256；
+  任何成功、失败或异常路径都不得修改来源目录。
+
+### 2.4 派生分析工作区
 
 - 已提交采集目录只能通过 identity-bound immutable reader 读取；旧版
   `normalize.py` / `analyze.py` / `render_report.py` 遇 `manifest.json` 或 `.complete` 必须拒绝，

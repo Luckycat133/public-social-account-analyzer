@@ -1316,7 +1316,7 @@ def test_weibo_comment_parent_requires_matching_public_post_url(
     assert task["comment_collection"]["failures"] == 1
 
 
-def test_resume_comments_leave_legacy_temp_symlink_read_only(
+def test_resume_rejects_legacy_comment_source_and_leaves_it_read_only(
     monkeypatch, tmp_path
 ):
     import collect
@@ -1324,12 +1324,44 @@ def test_resume_comments_leave_legacy_temp_symlink_read_only(
     old = tmp_path / "old"
     source = old / "source"
     source.mkdir(parents=True)
+    (old / "task.json").write_text(
+        json.dumps(
+            {
+                "platform": "douyin",
+                "profile_url": "https://www.douyin.com/user/example",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "profile.json").write_text(
+        json.dumps(
+            {
+                "platform": "douyin",
+                "profile_url": "https://www.douyin.com/user/example",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "posts.jsonl").write_text("", encoding="utf-8")
     victim = tmp_path / "victim.txt"
     victim.write_text("do-not-touch", encoding="utf-8")
     predictable = source / "comments.jsonl.tmp"
     predictable.symlink_to(victim)
     new = tmp_path / "new"
-    monkeypatch.setattr(collect, "_load_adapters", lambda: [_SafeCommentAdapter()])
+    before = {
+        "task": (old / "task.json").read_bytes(),
+        "profile": (source / "profile.json").read_bytes(),
+        "posts": (source / "posts.jsonl").read_bytes(),
+        "link": os.readlink(predictable),
+    }
+    adapter_loads = 0
+
+    def load_adapters():
+        nonlocal adapter_loads
+        adapter_loads += 1
+        return [_SafeCommentAdapter()]
+
+    monkeypatch.setattr(collect, "_load_adapters", load_adapters)
 
     assert collect.run(
         "https://www.douyin.com/user/example",
@@ -1337,11 +1369,15 @@ def test_resume_comments_leave_legacy_temp_symlink_read_only(
         include_comments=True,
         resume=True,
         resume_out=str(new),
-    ) == 0
+    ) == 2
+    assert adapter_loads == 0
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
     assert predictable.is_symlink()
-    assert (new / "source" / "comments.jsonl").is_file()
-    assert (new / ".complete").is_file()
+    assert os.readlink(predictable) == before["link"]
+    assert (old / "task.json").read_bytes() == before["task"]
+    assert (source / "profile.json").read_bytes() == before["profile"]
+    assert (source / "posts.jsonl").read_bytes() == before["posts"]
+    assert not new.exists()
 
 
 def test_comment_serialization_failure_leaves_sanitized_incomplete_workspace(
