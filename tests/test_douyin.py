@@ -352,6 +352,481 @@ def test_douyin_detail_rejects_candidate_whose_id_does_not_match_url():
     assert exc_info.value.stop_reason == "PARSER_FAILED"
 
 
+def test_collect_post_detail_uses_one_browser_detail_fallback_after_ssr_parser_failure(
+    monkeypatch,
+):
+    """Removing the parser-only browser fallback must make this test fail."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    calls = []
+
+    def browser_detail(**request):
+        calls.append(request)
+        return DouyinBrowserResult(
+            aweme_items=[
+                {
+                    "aweme_id": "7001",
+                    "aweme_id_str": "7001",
+                    "share_url": "https://www.douyin.com/video/7001",
+                    "desc": "公开详情没有话题",
+                    "text_extra": [],
+                    "create_time": 1_700_000_000,
+                    "statistics": {
+                        "digg_count": 0,
+                        "comment_count": None,
+                    },
+                    "video": {"duration": 0},
+                    "_collection_source": "network",
+                }
+            ],
+            source="network",
+        )
+
+    collector = DouyinCollector(browser_collect_detail=browser_detail)
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+
+    post = collector.collect_post_detail(
+        "https://www.douyin.com/video/7001?secret=strip-me"
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://www.douyin.com/video/7001"
+    assert post["post_id"] == "7001"
+    assert post["post_url"] == "https://www.douyin.com/video/7001"
+    assert post["likes"] == 0
+    assert post["comments"] is None
+    assert post["views"] is None
+    assert post["duration_seconds"] == 0
+    assert post["hashtags"] == []
+    assert post["collection_status"] == "SUCCESS"
+
+
+@pytest.mark.parametrize(
+    "render_data",
+    [
+        {"awemeDetail": {**AWEME, "text_extra": []}},
+        {"data": {"aweme_detail": {**AWEME, "text_extra": []}}},
+        {"data": {"awemeDetail": {**AWEME, "text_extra": []}}},
+    ],
+)
+def test_collect_post_detail_uses_every_frozen_ssr_detail_path_without_browser(
+    monkeypatch, render_data
+):
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **_request: pytest.fail(
+            "a frozen SSR detail must stay on the existing fast path"
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html(render_data),
+    )
+
+    post = collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert post["post_id"] == "7001"
+    assert post["hashtags"] == ["测试"]
+
+
+def test_collect_post_detail_id_only_ssr_uses_exactly_one_browser_fallback(
+    monkeypatch,
+):
+    """An identity is routing evidence, not sufficient public post detail."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    browser_calls = []
+
+    def browser_detail(**request):
+        browser_calls.append(request)
+        return DouyinBrowserResult(
+            aweme_items=[
+                {
+                    "aweme_id": "7001",
+                    "share_url": "https://www.douyin.com/video/7001",
+                    "desc": "浏览器公开详情",
+                    "text_extra": [],
+                }
+            ],
+            source="network",
+        )
+
+    collector = DouyinCollector(browser_collect_detail=browser_detail)
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"aweme_detail": {"aweme_id": "7001"}}),
+    )
+
+    post = collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert browser_calls == [{"url": "https://www.douyin.com/video/7001"}]
+    assert post["post_id"] == "7001"
+    assert post["title"] == "浏览器公开详情"
+
+
+def test_collect_post_detail_id_only_ssr_fails_when_browser_fallback_is_disabled(
+    monkeypatch,
+):
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector(
+        browser_fallback=False,
+        browser_collect_detail=lambda **_request: pytest.fail(
+            "disabled fallback must not open a browser"
+        ),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"aweme_detail": {"aweme_id": "7001"}}),
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+
+
+@pytest.mark.parametrize(
+    "conflicting_identity",
+    [
+        {"aweme_id": "9999"},
+        {
+            "aweme_id": "7001",
+            "share_url": "https://www.douyin.com/video/9999",
+        },
+    ],
+)
+def test_collect_post_detail_id_only_conflict_fails_before_browser(
+    monkeypatch, conflicting_identity
+):
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    browser_calls = []
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **request: browser_calls.append(request)
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"aweme_detail": conflicting_identity}),
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert browser_calls == []
+
+
+def test_collect_post_detail_empty_desc_without_hashtag_observation_uses_browser(
+    monkeypatch,
+):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    browser_calls = []
+
+    def browser_detail(**request):
+        browser_calls.append(request)
+        return DouyinBrowserResult(
+            aweme_items=[
+                {
+                    "aweme_id": "7001",
+                    "desc": "浏览器补充文案",
+                    "text_extra": [],
+                }
+            ]
+        )
+
+    collector = DouyinCollector(browser_collect_detail=browser_detail)
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html(
+            {"aweme_detail": {"aweme_id": "7001", "desc": ""}}
+        ),
+    )
+
+    post = collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert len(browser_calls) == 1
+    assert post["title"] == "浏览器补充文案"
+
+
+def test_collect_post_detail_empty_desc_with_known_empty_hashtags_is_trusted_ssr(
+    monkeypatch,
+):
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **_request: pytest.fail(
+            "known-empty hashtag evidence is a valid mapped detail field"
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html(
+            {
+                "aweme_detail": {
+                    "aweme_id": "7001",
+                    "desc": "",
+                    "text_extra": [],
+                }
+            }
+        ),
+    )
+
+    post = collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert post["post_id"] == "7001"
+    assert post["title"] == ""
+    assert post["hashtags"] == []
+    assert "hashtags" not in post["platform_metrics"].get(
+        "missing_detail_fields", []
+    )
+
+
+def test_collect_post_detail_respects_the_browser_fallback_disable_switch(monkeypatch):
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector(
+        browser_fallback=False,
+        browser_collect_detail=lambda **_request: pytest.fail(
+            "disabled detail fallback must not open a browser"
+        ),
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+def test_collect_post_detail_never_falls_back_after_http_restrictions(
+    monkeypatch, status
+):
+    import urllib.error
+
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    browser_calls = []
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **request: browser_calls.append(request)
+    )
+
+    def restricted(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "https://www.douyin.com/video/7001",
+            status,
+            "restricted",
+            None,
+            None,
+        )
+
+    monkeypatch.setattr("collectors.douyin.urllib.request.urlopen", restricted)
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert browser_calls == []
+
+
+def test_collect_post_detail_preserves_browser_restriction_over_item_data(monkeypatch):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **_request: DouyinBrowserResult(
+            aweme_items=[AWEME],
+            restriction=STOP_VERIFICATION,
+        )
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_VERIFICATION
+
+
+def test_collect_post_detail_does_not_report_success_after_browser_cleanup_failure(
+    monkeypatch,
+):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **_request: DouyinBrowserResult(
+            aweme_items=[
+                {
+                    **AWEME,
+                    "share_url": "https://www.douyin.com/video/7001",
+                    "text_extra": [],
+                }
+            ],
+            diagnostic_code="BROWSER_CLEANUP_FAILED",
+            diagnostics={"cleanup_codes": ["TEMP_PROFILE_REMOVE_FAILED"]},
+        )
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert exc_info.value.diagnostic_code == "BROWSER_CLEANUP_FAILED"
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"aweme_id": "9999", "aweme_id_str": "9999"},
+        {"aweme_id": "7001", "aweme_id_str": "9999"},
+        {
+            "aweme_id": "7001",
+            "aweme_id_str": "7001",
+            "share_url": "https://www.douyin.com/video/9999",
+        },
+        {
+            "aweme_id": "7001",
+            "aweme_id_str": "7001",
+            "share_url": "https://www.douyin.com/note/7001",
+        },
+    ],
+)
+def test_collect_post_detail_rechecks_raw_and_normalized_browser_identity(
+    monkeypatch, identity
+):
+    """Removing any collector-boundary identity check must make this test fail."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    browser_item = {
+        **AWEME,
+        "share_url": "https://www.douyin.com/video/7001",
+        "text_extra": [],
+        **identity,
+    }
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **_request: DouyinBrowserResult(
+            aweme_items=[browser_item],
+            source="network",
+        )
+    )
+    collector._browser_profile_cache[ACCOUNT_URL] = {"sentinel": "unchanged"}
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert exc_info.value.raw is None
+    assert collector._browser_profile_cache == {
+        ACCOUNT_URL: {"sentinel": "unchanged"}
+    }
+
+
+def test_collect_post_detail_rejects_a_multi_item_browser_payload(monkeypatch):
+    """The known-item fallback must not become an implicit discovery channel."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **_request: DouyinBrowserResult(
+            aweme_items=[
+                {
+                    **AWEME,
+                    "share_url": "https://www.douyin.com/video/7001",
+                    "text_extra": [],
+                },
+                {
+                    **AWEME,
+                    "share_url": "https://www.douyin.com/video/7001",
+                    "text_extra": [],
+                },
+            ],
+            source="network",
+        )
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert exc_info.value.raw is None
+
+
+def test_collect_post_detail_fails_closed_on_a_malformed_single_browser_item(
+    monkeypatch,
+):
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector(
+        browser_collect_detail=lambda **_request: DouyinBrowserResult(
+            aweme_items=[None],
+            source="network",
+        )
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert exc_info.value.raw is None
+
+
+def test_collect_post_detail_does_not_fallback_past_an_explicit_ssr_id_conflict(
+    monkeypatch,
+):
+    """Treating an SSR identity conflict as mere absence must make this test fail."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    browser_calls = []
+
+    def browser_detail(**request):
+        browser_calls.append(request)
+        return DouyinBrowserResult()
+
+    collector = DouyinCollector(
+        browser_collect_detail=browser_detail
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html(
+            {
+                "aweme": {
+                    "detail": {
+                        **AWEME,
+                        "aweme_id": "9999",
+                        "share_url": "https://www.douyin.com/video/9999",
+                    }
+                }
+            }
+        ),
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_detail("https://www.douyin.com/video/7001")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert browser_calls == []
+
+
 def test_enrich_details_cli_flag_is_forwarded(monkeypatch):
     import collect
 
@@ -1478,6 +1953,436 @@ def _response_event(request_id, *, host="www.douyin.com"):
 
 def _loading_event(method, request_id):
     return {"method": method, "params": {"requestId": request_id}}
+
+
+def test_collect_post_page_returns_only_the_bound_detail_payload():
+    """Removing the dedicated detail extractor must make this contract fail."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    item_url = "https://www.douyin.com/video/7001"
+    browser = FakeBrowser(
+        events=[
+            _response_event("detail"),
+            _loading_event("Network.loadingFinished", "detail"),
+        ],
+        bodies={
+            "detail": json.dumps(
+                {
+                    "aweme_detail": {
+                        **AWEME,
+                        "share_url": item_url,
+                        "text_extra": [],
+                    }
+                }
+            )
+        },
+    )
+
+    result = collect_post_page(
+        item_url,
+        session_factory=lambda: browser,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
+    assert result.source == "network"
+    assert result.restriction is None
+    assert len(browser.navigations) == 1
+    navigated_url, navigation_timeout = browser.navigations[0]
+    assert navigated_url == item_url
+    assert 0 < navigation_timeout <= 20.0
+    assert browser.scrolls == []
+
+
+def test_collect_post_page_ignores_lists_recommendations_and_arbitrary_id_objects():
+    """A detail fallback must not discover an item from unrelated payload shapes."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    browser = FakeBrowser(
+        events=[
+            _response_event("pollution"),
+            _loading_event("Network.loadingFinished", "pollution"),
+        ],
+        bodies={
+            "pollution": json.dumps(
+                {
+                    "aweme_list": [AWEME],
+                    "recommendations": {
+                        "aweme_detail": {
+                            **AWEME,
+                            "share_url": "https://www.douyin.com/video/7001",
+                        }
+                    },
+                    "analytics": {"aweme_id": "7001", "desc": "unrelated"},
+                }
+            )
+        },
+    )
+
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        session_factory=lambda: browser,
+    )
+
+    assert result.aweme_items == []
+    assert result.diagnostic_code is None
+
+
+def test_collect_post_page_visible_restriction_overrides_a_network_detail():
+    """Restriction evidence wins even when the same event reveals a bound item."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    class RestrictedBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            pytest.fail("restriction must stop before DOM fallback")
+
+    browser = RestrictedBrowser(
+        events=[
+            _response_event("detail"),
+            _loading_event("Network.loadingFinished", "detail"),
+        ],
+        bodies={
+            "detail": json.dumps(
+                {
+                    "aweme_detail": {
+                        **AWEME,
+                        "share_url": "https://www.douyin.com/video/7001",
+                    }
+                }
+            )
+        },
+        page_texts=["", "请登录后查看完整内容"],
+    )
+
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        session_factory=lambda: browser,
+    )
+
+    assert result.aweme_items == []
+    assert result.restriction == STOP_LOGIN
+    assert result.diagnostics["stop_condition"] == STOP_LOGIN
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_seconds": 0},
+        {"max_seconds": float("nan")},
+        {"max_seconds": 90.1},
+        {"max_candidates": 0},
+        {"max_candidates": 33},
+        {"max_candidates": 1.5},
+        {"max_body_chars": 0},
+        {"max_body_chars": 4_000_001},
+        {"max_body_chars": 1.5},
+    ],
+)
+def test_collect_post_page_rejects_invalid_budgets_before_opening_browser(kwargs):
+    """Removing any hard detail budget validation must make this test fail."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    with pytest.raises(ValueError):
+        collect_post_page(
+            "https://www.douyin.com/video/7001",
+            session_factory=lambda: pytest.fail("invalid budgets must not open Chrome"),
+            **kwargs,
+        )
+
+
+def test_collect_post_page_does_not_navigate_after_its_deadline_is_spent():
+    """Session startup time is part of the hard detail-page time budget."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    browser = FakeBrowser()
+    clock_reads = iter([0.0, 2.0, 2.0, 2.0])
+
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        max_seconds=1.0,
+        session_factory=lambda: browser,
+        monotonic=lambda: next(clock_reads),
+    )
+
+    assert browser.navigations == []
+    assert result.aweme_items == []
+    assert result.diagnostics["stop_condition"] == "timeout"
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        {"aweme_id": "9999"},
+        {"aweme_id": "7001", "aweme_id_str": "9999"},
+        {
+            "aweme_id": "7001",
+            "share_url": "https://www.douyin.com/video/9999?secret=do-not-leak",
+        },
+        {
+            "aweme_id": "7001",
+            "share_url": "https://www.douyin.com/note/7001",
+        },
+    ],
+)
+def test_collect_post_page_fails_closed_on_every_explicit_detail_identity_conflict(
+    conflict,
+):
+    """Removing raw ID/share-URL binding must make this test fail."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    browser = FakeBrowser(
+        events=[
+            _response_event("conflict"),
+            _loading_event("Network.loadingFinished", "conflict"),
+        ],
+        bodies={
+            "conflict": json.dumps(
+                {"aweme_detail": {**AWEME, "text_extra": [], **conflict}}
+            )
+        },
+    )
+
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        session_factory=lambda: browser,
+    )
+
+    assert result.aweme_items == []
+    assert result.diagnostic_code == "DETAIL_ID_MISMATCH"
+    assert "secret" not in json.dumps(result.diagnostics)
+
+
+def test_collect_post_page_uses_one_bound_visible_detail_snapshot_when_network_is_empty():
+    """Removing the detail-page DOM fallback must make this test fail."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    class VisibleDetailBrowser(FakeBrowser):
+        def __init__(self):
+            super().__init__(events=[], page_texts=[""])
+            self.evaluations = 0
+
+        def evaluate(self, _expression):
+            self.evaluations += 1
+            return {
+                "aweme_id": "7001",
+                "share_url": "https://www.douyin.com/video/7001",
+                "desc": "可见详情 #现场",
+                "text_extra": [{"hashtag_name": "现场"}],
+                "statistics": {"digg_count": "0", "comment_count": "3"},
+            }
+
+    browser = VisibleDetailBrowser()
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        session_factory=lambda: browser,
+    )
+
+    assert result.source == "dom"
+    assert result.aweme_items == [
+        {
+            "aweme_id": "7001",
+            "share_url": "https://www.douyin.com/video/7001",
+            "desc": "可见详情 #现场",
+            "text_extra": [{"hashtag_name": "现场"}],
+            "statistics": {"digg_count": "0", "comment_count": "3"},
+            "_collection_source": "dom",
+        }
+    ]
+    assert browser.evaluations == 1
+    assert browser.scrolls == []
+
+
+def test_collect_post_page_rejects_a_path_only_dom_snapshot_without_visible_evidence():
+    """A matching address alone must never be promoted to public detail data."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    class PathOnlyBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            return {
+                "aweme_id": "7001",
+                "share_url": "https://www.douyin.com/video/7001",
+                "desc": None,
+                "text_extra": [],
+                "statistics": {
+                    "digg_count": None,
+                    "comment_count": None,
+                    "collect_count": None,
+                    "share_count": None,
+                },
+            }
+
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        session_factory=PathOnlyBrowser,
+    )
+
+    assert result.aweme_items == []
+    assert result.diagnostic_code is None
+
+
+def test_collect_post_page_candidate_cap_still_finishes_the_first_candidate_once():
+    """Stopping before the accepted candidate finishes must make this test fail."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    class BodyCountingBrowser(FakeBrowser):
+        def __init__(self):
+            super().__init__(
+                events=[
+                    _response_event("first"),
+                    _response_event("ignored"),
+                    _loading_event("Network.loadingFinished", "first"),
+                    _loading_event("Network.loadingFinished", "ignored"),
+                ],
+                bodies={
+                    "first": json.dumps(
+                        {
+                            "aweme_detail": {
+                                **AWEME,
+                                "share_url": "https://www.douyin.com/video/7001",
+                            }
+                        }
+                    ),
+                    "ignored": json.dumps(
+                        {"aweme_detail": {**AWEME, "aweme_id": "9999"}}
+                    ),
+                },
+            )
+            self.body_reads = []
+
+        def get_response_body(self, request_id):
+            self.body_reads.append(request_id)
+            return super().get_response_body(request_id)
+
+        def evaluate(self, _expression):
+            return None
+
+    browser = BodyCountingBrowser()
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        max_candidates=1,
+        session_factory=lambda: browser,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
+    assert browser.body_reads == ["first"]
+    assert result.diagnostics["candidate_response_count"] == 1
+
+
+def test_collect_post_page_attempts_each_response_body_at_most_once():
+    """Retrying or surfacing a transient body read must make this test fail."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    class OneShotBodyBrowser(FakeBrowser):
+        def __init__(self):
+            super().__init__(
+                events=[
+                    _response_event("broken"),
+                    _loading_event("Network.loadingFinished", "broken"),
+                    None,
+                ],
+                body_errors={"broken": RuntimeError("signed body must not escape")},
+            )
+            self.body_reads = 0
+
+        def get_response_body(self, request_id, timeout=None):
+            del timeout
+            self.body_reads += 1
+            return super().get_response_body(request_id)
+
+        def evaluate(self, _expression):
+            return None
+
+    browser = OneShotBodyBrowser()
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        session_factory=lambda: browser,
+    )
+
+    assert result.aweme_items == []
+    assert result.diagnostic_code is None
+    assert browser.body_reads == 1
+    assert "signed body" not in json.dumps(result.diagnostics)
+
+
+def test_collect_post_page_never_reads_a_response_body_after_deadline():
+    """A loading event cannot extend the hard deadline into a body read."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    class DeadlineBrowser(FakeBrowser):
+        def __init__(self):
+            super().__init__(
+                events=[
+                    _response_event("late"),
+                    _loading_event("Network.loadingFinished", "late"),
+                ],
+                bodies={
+                    "late": json.dumps(
+                        {
+                            "aweme_detail": {
+                                **AWEME,
+                                "share_url": "https://www.douyin.com/video/7001",
+                            }
+                        }
+                    )
+                },
+            )
+            self.body_reads = 0
+
+        def get_response_body(self, request_id, timeout=None):
+            del timeout
+            self.body_reads += 1
+            return super().get_response_body(request_id)
+
+    browser = DeadlineBrowser()
+    clock_state = {"reads": 0}
+
+    def clock():
+        clock_state["reads"] += 1
+        return 2.0 if clock_state["reads"] >= 7 else 0.0
+
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        max_seconds=1.0,
+        session_factory=lambda: browser,
+        monotonic=clock,
+    )
+
+    assert browser.body_reads == 0
+    assert result.aweme_items == []
+    assert result.diagnostics["stop_condition"] == "timeout"
+
+
+def test_collect_post_page_never_parses_a_body_past_the_character_budget():
+    """Removing the body-size gate must make this test fail."""
+    from collectors._douyin_browser_transport import collect_post_page
+
+    body = json.dumps(
+        {
+            "aweme_detail": {
+                **AWEME,
+                "share_url": "https://www.douyin.com/video/7001",
+            }
+        }
+    )
+
+    class NoDomBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            return None
+
+    browser = NoDomBrowser(
+        events=[
+            _response_event("oversized"),
+            _loading_event("Network.loadingFinished", "oversized"),
+        ],
+        bodies={"oversized": body},
+    )
+    result = collect_post_page(
+        "https://www.douyin.com/video/7001",
+        max_body_chars=len(body) - 1,
+        session_factory=lambda: browser,
+    )
+
+    assert result.aweme_items == []
+    assert result.diagnostic_code is None
 
 
 def test_extract_aweme_items_deduplicates_nested_lists():

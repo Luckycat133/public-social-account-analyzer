@@ -214,6 +214,64 @@ def _is_trusted_image_text(aweme_type: Any, images: Any) -> bool:
     )
 
 
+def _has_trustworthy_detail_evidence(aweme: Any) -> bool:
+    """Require one valid, mappable public field beyond item identity."""
+    if not isinstance(aweme, dict):
+        return False
+
+    description = aweme.get("desc")
+    if isinstance(description, str) and bool(description.strip()):
+        return True
+    if _text_extra_is_structurally_observed(aweme.get("text_extra")):
+        return True
+
+    created_at = _int(aweme.get("create_time"))
+    if created_at is not None and created_at > 0 and _ts_to_iso(created_at) is not None:
+        return True
+
+    statistics = aweme.get("statistics")
+    if isinstance(statistics, dict):
+        for key in (
+            "play_count",
+            "digg_count",
+            "comment_count",
+            "collect_count",
+            "share_count",
+        ):
+            count = _int(statistics.get(key))
+            if count is not None and count >= 0:
+                return True
+
+    video = aweme.get("video")
+    if isinstance(video, dict):
+        duration = _int(video.get("duration"))
+        if duration is not None and duration >= 0:
+            return True
+
+    if any(
+        isinstance(aweme.get(key), bool)
+        for key in (
+            "is_top",
+            "is_top_aweme",
+            "is_repost",
+            "is_forward",
+            "is_ad",
+            "is_commerce",
+        )
+    ):
+        return True
+
+    if _is_trusted_image_text(aweme.get("aweme_type"), aweme.get("images")):
+        return True
+
+    collection = aweme.get("mix_info") or aweme.get("collection")
+    if isinstance(collection, dict):
+        collection_name = collection.get("mix_name")
+        if isinstance(collection_name, str) and bool(collection_name.strip()):
+            return True
+    return False
+
+
 def _extract_render_data(html: str) -> dict | None:
     """从页面提取内嵌 RENDER_DATA（URL 编码 JSON）及多变体 SSR 数据。
 
@@ -283,14 +341,26 @@ def _dig(data: dict | None, *path: str) -> Any:
 class DouyinCollector(BaseCollector):
     platform = "douyin"
 
-    def __init__(self, browser_fallback: bool = True, browser_collect=None):
+    def __init__(
+        self,
+        browser_fallback: bool = True,
+        browser_collect=None,
+        browser_collect_detail=None,
+    ):
         """Configure the optional, dependency-free browser collection fallback."""
-        if browser_collect is None:
-            from ._douyin_browser_transport import collect_account_page
+        if browser_collect is None or browser_collect_detail is None:
+            from ._douyin_browser_transport import (
+                collect_account_page,
+                collect_post_page,
+            )
 
-            browser_collect = collect_account_page
+            if browser_collect is None:
+                browser_collect = collect_account_page
+            if browser_collect_detail is None:
+                browser_collect_detail = collect_post_page
         self.browser_fallback = bool(browser_fallback)
         self._browser_collect = browser_collect
+        self._browser_collect_detail = browser_collect_detail
         self._collection_coverage: dict[str, Any] = {}
         self._browser_profile_cache: dict[str, dict[str, Any]] = {}
         self._detail_provenance: dict[
@@ -1132,6 +1202,56 @@ class DouyinCollector(BaseCollector):
         return value is None or value == "" or value == [] or value == {}
 
     # -- 单条详情 -----------------------------------------------------------
+    def _normalize_bound_post_detail(
+        self,
+        canonical_url: str,
+        aweme: Any,
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        """Normalize one detail only when raw and normalized identities agree."""
+        expected_post_id = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+        if not isinstance(aweme, dict):
+            raise DouyinError(STOP_PARSER_FAILED, "单条作品详情结构无效")
+        identifiers = [
+            str(aweme[key]).strip()
+            for key in ("aweme_id", "aweme_id_str")
+            if key in aweme and aweme[key] is not None
+        ]
+        if not identifiers or any(
+            identifier != expected_post_id for identifier in identifiers
+        ):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "单条作品详情标识与请求 URL 不一致",
+            )
+        share_url = aweme.get("share_url")
+        if share_url is not None and (
+            canonical_item_url("douyin", share_url, expected_post_id)
+            != canonical_url
+        ):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "单条作品详情地址与请求 URL 不一致",
+            )
+        if not _has_trustworthy_detail_evidence(aweme):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "单条作品详情未包含可信的公开字段",
+            )
+        raw = self._build_post_raw(canonical_url, aweme, source=source)
+        normalized = self.normalize_post(raw)
+        if (
+            str(normalized.get("post_id") or "").strip() != expected_post_id
+            or normalized.get("post_url") != canonical_url
+            or normalized.get("source_url") != canonical_url
+        ):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "归一化作品详情与请求 URL 不一致",
+            )
+        return normalized
+
     def collect_post_detail(self, post_url: str) -> dict[str, Any]:
         """采集单条作品详情并归一化。播放数可能不公开 → views=None。"""
         canonical_url = canonical_item_url("douyin", post_url)
@@ -1144,15 +1264,68 @@ class DouyinCollector(BaseCollector):
             raise DouyinError(restriction, f"采集作品详情时命中访问限制: {restriction}")
 
         data = _extract_render_data(html)
-        if data is None:
-            raise DouyinError(STOP_PARSER_FAILED, "作品页可访问但无 RENDER_DATA，无法解析")
-        aweme = self._find_aweme_detail(data, expected_post_id)
-        if not aweme:
-            raise DouyinError(
-                STOP_PARSER_FAILED, "RENDER_DATA 中未识别到单条作品结构"
+        if data:
+            detail_candidates = self._aweme_detail_candidates(data)
+            if any(
+                self._post_detail_identity_conflicts(canonical_url, candidate)
+                for candidate in detail_candidates
+            ):
+                raise DouyinError(
+                    STOP_PARSER_FAILED,
+                    "单条作品详情标识与请求 URL 不一致",
+                )
+            aweme = self._find_aweme_detail(data, expected_post_id)
+        else:
+            aweme = None
+        if aweme:
+            return self._normalize_bound_post_detail(
+                canonical_url, aweme, source="detail"
             )
-        raw = self._build_post_raw(canonical_url, aweme, source="detail")
-        return self.normalize_post(raw)
+        if not self.browser_fallback:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "作品页无可解析单条详情，且浏览器降级已禁用",
+            )
+        try:
+            result = self._browser_collect_detail(url=canonical_url)
+        except Exception as exc:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "抖音匿名作品详情浏览器降级失败",
+                diagnostic_code="BROWSER_DETAIL_TRANSPORT_FAILED",
+            ) from exc
+        result_restriction = getattr(result, "restriction", None)
+        diagnostic_code = getattr(result, "diagnostic_code", None)
+        if result_restriction:
+            raise DouyinError(
+                result_restriction,
+                f"浏览器详情采集中止: {result_restriction}",
+                diagnostic_code=diagnostic_code,
+            )
+        if diagnostic_code == "BROWSER_CLEANUP_FAILED":
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器详情采集完成，但资源清理失败",
+                diagnostic_code=diagnostic_code,
+            )
+        aweme_items = getattr(result, "aweme_items", None)
+        if not isinstance(aweme_items, list) or len(aweme_items) != 1:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器详情页未提供可绑定的公开作品数据",
+                diagnostic_code=diagnostic_code,
+            )
+        aweme = aweme_items[0]
+        return self._normalize_bound_post_detail(
+            canonical_url,
+            aweme,
+            source=_collection_source(
+                aweme.get("_collection_source")
+                if isinstance(aweme, dict)
+                else None,
+                _collection_source(getattr(result, "source", None), "network"),
+            ),
+        )
 
     # -- 评论（覆盖基类，best-effort） -------------------------------------
     def collect_comments(
@@ -1234,17 +1407,51 @@ class DouyinCollector(BaseCollector):
         found = self._search_list_of_key(data, "aweme_id")
         return found
 
-    def _find_aweme_detail(self, data: dict, expected_post_id: str) -> dict | None:
-        """在 RENDER_DATA 中定位单条作品结构。"""
+    @staticmethod
+    def _aweme_detail_candidates(data: dict) -> list[dict[str, Any]]:
+        """Return only detail objects from the frozen SSR detail paths."""
         candidates = [
+            _dig(data, "aweme_detail"),
+            _dig(data, "awemeDetail"),
+            _dig(data, "data", "aweme_detail"),
+            _dig(data, "data", "awemeDetail"),
             _dig(data, "aweme", "detail"),
             _dig(data, "video", "aweme"),
             _dig(data, "app", "aweme", "detail"),
-            _dig(data, "aweme_detail"),
         ]
-        for c in candidates:
-            if isinstance(c, dict) and str(c.get("aweme_id") or "") == expected_post_id:
-                return c
+        return [candidate for candidate in candidates if isinstance(candidate, dict)]
+
+    @staticmethod
+    def _post_detail_identity_conflicts(
+        canonical_url: str,
+        aweme: dict[str, Any],
+    ) -> bool:
+        expected_post_id = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+        identifiers = [
+            str(aweme[key]).strip()
+            for key in ("aweme_id", "aweme_id_str")
+            if key in aweme and aweme[key] is not None
+        ]
+        if any(identifier != expected_post_id for identifier in identifiers):
+            return True
+        share_url = aweme.get("share_url")
+        return share_url is not None and (
+            canonical_item_url("douyin", share_url, expected_post_id)
+            != canonical_url
+        )
+
+    def _find_aweme_detail(self, data: dict, expected_post_id: str) -> dict | None:
+        """在冻结的 RENDER_DATA 路径中定位与请求绑定的单条作品结构。"""
+        for candidate in self._aweme_detail_candidates(data):
+            identifiers = [
+                str(candidate[key]).strip()
+                for key in ("aweme_id", "aweme_id_str")
+                if key in candidate and candidate[key] is not None
+            ]
+            if identifiers and all(
+                identifier == expected_post_id for identifier in identifiers
+            ) and _has_trustworthy_detail_evidence(candidate):
+                return candidate
         return None
 
     def _find_comments(self, data: dict) -> list | None:

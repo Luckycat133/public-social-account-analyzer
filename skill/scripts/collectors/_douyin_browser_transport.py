@@ -31,7 +31,7 @@ from .browser_backend import (
     BrowserSession,
     _sanitize_cleanup_diagnostics,
 )
-from .url_policy import canonical_profile_url
+from .url_policy import canonical_item_url, canonical_profile_url
 
 
 _ITEM_LIST_KEYS = ("aweme_list", "awemeList", "post_list")
@@ -50,6 +50,12 @@ _KNOWN_VIDEO_FIELDS = {"duration", "play_addr", "cover", "origin_cover"}
 MAX_SECONDS = 90.0
 MAX_SCROLLS = 20
 MAX_IDLE_ROUNDS = 3
+DETAIL_DEFAULT_MAX_SECONDS = 20.0
+DETAIL_MAX_SECONDS = 90.0
+DETAIL_DEFAULT_MAX_CANDIDATES = 8
+DETAIL_MAX_CANDIDATES = 32
+DETAIL_DEFAULT_MAX_BODY_CHARS = 1_000_000
+DETAIL_MAX_BODY_CHARS = 4_000_000
 
 _ALLOWED_RESPONSE_HOSTS = ("douyin.com", "iesdouyin.com")
 _DOM_PROFILE_HELPERS = r"""
@@ -140,6 +146,41 @@ return {
 };
 })()"""
 
+_DOM_DETAIL_EXPRESSION = r"""(() => {
+const isVisible = node => Boolean(node && node.getClientRects().length > 0);
+const pathMatch = location.pathname.match(/^\/(video|note)\/(\d+)\/?$/);
+if (!pathMatch) return null;
+const detailRoot = Array.from(document.querySelectorAll(
+  '[data-e2e="video-detail"],[data-e2e="note-detail"],main'
+)).find(isVisible) || null;
+if (!detailRoot) return null;
+const visibleText = selectors => {
+  const node = Array.from(detailRoot.querySelectorAll(selectors)).find(isVisible) || null;
+  return node
+    ? (node.getAttribute('aria-label') || node.getAttribute('title') || node.innerText || '').trim() || null
+    : null;
+};
+const tagNodes = Array.from(detailRoot.querySelectorAll(
+  '[data-e2e="video-tag"],[data-e2e="note-tag"],a[href*="/hashtag/"]'
+)).filter(isVisible);
+const textExtra = tagNodes.map(node => ({
+  hashtag_name: (node.innerText || node.getAttribute('aria-label') || '')
+    .replace(/^#|#$/g, '').trim()
+})).filter(item => item.hashtag_name);
+return {
+  aweme_id: pathMatch[2],
+  share_url: location.href,
+  desc: visibleText('[data-e2e="video-desc"],[data-e2e="note-desc"],h1'),
+  text_extra: textExtra,
+  statistics: {
+    digg_count: visibleText('[data-e2e="video-digg"],[aria-label^="点赞"]'),
+    comment_count: visibleText('[data-e2e="video-comment"],[aria-label^="评论"]'),
+    collect_count: visibleText('[data-e2e="video-collect"],[aria-label^="收藏"]'),
+    share_count: visibleText('[data-e2e="video-share"],[aria-label^="分享"]')
+  }
+};
+})()"""
+
 _PROFILE_HINT_KEYS = {
     "account_id",
     "account_name",
@@ -180,6 +221,17 @@ class PostPageObservation:
     items: list[dict[str, Any]] = field(default_factory=list)
     has_more: Optional[bool] = None
     cursor: Any = None
+
+
+_DETAIL_RESPONSE_PATHS = (
+    ("aweme_detail",),
+    ("awemeDetail",),
+    ("data", "aweme_detail"),
+    ("data", "awemeDetail"),
+    ("aweme", "detail"),
+    ("video", "aweme"),
+    ("app", "aweme", "detail"),
+)
 
 
 def detect_restriction(text: str) -> Optional[str]:
@@ -581,6 +633,79 @@ def extract_aweme_items(data: Any) -> list[dict[str, Any]]:
         else:
             _merge_missing(unique[item_id], item)
     return list(unique.values())
+
+
+def _detail_response_candidates(data: Any) -> list[dict[str, Any]]:
+    """Read only frozen detail-object paths, never lists or recommendation trees."""
+    candidates: list[dict[str, Any]] = []
+    for path in _DETAIL_RESPONSE_PATHS:
+        value = data
+        for key in path:
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(key)
+        if isinstance(value, dict) and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def _bound_detail_item(
+    candidate: dict[str, Any], canonical_url: str
+) -> Optional[dict[str, Any]]:
+    """Return one detail item only when every supplied identity agrees."""
+    expected_id = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+    identifiers = [
+        str(candidate[key]).strip()
+        for key in ("aweme_id", "aweme_id_str")
+        if key in candidate and candidate[key] is not None
+    ]
+    if not identifiers or any(identifier != expected_id for identifier in identifiers):
+        return None
+    share_url = candidate.get("share_url")
+    if share_url is not None:
+        if canonical_item_url("douyin", share_url, expected_id) != canonical_url:
+            return None
+    if not _is_trustworthy_aweme(candidate):
+        return None
+    item = copy.deepcopy(candidate)
+    item["share_url"] = canonical_url
+    item["_collection_source"] = "network"
+    return item
+
+
+def _detail_identity_conflicts(
+    candidate: dict[str, Any], canonical_url: str
+) -> bool:
+    """Detect explicit item identity contradictions without treating gaps as proof."""
+    expected_id = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+    for key in ("aweme_id", "aweme_id_str"):
+        if key in candidate and candidate[key] is not None:
+            if str(candidate[key]).strip() != expected_id:
+                return True
+    share_url = candidate.get("share_url")
+    return bool(
+        share_url is not None
+        and canonical_item_url("douyin", share_url, expected_id) != canonical_url
+    )
+
+
+def _has_visible_detail_evidence(candidate: dict[str, Any]) -> bool:
+    """Require an actual visible detail field in addition to the address bar."""
+    description = candidate.get("desc")
+    if isinstance(description, str) and bool(description.strip()):
+        return True
+    text_extra = candidate.get("text_extra")
+    if isinstance(text_extra, list) and any(
+        isinstance(item, dict) and bool(str(item.get("hashtag_name") or "").strip())
+        for item in text_extra
+    ):
+        return True
+    statistics = candidate.get("statistics")
+    return isinstance(statistics, dict) and any(
+        key in statistics and _visible_metric_value(statistics[key]) is not None
+        for key in _KNOWN_STATISTICS
+    )
 
 
 def extract_post_page_observations(data: Any) -> list[PostPageObservation]:
@@ -1294,5 +1419,191 @@ def collect_account_page(
             "range_match_count": len(range_items) if bounds is not None else len(final),
             "range_filter_applied": bounds is not None,
             "range_no_match": bool(bounds is not None and observed_items and not range_items),
+        },
+    )
+
+
+def collect_post_page(
+    url: str,
+    *,
+    max_seconds: float = DETAIL_DEFAULT_MAX_SECONDS,
+    max_candidates: int = DETAIL_DEFAULT_MAX_CANDIDATES,
+    max_body_chars: int = DETAIL_DEFAULT_MAX_BODY_CHARS,
+    session_factory=BrowserSession,
+    monotonic=time.monotonic,
+) -> DouyinBrowserResult:
+    """Collect one already-known public detail item in one bounded session."""
+    canonical_url = canonical_item_url("douyin", url)
+    if canonical_url is None:
+        raise ValueError("invalid Douyin item URL")
+    if (
+        isinstance(max_seconds, bool)
+        or not isinstance(max_seconds, (int, float))
+        or not math.isfinite(max_seconds)
+        or max_seconds <= 0
+        or max_seconds > DETAIL_MAX_SECONDS
+    ):
+        raise ValueError("invalid detail max_seconds")
+    if (
+        isinstance(max_candidates, bool)
+        or not isinstance(max_candidates, int)
+        or max_candidates <= 0
+        or max_candidates > DETAIL_MAX_CANDIDATES
+    ):
+        raise ValueError("invalid detail max_candidates")
+    if (
+        isinstance(max_body_chars, bool)
+        or not isinstance(max_body_chars, int)
+        or max_body_chars <= 0
+        or max_body_chars > DETAIL_MAX_BODY_CHARS
+    ):
+        raise ValueError("invalid detail max_body_chars")
+    deadline = monotonic() + float(max_seconds)
+    pending: dict[str, str] = {}
+    candidate_count = 0
+    item: Optional[dict[str, Any]] = None
+    restriction: Optional[str] = None
+    identity_conflict = False
+    deadline_expired = False
+    source = "network"
+    cleanup_state: dict[str, Any] = {}
+
+    with _collection_session(session_factory, cleanup_state) as session:
+        budget = max(0.0, deadline - monotonic())
+        if budget > 0:
+            _call_with_timeout(
+                session.navigate,
+                canonical_url,
+                timeout=min(float(max_seconds), budget),
+            )
+        else:
+            deadline_expired = True
+        while item is None and restriction is None:
+            budget = max(0.0, deadline - monotonic())
+            if budget <= 0:
+                deadline_expired = True
+                break
+            event = session.poll_event(timeout=min(1.0, budget))
+            method = event.get("method") if isinstance(event, dict) else None
+            params = event.get("params") if isinstance(event, dict) else None
+            params = params if isinstance(params, dict) else {}
+            allowed = _allowed_response(event or {})
+            discovered: Optional[dict[str, Any]] = None
+            if allowed is not None:
+                request_id, safe_url = allowed
+                if candidate_count < max_candidates:
+                    candidate_count += 1
+                    pending[request_id] = safe_url
+            elif method == "Network.loadingFinished":
+                request_id = params.get("requestId")
+                if isinstance(request_id, str) and request_id in pending:
+                    pending.pop(request_id, None)
+                    body_budget = max(0.0, deadline - monotonic())
+                    if body_budget <= 0:
+                        deadline_expired = True
+                        body = None
+                    else:
+                        try:
+                            body = _call_with_timeout(
+                                session.get_response_body,
+                                request_id,
+                                timeout=body_budget,
+                            )
+                        except (
+                            BrowserError,
+                            KeyError,
+                            RuntimeError,
+                            TypeError,
+                            UnicodeError,
+                        ):
+                            body = None
+                    if isinstance(body, str) and len(body) <= max_body_chars:
+                        try:
+                            decoded = json.loads(body)
+                        except (json.JSONDecodeError, TypeError, UnicodeError):
+                            decoded = None
+                        candidates = _detail_response_candidates(decoded)
+                        identity_conflict = any(
+                            _detail_identity_conflicts(candidate, canonical_url)
+                            for candidate in candidates
+                        )
+                        if not identity_conflict:
+                            for candidate in candidates:
+                                discovered = _bound_detail_item(
+                                    candidate, canonical_url
+                                )
+                                if discovered is not None:
+                                    break
+
+            budget = max(0.0, deadline - monotonic())
+            if budget <= 0:
+                deadline_expired = True
+                break
+            visible_text = _call_with_timeout(
+                session.page_text,
+                timeout=budget,
+            )
+            restriction = detect_restriction(visible_text)
+            if restriction is not None:
+                break
+            if deadline - monotonic() <= 0:
+                deadline_expired = True
+                break
+            if identity_conflict:
+                break
+            if discovered is not None:
+                item = discovered
+                break
+            if event is None:
+                break
+
+        if item is None and restriction is None and not identity_conflict:
+            budget = max(0.0, deadline - monotonic())
+            if budget > 0:
+                snapshot = _call_with_timeout(
+                    session.evaluate,
+                    _DOM_DETAIL_EXPRESSION,
+                    timeout=budget,
+                )
+                if deadline - monotonic() <= 0:
+                    deadline_expired = True
+                elif isinstance(snapshot, dict):
+                    identity_conflict = _detail_identity_conflicts(
+                        snapshot, canonical_url
+                    )
+                    if not identity_conflict and _has_visible_detail_evidence(snapshot):
+                        item = _bound_detail_item(snapshot, canonical_url)
+                        if item is not None:
+                            item["_collection_source"] = "dom"
+                            source = "dom"
+            else:
+                deadline_expired = True
+
+    return DouyinBrowserResult(
+        aweme_items=[item] if item is not None else [],
+        source=source,
+        restriction=restriction,
+        diagnostic_code=(
+            cleanup_state.get("diagnostic_code")
+            or ("DETAIL_ID_MISMATCH" if identity_conflict else None)
+        ),
+        diagnostics={
+            "candidate_response_count": candidate_count,
+            "pending_response_count": len(pending),
+            "stop_condition": restriction
+            or (
+                "id_mismatch"
+                if identity_conflict
+                else "detail"
+                if item is not None
+                else "timeout"
+                if deadline_expired
+                else "empty"
+            ),
+            **(
+                {"cleanup_codes": cleanup_state["cleanup_codes"]}
+                if cleanup_state.get("cleanup_codes")
+                else {}
+            ),
         },
     )

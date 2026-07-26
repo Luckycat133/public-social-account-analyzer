@@ -97,7 +97,11 @@
 映射约定：
 - `content_type`：抖音作品默认 `video`；图文/图文笔记可能为 `image_text`（best-effort 判定）。
 - `title` 取 `desc` 首行（按换行截断）；`text` 取 `desc` 全文。
-- `hashtags` 从 `text_extra` 的 `hashtag_name` 抽取；无话题时为 `[]`。
+- `hashtags` 优先从结构有效的 `text_extra` 中提取 `hashtag_name`，并可从公开文案中的
+  `#话题` 补充。明确观察到 `text_extra=[]` 且文案也没有话题时，才表示“已知无话题”，
+  归一化为 `hashtags=[]` 且不标记详情缺失；`text_extra` 缺失或结构无效、文案中也无法
+  提取话题时，不能据此断言无话题。兼容性输出虽仍为 `[]`，但必须在
+  `platform_metrics.missing_detail_fields` 中保留 `hashtags`。
 - `is_pinned` / `is_repost` / `is_promoted` 仅在公开证据明确时写 `true` / `false`；字段缺失或不可验证时写 `null`。
 
 ## 公开指标
@@ -162,6 +166,29 @@
      任一显式账号绑定冲突都以 `PARSER_FAILED` 关闭，不用请求参数覆盖响应身份，也不以
      旧缓存掩盖冲突。浏览器缓存按证据强度合并并重新净化，后到的档案片段不会清除已
      确认的抖音号、获赞数（包括 0）或更强认证证据。
+  7. `collect_post_detail` 对**已经由作品列表或调用方提供的规范作品 URL**支持独立匿名
+     浏览器降级。它先尝试原有 HTTP/SSR 详情；仅在详情不存在或结构无法解析并对应
+     `PARSER_FAILED` 时，最多启动一次临时浏览器会话。HTTP `401` / `403` / `429`、页面
+     登录/验证/频控提示及其他明确限制均保持原 `stop_reason` 并立即停止，不进入该降级。
+     `SOCIAL_BROWSER_FALLBACK=0` 与 `--no-browser-fallback` 同样禁用这条路径。
+  8. 已知作品详情降级不是发现接口，也不改变 `supports()` 只接受账号主页的规则。网络
+     响应只读取冻结的单条详情路径：顶层 `aweme_detail` / `awemeDetail`、`data` 下同名
+     字段、`aweme.detail`、`video.aweme`、`app.aweme.detail`；明确忽略 `aweme_list`、推荐
+     列表及任意递归命中的作品 ID。网络详情优先；没有可绑定网络详情时才读取一次当前
+     `/video/<id>` 或 `/note/<id>` 页面中的可见详情快照，不滚动、不点击。
+  9. 该路径要求请求 URL、原始 `aweme_id` / `aweme_id_str` / `share_url`（凡是响应明确
+     提供的字段）和归一化后的 `post_id` / `post_url` / `source_url` 全部一致。任一显式
+     冲突立即以 `PARSER_FAILED` 关闭，不能用另一候选覆盖，也不写入缓存。一次调用最多
+     返回一条绑定作品；多条或畸形载荷同样失败关闭。冻结路径和一致的 ID/地址只证明
+     路由身份，不单独构成详情：候选还须至少包含一个有效且可映射的公开字段，例如非空
+     `desc`、结构有效的 `text_extra`（明确的空数组也表示已知无话题）、有效发布时间、
+     非负互动数/时长、明确布尔标记、有效图文载荷或非空合集名。空 `desc` 单独不可信；
+     ID-only 候选在启用降级时继续一次浏览器详情采集，禁用时返回 `PARSER_FAILED`，但其
+     显式身份冲突仍优先立即失败。
+  10. 已知作品详情会话的默认/硬上限分别为：20/90 秒、8/32 个候选响应、
+      1,000,000/4,000,000 个响应正文字符。会话计时包含浏览器启动，不滚动、不点击、
+      不刷新、不重试响应正文、不生成签名；仍使用同一套零 Python 依赖的系统浏览器
+      CDP 传输和临时用户目录。达到边界只返回诚实的空详情/`PARSER_FAILED`，不扩大采集。
 - **绝不**刷新、重试破解、伪造签名或模拟浏览器绕过；`urllib` 直连或浏览器传输层拿到的风控页即如实认定。
 - 单条内容级问题（`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE`）只下钻到内容级，
   **不**写入任务级 `stop_reason`（见 `exceptions.md` §1.1）。
