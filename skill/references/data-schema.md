@@ -41,7 +41,8 @@ workspace/<platform>-<account>-<date>/
 再排他创建空的无效 `.complete` 并同步必要目录；只有最后写入固定标记内容并 `fsync` 文件后
 才形成提交点。读取新格式任务前必须核验标记、清单、精确目录清单、大小和摘要。公开采集
 的新任务若显式指定 `--out`，任何已存在目标（包括空目录）都必须在
-适配器网络调用或产物写入前退出。授权采集器遵循相同的最终目录预留和不覆盖语义。
+适配器网络调用或产物写入前退出。授权采集器和 Web 索引证据导入器遵循相同的最终目录
+预留、白名单提交和不覆盖语义。
 
 最终标记的 `fsync` 最多尝试三次；提交后的用户路径核验遇 I/O 错误时也最多尝试三次。
 最终标记 `fsync` 持续失败，或标记已经成功同步但用户路径核验持续发生 I/O 错误时，提交状态为
@@ -67,13 +68,13 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 
 | 字段 | 类型 | 必填 | 可空 | 示例 | 说明 |
 |---|---|---:|---:|---|---|
-| task_id | string | 否 | 是 | bilibili-123-20260723-a1b2 | 任务唯一标识；现有 CLI 未生成时可省略或为 `null` |
+| task_id | string | 是 | 否 | bilibili-20260723T010203000000Z-a1b2c3d4 | 每个新任务生成的唯一非空标识 |
 | platform | enum | 是 | 否 | bilibili | bilibili / douyin / weibo |
 | profile_url | string | 是 | 否 | https://space.bilibili.com/123 | 账号主页 URL |
 | requested_limit | integer | 是 | 是 | 30 | 限量模式默认 30、范围 1–100；公开 `--all` 为接受后的 `max_items`（默认 10,000、硬上限 50,000）；授权 OpenAPI `--all` 为 `null` |
 | date_from | datetime | 否 | 是 | 2026-06-01T00:00:00+08:00 | 采集起始时间 |
 | date_to | datetime | 否 | 是 | 2026-07-23T23:59:59+08:00 | 采集结束时间 |
-| analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | 用户填写的分析目的 |
+| analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | `--analysis-goal`；省略为 `null`，提供时须为去首尾空白后的非空字符串、最多 500 字符且不含控制字符 |
 | include_comments | boolean | 是 | 否 | false | 评论采样开关，默认关闭 |
 | enrich_details | boolean | 否 | 否 | false | 仅补充缺失公开字段的抖音详情开关 |
 | task_status | enum | 是 | 否 | COMPLETED | 生命周期状态（§9.1） |

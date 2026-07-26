@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -20,6 +21,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from immutable_workspace import (
+    ImmutableWorkspace,
+    WorkspaceCapabilityError,
+    WorkspaceCommitIndeterminate,
+    WorkspaceError,
+    WorkspaceExistsError,
+    WorkspaceIdentityError,
+    WorkspaceVerificationError,
+)
+from task_contract import (
+    TaskContractError,
+    new_task_id,
+    validate_analysis_goal,
+)
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -33,6 +49,14 @@ STOP_REASONS = {
 METRIC_FIELDS = ("views", "likes", "comments", "favorites", "shares", "coins", "danmaku")
 ACCOUNT_METRIC_FIELDS = ("douyin_id", "total_likes", "latest_post_at")
 DIAGNOSTIC_CODE = "SANDBOX_INDEX_FALLBACK"
+_INDETERMINATE_EXIT_CODE = 4
+_INDEX_ARTIFACTS = frozenset({
+    "source/index-evidence.json",
+    "source/profile.json",
+    "source/posts.jsonl",
+    "task.json",
+    "collection-report.md",
+})
 
 
 class EvidenceError(ValueError):
@@ -516,8 +540,19 @@ def _report_text(result: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def run(evidence_path: str, out_dir: str, *, limit: int = 30) -> dict[str, Any]:
+def run(
+    evidence_path: str,
+    out_dir: str,
+    *,
+    limit: int = 30,
+    analysis_goal: str | None = None,
+) -> dict[str, Any]:
     """Validate an evidence JSON file and write a partial task workspace."""
+    try:
+        analysis_goal = validate_analysis_goal(analysis_goal)
+    except TaskContractError as exc:
+        raise EvidenceError("analysis_goal 参数无效") from exc
+
     path = Path(evidence_path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -525,31 +560,52 @@ def run(evidence_path: str, out_dir: str, *, limit: int = 30) -> dict[str, Any]:
         raise EvidenceError(f"无法读取 evidence JSON: {exc}") from exc
 
     result = validate_evidence(payload, limit=limit)
-    out = Path(out_dir).resolve()
-    if out.exists():
-        if not out.is_dir():
-            raise EvidenceError("输出路径已存在且不是目录")
-        try:
-            if any(out.iterdir()):
-                raise EvidenceError("输出目录非空，拒绝覆盖")
-        except OSError as exc:
-            raise EvidenceError(f"无法检查输出目录: {exc}") from exc
-
-    source = out / "source"
-    source.mkdir(parents=True, exist_ok=True)
-    (source / "index-evidence.json").write_text(_json_text(result["evidence"]), encoding="utf-8")
-    (source / "profile.json").write_text(_json_text(result["profile"]), encoding="utf-8")
-    posts_text = "".join(json.dumps(post, ensure_ascii=False) + "\n" for post in result["posts"])
-    (source / "posts.jsonl").write_text(posts_text, encoding="utf-8")
-    (out / "task.json").write_text(_json_text(result["task"]), encoding="utf-8")
-    (out / "collection-report.md").write_text(_report_text(result), encoding="utf-8")
+    result["task"]["task_id"] = new_task_id("douyin")
+    result["task"]["analysis_goal"] = analysis_goal
+    out = os.path.abspath(out_dir)
+    reservation: ImmutableWorkspace | None = None
+    try:
+        reservation = ImmutableWorkspace.reserve(
+            out, allowed_artifacts=_INDEX_ARTIFACTS
+        )
+        with reservation.open_text("source/index-evidence.json") as handle:
+            handle.write(_json_text(result["evidence"]))
+        with reservation.open_text("source/profile.json") as handle:
+            handle.write(_json_text(result["profile"]))
+        posts_text = "".join(
+            json.dumps(post, ensure_ascii=False) + "\n"
+            for post in result["posts"]
+        )
+        with reservation.open_text("source/posts.jsonl") as handle:
+            handle.write(posts_text)
+        with reservation.open_text("task.json") as handle:
+            handle.write(_json_text(result["task"]))
+        with reservation.open_text("collection-report.md") as handle:
+            handle.write(_report_text(result))
+        reservation.commit()
+    except WorkspaceCommitIndeterminate:
+        raise
+    except (
+        WorkspaceCapabilityError,
+        WorkspaceExistsError,
+        WorkspaceIdentityError,
+        WorkspaceVerificationError,
+    ) as exc:
+        raise EvidenceError(
+            "输出目录已存在、非空、占用或不安全"
+        ) from exc
+    except WorkspaceError as exc:
+        raise EvidenceError("索引产物路径不安全或无法提交") from exc
+    finally:
+        if reservation is not None:
+            reservation.close()
 
     return {
         "task_status": "PARTIAL",
         "stop_reason": result["task"]["stop_reason"],
         "collected_count": len(result["posts"]),
         "collection_source": result["task"]["collection_source"],
-        "output_dir": str(out),
+        "output_dir": out,
     }
 
 
@@ -558,11 +614,20 @@ def main(argv: list[str] | None = None) -> int:
         description="校验并导入抖音公开 Web 索引证据（零第三方运行时依赖）"
     )
     parser.add_argument("--evidence", required=True, help="结构化 evidence JSON")
-    parser.add_argument("--out", required=True, help="新的或空的任务输出目录")
+    parser.add_argument("--out", required=True, help="尚不存在的任务输出目录")
     parser.add_argument("--limit", type=int, default=30, help="导入上限（1-100，默认 30）")
+    parser.add_argument("--analysis-goal", default=None, help="可选分析目标")
     args = parser.parse_args(argv)
     try:
-        summary = run(args.evidence, args.out, limit=args.limit)
+        summary = run(
+            args.evidence,
+            args.out,
+            limit=args.limit,
+            analysis_goal=args.analysis_goal,
+        )
+    except WorkspaceCommitIndeterminate:
+        print("[INDETERMINATE] 索引产物提交状态无法确认", file=sys.stderr)
+        return _INDETERMINATE_EXIT_CODE
     except EmptyEvidenceError as exc:
         print(f"[EMPTY] {exc}", file=sys.stderr)
         return 3

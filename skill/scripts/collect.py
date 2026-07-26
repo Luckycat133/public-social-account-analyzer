@@ -79,6 +79,12 @@ from immutable_workspace import (  # noqa: E402
     reject_workspace_overlap,
     verify_committed_workspace,
 )
+from task_contract import (  # noqa: E402
+    TaskContractError,
+    account_output_key,
+    new_task_id,
+    validate_analysis_goal,
+)
 
 # 北京时间为中国平台默认时区(见 references/data-schema.md §1)
 _BEIJING = timezone(timedelta(hours=8))
@@ -968,6 +974,8 @@ def _write_task_json(
     ws: str,
     *,
     platform: str,
+    task_id: str,
+    analysis_goal: str | None,
     profile_url: str,
     requested_limit: int,
     date_from: str | None,
@@ -989,11 +997,13 @@ def _write_task_json(
 ) -> None:
     """落盘 task.json(任务状态与停止原因,见 SKILL.md「任务状态与停止原因」)。"""
     payload = {
+        "task_id": task_id,
         "platform": platform,
         "profile_url": _safe_public_url(profile_url),
         "requested_limit": requested_limit,
         "date_from": date_from,
         "date_to": date_to,
+        "analysis_goal": analysis_goal,
         "include_comments": include_comments,
         "enrich_details": enrich_details,
         "task_status": task_status,
@@ -1159,7 +1169,13 @@ def run(
     max_seconds: float | None = None,
     max_scrolls: int | None = None,
     enrich_details: bool = False,
+    analysis_goal: str | None = None,
 ) -> int:
+    try:
+        analysis_goal = validate_analysis_goal(analysis_goal)
+    except TaskContractError:
+        print("[FAILED] analysis_goal 参数无效", file=sys.stderr)
+        return 2
     if resume and not out_dir:
         print("[FAILED] 增量续采(--resume)必须配合 --out 指定既有任务目录", file=sys.stderr)
         return 2
@@ -1297,6 +1313,7 @@ def run(
         return 2
     url = canonical_url
     safe_url = canonical_url
+    task_id = new_task_id(platform)
     if collect_all and platform != "douyin":
         print("[FAILED] --all 目前仅支持抖音账号主页", file=sys.stderr)
         return 2
@@ -1306,8 +1323,7 @@ def run(
 
     requested_count = max_items if collect_all else limit
 
-    m = re.search(r"(\d+)", url)
-    account = m.group(1) if m else "account"
+    account = account_output_key(platform, canonical_url)
     date = datetime.now(_BEIJING).strftime("%Y%m%d")
     reservation: _WorkspaceReservation
     try:
@@ -1379,6 +1395,8 @@ def run(
             _write_task_json(
                 ws,
                 platform=platform,
+                task_id=task_id,
+                analysis_goal=analysis_goal,
                 profile_url=url,
                 requested_limit=requested_count,
                 date_from=date_from_iso,
@@ -1628,6 +1646,7 @@ def run(
     try:
         _write_task_json(
             ws, platform=platform, profile_url=url,
+            task_id=task_id, analysis_goal=analysis_goal,
             requested_limit=requested_count,
             date_from=date_from_iso, date_to=date_to_iso,
             include_comments=include_comments, task_status=task_status,
@@ -1716,6 +1735,11 @@ def main() -> None:
     ap.add_argument(
         "--out", default=None, help="输出目录(默认 workspace/<platform>-<account>-<date>/)"
     )
+    ap.add_argument(
+        "--analysis-goal",
+        default=None,
+        help="可选分析目标（最多500字符，不允许控制字符）",
+    )
     ap.add_argument("--comments", action="store_true", help="开启评论采样(默认关)")
     ap.add_argument(
         "--enrich-details",
@@ -1801,6 +1825,7 @@ def main() -> None:
         collect_all=args.collect_all, max_items=max_items,
         max_seconds=max_seconds, max_scrolls=max_scrolls,
         enrich_details=args.enrich_details,
+        analysis_goal=args.analysis_goal,
     ))
 
 

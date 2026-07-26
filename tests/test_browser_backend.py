@@ -636,7 +636,7 @@ def test_context_exit_preserves_an_active_error_diagnostic_code(monkeypatch):
 # --------------------------------------------------------------------------
 # 浏览器降级接线（不联网、不启动浏览器，纯 mock）
 # --------------------------------------------------------------------------
-def test_get_json_browser_fallback_wiring(monkeypatch):
+def test_get_json_never_uses_browser_after_waf(monkeypatch):
     from collectors.bilibili import Session, STOP_ACCESS_RESTRICTED, BilibiliError
 
     monkeypatch.setattr("collectors.bilibili._backoff", lambda _: 0)
@@ -648,11 +648,16 @@ def test_get_json_browser_fallback_wiring(monkeypatch):
 
     monkeypatch.setattr(s, "_curl", _boom)
     monkeypatch.setattr(s, "ensure_buvid", lambda *a, **k: None)
+    browser_calls = []
     monkeypatch.setattr(
-        s, "_fetch_via_browser", lambda full, referer: '{"code":0,"data":{"x":1}}'
+        s,
+        "_fetch_via_browser",
+        lambda full, referer: browser_calls.append(full) or '{"code":0}',
     )
-    data = s.get_json("/x/space/wbi/arc/search", {"mid": 1}, wbi=True)
-    assert data["data"]["x"] == 1
+    with pytest.raises(BilibiliError) as exc_info:
+        s.get_json("/x/space/wbi/arc/search", {"mid": 1}, wbi=True)
+    assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert browser_calls == []
 
 
 def test_get_json_no_fallback_raises_on_waf(monkeypatch):

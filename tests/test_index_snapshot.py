@@ -16,6 +16,7 @@ import pytest
 
 import analyze
 import import_index_snapshot as importer
+import immutable_workspace as immutable
 import normalize
 import render_report
 
@@ -370,6 +371,104 @@ def test_run_writes_compatible_partial_workspace(tmp_path):
     report = (out / "collection-report.md").read_text(encoding="utf-8")
     assert "索引快照" in report
     assert "不是抖音实时完整作品列表" in report
+
+
+def test_index_task_persists_task_id_goal_and_committed_manifest(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    out = tmp_path / "task"
+
+    importer.run(
+        str(evidence_path),
+        str(out),
+        limit=1,
+        analysis_goal="分析公开索引选题",
+    )
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["analysis_goal"] == "分析公开索引选题"
+    assert isinstance(task["task_id"], str) and task["task_id"]
+    assert (out / "manifest.json").is_file()
+    assert (out / ".complete").is_file()
+    immutable.verify_committed_workspace(
+        str(out), allowed_artifacts=importer._INDEX_ARTIFACTS
+    )
+
+
+@pytest.mark.parametrize("goal", [123, "", " ", "x" * 501, "a\nb", "a\x00b"])
+def test_index_rejects_invalid_goal_before_evidence_read_or_output(
+    tmp_path, goal
+):
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="analysis_goal"):
+        importer.run(
+            str(tmp_path / "missing-evidence.json"),
+            str(out),
+            analysis_goal=goal,
+        )
+
+    assert not out.exists()
+
+
+def test_index_cli_forwards_analysis_goal(monkeypatch, capsys):
+    captured = {}
+
+    def fake_run(evidence, out, *, limit, analysis_goal):
+        captured.update(
+            evidence=evidence,
+            out=out,
+            limit=limit,
+            analysis_goal=analysis_goal,
+        )
+        return {
+            "task_status": "PARTIAL",
+            "stop_reason": "LOGIN_REQUIRED",
+            "collected_count": 1,
+            "collection_source": "douyin_search_index",
+            "output_dir": out,
+        }
+
+    monkeypatch.setattr(importer, "run", fake_run)
+
+    assert importer.main([
+        "--evidence", "evidence.json",
+        "--out", "task",
+        "--analysis-goal", "分析公开索引",
+    ]) == 0
+    assert captured["analysis_goal"] == "分析公开索引"
+    assert capsys.readouterr().err == ""
+
+
+def test_index_refuses_existing_empty_workspace(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps(_search_evidence()), encoding="utf-8")
+    out = tmp_path / "task"
+    out.mkdir()
+
+    with pytest.raises(importer.EvidenceError, match="已存在|占用"):
+        importer.run(str(evidence_path), str(out), limit=1)
+
+    assert list(out.iterdir()) == []
+
+
+def test_index_rejects_symlink_ancestor_without_writing_outside(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps(_search_evidence()), encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(importer.EvidenceError, match="不安全|符号链接"):
+        importer.run(str(evidence_path), str(linked_parent / "task"), limit=1)
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert sorted(path.name for path in outside.iterdir()) == ["keep.txt"]
 
 
 def test_run_refuses_to_overwrite_nonempty_workspace(tmp_path):

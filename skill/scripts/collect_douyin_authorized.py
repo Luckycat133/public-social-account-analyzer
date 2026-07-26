@@ -26,6 +26,11 @@ from immutable_workspace import (
     preflight_backend,
     verify_committed_workspace,
 )
+from task_contract import (
+    TaskContractError,
+    new_task_id,
+    validate_analysis_goal,
+)
 
 
 _BEIJING = timezone(timedelta(hours=8))
@@ -76,6 +81,8 @@ def _serialize_artifacts(
     task_status: str,
     stop_reason: str | None,
     coverage: dict[str, Any],
+    task_id: str,
+    analysis_goal: str | None,
     diagnostic_code: str | None = None,
 ) -> None:
     with reservation.open_text("source/profile.json") as handle:
@@ -87,11 +94,13 @@ def _serialize_artifacts(
 
     collected_at = datetime.now(_BEIJING).isoformat()
     task = {
+        "task_id": task_id,
         "platform": "douyin",
         "profile_url": profile.get("profile_url") or _PROFILE_ENDPOINT,
         "requested_limit": requested_limit,
         "date_from": None,
         "date_to": None,
+        "analysis_goal": analysis_goal,
         "include_comments": False,
         "task_status": task_status,
         "stop_reason": stop_reason,
@@ -189,6 +198,8 @@ def _run_reserved_collection(
     limit: int,
     collect_all: bool,
     page_size: int,
+    task_id: str,
+    analysis_goal: str | None,
 ) -> int:
     profile: dict[str, Any] = {}
     posts: list[dict[str, Any]] = []
@@ -214,6 +225,8 @@ def _run_reserved_collection(
             task_status="FAILED",
             stop_reason="OPENAPI_ERROR",
             coverage=coverage,
+            task_id=task_id,
+            analysis_goal=analysis_goal,
             diagnostic_code=exc.error_code,
         )
         print("[FAILED] 授权账号资料请求失败", file=sys.stderr)
@@ -258,6 +271,8 @@ def _run_reserved_collection(
         task_status=task_status,
         stop_reason=stop_reason,
         coverage=coverage,
+        task_id=task_id,
+        analysis_goal=analysis_goal,
         diagnostic_code=diagnostic_code,
     )
     print(
@@ -304,8 +319,15 @@ def run(
     page_size: int = 20,
     environ: Mapping[str, str] | None = None,
     client: DouyinOpenAPIClient | None = None,
+    analysis_goal: str | None = None,
 ) -> int:
     """Run an authorized-owner collection without OAuth lifecycle operations."""
+
+    try:
+        analysis_goal = validate_analysis_goal(analysis_goal)
+    except TaskContractError:
+        print("[FAILED] analysis_goal 参数无效", file=sys.stderr)
+        return 2
 
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         print("[FAILED] --limit 必须为正整数", file=sys.stderr)
@@ -320,6 +342,7 @@ def run(
         print(f"[FAILED] 缺少环境变量 {_TOKEN_ENV}", file=sys.stderr)
         return 2
 
+    task_id = new_task_id("douyin")
     reservation = _reserve_authorized_output(out_dir)
     try:
         api = client or DouyinOpenAPIClient(access_token)
@@ -329,6 +352,8 @@ def run(
             limit=limit,
             collect_all=collect_all,
             page_size=page_size,
+            task_id=task_id,
+            analysis_goal=analysis_goal,
         )
     finally:
         reservation.close()
@@ -344,9 +369,15 @@ def main() -> None:
     range_group.add_argument("--all", dest="collect_all", action="store_true")
     range_group.add_argument("--limit", type=int, default=30)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--analysis-goal", default=None)
     args = parser.parse_args()
     raise SystemExit(
-        run(out_dir=args.out, limit=args.limit, collect_all=args.collect_all)
+        run(
+            out_dir=args.out,
+            limit=args.limit,
+            collect_all=args.collect_all,
+            analysis_goal=args.analysis_goal,
+        )
     )
 
 

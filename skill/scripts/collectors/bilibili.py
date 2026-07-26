@@ -10,8 +10,8 @@ HTTP 412），而 curl 携带完整浏览器头（Origin / Sec-Fetch / --compres
   - buvid3/buvid4 前置（finger/spi，JSON 直接返回 b_3/b_4，无需解析 Set-Cookie）
   - 高风险层 space 接口必须走 wbi 签名，且签名字典**必须含 web_location**（注意：acc/info 用 333.1007，arc/search 用 333.1387，用错会导致签名被拒 -799）
   - 正确路径为 /x/space/wbi/acc/info 与 /x/space/wbi/arc/search
-  - 风控为概率型（-799 限流 / -352 v_voucher / -401 验证码）：换全新 buvid cookie
-    + 完整头 + 退避重试可偶发通过；穷尽重试仍失败才如实上抛 stop_reason
+  - 平台一旦返回限流、验证码或登录墙，当前任务立即停止；不会轮换身份、切换端点
+    或改走浏览器。仅没有收到平台响应的本地传输失败可用同一身份重试一次。
 
 合规边界（见 SKILL.md 与 references/platform-bilibili.md）：
 - 不登录、不绕过验证码 / WBI / 频控；遇阻停止并抛 BilibiliError(stop_reason)。
@@ -67,10 +67,14 @@ MIXIN_KEY_ENC_TAB = [
     6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
 ]
 
-# 机会型瞬态码：可换 fresh buvid + 退避重试；穷尽后上抛 stop_reason。
-# 仅含「概率型风控拦截」：-412/-799/-403（端点级/进阶风控）、-400（间歇型拒绝，重试常可恢复）。
-# 注意：-401/-352 属验证码/滑块场景，按合规边界必须立即停止、绝不重试（见 _stop_reason_for_code 映射 VERIFICATION_REQUIRED）。
-TRANSIENT = {-412, -799, -403, -400}
+# 这些业务码都是平台已明确返回的保护响应，绝不是传输层瞬态失败。
+# 一旦命中便打开会话断路器，当前任务不再发送任何 B 站请求。
+PLATFORM_PROTECTION_CODES = {-412, -799, -403, -400, -401, -352, -101}
+PLATFORM_PROTECTION_REASONS = {
+    STOP_LOGIN,
+    STOP_VERIFICATION,
+    STOP_ACCESS_RESTRICTED,
+}
 # space 类 wbi 接口的 web_location（签名字典必须包含，否则签名被拒 -412）
 # 注意：不同 space 子接口要求不同 web_location：
 #   - acc/info   → 333.1007
@@ -98,13 +102,8 @@ class BilibiliError(Exception):
         self.raw = raw
 
 
-class _Retryable(BilibiliError):
-    """HTTP 主路径下可退避重试的错误（瞬态风控码与非 JSON 拦截页）。
-
-    区别于不可重试的 BilibiliError（如 -404 账号不存在、-101 需原样返回的登录墙）：
-    本类仅用于「换 fresh buvid + 退避后有机会恢复」的场景，供 get_json 的循环识别并继续重试。
-    其 stop_reason / message / raw 均忠实继承，最终上抛时信息不丢失。
-    """
+class _TransportError(BilibiliError):
+    """没有收到平台响应的本地传输失败；最多以同一身份重试一次。"""
 
 
 # --------------------------------------------------------------------------
@@ -151,6 +150,10 @@ def _backoff(attempt: int) -> float:
     return min(30.0, 3.0 * (2 ** attempt))
 
 
+def _is_platform_protection(error: BilibiliError) -> bool:
+    return error.stop_reason in PLATFORM_PROTECTION_REASONS
+
+
 # --------------------------------------------------------------------------
 # HTTP 会话（curl 传输层）
 # --------------------------------------------------------------------------
@@ -166,9 +169,9 @@ class Session:
         self.min_interval = min_interval
         self._last = 0.0
         self._wbi: tuple[str, str] | None = None
-        # 浏览器降级（可选、默认关闭）：仅当 HTTP 主路径因出口 IP 被 WAF 封禁而全部重试失败时，
-        # 改由运行环境的浏览器进程经真实网络出口再试一次。绝不用于绕过验证码/登录墙/频控。
-        # 显式三态策略优先于兼容环境变量；False 必须能压过 env=1。
+        self._blocked_reason: str | None = None
+        self._buvid_initialized = False
+        # 保留配置字段以兼容调用方和显式浏览器工具，但平台保护响应绝不会触发浏览器降级。
         self._browser_fallback = (
             os.environ.get("BILIBILI_BROWSER_FALLBACK") == "1"
             if browser_fallback is None
@@ -205,13 +208,21 @@ class Session:
                 cmd, capture_output=True, text=True, timeout=self.timeout + 10
             )
         except subprocess.TimeoutExpired:
-            raise BilibiliError(STOP_ACCESS_RESTRICTED, f"curl 超时: {url}")
+            raise _TransportError(STOP_INTERNAL, "B站请求传输超时")
         if proc.returncode != 0:
-            raise BilibiliError(
-                STOP_ACCESS_RESTRICTED,
-                f"curl 失败 rc={proc.returncode}: {proc.stderr[:200]}",
-            )
+            raise _TransportError(STOP_INTERNAL, "B站请求传输失败")
         return proc.stdout
+
+    def _raise_if_blocked(self) -> None:
+        if self._blocked_reason is not None:
+            raise BilibiliError(
+                self._blocked_reason,
+                "B站会话已因平台保护响应停止",
+            )
+
+    def _trip_circuit(self, error: BilibiliError) -> None:
+        if error.stop_reason in PLATFORM_PROTECTION_REASONS:
+            self._blocked_reason = error.stop_reason
 
     def get_json(
         self,
@@ -222,82 +233,51 @@ class Session:
         retry: int = 3,
         raise_on_error: bool = True,
     ) -> dict:
-        """取 JSON。
-
-        主路径：标准库 curl 直连，遇瞬态风控码(-412/-799/-403/-400)与非 JSON 拦截页
-        退避重试。全部重试耗尽且命中 WAF 时，若启用浏览器降级（见 _browser_fallback），
-        则改由运行环境的浏览器进程经真实网络出口再试一次（仅传输层降级，绝不绕过
-        验证码/登录墙/频控）。nav 的 -101 需原样返回以取 wbi_img（raise_on_error=False）。
-        """
+        """取 JSON；平台保护响应立即停，纯传输失败同身份最多重试一次。"""
+        self._raise_if_blocked()
         q = dict(params or {})
         if wbi:
             if self._wbi is None:
                 self._refresh_wbi()
             q = enc_wbi(q, self._wbi[0], self._wbi[1])
         full = API + path + (("?" + urllib.parse.urlencode(q)) if q else "")
-        last_exc: BilibiliError | None = None
-        # --- 主路径：HTTP(curl) 退避重试 ---
-        for attempt in range(retry):
+        attempts = 1 if retry <= 1 else 2
+        for attempt in range(attempts):
             try:
                 body = self._curl(full, referer)
-            except BilibiliError as e:
-                last_exc = e
-                if attempt < retry - 1:
-                    self.ensure_buvid(force=True)
+            except _TransportError:
+                if attempt + 1 < attempts:
                     time.sleep(_backoff(attempt))
                     continue
-                break
+                raise
+            except BilibiliError as error:
+                self._trip_circuit(error)
+                raise
             try:
                 return self._parse_and_check(body, path, raise_on_error)
-            except _Retryable as e:
-                last_exc = e
-                if attempt < retry - 1:
-                    self.ensure_buvid(force=True)
-                    time.sleep(_backoff(attempt))
-                    continue
-                break
-            except BilibiliError as e:
-                last_exc = e
-                break
-        # --- 可选降级：浏览器（仅当主路径因 WAF 失败且显式启用）---
-        if last_exc is not None and self._browser_fallback:
-            try:
-                body = self._fetch_via_browser(full, referer)
-            except BrowserError as be:
-                last_exc = BilibiliError(
-                    STOP_ACCESS_RESTRICTED, f"浏览器降级也失败: {be}"
-                )
-            else:
-                try:
-                    return self._parse_and_check(body, path, raise_on_error)
-                except BilibiliError as e:
-                    last_exc = e
-        raise last_exc or BilibiliError(STOP_INTERNAL, "unreachable")
+            except BilibiliError as error:
+                self._trip_circuit(error)
+                raise
+        raise BilibiliError(STOP_INTERNAL, "B站请求未完成")
 
     def _parse_and_check(
         self, body: str, path: str, raise_on_error: bool
     ) -> dict:
-        """解析响应体并按业务码决策：成功返回 data；瞬态/非 JSON 抛 _Retryable（可重试）；
-        其余非 0 码抛 BilibiliError（stop_reason）。"""
+        """解析响应体；任何平台保护码或保护页都立即上抛。"""
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            e = self._non_json_error(path, body)
-            raise _Retryable(e.stop_reason, e.message, e.raw)
+            raise self._non_json_error(path, body)
         code = data.get("code")
         if code == 0 or code is None:
             return data
+        if code in PLATFORM_PROTECTION_CODES:
+            raise BilibiliError(
+                _stop_reason_for_code(code),
+                f"{path} 被平台拒绝 (code={code})",
+            )
         if not raise_on_error:
             return data
-        if code in TRANSIENT:
-            msg = f"{path} code={code} {data.get('message')}"
-            if code == -403:
-                # 诊断提示：持续 -403 通常意味着 WBI 签名实现问题，而非概率型风控。
-                msg = (
-                    f"疑似 WBI 签名错误(-403)：请核对 web_location 取值与签名实现 "
-                    f"({path} {data.get('message')})"
-                )
-            raise _Retryable(STOP_ACCESS_RESTRICTED, msg, data)
         raise BilibiliError(
             _stop_reason_for_code(code),
             f"{path} code={code} {data.get('message')}",
@@ -352,8 +332,13 @@ class Session:
         self._wbi = (img, sub)
 
     def ensure_buvid(self, force: bool = False) -> None:
-        if self.cookies.get("buvid3") and not force:
+        del force  # 兼容旧调用签名；当前任务绝不轮换已经建立的公开身份。
+        if self.cookies.get("buvid3"):
+            self._buvid_initialized = True
             return
+        if self._buvid_initialized:
+            return
+        self._buvid_initialized = True
         try:
             data = self.get_json("/x/frontend/finger/spi", retry=2)
             d = data.get("data") or {}
@@ -362,7 +347,7 @@ class Session:
             if d.get("b_4"):
                 self.cookies["buvid4"] = d["b_4"]
         except BilibiliError:
-            pass
+            return
 
     # -- 投稿发现 --
     def discover_medialist(self, mid: str, limit: int) -> list:
@@ -451,8 +436,9 @@ class Session:
             if data.get("code") == 0:
                 tags = data.get("data") or []
                 return [t.get("tag_name") for t in tags if t.get("tag_name")]
-        except BilibiliError:
-            pass
+        except BilibiliError as error:
+            if _is_platform_protection(error):
+                raise
         return []
 
     def discover_arc(self, mid: str, limit: int) -> list:
@@ -462,9 +448,8 @@ class Session:
         pn = 1
         while len(out) < limit:
             if pn > 1:
-                # 翻页间隔：arc/search 对突发频控敏感(-412)，间隔 + 轮换 buvid 可显著降低被拦
+                # 翻页时仅节流，始终复用任务创建时的公开身份。
                 time.sleep(6)
-                self.ensure_buvid(force=True)
             data = self.get_json(
                 "/x/space/wbi/arc/search",
                 {
@@ -646,10 +631,13 @@ class BilibiliCollector(BaseCollector):
 
     def __init__(self, browser_fallback: bool | None = None):
         self.browser_fallback = browser_fallback
+        self._task_session: Session | None = None
 
     def _new_session(self) -> Session:
-        """Create a task session with the caller's explicit browser policy."""
-        return Session(browser_fallback=self.browser_fallback)
+        """Return the collector task's single shared session."""
+        if self._task_session is None:
+            self._task_session = Session(browser_fallback=self.browser_fallback)
+        return self._task_session
 
     # -- 路由 --
     def supports(self, url: str) -> bool:
@@ -679,6 +667,8 @@ class BilibiliCollector(BaseCollector):
                 data = s.get_json(path, params, retry=2)
             except BilibiliError as e:
                 last = e
+                if _is_platform_protection(e):
+                    break
                 continue
             code = data.get("code")
             if code == 0:
@@ -705,7 +695,9 @@ class BilibiliCollector(BaseCollector):
             stat = s.get_json("/x/relation/stat", {"mid": mid}, retry=2)
             if stat.get("code") != 0:
                 stat = None
-        except BilibiliError:
+        except BilibiliError as error:
+            if _is_platform_protection(error):
+                raise
             stat = None
 
         # acc/info(wbi + web_location) 作富字段增强，失败不影响主路径
@@ -718,7 +710,9 @@ class BilibiliCollector(BaseCollector):
             )
             if acc_raw.get("code") == 0:
                 acc = acc_raw.get("data")
-        except BilibiliError:
+        except BilibiliError as error:
+            if _is_platform_protection(error):
+                raise
             acc = None
 
         return self.normalize_profile(_build_profile_raw(mid, card, stat, acc))
@@ -746,7 +740,9 @@ class BilibiliCollector(BaseCollector):
         try:
             entries = s.discover_medialist(mid, limit)
             source = "medialist"
-        except BilibiliError:
+        except BilibiliError as error:
+            if _is_platform_protection(error):
+                raise
             entries = None
 
         # 降级 A：arc/search（wbi + web_location=333.1387）
@@ -754,7 +750,9 @@ class BilibiliCollector(BaseCollector):
             try:
                 entries = s.discover_arc(mid, limit)
                 source = "arc"
-            except BilibiliError:
+            except BilibiliError as error:
+                if _is_platform_protection(error):
+                    raise
                 entries = None
 
         # 降级 B：search/type（仅 BV 列表，需逐条 view 补全）
@@ -786,7 +784,9 @@ class BilibiliCollector(BaseCollector):
                     if v.get("code") == 0:
                         base = _build_post_raw_from_view(v["data"], url)
                         any_view_ok = True
-                except BilibiliError:
+                except BilibiliError as error:
+                    if _is_platform_protection(error):
+                        raise
                     pass  # 保留 vlist 级数据（honest null）
             else:
                 base = _empty_post(bvid)
@@ -796,13 +796,19 @@ class BilibiliCollector(BaseCollector):
                     if v.get("code") == 0:
                         base = _build_post_raw_from_view(v["data"], url)
                         any_view_ok = True
-                except BilibiliError:
+                except BilibiliError as error:
+                    if _is_platform_protection(error):
+                        raise
                     pass
 
             # 权威标签补全：tag API（/x/tag/archive/tags）更权威，合并进 base.hashtags。
             # 仅作增量增强，失败不影响主流程（collect_tags 内部已吞异常返回 []）。
             try:
                 api_tags = s.collect_tags(bvid)
+            except BilibiliError as error:
+                if _is_platform_protection(error):
+                    raise
+                api_tags = []
             except Exception:
                 api_tags = []
             if api_tags:

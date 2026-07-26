@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -716,6 +717,82 @@ def test_default_public_output_uses_repository_workspace(monkeypatch, tmp_path):
     assert len(tasks) == 1
     assert (tasks[0] / "task.json").is_file()
     assert not (repo / "skill" / "workspace").exists()
+
+
+def test_public_task_persists_unique_task_id_and_analysis_goal(
+    monkeypatch, tmp_path
+):
+    adapter = RecordingBilibiliAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+
+    assert collect.run(
+        BILIBILI_URL, out_dir=str(first), analysis_goal="分析选题节奏"
+    ) == 0
+    assert collect.run(
+        BILIBILI_URL, out_dir=str(second), analysis_goal="分析选题节奏"
+    ) == 0
+
+    first_task = json.loads((first / "task.json").read_text(encoding="utf-8"))
+    second_task = json.loads((second / "task.json").read_text(encoding="utf-8"))
+    assert first_task["analysis_goal"] == "分析选题节奏"
+    assert isinstance(first_task["task_id"], str) and first_task["task_id"]
+    assert first_task["task_id"] != second_task["task_id"]
+
+
+@pytest.mark.parametrize(
+    "goal",
+    [123, "", "   ", "x" * 501, "分析\n注入", "分析\x00注入"],
+)
+def test_public_rejects_invalid_analysis_goal_before_network_or_output(
+    monkeypatch, tmp_path, goal
+):
+    monkeypatch.setattr(collect, "_load_adapters", _must_not_load_adapters)
+    out = tmp_path / "task"
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out), analysis_goal=goal) == 2
+    assert not out.exists()
+
+
+def test_public_cli_forwards_analysis_goal(monkeypatch):
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(collect, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["collect.py", BILIBILI_URL, "--analysis-goal", "分析互动表现"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        collect.main()
+
+    assert exc_info.value.code == 0
+    assert captured["analysis_goal"] == "分析互动表现"
+
+
+def test_default_douyin_output_hashes_the_canonical_sec_uid(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    adapter = RecordingDouyinAdapter()
+    sec_uid = "MS4wLjABAAAAstable123"
+    url = f"https://www.douyin.com/user/{sec_uid}"
+    expected = hashlib.sha256(sec_uid.encode("utf-8")).hexdigest()[:12]
+    monkeypatch.setattr(collect, "_HERE", str(repo / "skill" / "scripts"))
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+
+    assert collect.run(url) == 0
+
+    tasks = list((repo / "workspace").glob(f"douyin-{expected}-*"))
+    assert len(tasks) == 1
+    assert not list((repo / "workspace").glob("douyin-4-*"))
 
 
 def test_default_reservation_creates_source_before_returning(monkeypatch, tmp_path):

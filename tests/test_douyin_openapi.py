@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.error
 from pathlib import Path
 
@@ -839,6 +840,71 @@ def test_all_writes_standard_completed_artifacts_without_token(tmp_path, capsys)
     assert task["collection_source"] == "douyin_openapi_token_owner"
     assert TOKEN not in _artifact_text(out_dir)
     assert TOKEN not in captured.out + captured.err
+
+
+def test_authorized_task_persists_task_id_and_analysis_goal(tmp_path):
+    out_dir = tmp_path / "authorized-goal"
+    client = DouyinOpenAPIClient(
+        TOKEN,
+        transport=FakeTransport([
+            _profile_response(),
+            _page([], cursor=0, has_more=0),
+        ]),
+    )
+
+    assert run(
+        out_dir=str(out_dir),
+        analysis_goal="分析授权账号作品节奏",
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=client,
+    ) == 0
+
+    task = json.loads((out_dir / "task.json").read_text(encoding="utf-8"))
+    assert task["analysis_goal"] == "分析授权账号作品节奏"
+    assert isinstance(task["task_id"], str) and task["task_id"]
+
+
+@pytest.mark.parametrize("goal", [123, "", " ", "x" * 501, "a\nb", "a\x00b"])
+def test_authorized_rejects_invalid_analysis_goal_before_output_or_client(
+    tmp_path, goal
+):
+    class MustNotRun:
+        def collect_profile(self):
+            pytest.fail("client must not run")
+
+    out_dir = tmp_path / "invalid-goal"
+    assert run(
+        out_dir=str(out_dir),
+        analysis_goal=goal,
+        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
+        client=MustNotRun(),
+    ) == 2
+    assert not out_dir.exists()
+
+
+def test_authorized_cli_forwards_analysis_goal(monkeypatch):
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(authorized, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect_douyin_authorized.py",
+            "--analysis-goal",
+            "分析授权内容",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        authorized.main()
+
+    assert exc_info.value.code == 0
+    assert captured["analysis_goal"] == "分析授权内容"
 
 
 def test_api_error_after_page_writes_partial_artifacts(tmp_path):
