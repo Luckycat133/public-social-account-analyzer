@@ -423,6 +423,9 @@ class DouyinCollector(BaseCollector):
         """fallback 降级调用 iesdouyin 公开 API 提取公开资料。"""
         if not sec_uid:
             return None
+        canonical_url = canonical_profile_url("douyin", url)
+        if canonical_url is None:
+            return None
         api_url = f"https://www.iesdouyin.com/web/api/v2/user/info/?sec_uid={sec_uid}"
         try:
             req = urllib.request.Request(
@@ -435,30 +438,75 @@ class DouyinCollector(BaseCollector):
                 ui = data.get("user_info")
                 if not ui:
                     return None
+                if "sec_uid" in ui and ui.get("sec_uid") is not None:
+                    response_sec_uid = ui.get("sec_uid")
+                    if (
+                        not isinstance(response_sec_uid, str)
+                        or response_sec_uid.strip() != sec_uid
+                    ):
+                        raise DouyinError(
+                            STOP_PARSER_FAILED,
+                            "iesdouyin API 返回账号标识与请求主页不一致",
+                        )
+                    bound_sec_uid = response_sec_uid.strip()
+                else:
+                    bound_sec_uid = sec_uid
+                response_profile_url = None
+                for key in ("profile_url", "share_url"):
+                    if key not in ui or ui.get(key) is None:
+                        continue
+                    candidate_url = ui.get(key)
+                    if (
+                        not isinstance(candidate_url, str)
+                        or canonical_profile_url("douyin", candidate_url)
+                        != canonical_url
+                    ):
+                        raise DouyinError(
+                            STOP_PARSER_FAILED,
+                            "iesdouyin API 返回主页地址与请求主页不一致",
+                        )
+                    response_profile_url = candidate_url
+                follower_value = ui.get("follower_count")
+                if follower_value is None:
+                    follower_value = ui.get("mplatform_followers_count")
+                followers = _int(follower_value)
+                post_count = _int(ui.get("aweme_count"))
                 raw = {
                     "platform": "douyin",
-                    "account_id": ui.get("unique_id") or ui.get("short_id") or sec_uid,
+                    "account_id": ui.get("unique_id") or ui.get("short_id") or bound_sec_uid,
                     "account_name": ui.get("nickname"),
-                    "profile_url": url,
+                    "profile_url": response_profile_url or canonical_url,
                     "bio": ui.get("signature") or None,
-                    "verified": bool(ui.get("custom_verify") or ui.get("enterprise_verify_reason") or ui.get("verification_type")),
-                    "followers": _int(ui.get("follower_count") or ui.get("mplatform_followers_count")),
-                    "post_count": _int(ui.get("aweme_count")),
+                    "verified": self._extract_verified(ui),
+                    "enterprise_verify_reason": ui.get("enterprise_verify_reason"),
+                    "custom_verify": ui.get("custom_verify"),
+                    "verification_type": ui.get("verification_type"),
+                    "followers": followers,
+                    "post_count": post_count,
                     "platform_metrics": {
                         "total_likes": _int(ui.get("total_favorited")),
-                        "sec_uid": sec_uid,
+                        "sec_uid": bound_sec_uid,
                         "unique_id": ui.get("unique_id"),
-                        "enterprise_verify_reason": ui.get("enterprise_verify_reason"),
                     },
                     "collected_at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
                     "field_visibility": {
                         "account_name": "visible" if ui.get("nickname") else "hidden",
                         "bio": "visible" if ui.get("signature") else "hidden",
-                        "followers": "visible" if (ui.get("follower_count") or ui.get("mplatform_followers_count")) is not None else "hidden",
-                        "post_count": "visible" if ui.get("aweme_count") is not None else "hidden",
+                        "followers": "visible" if followers is not None else "hidden",
+                        "post_count": "visible" if post_count is not None else "hidden",
                     }
                 }
-                return self.normalize_profile(raw)
+                from ._douyin_browser_transport import sanitize_profile_raw
+
+                clean = sanitize_profile_raw(raw, canonical_url)
+                if clean is None:
+                    raise DouyinError(
+                        STOP_PARSER_FAILED,
+                        "iesdouyin API 账号证据无法绑定到请求主页",
+                    )
+                return self.normalize_profile(clean)
+        except DouyinError:
+            raise
         except Exception:
             return None
 
@@ -484,7 +532,9 @@ class DouyinCollector(BaseCollector):
             if sec_uid:
                 fallback = self._fetch_profile_via_iesdouyin_api(sec_uid, url)
                 if fallback:
-                    return fallback
+                    merged = self._merge_cached_profile(url, fallback)
+                    if merged is not None:
+                        return merged
             cached = self._browser_profile_cache.get(
                 canonical_profile_url("douyin", url) or ""
             )
@@ -495,16 +545,63 @@ class DouyinCollector(BaseCollector):
             )
 
         raw = self._build_profile_raw(url, user)
-        return self.normalize_profile(raw)
+        merged = self._merge_cached_profile(url, raw)
+        if merged is None:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "SSR 账号证据与请求主页不一致，已拒绝输出",
+            )
+        return merged
+
+    def _merge_cached_profile(
+        self, url: str, profile_raw: Any
+    ) -> dict[str, Any] | None:
+        """Merge only profile evidence bound to the same canonical account."""
+        from ._douyin_browser_transport import (
+            _merge_profile_evidence,
+            sanitize_profile_raw,
+        )
+
+        canonical_url = canonical_profile_url("douyin", url)
+        if canonical_url is None:
+            return None
+        primary = sanitize_profile_raw(profile_raw, canonical_url)
+        if primary is None:
+            return None
+        cached = self._browser_profile_cache.get(canonical_url)
+        if cached is not None:
+            _merge_profile_evidence(primary, cached)
+        clean = sanitize_profile_raw(
+            primary, canonical_url, allow_dom_badge=True
+        )
+        return self.normalize_profile(clean) if clean is not None else None
 
     def _cache_browser_profile(self, url: str, profile_raw: Any) -> None:
         """Re-sanitize browser profile evidence and bind it to one account."""
-        from ._douyin_browser_transport import sanitize_profile_raw
+        from ._douyin_browser_transport import (
+            _merge_profile_evidence,
+            sanitize_profile_raw,
+        )
 
         canonical_url = canonical_profile_url("douyin", url)
         if canonical_url is None:
             return
-        clean = sanitize_profile_raw(profile_raw, canonical_url)
+        incoming = sanitize_profile_raw(
+            profile_raw, canonical_url, allow_dom_badge=True
+        )
+        if incoming is None:
+            return
+        existing = self._browser_profile_cache.get(canonical_url)
+        if existing is not None:
+            clean_existing = sanitize_profile_raw(
+                existing, canonical_url, allow_dom_badge=True
+            )
+            if clean_existing is not None:
+                _merge_profile_evidence(clean_existing, incoming)
+                incoming = clean_existing
+        clean = sanitize_profile_raw(
+            incoming, canonical_url, allow_dom_badge=True
+        )
         if clean is not None:
             self._browser_profile_cache[canonical_url] = clean
 
@@ -1209,16 +1306,27 @@ class DouyinCollector(BaseCollector):
         unique_id = user.get("unique_id")  # 抖音号（用户自定义，可能为空）
         account_id = unique_id or sec_uid  # 优先抖音号，回退 sec_uid
         verified = DouyinCollector._extract_verified(user)
-        followers = _int(user.get("follower_count") or user.get("followers"))
-        post_count = _int(user.get("aweme_count") or user.get("aweme_counts"))
+        follower_value = user.get("follower_count")
+        if follower_value is None:
+            follower_value = user.get("followers")
+        post_count_value = user.get("aweme_count")
+        if post_count_value is None:
+            post_count_value = user.get("aweme_counts")
+        followers = _int(follower_value)
+        post_count = _int(post_count_value)
         total_likes = _int(user.get("total_favorited"))
         return {
             "platform": "douyin",
             "account_id": account_id,
             "account_name": user.get("nickname"),
-            "profile_url": url,
+            "profile_url": user.get("profile_url") or user.get("share_url") or url,
             "bio": user.get("signature"),
             "verified": verified,
+            "enterprise_verify_reason": user.get("enterprise_verify_reason"),
+            "custom_verify": user.get("custom_verify"),
+            "verification_type": user.get("verification_type"),
+            "verification": user.get("verification"),
+            "verify_info": user.get("verify_info"),
             "followers": followers,
             "post_count": post_count,
             "platform_metrics": {
@@ -1235,20 +1343,11 @@ class DouyinCollector(BaseCollector):
         }
 
     @staticmethod
-    def _extract_verified(user: dict) -> bool | str:
-        """认证信息：有企业/个人认证文案 → 返回文案；否则布尔。"""
-        enterprise = user.get("enterprise_verify_reason")
-        custom = user.get("custom_verify")
-        if enterprise:
-            return enterprise
-        if custom:
-            return custom
-        v = user.get("verification") or user.get("verify_info")
-        if isinstance(v, dict):
-            vtype = v.get("type")
-            if vtype not in (None, 0, -1):
-                return True
-        return False
+    def _extract_verified(user: dict) -> bool | str | None:
+        """Return strict, shared public certification evidence."""
+        from ._douyin_browser_transport import _public_verified
+
+        return _public_verified(user)
 
     @staticmethod
     def _build_post_raw(url: str, aweme: dict, source: str) -> dict:

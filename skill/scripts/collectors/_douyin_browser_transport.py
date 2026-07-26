@@ -52,12 +52,70 @@ MAX_SCROLLS = 20
 MAX_IDLE_ROUNDS = 3
 
 _ALLOWED_RESPONSE_HOSTS = ("douyin.com", "iesdouyin.com")
-_DOM_CARDS_EXPRESSION = r"""(() => {
+_DOM_PROFILE_HELPERS = r"""
+const isVisible = node => Boolean(node && node.getClientRects().length > 0);
 const visibleText = (root, selector) => {
   const node = root.querySelector(selector);
-  if (!node || node.getClientRects().length === 0) return null;
+  if (!isVisible(node)) return null;
   return (node.getAttribute('aria-label') || node.innerText || '').trim() || null;
 };
+const boundedText = value => {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text && text.length <= 120 ? text : null;
+};
+const readProfile = () => {
+  const pathMatch = location.pathname.match(/^\/(?:user|share\/user)\/([A-Za-z0-9_-]+)\/?$/);
+  const titleNode = document.querySelector('[data-e2e="user-title"],h1');
+  if (!pathMatch || !isVisible(titleNode)) return null;
+  const profileRoot = titleNode.closest(
+    '[data-e2e="user-info"],[data-e2e="user-detail"],header'
+  ) || (titleNode.parentElement && titleNode.parentElement.parentElement) ||
+    titleNode.parentElement;
+  if (!profileRoot || !isVisible(profileRoot)) return null;
+  const badgeSelector = [
+    '[data-e2e="user-info-verify"]',
+    '[data-e2e="user-info-authentication"]',
+    '[aria-label*="认证"]',
+    'img[alt*="认证"]',
+    '[title*="认证"]'
+  ].join(',');
+  const verifiedNode = Array.from(profileRoot.querySelectorAll(badgeSelector)).find(isVisible) || null;
+  const authContainer = verifiedNode && verifiedNode.closest(
+    '[data-e2e="user-info-verify"],[data-e2e="user-info-authentication"]'
+  );
+  const label = boundedText(
+    (authContainer && authContainer.innerText) ||
+    (verifiedNode && (
+      verifiedNode.getAttribute('aria-label') ||
+      verifiedNode.getAttribute('alt') ||
+      verifiedNode.getAttribute('title') ||
+      verifiedNode.innerText
+    ))
+  );
+  const genericLabels = new Set(['认证', '已认证', '认证徽章']);
+  const negativeLabels = new Set(['false', '未认证', '无认证', 'not verified']);
+  return {
+    profile_url: location.href,
+    sec_uid: pathMatch[1],
+    nickname: visibleText(profileRoot, '[data-e2e="user-title"],h1'),
+    signature: visibleText(profileRoot, '[data-e2e="user-signature"]'),
+    follower_count: visibleText(profileRoot, '[data-e2e="user-info-follower"]'),
+    aweme_count: visibleText(profileRoot, '[data-e2e="user-info-post-count"]'),
+    total_favorited: visibleText(profileRoot, '[data-e2e="user-info-like"]'),
+    dom_verified_badge: verifiedNode
+      ? (label && negativeLabels.has(label.toLowerCase())
+        ? null
+        : (label && !genericLabels.has(label) ? label : true))
+      : null
+  };
+};
+"""
+
+_DOM_PROFILE_EXPRESSION = (
+    "(() => {\n" + _DOM_PROFILE_HELPERS + "\nreturn readProfile();\n})()"
+)
+
+_DOM_CARDS_EXPRESSION = "(() => {\n" + _DOM_PROFILE_HELPERS + r"""
 const cards = Array.from(
   document.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')
 ).map(a => {
@@ -76,23 +134,9 @@ const cards = Array.from(
     }
   };
 });
-const page = document.body || document.documentElement;
-const pathMatch = location.pathname.match(/^\/(?:user|share\/user)\/([A-Za-z0-9_-]+)\/?$/);
-const verifiedNode = document.querySelector(
-  '[data-e2e="user-info-verify"],[data-e2e="user-info-authentication"],[aria-label*="认证"]'
-);
 return {
   cards,
-  profile: {
-    profile_url: location.href,
-    sec_uid: pathMatch ? pathMatch[1] : null,
-    nickname: visibleText(page, '[data-e2e="user-title"],h1'),
-    signature: visibleText(page, '[data-e2e="user-signature"]'),
-    follower_count: visibleText(page, '[data-e2e="user-info-follower"]'),
-    aweme_count: visibleText(page, '[data-e2e="user-info-post-count"]'),
-    total_favorited: visibleText(page, '[data-e2e="user-info-like"]'),
-    verified: verifiedNode && verifiedNode.getClientRects().length > 0 ? true : null
-  }
+  profile: readProfile()
 };
 })()"""
 
@@ -219,6 +263,44 @@ def _merge_missing(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
             _merge_missing(existing[key], value)
 
 
+def _verification_strength(value: Any) -> int:
+    if isinstance(value, str) and value.strip():
+        return 3
+    if value is True:
+        return 2
+    if value is False:
+        return 1
+    return 0
+
+
+def _account_id_strength(profile: dict[str, Any]) -> int:
+    account_id = profile.get("account_id")
+    if _is_missing(account_id):
+        return 0
+    visibility = profile.get("field_visibility")
+    if isinstance(visibility, dict) and visibility.get("account_id") == "visible":
+        return 2
+    return 1
+
+
+def _merge_profile_evidence(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> None:
+    """Fill profile gaps while allowing stronger certification evidence."""
+    existing_verified = existing.get("verified")
+    incoming_verified = incoming.get("verified")
+    existing_account_strength = _account_id_strength(existing)
+    incoming_account_strength = _account_id_strength(incoming)
+    incoming_account_id = incoming.get("account_id")
+    _merge_missing(existing, incoming)
+    if incoming_account_strength > existing_account_strength:
+        existing["account_id"] = copy.deepcopy(incoming_account_id)
+    if _verification_strength(incoming_verified) > _verification_strength(
+        existing_verified
+    ):
+        existing["verified"] = copy.deepcopy(incoming_verified)
+
+
 def _first_present(source: dict[str, Any], *keys: str) -> Any:
     """Return the first present value without discarding explicit zero/false."""
     for key in keys:
@@ -252,29 +334,91 @@ def _public_count(value: Any) -> Optional[int]:
     return int(parsed * multiplier) if math.isfinite(parsed) and parsed >= 0 else None
 
 
-def _public_verified(value: dict[str, Any]) -> bool | str | None:
-    enterprise = _public_text(value.get("enterprise_verify_reason"))
-    if enterprise is not None:
-        return enterprise
-    custom = _public_text(value.get("custom_verify"))
-    if custom is not None:
-        return custom
+_NEGATIVE_CERTIFICATION_LABELS = frozenset(
+    {"false", "未认证", "无认证", "not verified"}
+)
+_GENERIC_CERTIFICATION_LABELS = frozenset({"认证", "已认证", "认证徽章"})
+
+
+def _certification_text(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r"\s+", " ", value).strip()
+    if (
+        not text
+        or len(text) > 120
+        or any(ord(char) < 32 or ord(char) == 127 for char in text)
+        or text.casefold() in _NEGATIVE_CERTIFICATION_LABELS
+    ):
+        return None
+    return text
+
+
+def _verification_type_status(value: Any) -> Optional[bool]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value in (0, -1):
+        return False
+    return True if value > 0 else None
+
+
+def _verification_evidence(
+    value: dict[str, Any], *, allow_dom_badge: bool = False
+) -> tuple[bool | str | None, Optional[str], Any]:
+    supplied_metrics = value.get("platform_metrics")
+    metrics = supplied_metrics if isinstance(supplied_metrics, dict) else {}
+    for key in ("enterprise_verify_reason", "custom_verify"):
+        raw_text = value.get(key) if key in value else metrics.get(key)
+        text = _certification_text(raw_text)
+        if text is not None:
+            return text, key, text
+
+    if allow_dom_badge:
+        badge = (
+            value.get("dom_verified_badge")
+            if "dom_verified_badge" in value
+            else metrics.get("dom_verified_badge")
+        )
+        if badge is True:
+            return True, "dom_verified_badge", True
+        label = _certification_text(badge)
+        if label is not None:
+            verified = (
+                True if label in _GENERIC_CERTIFICATION_LABELS else label
+            )
+            return verified, "dom_verified_badge", badge
+
     verified = value.get("verified")
     if isinstance(verified, bool):
-        return verified
-    if isinstance(verified, str):
-        return _public_text(verified)
-    verification_type = value.get("verification_type")
-    if isinstance(verification_type, (int, float)) and not isinstance(
-        verification_type, bool
-    ):
-        return verification_type not in (0, -1)
-    return None
+        return verified, None, None
+
+    if "verification_type" in value:
+        status = _verification_type_status(value.get("verification_type"))
+        if status is not None:
+            return status, None, None
+    nested = value.get("verification") or value.get("verify_info")
+    if isinstance(nested, dict):
+        status = _verification_type_status(nested.get("type"))
+        if status is not None:
+            return status, None, None
+    return None, None, None
+
+
+def _public_verified(
+    value: dict[str, Any], *, allow_dom_badge: bool = False
+) -> bool | str | None:
+    return _verification_evidence(
+        value, allow_dom_badge=allow_dom_badge
+    )[0]
 
 
 def sanitize_profile_raw(
     value: Any,
     requested_url: str,
+    *,
+    allow_dom_badge: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Bind one profile candidate to the requested account and allowlist fields.
 
@@ -317,7 +461,8 @@ def sanitize_profile_raw(
     uid = _public_text(
         _first_present(value, "uid") if "uid" in value else metrics.get("uid")
     )
-    account_id = _public_text(value.get("account_id")) or unique_id or supplied_sec_uid
+    explicit_account_id = _public_text(value.get("account_id"))
+    account_id = explicit_account_id or unique_id or supplied_sec_uid
     account_name = _public_text(_first_present(value, "account_name", "nickname"))
     bio = _public_text(_first_present(value, "bio", "signature"))
     followers = _public_count(_first_present(value, "followers", "follower_count"))
@@ -327,9 +472,9 @@ def sanitize_profile_raw(
         if "total_favorited" in value
         else metrics.get("total_likes")
     )
-    verified = _public_verified(value)
-    if verified is None and isinstance(value.get("verified"), bool):
-        verified = value["verified"]
+    verified, verification_source, verification_source_value = (
+        _verification_evidence(value, allow_dom_badge=allow_dom_badge)
+    )
 
     public_metrics = {
         key: metric_value
@@ -341,6 +486,8 @@ def sanitize_profile_raw(
         )
         if metric_value is not None
     }
+    if verification_source is not None:
+        public_metrics[verification_source] = verification_source_value
     return {
         "platform": "douyin",
         "account_id": account_id,
@@ -352,10 +499,23 @@ def sanitize_profile_raw(
         "post_count": post_count,
         "platform_metrics": public_metrics,
         "field_visibility": {
+            "account_id": (
+                "visible"
+                if unique_id is not None
+                or (
+                    explicit_account_id is not None
+                    and explicit_account_id != supplied_sec_uid
+                )
+                else "partial"
+                if account_id is not None
+                else "hidden"
+            ),
             "account_name": "visible" if account_name is not None else "hidden",
             "bio": "visible" if bio is not None else "hidden",
+            "verified": "visible" if verified is not None else "hidden",
             "followers": "visible" if followers is not None else "hidden",
             "post_count": "visible" if post_count is not None else "hidden",
+            "total_likes": "visible" if total_likes is not None else "hidden",
         },
     }
 
@@ -375,7 +535,7 @@ def extract_profile_raw(data: Any, requested_url: str) -> Optional[dict[str, Any
                     if merged is None:
                         merged = candidate
                     else:
-                        _merge_missing(merged, candidate)
+                        _merge_profile_evidence(merged, candidate)
             for child in node.values():
                 walk(child, depth + 1)
         elif isinstance(node, list):
@@ -640,7 +800,27 @@ def _dom_snapshot(
         if isinstance(cards, list)
         else []
     )
-    return clean_cards, sanitize_profile_raw(snapshot.get("profile"), requested_url)
+    return clean_cards, sanitize_profile_raw(
+        snapshot.get("profile"), requested_url, allow_dom_badge=True
+    )
+
+
+def _dom_profile_snapshot(
+    session: BrowserSession,
+    requested_url: str,
+    timeout: float,
+) -> Optional[dict[str, Any]]:
+    """Read only the visible account header after a task-level restriction."""
+    snapshot = _call_with_timeout(
+        session.evaluate,
+        _DOM_PROFILE_EXPRESSION,
+        timeout=timeout,
+    )
+    if isinstance(snapshot, dict) and "profile" in snapshot:
+        snapshot = snapshot.get("profile")
+    return sanitize_profile_raw(
+        snapshot, requested_url, allow_dom_badge=True
+    )
 
 
 def _date_bound(raw: Any) -> Optional[float]:
@@ -841,7 +1021,7 @@ def collect_account_page(
             if profile_raw is None:
                 profile_raw = discovered_profile
             else:
-                _merge_missing(profile_raw, discovered_profile)
+                _merge_profile_evidence(profile_raw, discovered_profile)
         safe_url = candidate["safe_url"]
         if safe_url not in safe_paths:
             safe_paths.append(safe_url)
@@ -991,10 +1171,23 @@ def collect_account_page(
         network_count = sum(
             item.get("_collection_source") == "network" for item in items.values()
         )
-        if not restriction and not deadline_expired:
+        if not deadline_expired:
             budget = remaining()
             if budget > 0:
-                cards, visible_profile = _dom_snapshot(session, url, budget)
+                try:
+                    if restriction:
+                        cards = []
+                        visible_profile = _dom_profile_snapshot(
+                            session, url, budget
+                        )
+                    else:
+                        cards, visible_profile = _dom_snapshot(
+                            session, url, budget
+                        )
+                except Exception:
+                    if not restriction:
+                        raise
+                    cards, visible_profile = [], None
                 if remaining() <= 0:
                     deadline_expired = True
                     stop_condition = "timeout"
@@ -1003,13 +1196,14 @@ def collect_account_page(
                         if profile_raw is None:
                             profile_raw = visible_profile
                         else:
-                            _merge_missing(profile_raw, visible_profile)
-                    for item in extract_dom_items(cards):
-                        item_id = str(item["aweme_id"])
-                        if item_id not in items:
-                            items[item_id] = item
-                        else:
-                            _merge_missing(items[item_id], item)
+                            _merge_profile_evidence(profile_raw, visible_profile)
+                    if not restriction:
+                        for item in extract_dom_items(cards):
+                            item_id = str(item["aweme_id"])
+                            if item_id not in items:
+                                items[item_id] = item
+                            else:
+                                _merge_missing(items[item_id], item)
             else:
                 deadline_expired = True
                 stop_condition = "timeout"
@@ -1062,6 +1256,12 @@ def collect_account_page(
         and not restriction
         and stop_condition == "terminal_page"
     )
+    if profile_raw is not None:
+        sanitized_profile = sanitize_profile_raw(
+            profile_raw, url, allow_dom_badge=True
+        )
+        if sanitized_profile is not None:
+            profile_raw = sanitized_profile
     return DouyinBrowserResult(
         profile_raw=profile_raw,
         aweme_items=final,

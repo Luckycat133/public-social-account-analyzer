@@ -32,8 +32,9 @@
 - 搜索页：`.../search?keyword=...`。
 - 话题/音乐/直播/发现页：`/topic/`、`/music/`、`/challenge/`、`/live/`、`/discover/`。
 
-> 说明：抖音的 `sec_uid` 是用户唯一且稳定的公开标识，用作 `account_id` 的首选；
-> 抖音号（`unique_id`）是用户自定义的可变标识，单独记入 `platform_metrics.unique_id`。
+> 说明：抖音的 `sec_uid` 是用户唯一且稳定的公开标识，用作 `account_id` 的保底值；
+> 页面明确展示抖音号（`unique_id`）时优先作为 `account_id`，并同时记入
+> `platform_metrics.unique_id`。
 
 ## 账号主页与作品页区分
 
@@ -68,9 +69,16 @@
 
 映射约定：
 - `account_id`：优先 `unique_id`（抖音号）；为 `null`/空时回退到 `sec_uid`；两者皆无则为 `null`。
-- `verified`：有企业/个人认证文案或 `verification.type>0` → 记认证文案或 `True`；否则 `False`。
+- `verified`：公开 `enterprise_verify_reason` / `custom_verify` 文案或账号头中已绑定的
+  可见认证徽章优先于布尔值；generic `verified` 字符串不是认证证据。明确
+  `verified=false` 或认证类型 `0` / `-1` 才记 `False`，有限正数认证类型记 `True`；
+  其他负数、非有限数、布尔类型码及没有认证证据的情况均记 `null`，不得把未知伪装成
+  未认证，也不得把 `"false"` / `"未认证"` 当认证文案。
 - 获赞总量只进 `platform_metrics.total_likes`，统一层 `platform_metrics` 为必填对象。
 - 页面未展示的字段一律写 `null`（绝不用 `0` 代替未知，见 `data-schema.md` §7 / §8）。
+- `field_visibility` 必须覆盖 `account_id`、`verified` 与 `total_likes`：URL 中的
+  `sec_uid` 回退为 `partial`，公开抖音号/明确认证证据/明确的获赞数（包括 0）为
+  `visible`，无证据为 `hidden`。
 
 ## 内容字段
 
@@ -145,7 +153,15 @@
   2. 降级不会声称加载“完整 DOM”。实现会先观察来自公开 Douyin/iesdouyin 域名的 CDP XHR/Fetch JSON 响应并提取已验证的作品结构；不足时才从可见的 `/video/<id>` 或 `/note/<id>` 卡片提取最小字段。浏览器不参与签名生成或保护绕过。
   3. 系统 Chrome、Chromium、Edge 或 Brave 是可选前置条件，可通过 `BROWSER_BIN` / `CHROME_BIN` 指定。未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外 `stop_reason` 仍为 `PARSER_FAILED`。
   4. 浏览器运行不新增 pip 或其他 Python 运行时依赖。每次启动均创建并删除临时用户目录，不附着或复用本机浏览器的登录状态、Cookie 或用户配置；不持久化 Cookie、请求头、带签名 URL、完整响应或媒体。
-  5. 遇到登录、验证码、滑块、频控或其他限制立即停止；已采集的公开作品可作为部分结果保留。后续 `run_pipeline.py` 仅在至少有 1 条有效可分析作品时提交独立分析工作区；0 条有效数据会在输出预留前失败，不发布空分析。
+  5. 遇到登录、验证码、滑块、频控或其他限制立即停止；若时间预算尚存，只读取当前
+     精确账号路径下已可见的主页标题区（含认证徽章），不再滚动且不查询/接纳 DOM
+     作品卡片，原限制状态保持不变。已采集的公开作品可作为部分结果保留。后续
+     `run_pipeline.py` 仅在至少有 1 条有效可分析作品时提交独立分析工作区；0 条有效
+     数据会在输出预留前失败，不发布空分析。
+  6. API、SSR、网络响应和可见账号头只在 `sec_uid` 与规范化主页 URL 均不矛盾时合并；
+     任一显式账号绑定冲突都以 `PARSER_FAILED` 关闭，不用请求参数覆盖响应身份，也不以
+     旧缓存掩盖冲突。浏览器缓存按证据强度合并并重新净化，后到的档案片段不会清除已
+     确认的抖音号、获赞数（包括 0）或更强认证证据。
 - **绝不**刷新、重试破解、伪造签名或模拟浏览器绕过；`urllib` 直连或浏览器传输层拿到的风控页即如实认定。
 - 单条内容级问题（`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE`）只下钻到内容级，
   **不**写入任务级 `stop_reason`（见 `exceptions.md` §1.1）。
@@ -208,6 +224,12 @@
   "post_count": 67,
   "platform_metrics": { "total_likes": 890000, "sec_uid": "...", "unique_id": "..." },
   "collected_at": "2026-07-23T09:00:00+08:00",
-  "field_visibility": { "followers": "visible", "post_count": "visible" }
+  "field_visibility": {
+    "account_id": "visible",
+    "verified": "visible",
+    "followers": "visible",
+    "post_count": "visible",
+    "total_likes": "visible"
+  }
 }
 ```

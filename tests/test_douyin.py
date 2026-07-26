@@ -1768,6 +1768,103 @@ def test_collect_account_page_returns_restriction_with_retained_items():
     assert result.diagnostics["stop_condition"] == STOP_VERIFICATION
 
 
+def test_restriction_retains_visible_profile_header_but_ignores_dom_cards():
+    """Reading the already-visible account header must not bypass a login stop."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    class RestrictedProfileBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            return {
+                "cards": [
+                    {
+                        "href": "https://www.douyin.com/video/7999",
+                        "text": "不得在限制后接纳的作品",
+                    }
+                ],
+                "profile": {
+                    "profile_url": ACCOUNT_URL,
+                    "sec_uid": "example",
+                    "nickname": "公开昵称",
+                    "dom_verified_badge": "搞笑短视频创作者",
+                },
+            }
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: RestrictedProfileBrowser(
+            page_texts=["登录后查看"]
+        ),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.restriction == STOP_LOGIN
+    assert result.aweme_items == []
+    assert result.profile_raw["account_name"] == "公开昵称"
+    assert result.profile_raw["verified"] == "搞笑短视频创作者"
+
+
+def test_restriction_uses_profile_only_dom_snapshot_contract():
+    """The restricted path consumes only one raw profile-header snapshot."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    class ProfileOnlyBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            return {
+                "profile_url": ACCOUNT_URL,
+                "sec_uid": "example",
+                "nickname": "公开昵称",
+                "verified": True,
+            }
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: ProfileOnlyBrowser(page_texts=["登录后查看"]),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.restriction == STOP_LOGIN
+    assert result.aweme_items == []
+    assert result.profile_raw["account_name"] == "公开昵称"
+    assert result.profile_raw["verified"] is True
+
+
+def test_restricted_dom_expression_is_scoped_profile_only():
+    """Restricted reads may inspect badges, never body text or post cards."""
+    from collectors._douyin_browser_transport import _DOM_PROFILE_EXPRESSION
+
+    assert 'profileRoot.querySelectorAll(badgeSelector)' in _DOM_PROFILE_EXPRESSION
+    assert 'img[alt*="认证"]' in _DOM_PROFILE_EXPRESSION
+    assert '[aria-label*="认证"]' in _DOM_PROFILE_EXPRESSION
+    assert '[title*="认证"]' in _DOM_PROFILE_EXPRESSION
+    assert "dom_verified_badge" in _DOM_PROFILE_EXPRESSION
+    assert "document.body" not in _DOM_PROFILE_EXPRESSION
+    assert 'a[href*="/video/"]' not in _DOM_PROFILE_EXPRESSION
+    assert 'a[href*="/note/"]' not in _DOM_PROFILE_EXPRESSION
+    assert "const cards" not in _DOM_PROFILE_EXPRESSION
+
+
+def test_restriction_remains_authoritative_when_profile_snapshot_fails():
+    """Best-effort header evidence cannot replace an already observed stop."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    class BrokenProfileBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            raise RuntimeError("private browser detail must not escape")
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: BrokenProfileBrowser(page_texts=["登录后查看"]),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.restriction == STOP_LOGIN
+    assert result.profile_raw is None
+    assert result.aweme_items == []
+
+
 @pytest.mark.parametrize(
     ("visible_text", "expected"),
     [
@@ -2849,6 +2946,429 @@ def test_browser_profile_extraction_is_allowlisted_and_account_bound():
     assert extract_profile_raw(mismatched, ACCOUNT_URL) is None
 
 
+def test_browser_profile_merge_upgrades_false_to_public_certification_text():
+    """Later account-bound positive evidence must beat an earlier weak negative."""
+    from collectors._douyin_browser_transport import extract_profile_raw
+
+    profile = extract_profile_raw(
+        {
+            "candidates": [
+                {
+                    "sec_uid": "example",
+                    "unique_id": "public-id",
+                    "verified": False,
+                },
+                {
+                    "sec_uid": "example",
+                    "enterprise_verify_reason": "搞笑短视频创作者",
+                },
+            ]
+        },
+        ACCOUNT_URL,
+    )
+
+    assert profile["verified"] == "搞笑短视频创作者"
+
+
+def test_browser_profile_merge_upgrades_sec_uid_fallback_to_public_id():
+    """A later public Douyin ID is stronger than the URL sec_uid fallback."""
+    from collectors._douyin_browser_transport import extract_profile_raw
+
+    profile = extract_profile_raw(
+        {
+            "candidates": [
+                {"sec_uid": "example"},
+                {"sec_uid": "example", "unique_id": "public-id"},
+            ]
+        },
+        ACCOUNT_URL,
+    )
+
+    assert profile["account_id"] == "public-id"
+    assert profile["platform_metrics"]["unique_id"] == "public-id"
+    assert profile["field_visibility"]["account_id"] == "visible"
+
+
+def test_browser_network_profile_updates_upgrade_false_to_certification_text():
+    """Separate account-bound responses use the same verification precedence."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    browser = FakeBrowser(
+        events=[
+            _response_event("profile-false"),
+            _loading_event("Network.loadingFinished", "profile-false"),
+            _response_event("profile-text"),
+            _loading_event("Network.loadingFinished", "profile-text"),
+        ],
+        bodies={
+            "profile-false": json.dumps(
+                {"user_info": {"sec_uid": "example", "verified": False}}
+            ),
+            "profile-text": json.dumps(
+                {
+                    "user_info": {
+                        "sec_uid": "example",
+                        "enterprise_verify_reason": "搞笑短视频创作者",
+                    }
+                }
+            ),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        max_scrolls=1,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.profile_raw["verified"] == "搞笑短视频创作者"
+
+
+def test_browser_network_profile_merge_recomputes_verification_visibility():
+    """A later visible badge upgrades an earlier unknown visibility state."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    browser = FakeBrowser(
+        events=[
+            _response_event("profile-unknown"),
+            _loading_event("Network.loadingFinished", "profile-unknown"),
+            _response_event("profile-text"),
+            _loading_event("Network.loadingFinished", "profile-text"),
+        ],
+        bodies={
+            "profile-unknown": json.dumps(
+                {"user_info": {"sec_uid": "example"}}
+            ),
+            "profile-text": json.dumps(
+                {
+                    "user_info": {
+                        "sec_uid": "example",
+                        "enterprise_verify_reason": "搞笑短视频创作者",
+                    }
+                }
+            ),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        max_scrolls=1,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.profile_raw["verified"] == "搞笑短视频创作者"
+    assert result.profile_raw["field_visibility"]["verified"] == "visible"
+
+
+def test_ssr_profile_missing_verification_evidence_remains_unknown():
+    """Omitted certification fields are unknown, not an explicit negative."""
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(browser_fallback=False)
+    collector._fetch = lambda _url: _ssr_html(
+        {
+            "user": {
+                "user": {
+                    "sec_uid": "example",
+                    "unique_id": "public-id",
+                    "nickname": "公开昵称",
+                    "follower_count": 0,
+                    "aweme_count": 0,
+                    "total_favorited": 0,
+                }
+            }
+        }
+    )
+
+    profile = collector.collect_profile(ACCOUNT_URL)
+
+    assert profile["verified"] is None
+    assert profile["followers"] == 0
+    assert profile["post_count"] == 0
+    assert profile["platform_metrics"]["total_likes"] == 0
+    assert profile["field_visibility"]["followers"] == "visible"
+    assert profile["field_visibility"]["post_count"] == "visible"
+    assert profile["field_visibility"]["total_likes"] == "visible"
+
+
+@pytest.mark.parametrize(
+    ("user", "expected"),
+    [
+        ({"verification_type": 0}, False),
+        ({"verification_type": -1}, False),
+        ({"verification_type": 2}, True),
+        ({"verified": False}, False),
+        ({"verified": True}, True),
+        (
+            {
+                "verification_type": 2,
+                "enterprise_verify_reason": "搞笑短视频创作者",
+            },
+            "搞笑短视频创作者",
+        ),
+    ],
+)
+def test_ssr_profile_uses_only_explicit_verification_evidence(user, expected):
+    """Explicit status fields are tri-state while public text stays strongest."""
+    from collectors.douyin import DouyinCollector
+
+    assert DouyinCollector._extract_verified(user) == expected
+
+
+@pytest.mark.parametrize(
+    ("verification", "expected"),
+    [
+        ({}, None),
+        ({"verification_type": 0}, False),
+        ({"verification_type": -1}, False),
+        ({"verification_type": 2}, True),
+        ({"custom_verify": "个人认证创作者"}, "个人认证创作者"),
+        (
+            {"enterprise_verify_reason": "搞笑短视频创作者"},
+            "搞笑短视频创作者",
+        ),
+    ],
+)
+def test_ies_profile_api_preserves_explicit_verification_tristate(
+    monkeypatch, verification, expected
+):
+    """The public API fallback must not collapse missing evidence into false."""
+    from collectors.douyin import DouyinCollector
+
+    payload = {
+        "user_info": {
+            "sec_uid": "example",
+            "unique_id": "public-id",
+            "nickname": "公开昵称",
+            "follower_count": 0,
+            "aweme_count": 0,
+            "total_favorited": 0,
+            **verification,
+        }
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda _request, timeout: Response()
+    )
+    profile = DouyinCollector()._fetch_profile_via_iesdouyin_api(
+        "example", ACCOUNT_URL
+    )
+
+    assert profile["verified"] == expected
+    assert profile["followers"] == 0
+    assert profile["post_count"] == 0
+    assert profile["platform_metrics"]["total_likes"] == 0
+    assert profile["field_visibility"]["followers"] == "visible"
+    assert profile["field_visibility"]["post_count"] == "visible"
+    assert profile["field_visibility"]["total_likes"] == "visible"
+
+
+@pytest.mark.parametrize(
+    "conflicting_binding",
+    [
+        {"sec_uid": "other-account"},
+        {
+            "sec_uid": "example",
+            "profile_url": "https://www.douyin.com/user/other-account",
+        },
+    ],
+)
+def test_ies_profile_api_rejects_conflicting_account_binding_without_cache_pollution(
+    monkeypatch, conflicting_binding
+):
+    """An API response must prove the requested account instead of being relabelled."""
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    payload = {
+        "user_info": {
+            "unique_id": "other-public-id",
+            "nickname": "错误账号",
+            **conflicting_binding,
+        }
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(payload).encode("utf-8")
+
+    collector = DouyinCollector()
+    collector._cache_browser_profile(
+        ACCOUNT_URL,
+        {
+            "profile_url": ACCOUNT_URL,
+            "sec_uid": "example",
+            "nickname": "原缓存账号",
+        },
+    )
+    cache_before = json.dumps(
+        collector._browser_profile_cache, ensure_ascii=False, sort_keys=True
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda _request, timeout: Response()
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_profile(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert exc_info.value.raw is None
+    assert json.dumps(
+        collector._browser_profile_cache, ensure_ascii=False, sort_keys=True
+    ) == cache_before
+
+
+@pytest.mark.parametrize(
+    "conflicting_user",
+    [
+        {
+            "sec_uid": "other-account",
+            "unique_id": "other-public-id",
+            "nickname": "错误账号",
+        },
+        {
+            "sec_uid": "example",
+            "unique_id": "other-public-id",
+            "nickname": "错误账号",
+            "profile_url": "https://www.douyin.com/user/other-account",
+        },
+    ],
+)
+def test_ssr_profile_rejects_conflicting_account_without_cache_fallback(
+    monkeypatch, conflicting_user
+):
+    """Explicit SSR account mismatch fails closed and cannot emit cached output."""
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector()
+    collector._cache_browser_profile(
+        ACCOUNT_URL,
+        {
+            "profile_url": ACCOUNT_URL,
+            "sec_uid": "example",
+            "nickname": "原缓存账号",
+        },
+    )
+    cache_before = json.dumps(
+        collector._browser_profile_cache, ensure_ascii=False, sort_keys=True
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html(
+            {
+                "user": {
+                    "user": conflicting_user
+                }
+            }
+        ),
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_profile(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert exc_info.value.raw is None
+    assert json.dumps(
+        collector._browser_profile_cache, ensure_ascii=False, sort_keys=True
+    ) == cache_before
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        ({"verified": "false"}, None),
+        ({"verified": "未认证"}, None),
+        ({"verified": "机构认证"}, None),
+        ({"verification_type": -2}, None),
+        ({"verification_type": float("nan")}, None),
+        ({"verification_type": float("inf")}, None),
+        ({"verification_type": float("-inf")}, None),
+        ({"verification_type": True}, None),
+        ({"verification_type": False}, None),
+        ({"verification_type": "2"}, None),
+        ({"verification_type": 0}, False),
+        ({"verification_type": -1}, False),
+        ({"verification_type": 1.5}, True),
+        ({"verification_type": 10**1000}, True),
+        ({"verification": {"type": -2}}, None),
+        ({"verification": {"type": 2}}, True),
+    ],
+)
+def test_profile_verification_parsers_share_strict_value_domain(evidence, expected):
+    """Network/browser and SSR/API parsing use the same finite tri-state rules."""
+    from collectors._douyin_browser_transport import sanitize_profile_raw
+    from collectors.douyin import DouyinCollector
+
+    browser_profile = sanitize_profile_raw(
+        {"sec_uid": "example", **evidence}, ACCOUNT_URL
+    )
+
+    assert browser_profile["verified"] == expected
+    assert DouyinCollector._extract_verified(evidence) == expected
+
+
+@pytest.mark.parametrize("label", ["false", "未认证"])
+def test_dom_badge_negative_labels_are_not_positive_certification(label):
+    from collectors._douyin_browser_transport import sanitize_profile_raw
+
+    untrusted_generic = sanitize_profile_raw(
+        {"sec_uid": "example", "verified": label}, ACCOUNT_URL
+    )
+    bound_badge = sanitize_profile_raw(
+        {"sec_uid": "example", "dom_verified_badge": label},
+        ACCOUNT_URL,
+        allow_dom_badge=True,
+    )
+
+    assert untrusted_generic["verified"] is None
+    assert bound_badge["verified"] is None
+
+
+def test_only_account_bound_dom_badge_can_supply_certification_text():
+    from collectors._douyin_browser_transport import sanitize_profile_raw
+
+    ignored = sanitize_profile_raw(
+        {
+            "sec_uid": "example",
+            "verified": "搞笑短视频创作者",
+            "dom_verified_badge": "搞笑短视频创作者",
+        },
+        ACCOUNT_URL,
+    )
+    accepted = sanitize_profile_raw(
+        {
+            "sec_uid": "example",
+            "dom_verified_badge": "搞笑短视频创作者",
+        },
+        ACCOUNT_URL,
+        allow_dom_badge=True,
+    )
+
+    assert ignored["verified"] is None
+    assert accepted["verified"] == "搞笑短视频创作者"
+
+
 def test_browser_profile_sanitizer_rejects_nonfinite_public_counts():
     from collectors._douyin_browser_transport import sanitize_profile_raw
 
@@ -2866,6 +3386,33 @@ def test_browser_profile_sanitizer_rejects_nonfinite_public_counts():
     assert profile["post_count"] is None
 
 
+def test_browser_profile_visibility_distinguishes_public_zero_and_url_fallback():
+    """Visibility must describe evidence strength without treating zero as absent."""
+    from collectors._douyin_browser_transport import sanitize_profile_raw
+
+    visible = sanitize_profile_raw(
+        {
+            "profile_url": ACCOUNT_URL,
+            "sec_uid": "example",
+            "unique_id": "public-id",
+            "verified": False,
+            "total_favorited": 0,
+        },
+        ACCOUNT_URL,
+    )
+    fallback = sanitize_profile_raw(
+        {"profile_url": ACCOUNT_URL, "sec_uid": "example"},
+        ACCOUNT_URL,
+    )
+
+    assert visible["field_visibility"]["account_id"] == "visible"
+    assert visible["field_visibility"]["verified"] == "visible"
+    assert visible["field_visibility"]["total_likes"] == "visible"
+    assert fallback["field_visibility"]["account_id"] == "partial"
+    assert fallback["field_visibility"]["verified"] == "hidden"
+    assert fallback["field_visibility"]["total_likes"] == "hidden"
+
+
 def test_browser_profile_sanitizer_is_idempotent_for_public_verification_text():
     from collectors._douyin_browser_transport import sanitize_profile_raw
 
@@ -2881,6 +3428,48 @@ def test_browser_profile_sanitizer_is_idempotent_for_public_verification_text():
 
     assert first["verified"] == "机构认证"
     assert second["verified"] == "机构认证"
+
+
+@pytest.mark.parametrize("dom_first", [False, True])
+def test_browser_profile_cache_merges_snapshots_without_losing_stronger_fields(
+    dom_first,
+):
+    """Cache updates are commutative for complementary evidence, including zero."""
+    from collectors.douyin import DouyinCollector
+
+    network_snapshot = {
+        "profile_url": ACCOUNT_URL,
+        "sec_uid": "example",
+        "unique_id": "public-id",
+        "nickname": "公开昵称",
+        "total_favorited": 0,
+        "follower_count": 0,
+        "verified": False,
+    }
+    dom_snapshot = {
+        "profile_url": ACCOUNT_URL,
+        "sec_uid": "example",
+        "dom_verified_badge": "搞笑短视频创作者",
+    }
+    ordered = (
+        (dom_snapshot, network_snapshot)
+        if dom_first
+        else (network_snapshot, dom_snapshot)
+    )
+    collector = DouyinCollector()
+
+    for snapshot in ordered:
+        collector._cache_browser_profile(ACCOUNT_URL, snapshot)
+
+    cached = collector._browser_profile_cache[ACCOUNT_URL]
+    assert cached["account_id"] == "public-id"
+    assert cached["account_name"] == "公开昵称"
+    assert cached["followers"] == 0
+    assert cached["platform_metrics"]["total_likes"] == 0
+    assert cached["verified"] == "搞笑短视频创作者"
+    assert cached["field_visibility"]["account_id"] == "visible"
+    assert cached["field_visibility"]["verified"] == "visible"
+    assert cached["field_visibility"]["total_likes"] == "visible"
 
 
 def test_limited_browser_nonfinite_date_does_not_satisfy_range_target():
@@ -2958,6 +3547,89 @@ def test_browser_profile_cache_falls_back_after_ssr_and_api_profile_fail(monkeyp
     assert "SECRET" not in serialized
     assert "cookie" not in serialized
     assert "cursor" not in serialized
+
+
+def test_live_profile_merges_api_identity_with_visible_browser_certification(
+    monkeypatch,
+):
+    """API identity stays exact while visible account-bound certification wins."""
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector()
+    collector._cache_browser_profile(
+        ACCOUNT_URL,
+        {
+            "profile_url": ACCOUNT_URL,
+            "sec_uid": "example",
+            "nickname": "公开昵称",
+            "dom_verified_badge": "搞笑短视频创作者",
+        },
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+    monkeypatch.setattr(
+        collector,
+        "_fetch_profile_via_iesdouyin_api",
+        lambda _sec_uid, _url: {
+            "platform": "douyin",
+            "account_id": "8533800Pt",
+            "account_name": "公开昵称",
+            "profile_url": ACCOUNT_URL,
+            "bio": "公开简介",
+            "verified": False,
+            "followers": 12_815_000,
+            "post_count": 726,
+            "platform_metrics": {
+                "total_likes": 148_136_347,
+                "sec_uid": "example",
+                "unique_id": "8533800Pt",
+            },
+            "field_visibility": {},
+        },
+    )
+
+    profile = collector.collect_profile(ACCOUNT_URL)
+
+    assert profile["account_id"] == "8533800Pt"
+    assert profile["platform_metrics"]["total_likes"] == 148_136_347
+    assert profile["verified"] == "搞笑短视频创作者"
+
+
+def test_ssr_profile_merges_same_account_visible_browser_certification(monkeypatch):
+    """An SSR weak negative must not bypass stronger visible browser evidence."""
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector()
+    collector._cache_browser_profile(
+        ACCOUNT_URL,
+        {
+            "profile_url": ACCOUNT_URL,
+            "sec_uid": "example",
+            "dom_verified_badge": "搞笑短视频创作者",
+        },
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html(
+            {
+                "user": {
+                    "user": {
+                        "sec_uid": "example",
+                        "unique_id": "8533800Pt",
+                        "nickname": "公开昵称",
+                        "verified": False,
+                        "total_favorited": 148_136_347,
+                    }
+                }
+            }
+        ),
+    )
+
+    profile = collector.collect_profile(ACCOUNT_URL)
+
+    assert profile["account_id"] == "8533800Pt"
+    assert profile["platform_metrics"]["total_likes"] == 148_136_347
+    assert profile["verified"] == "搞笑短视频创作者"
 
 
 def test_visible_browser_snapshot_can_supply_account_bound_profile():
