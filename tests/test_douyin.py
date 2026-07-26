@@ -23,6 +23,7 @@ AWEME = {
 
 
 ACCOUNT_URL = "https://www.douyin.com/user/example"
+ACCOUNT_AWEME = {**AWEME, "author": {"sec_uid": "example"}}
 
 
 def test_douyin_supports_canonicalizable_profile_and_rejects_authority_data():
@@ -1851,7 +1852,7 @@ def test_all_transport_accepts_exact_caps_and_reports_effective_max_items():
     from collectors._douyin_browser_transport import collect_account_page
 
     payload = {
-        "aweme_list": [AWEME],
+        "aweme_list": [ACCOUNT_AWEME],
         "has_more": False,
         "cursor": "must-not-persist",
     }
@@ -1942,10 +1943,10 @@ RESPONSE_EVENT = {
 }
 
 
-def _response_event(request_id, *, host="www.douyin.com"):
+def _response_event(request_id, *, host="www.douyin.com", url=None):
     event = json.loads(json.dumps(RESPONSE_EVENT))
     event["params"]["requestId"] = request_id
-    event["params"]["response"]["url"] = (
+    event["params"]["response"]["url"] = url or (
         f"https://{host}/aweme/v1/web/aweme/post/?signed=secret"
     )
     return event
@@ -1953,6 +1954,504 @@ def _response_event(request_id, *, host="www.douyin.com"):
 
 def _loading_event(method, request_id):
     return {"method": method, "params": {"requestId": request_id}}
+
+
+@pytest.mark.parametrize(
+    "unbound_items",
+    [
+        [
+            {
+                **AWEME,
+                "author": {"sec_uid": "foreign-account"},
+            }
+        ],
+        [AWEME],
+        [
+            ACCOUNT_AWEME,
+            {
+                **AWEME,
+                "aweme_id": "7002",
+                "author": {"sec_uid": "foreign-account"},
+            },
+        ],
+    ],
+    ids=["foreign-author", "missing-author", "mixed-authors"],
+)
+def test_account_page_ignores_whole_unbound_page_and_continues(unbound_items):
+    """A foreign, missing, or mixed author must not donate items or pagination."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    later = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7999",
+        "desc": "目标账号后续作品",
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event(
+                "unbound",
+                url=(
+                    "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                    "?sec_uid=example&signed=must-not-win"
+                ),
+            ),
+            _loading_event("Network.loadingFinished", "unbound"),
+            _response_event("bound"),
+            _loading_event("Network.loadingFinished", "bound"),
+        ],
+        bodies={
+            "unbound": json.dumps(
+                {
+                    "aweme_list": unbound_items,
+                    "has_more": False,
+                    "max_cursor": "foreign-terminal-cursor",
+                }
+            ),
+            "bound": json.dumps(
+                {
+                    "aweme_list": [later],
+                    "has_more": False,
+                    "max_cursor": "bound-terminal-cursor",
+                }
+            ),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7999"]
+    assert result.coverage["observed_page_count"] == 1
+    assert result.coverage["cursor_fingerprint_count"] == 1
+    assert result.coverage["terminal_page_observed"] is True
+    assert result.coverage["is_exhaustive"] is True
+
+
+def test_limited_account_page_does_not_mix_foreign_network_items():
+    """Limited mode applies the same account binding before satisfying its limit."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    foreign = {
+        **AWEME,
+        "author": {"sec_uid": "foreign-account"},
+    }
+    target = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7999",
+        "desc": "目标账号作品",
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event("foreign"),
+            _loading_event("Network.loadingFinished", "foreign"),
+            _response_event("target"),
+            _loading_event("Network.loadingFinished", "target"),
+        ],
+        bodies={
+            "foreign": json.dumps({"aweme_list": [foreign]}),
+            "target": json.dumps({"aweme_list": [target]}),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7999"]
+    assert result.coverage["observed_page_count"] == 1
+
+
+def test_account_page_accepts_only_bound_list_items_not_detail_siblings():
+    """Only a bound list container may contribute account-page network items."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    unrelated_detail = {
+        **AWEME,
+        "aweme_id": "7998",
+        "desc": "同响应中的无关详情",
+        "author": {"sec_uid": "foreign-account"},
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event("bound"),
+            _loading_event("Network.loadingFinished", "bound"),
+        ],
+        bodies={
+            "bound": json.dumps(
+                {
+                    "data": {
+                        "aweme_list": [ACCOUNT_AWEME],
+                        "has_more": False,
+                    },
+                    "aweme_detail": unrelated_detail,
+                }
+            )
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
+    assert result.coverage["is_exhaustive"] is True
+
+
+@pytest.mark.parametrize(
+    ("body", "response_url"),
+    [
+        (
+            {"aweme_list": [], "has_more": False},
+            "https://www.douyin.com/aweme/v1/web/aweme/post/",
+        ),
+        (
+            {"aweme_list": [], "has_more": False},
+            "https://www.douyin.com/aweme/v1/web/aweme/post/?signed=irrelevant",
+        ),
+        (
+            {"aweme_list": [], "has_more": False},
+            (
+                "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                "?sec_uid=example&sec_uid=example"
+            ),
+        ),
+        (
+            {"aweme_list": [], "has_more": False},
+            (
+                "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                "?sec_uid=example&sec_user_id=foreign-account"
+            ),
+        ),
+        (
+            {"aweme_list": [], "has_more": False},
+            (
+                "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                "?sec_uid=%FF"
+            ),
+        ),
+        (
+            {"aweme_list": [], "has_more": False},
+            (
+                "https://www.douyin.com/aweme/v1/web/general/search/"
+                "?sec_uid=example"
+            ),
+        ),
+        (
+            {
+                "aweme_list": [],
+                "sec_uid": "foreign-account",
+                "has_more": False,
+            },
+            (
+                "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                "?sec_uid=example"
+            ),
+        ),
+        (
+            {
+                "aweme_list": [],
+                "sec_uid": "example",
+                "sec_user_id": "foreign-account",
+                "has_more": False,
+            },
+            "https://www.douyin.com/aweme/v1/web/aweme/post/",
+        ),
+    ],
+    ids=[
+        "missing-binding",
+        "unrelated-query",
+        "duplicate-binding",
+        "conflicting-query-bindings",
+        "invalid-utf8-binding",
+        "unrelated-response-path",
+        "container-conflicts-with-query",
+        "container-conflicting-bindings",
+    ],
+)
+def test_unbound_empty_page_cannot_prove_terminal_or_exhaustive(body, response_url):
+    """An empty list needs one unambiguous account proof from its owner or URL."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    browser = FakeBrowser(
+        events=[
+            _response_event("empty", url=response_url),
+            _loading_event("Network.loadingFinished", "empty"),
+        ],
+        bodies={"empty": json.dumps(body)},
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.aweme_items == []
+    assert result.coverage["observed_page_count"] == 0
+    assert result.coverage["terminal_page_observed"] is False
+    assert result.coverage["is_exhaustive"] is False
+
+
+@pytest.mark.parametrize(
+    ("body", "response_url"),
+    [
+        (
+            {
+                "aweme_list": [],
+                "sec_uid": "example",
+                "has_more": False,
+            },
+            "https://www.douyin.com/aweme/v1/web/aweme/post/",
+        ),
+        (
+            {
+                "aweme_list": [],
+                "sec_user_id": "example",
+                "has_more": False,
+            },
+            "https://www.douyin.com/aweme/v1/web/aweme/post/",
+        ),
+        (
+            {"aweme_list": [], "has_more": False},
+            (
+                "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                "?sec_user_id=%65xample&signed=query-secret"
+            ),
+        ),
+    ],
+    ids=["container-sec-uid", "container-sec-user-id", "strict-decoded-url"],
+)
+def test_bound_empty_page_can_prove_terminal_without_leaking_query(body, response_url):
+    """A single exact empty-page binding may prove exhaustion; query stays ephemeral."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    browser = FakeBrowser(
+        events=[
+            _response_event("empty", url=response_url),
+            _loading_event("Network.loadingFinished", "empty"),
+        ],
+        bodies={"empty": json.dumps(body)},
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.aweme_items == []
+    assert result.coverage["observed_page_count"] == 1
+    assert result.coverage["terminal_page_observed"] is True
+    assert result.coverage["is_exhaustive"] is True
+    assert result.diagnostics["response_paths"] == [
+        "https://www.douyin.com/aweme/v1/web/aweme/post/"
+    ]
+    assert "example" not in json.dumps(result.diagnostics)
+    assert "query-secret" not in json.dumps(result.diagnostics)
+
+
+@pytest.mark.parametrize(
+    "response_path",
+    [
+        "/aweme/v1/web/recommend/feed/",
+        "/aweme/v1/web/general/search/",
+        "/aweme/v1/web/aweme/detail/",
+    ],
+    ids=["recommend", "search", "detail"],
+)
+def test_account_page_ignores_matching_lists_from_non_post_responses(response_path):
+    """A matching author cannot turn a non-account response into pagination."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    unrelated = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7888",
+        "desc": "非账号作品列表响应",
+    }
+    target = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7999",
+        "desc": "账号作品接口结果",
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event(
+                "unrelated",
+                url=(
+                    f"https://www.douyin.com{response_path}"
+                    "?sec_uid=example"
+                ),
+            ),
+            _loading_event("Network.loadingFinished", "unrelated"),
+            _response_event("bound"),
+            _loading_event("Network.loadingFinished", "bound"),
+        ],
+        bodies={
+            "unrelated": json.dumps(
+                {
+                    "aweme_list": [unrelated],
+                    "has_more": False,
+                    "max_cursor": "unrelated-terminal-cursor",
+                }
+            ),
+            "bound": json.dumps(
+                {
+                    "aweme_list": [target],
+                    "has_more": False,
+                    "max_cursor": "bound-terminal-cursor",
+                }
+            ),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7999"]
+    assert result.coverage["observed_page_count"] == 1
+    assert result.coverage["cursor_fingerprint_count"] == 1
+    assert result.coverage["is_exhaustive"] is True
+
+
+def test_account_post_response_ignores_recommendation_list_sibling():
+    """A nested recommendation cannot donate items or a terminal flag."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    recommendation = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7888",
+        "desc": "推荐区同作者作品",
+    }
+    later = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7999",
+        "desc": "下一页账号作品",
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event("first"),
+            _loading_event("Network.loadingFinished", "first"),
+            _response_event("later"),
+            _loading_event("Network.loadingFinished", "later"),
+        ],
+        bodies={
+            "first": json.dumps(
+                {
+                    "aweme_list": [ACCOUNT_AWEME],
+                    "has_more": True,
+                    "max_cursor": "account-cursor",
+                    "recommendations": {
+                        "aweme_list": [recommendation],
+                        "has_more": False,
+                        "max_cursor": "recommendation-terminal-cursor",
+                    },
+                }
+            ),
+            "later": json.dumps(
+                {
+                    "aweme_list": [later],
+                    "has_more": False,
+                    "max_cursor": "account-terminal-cursor",
+                }
+            ),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == [
+        "7001",
+        "7999",
+    ]
+    assert result.coverage["observed_page_count"] == 2
+    assert result.coverage["cursor_fingerprint_count"] == 2
+    assert result.coverage["is_exhaustive"] is True
+
+
+def test_account_post_response_ignores_deep_arbitrary_list_owner():
+    """Recognized list keys are inert outside the frozen root/data owners."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    deep_item = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7888",
+        "desc": "深层任意列表",
+    }
+    later = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7999",
+        "desc": "冻结路径账号作品",
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event("deep"),
+            _loading_event("Network.loadingFinished", "deep"),
+            _response_event("later"),
+            _loading_event("Network.loadingFinished", "later"),
+        ],
+        bodies={
+            "deep": json.dumps(
+                {
+                    "envelope": {
+                        "data": {
+                            "aweme_list": [deep_item],
+                            "has_more": False,
+                            "max_cursor": "deep-terminal-cursor",
+                        }
+                    }
+                }
+            ),
+            "later": json.dumps(
+                {
+                    "data": {
+                        "aweme_list": [later],
+                        "has_more": False,
+                        "max_cursor": "bound-terminal-cursor",
+                    }
+                }
+            ),
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7999"]
+    assert result.coverage["observed_page_count"] == 1
+    assert result.coverage["cursor_fingerprint_count"] == 1
+    assert result.coverage["is_exhaustive"] is True
 
 
 def test_collect_post_page_returns_only_the_bound_detail_payload():
@@ -2417,9 +2916,11 @@ def test_page_observation_merges_duplicate_items_without_persisting_cursor():
         extract_post_page_observations,
     )
 
-    listed = dict(AWEME, desc="列表文案", video={})
-    enriched = dict(AWEME, desc="不同文案", video={"duration": 9000})
-    payload = {
+    listed = dict(ACCOUNT_AWEME, desc="列表文案", video={})
+    enriched = dict(
+        ACCOUNT_AWEME, desc="不同文案", video={"duration": 9000}
+    )
+    generic_payload = {
         "first": {"aweme_list": [listed], "has_more": True, "cursor": "alpha"},
         "second": {
             "post_list": [enriched],
@@ -2428,13 +2929,23 @@ def test_page_observation_merges_duplicate_items_without_persisting_cursor():
         },
     }
 
-    pages = extract_post_page_observations(payload)
+    pages = extract_post_page_observations(generic_payload)
     assert len(pages) == 2
     assert pages[1].items[0]["video"] == {"duration": 9000}
 
+    account_payload = {
+        "aweme_list": [listed],
+        "has_more": True,
+        "cursor": "alpha",
+        "data": {
+            "post_list": [enriched],
+            "has_more": False,
+            "max_cursor": "secret-cursor",
+        },
+    }
     browser = FakeBrowser(
         events=[_response_event("r1")],
-        bodies={"r1": json.dumps(payload)},
+        bodies={"r1": json.dumps(account_payload)},
     )
     result = collect_account_page(
         ACCOUNT_URL,
@@ -2579,6 +3090,13 @@ def test_dom_expression_requests_only_visible_pin_and_metric_fields():
     assert "statistics" in _DOM_CARDS_EXPRESSION
     assert "digg_count" in _DOM_CARDS_EXPRESSION
     assert "comment_count" in _DOM_CARDS_EXPRESSION
+    assert (
+        "document.querySelectorAll('[data-e2e=\"user-post-item\"]')"
+        in _DOM_CARDS_EXPRESSION
+    )
+    assert "document.querySelectorAll('a[href" not in _DOM_CARDS_EXPRESSION
+    assert "a.parentElement" not in _DOM_CARDS_EXPRESSION
+    assert "[data-e2e=\"user-post-item\"],li" not in _DOM_CARDS_EXPRESSION
 
 
 def test_restriction_priority_and_url_sanitization():
@@ -2632,7 +3150,7 @@ def test_collect_account_page_keeps_allowed_network_items_and_safe_paths():
 
     browser = FakeBrowser(
         events=[RESPONSE_EVENT],
-        bodies={"r1": json.dumps({"aweme_list": [AWEME]})},
+        bodies={"r1": json.dumps({"aweme_list": [ACCOUNT_AWEME]})},
     )
 
     result = collect_account_page(
@@ -2656,7 +3174,7 @@ def test_collect_account_page_returns_restriction_with_retained_items():
 
     browser = FakeBrowser(
         events=[RESPONSE_EVENT, None],
-        bodies={"r1": json.dumps({"aweme_list": [AWEME]})},
+        bodies={"r1": json.dumps({"aweme_list": [ACCOUNT_AWEME]})},
         page_texts=["", "请完成滑动验证"],
     )
 
@@ -2783,7 +3301,7 @@ def test_terminal_page_cannot_bypass_visible_restriction(visible_text, expected)
 
     terminal_payload = {
         "data": {
-            "aweme_list": [AWEME],
+            "aweme_list": [ACCOUNT_AWEME],
             "has_more": False,
             "max_cursor": "must-not-persist",
         }
@@ -2813,9 +3331,22 @@ def test_terminal_page_cannot_bypass_visible_restriction(visible_text, expected)
 def test_collect_account_page_uses_dom_cards_when_network_is_empty():
     from collectors._douyin_browser_transport import collect_account_page
 
-    browser = FakeBrowser(
-        cards=[{"href": "https://www.douyin.com/video/7002?token=secret", "text": "作品二"}],
-    )
+    class BoundDomBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            return {
+                "cards": [{
+                    "href": (
+                        "https://www.douyin.com/video/7002?token=secret"
+                    ),
+                    "text": "作品二",
+                }],
+                "profile": {
+                    "profile_url": ACCOUNT_URL,
+                    "sec_uid": "example",
+                },
+            }
+
+    browser = BoundDomBrowser()
 
     result = collect_account_page(
         "https://www.douyin.com/user/example",
@@ -2827,6 +3358,96 @@ def test_collect_account_page_uses_dom_cards_when_network_is_empty():
     assert result.source == "dom"
     assert result.aweme_items[0]["aweme_id"] == "7002"
     assert result.aweme_items[0]["share_url"] == "https://www.douyin.com/video/7002"
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        [
+            {
+                "href": "https://www.douyin.com/video/7002",
+                "text": "legacy list-only card",
+            }
+        ],
+        {
+            "cards": [{
+                "href": "https://www.douyin.com/video/7002",
+                "text": "missing profile card",
+            }]
+        },
+        {
+            "cards": [{
+                "href": "https://www.douyin.com/video/7002",
+                "text": "missing sec_uid card",
+            }],
+            "profile": {"profile_url": ACCOUNT_URL},
+        },
+        {
+            "cards": [{
+                "href": "https://www.douyin.com/video/7002",
+                "text": "foreign profile card",
+            }],
+            "profile": {
+                "profile_url": "https://www.douyin.com/user/foreign-account",
+                "sec_uid": "foreign-account",
+            },
+        },
+    ],
+    ids=[
+        "legacy-list-only",
+        "missing-profile",
+        "missing-profile-sec-uid",
+        "foreign-profile",
+    ],
+)
+def test_account_page_ignores_dom_cards_without_same_snapshot_binding(snapshot):
+    """DOM cards need an exact profile.sec_uid in the same snapshot."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    class SnapshotBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            return snapshot
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        max_scrolls=1,
+        session_factory=lambda: SnapshotBrowser(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.aweme_items == []
+    assert result.profile_raw is None
+    assert result.coverage["terminal_page_observed"] is False
+    assert result.coverage["is_exhaustive"] is False
+
+
+def test_bound_dom_empty_snapshot_cannot_prove_terminal_or_exhaustive():
+    """An account-bound visible empty card set is not a pagination terminal."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    class EmptyBoundSnapshotBrowser(FakeBrowser):
+        def evaluate(self, _expression):
+            return {
+                "cards": [],
+                "profile": {
+                    "profile_url": ACCOUNT_URL,
+                    "sec_uid": "example",
+                },
+            }
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        max_scrolls=1,
+        session_factory=lambda: EmptyBoundSnapshotBrowser(),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.aweme_items == []
+    assert result.coverage["terminal_page_observed"] is False
+    assert result.coverage["is_exhaustive"] is False
 
 
 def test_collect_account_page_continues_after_response_body_is_unavailable():
@@ -2846,7 +3467,7 @@ def test_collect_account_page_continues_after_response_body_is_unavailable():
     }
     browser = FakeBrowser(
         events=[RESPONSE_EVENT, later_event],
-        bodies={"r2": json.dumps({"aweme_list": [AWEME]})},
+        bodies={"r2": json.dumps({"aweme_list": [ACCOUNT_AWEME]})},
         body_errors={"r1": BrowserError("response body is no longer available")},
     )
 
@@ -2902,7 +3523,11 @@ def test_collect_account_page_reads_body_only_after_loading_finished():
                     _response_event("r1"),
                     _loading_event("Network.loadingFinished", "r1"),
                 ],
-                bodies={"r1": json.dumps({"aweme_list": [AWEME]})},
+                bodies={
+                    "r1": json.dumps(
+                        {"aweme_list": [ACCOUNT_AWEME]}
+                    )
+                },
             )
             self.finished = set()
             self.body_calls = []
@@ -2960,7 +3585,7 @@ def test_collect_account_page_retries_pending_body_for_header_only_fake():
 
     browser = FakeBrowser(
         events=[_response_event("r1")],
-        bodies={"r1": json.dumps({"aweme_list": [AWEME]})},
+        bodies={"r1": json.dumps({"aweme_list": [ACCOUNT_AWEME]})},
     )
 
     result = collect_account_page(
@@ -2988,7 +3613,7 @@ def test_collect_account_page_resets_idle_after_a_productive_round():
             None,
             None,
         ],
-        bodies={"r1": json.dumps({"aweme_list": [AWEME]})},
+        bodies={"r1": json.dumps({"aweme_list": [ACCOUNT_AWEME]})},
     )
 
     result = collect_account_page(
@@ -3069,7 +3694,7 @@ def test_terminal_page_timeout_after_response_decode_is_not_exhaustive():
         ],
         bodies={
             "terminal": json.dumps({
-                "aweme_list": [AWEME],
+                "aweme_list": [ACCOUNT_AWEME],
                 "has_more": False,
             })
         },
@@ -3114,7 +3739,7 @@ def test_terminal_page_timeout_during_page_text_is_not_exhaustive():
         ],
         bodies={
             "terminal": json.dumps({
-                "aweme_list": [AWEME],
+                "aweme_list": [ACCOUNT_AWEME],
                 "has_more": False,
             })
         },
@@ -3149,7 +3774,7 @@ def test_terminal_page_timeout_during_dom_fallback_is_not_exhaustive():
                 ],
                 bodies={
                     "terminal": json.dumps({
-                        "aweme_list": [AWEME],
+                        "aweme_list": [ACCOUNT_AWEME],
                         "has_more": False,
                     })
                 },
@@ -3189,8 +3814,12 @@ def test_collect_account_page_confirms_date_lower_bound_on_following_round():
     """An old non-pinned post needs a later round with no in-range addition."""
     from collectors._douyin_browser_transport import collect_account_page
 
-    old = dict(AWEME, aweme_id="6999", create_time=1_600_000_000)
-    recent = dict(AWEME, aweme_id="7001", create_time=1_700_000_000)
+    old = dict(
+        ACCOUNT_AWEME, aweme_id="6999", create_time=1_600_000_000
+    )
+    recent = dict(
+        ACCOUNT_AWEME, aweme_id="7001", create_time=1_700_000_000
+    )
     browser = FakeBrowser(
         events=[
             _response_event("old"),
@@ -3223,8 +3852,13 @@ def test_collect_account_page_confirms_date_lower_bound_on_following_round():
 @pytest.mark.parametrize(
     "old_item",
     [
-        dict(AWEME, aweme_id="6998", create_time=1_600_000_000, is_top=True),
-        dict(AWEME, aweme_id="6997", create_time=None),
+        dict(
+            ACCOUNT_AWEME,
+            aweme_id="6998",
+            create_time=1_600_000_000,
+            is_top=True,
+        ),
+        dict(ACCOUNT_AWEME, aweme_id="6997", create_time=None),
     ],
 )
 def test_collect_account_page_pin_or_unknown_date_cannot_trigger_date_stop(old_item):
@@ -3372,7 +4006,7 @@ def test_collect_account_page_returns_items_with_cleanup_diagnostic():
 
     browser = CleanupFailBrowser(
         events=[RESPONSE_EVENT],
-        bodies={"r1": json.dumps({"aweme_list": [AWEME]})},
+        bodies={"r1": json.dumps({"aweme_list": [ACCOUNT_AWEME]})},
     )
 
     result = collect_account_page(
@@ -3720,10 +4354,16 @@ def test_workspace_date_intersection_excludes_unknown_rows_when_range_is_explici
 def test_limited_browser_targets_in_range_unique_posts_with_both_bounds():
     from collectors._douyin_browser_transport import collect_account_page
 
-    newer = dict(AWEME, aweme_id="8001", create_time=1_704_067_200)
-    unknown = dict(AWEME, aweme_id="8002", create_time=None)
-    in_range_one = dict(AWEME, aweme_id="7001", create_time=1_685_577_600)
-    in_range_two = dict(AWEME, aweme_id="7002", create_time=1_690_000_000)
+    newer = dict(
+        ACCOUNT_AWEME, aweme_id="8001", create_time=1_704_067_200
+    )
+    unknown = dict(ACCOUNT_AWEME, aweme_id="8002", create_time=None)
+    in_range_one = dict(
+        ACCOUNT_AWEME, aweme_id="7001", create_time=1_685_577_600
+    )
+    in_range_two = dict(
+        ACCOUNT_AWEME, aweme_id="7002", create_time=1_690_000_000
+    )
     browser = FakeBrowser(
         events=[
             _response_event("outside"),
@@ -3763,14 +4403,19 @@ def test_limited_browser_duplicate_date_enrichment_counts_in_confirmation_round(
     """A duplicate that fills create_time must cancel a pending lower-bound stop."""
     from collectors._douyin_browser_transport import collect_account_page
 
-    old = dict(AWEME, aweme_id="6001", create_time=1_600_000_000)
-    unknown = dict(AWEME, aweme_id="7001", create_time=None)
+    old = dict(
+        ACCOUNT_AWEME, aweme_id="6001", create_time=1_600_000_000
+    )
+    unknown = dict(ACCOUNT_AWEME, aweme_id="7001", create_time=None)
     dated_duplicate = {
         "aweme_id": "7001",
         "create_time": 1_685_577_600,
         "video": {"duration": 9_000},
+        "author": {"sec_uid": "example"},
     }
-    second_match = dict(AWEME, aweme_id="7002", create_time=1_690_000_000)
+    second_match = dict(
+        ACCOUNT_AWEME, aweme_id="7002", create_time=1_690_000_000
+    )
     browser = FakeBrowser(
         events=[
             _response_event("old"),
@@ -4380,8 +5025,12 @@ def test_browser_profile_cache_merges_snapshots_without_losing_stronger_fields(
 def test_limited_browser_nonfinite_date_does_not_satisfy_range_target():
     from collectors._douyin_browser_transport import collect_account_page
 
-    invalid_date = dict(AWEME, aweme_id="8001", create_time=float("nan"))
-    valid_date = dict(AWEME, aweme_id="7001", create_time=1_685_577_600)
+    invalid_date = dict(
+        ACCOUNT_AWEME, aweme_id="8001", create_time=float("nan")
+    )
+    valid_date = dict(
+        ACCOUNT_AWEME, aweme_id="7001", create_time=1_685_577_600
+    )
     browser = FakeBrowser(
         events=[
             _response_event("invalid"),

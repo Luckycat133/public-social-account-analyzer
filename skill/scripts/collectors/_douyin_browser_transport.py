@@ -36,8 +36,16 @@ from .url_policy import canonical_item_url, canonical_profile_url
 
 _ITEM_LIST_KEYS = ("aweme_list", "awemeList", "post_list")
 _ITEM_DETAIL_KEYS = {"aweme_detail", "awemeDetail"}
+_ACCOUNT_BINDING_KEYS = ("sec_uid", "sec_user_id")
+_ACCOUNT_POST_LIST_PATHS = frozenset({"/aweme/v1/web/aweme/post/"})
+_ACCOUNT_POST_LIST_OWNER_PATHS = ((), ("data",))
+_BINDING_ABSENT = "absent"
+_BINDING_MATCH = "match"
+_BINDING_CONFLICT = "conflict"
+_BINDING_INVALID = "invalid"
 _POST_PATH = re.compile(r"/(?P<kind>video|note)/(?P<post_id>\d+)")
 _POST_ID = re.compile(r"\d+")
+_HEX_PAIR = re.compile(r"[0-9A-Fa-f]{2}")
 _VISIBLE_METRIC_NUMBER = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?\s*[万亿]?")
 _KNOWN_STATISTICS = {
     "play_count",
@@ -123,9 +131,12 @@ _DOM_PROFILE_EXPRESSION = (
 
 _DOM_CARDS_EXPRESSION = "(() => {\n" + _DOM_PROFILE_HELPERS + r"""
 const cards = Array.from(
-  document.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')
-).map(a => {
-  const root = a.closest('[data-e2e="user-post-item"],li') || a.parentElement || a;
+  document.querySelectorAll('[data-e2e="user-post-item"]')
+).filter(isVisible).map(root => {
+  const a = Array.from(
+    root.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')
+  ).find(isVisible) || null;
+  if (!a) return null;
   const pinNode = root.querySelector('[data-e2e="video-card-top"],[aria-label="置顶"]');
   const isPinned = pinNode && pinNode.getClientRects().length > 0 ? true : null;
   return {
@@ -139,7 +150,7 @@ const cards = Array.from(
       share_count: visibleText(root, '[data-e2e="video-share-count"],[aria-label^="分享"]')
     }
   };
-});
+}).filter(Boolean);
 return {
   cards,
   profile: readProfile()
@@ -708,58 +719,212 @@ def _has_visible_detail_evidence(candidate: dict[str, Any]) -> bool:
     )
 
 
-def extract_post_page_observations(data: Any) -> list[PostPageObservation]:
-    """Extract list-scoped pagination facts without treating nested flags as proof."""
+def _strict_query_component(value: str) -> Optional[str]:
+    """Decode one form-query component only when every escape and byte is valid."""
+    offset = 0
+    while offset < len(value):
+        if value[offset] == "%":
+            if (
+                offset + 2 >= len(value)
+                or _HEX_PAIR.fullmatch(value[offset + 1 : offset + 3]) is None
+            ):
+                return None
+            offset += 3
+            continue
+        offset += 1
+    try:
+        raw = urllib.parse.unquote_to_bytes(value.replace("+", " "))
+        return raw.decode("utf-8", errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _response_account_binding(
+    event: dict[str, Any], expected_sec_uid: str
+) -> str:
+    """Classify one ephemeral response query without retaining any query value."""
+    params = event.get("params")
+    response = params.get("response") if isinstance(params, dict) else None
+    response_url = response.get("url") if isinstance(response, dict) else None
+    if not isinstance(response_url, str):
+        return _BINDING_ABSENT
+    try:
+        parsed = urllib.parse.urlsplit(response_url)
+    except ValueError:
+        return _BINDING_INVALID
+    if parsed.path not in _ACCOUNT_POST_LIST_PATHS:
+        return _BINDING_ABSENT
+    bindings: list[str] = []
+    for part in parsed.query.split("&"):
+        if not part:
+            continue
+        encoded_key, separator, encoded_value = part.partition("=")
+        key = _strict_query_component(encoded_key)
+        if key is None:
+            return _BINDING_INVALID
+        if key not in _ACCOUNT_BINDING_KEYS:
+            continue
+        if not separator:
+            return _BINDING_INVALID
+        value = _strict_query_component(encoded_value)
+        if value is None:
+            return _BINDING_INVALID
+        bindings.append(value)
+    if not bindings:
+        return _BINDING_ABSENT
+    if len(bindings) != 1:
+        return _BINDING_INVALID
+    return (
+        _BINDING_MATCH
+        if bindings[0] == expected_sec_uid
+        else _BINDING_CONFLICT
+    )
+
+
+def _is_account_post_response(event: dict[str, Any]) -> bool:
+    """Accept account pagination only from frozen official response paths."""
+    params = event.get("params")
+    response = params.get("response") if isinstance(params, dict) else None
+    response_url = response.get("url") if isinstance(response, dict) else None
+    if not isinstance(response_url, str):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(response_url)
+    except ValueError:
+        return False
+    return parsed.path in _ACCOUNT_POST_LIST_PATHS
+
+
+def _container_account_binding(
+    container: dict[str, Any], expected_sec_uid: str
+) -> str:
+    """Read account identity only from frozen keys on the list-owning object."""
+    supplied = [
+        container[key]
+        for key in _ACCOUNT_BINDING_KEYS
+        if key in container
+    ]
+    if not supplied:
+        return _BINDING_ABSENT
+    if any(
+        not isinstance(value, str) or value != expected_sec_uid
+        for value in supplied
+    ):
+        return _BINDING_CONFLICT
+    return _BINDING_MATCH
+
+
+def _item_belongs_to_account(
+    item: dict[str, Any], expected_sec_uid: str
+) -> bool:
+    """Require the frozen author.sec_uid path to match exactly."""
+    author = item.get("author")
+    return bool(
+        isinstance(author, dict)
+        and isinstance(author.get("sec_uid"), str)
+        and author["sec_uid"] == expected_sec_uid
+    )
+
+
+def extract_post_page_observations(
+    data: Any,
+    *,
+    expected_sec_uid: Optional[str] = None,
+    response_binding: str = _BINDING_ABSENT,
+) -> list[PostPageObservation]:
+    """Extract list-scoped pagination facts, optionally bound to one account."""
     observations: list[PostPageObservation] = []
+
+    def inspect_owner(value: dict[str, Any]) -> None:
+        owned_lists = [
+            value[key]
+            for key in _ITEM_LIST_KEYS
+            if key in value and isinstance(value[key], list)
+        ]
+        for raw_items in owned_lists:
+            trustworthy_items = [
+                raw_item
+                for raw_item in raw_items
+                if isinstance(raw_item, dict)
+                and _is_trustworthy_aweme(raw_item)
+            ]
+            if expected_sec_uid is not None:
+                if trustworthy_items:
+                    if any(
+                        not _item_belongs_to_account(
+                            raw_item, expected_sec_uid
+                        )
+                        for raw_item in trustworthy_items
+                    ):
+                        continue
+                else:
+                    # A non-empty but unrecognized list is not an empty page.
+                    if raw_items:
+                        continue
+                    container_binding = _container_account_binding(
+                        value, expected_sec_uid
+                    )
+                    if (
+                        container_binding == _BINDING_CONFLICT
+                        or response_binding
+                        in {_BINDING_CONFLICT, _BINDING_INVALID}
+                        or _BINDING_MATCH
+                        not in {container_binding, response_binding}
+                    ):
+                        continue
+            unique: dict[str, dict[str, Any]] = {}
+            for raw_item in trustworthy_items:
+                item_id = _item_id(raw_item)
+                if item_id is None:
+                    continue
+                if item_id not in unique:
+                    unique[item_id] = copy.deepcopy(raw_item)
+                else:
+                    _merge_missing(unique[item_id], raw_item)
+            if raw_items and not unique:
+                continue
+            has_more = value.get("has_more")
+            if not isinstance(has_more, bool):
+                has_more = None
+            cursor = next(
+                (
+                    value[key]
+                    for key in ("max_cursor", "cursor", "min_cursor")
+                    if key in value and value[key] is not None
+                ),
+                None,
+            )
+            observations.append(
+                PostPageObservation(
+                    items=list(unique.values()),
+                    has_more=has_more,
+                    cursor=cursor,
+                )
+            )
 
     def walk(value: Any, depth: int = 0) -> None:
         if depth > 10:
             return
         if isinstance(value, dict):
-            owned_lists = [
-                value[key]
-                for key in _ITEM_LIST_KEYS
-                if key in value and isinstance(value[key], list)
-            ]
-            for raw_items in owned_lists:
-                unique: dict[str, dict[str, Any]] = {}
-                for raw_item in raw_items:
-                    if not isinstance(raw_item, dict) or not _is_trustworthy_aweme(raw_item):
-                        continue
-                    item_id = _item_id(raw_item)
-                    if item_id is None:
-                        continue
-                    if item_id not in unique:
-                        unique[item_id] = copy.deepcopy(raw_item)
-                    else:
-                        _merge_missing(unique[item_id], raw_item)
-                if raw_items and not unique:
-                    continue
-                has_more = value.get("has_more")
-                if not isinstance(has_more, bool):
-                    has_more = None
-                cursor = next(
-                    (
-                        value[key]
-                        for key in ("max_cursor", "cursor", "min_cursor")
-                        if key in value and value[key] is not None
-                    ),
-                    None,
-                )
-                observations.append(
-                    PostPageObservation(
-                        items=list(unique.values()),
-                        has_more=has_more,
-                        cursor=cursor,
-                    )
-                )
+            inspect_owner(value)
             for child in value.values():
                 walk(child, depth + 1)
         elif isinstance(value, list):
             for child in value:
                 walk(child, depth + 1)
 
-    walk(data)
+    if expected_sec_uid is None:
+        walk(data)
+    else:
+        for owner_path in _ACCOUNT_POST_LIST_OWNER_PATHS:
+            owner = data
+            for key in owner_path:
+                if not isinstance(owner, dict):
+                    owner = None
+                    break
+                owner = owner.get(key)
+            if isinstance(owner, dict):
+                inspect_owner(owner)
     return observations
 
 
@@ -909,15 +1074,29 @@ def _dom_snapshot(
     requested_url: str,
     timeout: float,
 ) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]]]:
-    """Read one bounded visible snapshot, accepting legacy list-only fakes."""
+    """Read cards only with an exact same-snapshot account identity."""
     snapshot = _call_with_timeout(
         session.evaluate,
         _DOM_CARDS_EXPRESSION,
         timeout=timeout,
     )
-    if isinstance(snapshot, list):
-        return [card for card in snapshot if isinstance(card, dict)], None
     if not isinstance(snapshot, dict):
+        return [], None
+    canonical_url = canonical_profile_url("douyin", requested_url)
+    if canonical_url is None:
+        return [], None
+    expected_sec_uid = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+    raw_profile = snapshot.get("profile")
+    if (
+        not isinstance(raw_profile, dict)
+        or not isinstance(raw_profile.get("sec_uid"), str)
+        or raw_profile["sec_uid"] != expected_sec_uid
+    ):
+        return [], None
+    profile = sanitize_profile_raw(
+        raw_profile, requested_url, allow_dom_badge=True
+    )
+    if profile is None:
         return [], None
     cards = snapshot.get("cards")
     clean_cards = (
@@ -925,9 +1104,7 @@ def _dom_snapshot(
         if isinstance(cards, list)
         else []
     )
-    return clean_cards, sanitize_profile_raw(
-        snapshot.get("profile"), requested_url, allow_dom_badge=True
-    )
+    return clean_cards, profile
 
 
 def _dom_profile_snapshot(
@@ -1034,6 +1211,10 @@ def collect_account_page(
     sleep=time.sleep,
 ) -> DouyinBrowserResult:
     """Observe public response bodies within hard time/scroll/idle boundaries."""
+    canonical_url = canonical_profile_url("douyin", url)
+    if canonical_url is None:
+        raise ValueError("invalid Douyin profile URL")
+    expected_sec_uid = canonical_url.rstrip("/").rsplit("/", 1)[-1]
     if all_posts:
         seconds_budget = (
             PUBLIC_ALL_DEFAULT_MAX_SECONDS
@@ -1151,7 +1332,15 @@ def collect_account_page(
         if safe_url not in safe_paths:
             safe_paths.append(safe_url)
         before = len(items)
-        observations = extract_post_page_observations(decoded)
+        observations = (
+            extract_post_page_observations(
+                decoded,
+                expected_sec_uid=expected_sec_uid,
+                response_binding=candidate["account_binding"],
+            )
+            if candidate["is_account_post_response"]
+            else []
+        )
         if observations:
             for observation in observations:
                 observed_page_count += 1
@@ -1167,8 +1356,8 @@ def collect_account_page(
                     terminal_page_observed = True
                     if all_posts:
                         stop_condition = "terminal_page"
-        for item in extract_aweme_items(decoded):
-            store_network_item(item)
+                for item in observation.items:
+                    store_network_item(item)
         return len(items) > before
 
     def flush_pending(session: BrowserSession) -> None:
@@ -1216,6 +1405,12 @@ def collect_account_page(
                     safe_paths.append(safe_url)
                 pending[request_id] = {
                     "safe_url": safe_url,
+                    "is_account_post_response": _is_account_post_response(
+                        event or {}
+                    ),
+                    "account_binding": _response_account_binding(
+                        event or {}, expected_sec_uid
+                    ),
                     "ready": False,
                     "attempts": 0,
                 }
