@@ -441,15 +441,47 @@ collection_status_source, collected_at, collection_source,
 platform_post_id_known, local_record_key, item_url_known, source_rank,
 metrics, value, rank, reason, relative_to_main_median, duration_seconds,
 hashtags, content_type, is_pinned, is_repost, is_promoted,
-platform_metrics, field_visibility, main_metric
+platform_metrics, field_visibility, main_metric, url_kind
 ```
 
 `rank` 是实测样本的全局排名。`relative_to_main_median = value /
 main_metric_median`，保留 4 位小数；中位数为 `0` 或 `null` 时该值为
-`null`。`published_at` 输出 ISO 8601 字符串。`item_url_known=false`
-时 `post_url` 为 `null`，但保留已验证的 `source_url` / `evidence_url`
-来源锚点。`hashtags`、`platform_metrics` 和 `field_visibility` 须按值复制，
-不得丢失来源证据或平台扩展字段。
+`null`。`published_at` 输出 ISO 8601 字符串。`hashtags`、
+`platform_metrics` 和 `field_visibility` 须按值复制，不得丢失来源证据或
+平台扩展字段。
+
+`url_kind` 固定为 `item` / `profile_index` / `missing`：
+
+- `item` 必须满足 `item_url_known=true`，且 `post_url` 通过对应平台的作品 URL
+  规范化并与 `post_id` 一致；此时 `post_url` 与 `evidence_url` 都写规范化作品 URL。
+  `douyin_jingxuan` 仅额外接受平台为 `douyin`、路径严格为
+  `https://jingxuan.douyin.com/m/video/<post_id>` 的官方作品 URL。
+- 普通记录的主页 URL、站外 URL、不安全 URL 或仅存在于 `source_url` 的候选不得提升为
+  作品证据；此时 `post_url` / `evidence_url` 为 `null`，`url_kind=missing`。
+- `profile_index` 仅允许 `platform=douyin` 的抖音搜索索引记录使用，且须同时满足
+  `collection_source=douyin_search_index`、`item_url_known=false`、
+  `platform_post_id_known=false`、`local_record_key=true`。其规范化账号主页只写入
+  `evidence_url`，`post_url` 保持 `null`；该锚点不是作品链接，也不计入完整作品证据。
+
+高低组被选条目的作品证据覆盖率同时写入根级 `evidence_coverage` 与
+`performance_meta.evidence_coverage`：
+
+```text
+selected_count, complete_count, missing_count, missing_post_ids, rate, status
+```
+
+一条完整证据必须同时具有 `url_kind=item`、规范化且 ID 一致的作品 URL、带时区的
+`collected_at`、主指标 `value` 与 `metrics`。`rate = complete_count /
+selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
+`PARTIAL_EVIDENCE`。高低组未生成时计数均为 `0`、`rate=null`、
+`status=COMPLETE`，表示本模块没有待核验的被选条目。
+流水线只有在证据状态明确为 `COMPLETE` 时才允许分析阶段完成；缺失、未知或其他非法
+状态均按 `PARTIAL` 关闭失败，不能由完成分类绕过。
+
+根级 `core_insights` 只输出高/低组事实。每项固定包含 `id`、`kind`、
+`statement`、`main_metric`、`evidence`；每条 evidence 固定包含
+`post_id`、`url`、`url_kind`、`collected_at`、`metrics`、`rank`、`value`。
+证据顺序必须与确定性高/低组选取顺序一致，不得引用组外记录或补充因果解释。
 
 ## 8. 空值规则（field_visibility）
 

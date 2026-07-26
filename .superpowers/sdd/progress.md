@@ -32,5 +32,6 @@ Task 3C-A: complete — commits `122ffec`, `8896f08`; independent review approve
 Task 3C-B: complete — immutable derived analysis pipeline; independent review approved; final full suite 684 passed
 Task 3C-C1A: complete — schema fidelity, tri-state evidence, status provenance, canonical/backward-compatible CSV, and metrics closure; independent review clean; final full suite 743 passed
 Task 3C-C1B1-A: complete — measured high/low grouping, deterministic ties, exact selected-item provenance, and CLI parity; independent review clean; final full suite 756 passed
+Task 3C-C1B1-B: complete — strict selected-item evidence, deterministic coverage/core insights, and evidence-aware pipeline lifecycle; independent review clean; final full suite 779 passed
 Task 4: pending — consolidated documentation and acceptance refresh
 Task 5: pending — whole-branch review and delivery

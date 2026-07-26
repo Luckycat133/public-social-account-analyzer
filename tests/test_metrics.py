@@ -56,6 +56,22 @@ def _high_low_post(index: int, views) -> dict:
     }
 
 
+def _evidenced_high_low_post(index: int, views) -> dict:
+    post = _high_low_post(index, views)
+    post.update(
+        {
+            "source_url": post["post_url"],
+            "collected_at": "2026-07-02T09:00:00+08:00",
+            "collection_source": "douyin_web",
+            "platform_post_id_known": True,
+            "local_record_key": False,
+            "item_url_known": True,
+            "source_rank": index + 1,
+        }
+    )
+    return post
+
+
 @pytest.mark.parametrize(
     ("measured_count", "expected_group_size", "expected_median"),
     [
@@ -271,6 +287,7 @@ def test_high_low_item_has_exact_schema_provenance_and_relative_to_median():
         "platform_metrics",
         "field_visibility",
         "main_metric",
+        "url_kind",
     }
     assert item["platform"] == "douyin"
     assert item["post_id"] == "14"
@@ -310,12 +327,14 @@ def test_high_low_item_has_exact_schema_provenance_and_relative_to_median():
     assert item["platform_metrics"] == {"raw_views": 114}
     assert item["field_visibility"] == {"views": "visible"}
     assert item["main_metric"] == "views"
+    assert item["url_kind"] == "item"
 
 
-def test_high_low_unknown_item_url_suppresses_post_url_but_keeps_source_anchor():
-    posts = [_high_low_post(index, index + 1) for index in range(15)]
+def test_high_low_ordinary_profile_anchor_is_not_item_evidence():
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
     source_anchor = "https://www.douyin.com/user/example"
     posts[-1]["item_url_known"] = False
+    posts[-1]["post_url"] = source_anchor
     posts[-1]["source_url"] = source_anchor
 
     result = analyze.compute_high_low(posts, "views")
@@ -324,8 +343,295 @@ def test_high_low_unknown_item_url_suppresses_post_url_but_keeps_source_anchor()
     item = result["high"][0]
     assert item["post_url"] is None
     assert item["source_url"] == source_anchor
-    assert item["evidence_url"] == source_anchor
+    assert item["evidence_url"] is None
     assert item["item_url_known"] is False
+    assert item["url_kind"] == "missing"
+    assert result["evidence_coverage"] == {
+        "selected_count": 6,
+        "complete_count": 5,
+        "missing_count": 1,
+        "missing_post_ids": ["14"],
+        "rate": 0.8333,
+        "status": "PARTIAL_EVIDENCE",
+    }
+
+
+def test_high_low_complete_item_evidence_has_full_coverage():
+    rows = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+
+    analysis = analyze.analyze_in_memory(
+        {"platform": "douyin", "followers": 100},
+        rows,
+        {"platform": "douyin", "analysis_goal": "播放表现"},
+    ).analysis
+
+    expected = {
+        "selected_count": 6,
+        "complete_count": 6,
+        "missing_count": 0,
+        "missing_post_ids": [],
+        "rate": 1.0,
+        "status": "COMPLETE",
+    }
+    assert analysis["performance_meta"]["evidence_coverage"] == expected
+    assert analysis["evidence_coverage"] == expected
+
+
+def test_high_low_missing_evidence_reports_exact_ids_and_rate():
+    rows = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    rows[14]["collected_at"] = None
+    rows[0]["post_url"] = None
+    rows[0]["source_url"] = None
+
+    analysis = analyze.analyze_in_memory(
+        {"platform": "douyin", "followers": 100},
+        rows,
+        {"platform": "douyin", "analysis_goal": "播放表现"},
+    ).analysis
+
+    assert analysis["evidence_coverage"] == {
+        "selected_count": 6,
+        "complete_count": 4,
+        "missing_count": 2,
+        "missing_post_ids": ["14", "0"],
+        "rate": 0.6667,
+        "status": "PARTIAL_EVIDENCE",
+    }
+
+
+def test_coherent_search_index_profile_anchor_is_disclosed_but_incomplete():
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    profile_anchor = "https://www.douyin.com/user/example"
+    posts[-1].update(
+        {
+            "post_url": profile_anchor,
+            "source_url": profile_anchor,
+            "collection_source": "douyin_search_index",
+            "platform_post_id_known": False,
+            "local_record_key": True,
+            "item_url_known": False,
+        }
+    )
+
+    result = analyze.compute_high_low(posts, "views")
+
+    assert result is not None
+    item = result["high"][0]
+    assert item["post_url"] is None
+    assert item["evidence_url"] == profile_anchor
+    assert item["url_kind"] == "profile_index"
+    assert result["evidence_coverage"]["missing_post_ids"] == ["14"]
+    assert result["evidence_coverage"]["status"] == "PARTIAL_EVIDENCE"
+
+
+def test_search_index_profile_anchor_requires_douyin_platform_provenance():
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    profile_anchor = "https://www.douyin.com/user/example"
+    posts[-1].update(
+        {
+            "platform": "weibo",
+            "post_url": profile_anchor,
+            "source_url": profile_anchor,
+            "collection_source": "douyin_search_index",
+            "platform_post_id_known": False,
+            "local_record_key": True,
+            "item_url_known": False,
+        }
+    )
+
+    result = analyze.compute_high_low(posts, "views")
+
+    assert result is not None
+    item = result["high"][0]
+    assert item["post_url"] is None
+    assert item["evidence_url"] is None
+    assert item["url_kind"] == "missing"
+
+
+@pytest.mark.parametrize(
+    "provenance_override",
+    [
+        {"collection_source": "douyin_web"},
+        {"platform_post_id_known": True},
+        {"local_record_key": False},
+        {"item_url_known": True},
+    ],
+)
+def test_incoherent_search_index_provenance_cannot_use_profile_anchor(
+    provenance_override,
+):
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    profile_anchor = "https://www.douyin.com/user/example"
+    posts[-1].update(
+        {
+            "post_url": profile_anchor,
+            "source_url": profile_anchor,
+            "collection_source": "douyin_search_index",
+            "platform_post_id_known": False,
+            "local_record_key": True,
+            "item_url_known": False,
+            **provenance_override,
+        }
+    )
+
+    result = analyze.compute_high_low(posts, "views")
+
+    assert result is not None
+    item = result["high"][0]
+    assert item["post_url"] is None
+    assert item["evidence_url"] is None
+    assert item["url_kind"] == "missing"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "javascript:alert(1)",
+        "https://www.douyin.com/user/example",
+        "https://off-platform.example/video/14",
+    ],
+)
+def test_noncanonical_item_url_is_not_complete_evidence(candidate):
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    posts[-1]["post_url"] = candidate
+    posts[-1]["source_url"] = candidate
+
+    result = analyze.compute_high_low(posts, "views")
+
+    assert result is not None
+    item = result["high"][0]
+    assert item["post_url"] is None
+    assert item["evidence_url"] is None
+    assert item["url_kind"] == "missing"
+    assert result["evidence_coverage"]["missing_post_ids"] == ["14"]
+
+
+def test_source_url_cannot_replace_a_missing_regular_post_url():
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    posts[-1]["post_url"] = None
+    posts[-1]["source_url"] = "https://www.douyin.com/video/14"
+
+    result = analyze.compute_high_low(posts, "views")
+
+    assert result is not None
+    item = result["high"][0]
+    assert item["post_url"] is None
+    assert item["evidence_url"] is None
+    assert item["url_kind"] == "missing"
+    assert result["evidence_coverage"]["missing_post_ids"] == ["14"]
+
+
+def test_jingxuan_official_item_url_is_strict_direct_evidence():
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    jingxuan_url = "https://jingxuan.douyin.com/m/video/14"
+    posts[-1].update(
+        {
+            "post_url": jingxuan_url,
+            "source_url": jingxuan_url,
+            "collection_source": "douyin_jingxuan",
+        }
+    )
+
+    result = analyze.compute_high_low(posts, "views")
+
+    assert result is not None
+    item = result["high"][0]
+    assert item["post_url"] == jingxuan_url
+    assert item["evidence_url"] == jingxuan_url
+    assert item["url_kind"] == "item"
+    assert result["evidence_coverage"]["status"] == "COMPLETE"
+
+
+def test_jingxuan_item_evidence_requires_douyin_platform_provenance():
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    posts[-1].update(
+        {
+            "platform": "weibo",
+            "post_url": "https://jingxuan.douyin.com/m/video/14",
+            "source_url": "https://jingxuan.douyin.com/m/video/14",
+            "collection_source": "douyin_jingxuan",
+        }
+    )
+
+    result = analyze.compute_high_low(posts, "views")
+
+    assert result is not None
+    item = result["high"][0]
+    assert item["post_url"] is None
+    assert item["evidence_url"] is None
+    assert item["url_kind"] == "missing"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "https://jingxuan.douyin.com/m/video/999",
+        "https://jingxuan.douyin.com/video/14",
+        "https://www.douyin.com/m/video/14",
+    ],
+)
+def test_jingxuan_item_url_requires_exact_host_path_and_post_id(candidate):
+    posts = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+    posts[-1].update(
+        {
+            "post_url": candidate,
+            "source_url": candidate,
+            "collection_source": "douyin_jingxuan",
+        }
+    )
+
+    result = analyze.compute_high_low(posts, "views")
+
+    assert result is not None
+    item = result["high"][0]
+    assert item["post_url"] is None
+    assert item["evidence_url"] is None
+    assert item["url_kind"] == "missing"
+    assert result["evidence_coverage"]["missing_post_ids"] == ["14"]
+
+
+def test_core_insights_are_deterministic_and_reference_exact_selected_rows():
+    rows = [_evidenced_high_low_post(index, index + 1) for index in range(15)]
+
+    forward = analyze.analyze_in_memory(
+        {"platform": "douyin", "followers": 100},
+        rows,
+        {"platform": "douyin", "analysis_goal": "播放表现"},
+    ).analysis
+    reverse = analyze.analyze_in_memory(
+        {"platform": "douyin", "followers": 100},
+        list(reversed(rows)),
+        {"platform": "douyin", "analysis_goal": "播放表现"},
+    ).analysis
+
+    assert forward["core_insights"] == reverse["core_insights"]
+    assert [item["id"] for item in forward["core_insights"]] == [
+        "performance-high",
+        "performance-low",
+    ]
+    selected = forward["high_performance"] + forward["low_performance"]
+    expected_evidence = [
+        {
+            "post_id": item["post_id"],
+            "url": item["evidence_url"],
+            "url_kind": item["url_kind"],
+            "collected_at": item["collected_at"],
+            "metrics": item["metrics"],
+            "rank": item["rank"],
+            "value": item["value"],
+        }
+        for item in selected
+    ]
+    actual_evidence = [
+        evidence
+        for insight in forward["core_insights"]
+        for evidence in insight["evidence"]
+    ]
+    assert actual_evidence == expected_evidence
+    assert all(
+        set(insight) == {"id", "kind", "statement", "main_metric", "evidence"}
+        for insight in forward["core_insights"]
+    )
 
 
 def test_successful_performance_meta_exposes_measured_count_and_median():
@@ -340,6 +646,28 @@ def test_successful_performance_meta_exposes_measured_count_and_median():
     assert result["performance_meta"]["status"] == "ok"
     assert result["performance_meta"]["measured_count"] == 15
     assert result["performance_meta"]["main_metric_median"] == 8.0
+
+
+def test_insufficient_sample_has_empty_complete_evidence_summary():
+    rows = [_evidenced_high_low_post(index, index + 1) for index in range(14)]
+
+    result = analyze.analyze_in_memory(
+        {"platform": "douyin", "followers": 100},
+        rows,
+        {"platform": "douyin", "analysis_goal": "播放表现"},
+    ).analysis
+
+    expected = {
+        "selected_count": 0,
+        "complete_count": 0,
+        "missing_count": 0,
+        "missing_post_ids": [],
+        "rate": None,
+        "status": "COMPLETE",
+    }
+    assert result["performance_meta"]["evidence_coverage"] == expected
+    assert result["evidence_coverage"] == expected
+    assert result["core_insights"] == []
 
 
 def test_legacy_cli_high_low_matches_in_memory(tmp_path):
@@ -370,6 +698,8 @@ def test_legacy_cli_high_low_matches_in_memory(tmp_path):
     assert actual["high_performance"] == expected["high_performance"]
     assert actual["low_performance"] == expected["low_performance"]
     assert actual["performance_meta"] == expected["performance_meta"]
+    assert actual["evidence_coverage"] == expected["evidence_coverage"]
+    assert actual["core_insights"] == expected["core_insights"]
 
 
 def test_build_posts_normalizes_blank_collected_at_to_none():

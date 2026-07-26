@@ -272,6 +272,26 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
 - **不得从相关特征推导因果关系**：高/低表现分组仅描述"哪组表现更高/更低"，不得断言某特征"导致"表现差异；
 - 跨组对比应仅呈现事实性差异（如主题分布、format 分布），避免因果措辞（"因为…所以…"）。
 
+### 6.5 作品证据与核心洞察
+
+- 高低组每条被选记录必须按 data-schema §7.1 验证作品证据。只有平台作品 URL
+  规范化成功、URL 中作品 ID 与 `post_id` 一致、`item_url_known=true`、带时区
+  `collected_at` 存在，且主指标值与 `metrics` 存在时，才计为完整证据。
+- 普通记录不得以账号主页、站外 HTTPS URL、不安全 URL 或单独的 `source_url`
+  代替作品 URL。抖音京选只接受严格的官方 `jingxuan.douyin.com/m/video/<id>`
+  作品地址，且平台与 ID 必须一致。
+- 抖音搜索索引仅在 `platform=douyin` 且四项来源字段完全一致时可保留账号主页
+  `profile_index` 锚点。该锚点不是作品链接，必须使证据覆盖状态保持
+  `PARTIAL_EVIDENCE`。
+- `evidence_coverage` 对高低组全部被选记录计算完整数、缺失数、缺失作品 ID 与覆盖率；
+  任一被选记录不完整时，分析阶段为 `PARTIAL`，流水线原因必须包含
+  `EVIDENCE_INCOMPLETE`。完成语义分类不能覆盖该降级。
+- 流水线证据完成门必须关闭失败：只有明确的 `evidence_coverage.status=COMPLETE`
+  可以完成分析阶段；状态缺失、未知或非法时同样保持 `PARTIAL`，不得按“非部分”推断完成。
+- `core_insights` 仅可陈述高/低组的确定性排名事实；其中每条 evidence 必须逐条对应
+  被选记录，保留 URL 类型、采集时间、公开指标、全局排名和主指标值。不得基于标题、
+  主题或相关性生成原因、策略或语义推断。
+
 ---
 
 ## 附：与 data-schema.md 的枚举一致性核对

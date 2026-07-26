@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added deterministic high/low evidence coverage and structured core insights whose evidence rows map exactly to selected records.
 - Added `run_pipeline.py`, which verifies a committed collection through one identity-bound reader and publishes normalization, analysis, provenance, Markdown, and HTML as a separate create-only immutable workspace.
 - Added explicit required/optional analysis artifact inventories, create-only binary writes, call-local renderer diagnostics, and pure in-memory normalize/analyze/render interfaces.
 - Added strict, complete semantic-classification input via `--classification-results`; validated source bytes are preserved in the immutable analysis workspace and can advance analysis status to `COMPLETED`.
@@ -16,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a zero-runtime-dependency `import_index_snapshot.py` path for public Douyin Web-index evidence after direct collection is blocked. The Agent verifies source/item ownership, while the importer validates official URLs and field consistency; it supports official Jingxuan item URLs and explicitly disclosed profile-index records.
 
 ### Changed
+- High/low item evidence now requires a canonical, post-ID-bound platform item URL, collection timestamp, and metrics. Ordinary profile/off-platform/source-only links are rejected; the strict Douyin search-index profile exception remains disclosed but incomplete, while exact official Jingxuan item URLs are supported.
+- Derived analysis now remains `PARTIAL` with `EVIDENCE_INCOMPLETE` when any selected high/low record lacks complete item evidence, even after semantic classification is complete.
 - High/low analysis now thresholds and sizes groups from non-null measured values (including zero), reports measured count and median, resolves ties deterministically, and preserves the exact selected-item provenance contract with median-relative performance.
 - Normalized posts now preserve `hashtags`, `platform_metrics`, `field_visibility`, provenance, collection timestamps, source URLs, and nullable public flags across memory, canonical JSON CSV, and analysis outputs; bounded, type-checked readers retain compatibility with legacy delimited hashtags and historical Python-repr structured cells.
 - Missing or invalid per-post collection status now becomes auditable `PARTIAL` data with source provenance and a normalization warning. Analysis exposes fixed zero-filled `status_counts`, and warnings downgrade the normalization phase instead of inventing success.

@@ -129,6 +129,19 @@ def _classification(post_id: str = "1", **overrides) -> dict:
     return result
 
 
+def _performance_posts(*, missing_collected_at: str | None = None) -> list[dict]:
+    posts = []
+    for index in range(1, 16):
+        post_id = f"{index:02d}"
+        post = _sample_post(post_id)
+        post["views"] = 100 + index
+        post["collected_at"] = "2026-07-02T09:00:00+08:00"
+        if post_id == missing_collected_at:
+            post["collected_at"] = None
+        posts.append(post)
+    return posts
+
+
 def _pipeline_module():
     return importlib.import_module("run_pipeline")
 
@@ -478,6 +491,28 @@ def test_analyze_in_memory_has_no_filesystem_side_effects(tmp_path):
     assert result.analysis["sample_boundary"]["valid"] == 1
     assert result.analysis["classification_status"] == "pending-model"
     assert list(tmp_path.iterdir()) == before
+
+
+@pytest.mark.parametrize(
+    "analysis_payload",
+    [
+        {"classification_status": "llm-1"},
+        {
+            "classification_status": "llm-1",
+            "evidence_coverage": {"status": "UNKNOWN"},
+        },
+    ],
+)
+def test_analysis_status_fails_closed_without_exact_complete_evidence(
+    analysis_payload,
+):
+    pipeline = _pipeline_module()
+    result = analyze.AnalysisResult(
+        analysis=analysis_payload,
+        taxonomy_prompt=None,
+    )
+
+    assert pipeline._analysis_status(result) == "PARTIAL"
 
 
 def test_analyzer_reads_historical_collection_python_repr_cells():
@@ -886,6 +921,88 @@ def test_complete_classification_is_validated_applied_and_copied_exactly(tmp_pat
     assert {item["path"] for item in verified["artifacts"]} == set(
         pipeline.ANALYSIS_REQUIRED_ARTIFACTS
     ) | {"source/classification-results.json"}
+
+
+def test_complete_classification_with_incomplete_evidence_stays_partial(tmp_path):
+    pipeline = _pipeline_module()
+    posts = _performance_posts(missing_collected_at="01")
+    collection, _ = _collection(
+        tmp_path, task_status="COMPLETED", posts=posts
+    )
+    output = tmp_path / "analysis"
+    classification_path = tmp_path / "classification-results.json"
+    classification_path.write_text(
+        json.dumps(
+            [_classification(post["post_id"]) for post in posts],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = pipeline.run_pipeline(
+        str(collection),
+        str(output),
+        template_text=_minimal_template(),
+        classification_results_path=str(classification_path),
+    )
+
+    task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+    analysis_payload = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )
+    assert result.task_status == task["task_status"] == "PARTIAL"
+    assert task["phase_results"]["analysis"] == "PARTIAL"
+    assert task["partial_reasons"] == ["EVIDENCE_INCOMPLETE"]
+    assert analysis_payload["classification_status"] == "llm-1"
+    assert analysis_payload["evidence_coverage"]["status"] == (
+        "PARTIAL_EVIDENCE"
+    )
+    assert analysis_payload["evidence_coverage"]["missing_post_ids"] == [
+        "01"
+    ]
+    assert analysis_payload["meta"]["partial_reasons"] == [
+        "EVIDENCE_INCOMPLETE"
+    ]
+
+
+def test_complete_classification_and_item_evidence_complete_pipeline(tmp_path):
+    pipeline = _pipeline_module()
+    posts = _performance_posts()
+    collection, _ = _collection(
+        tmp_path, task_status="COMPLETED", posts=posts
+    )
+    output = tmp_path / "analysis"
+    classification_path = tmp_path / "classification-results.json"
+    classification_path.write_text(
+        json.dumps(
+            [_classification(post["post_id"]) for post in posts],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = pipeline.run_pipeline(
+        str(collection),
+        str(output),
+        template_text=_minimal_template(),
+        classification_results_path=str(classification_path),
+    )
+
+    task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+    analysis_payload = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )
+    assert result.task_status == task["task_status"] == "COMPLETED"
+    assert task["phase_results"]["analysis"] == "COMPLETED"
+    assert task["partial_reasons"] == []
+    assert analysis_payload["evidence_coverage"] == {
+        "selected_count": 6,
+        "complete_count": 6,
+        "missing_count": 0,
+        "missing_post_ids": [],
+        "rate": 1.0,
+        "status": "COMPLETE",
+    }
 
 
 @pytest.mark.parametrize(

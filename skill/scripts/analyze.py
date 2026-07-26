@@ -15,9 +15,15 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from immutable_workspace import WorkspaceError, reject_sealed_workspace
 from csv_contract import parse_hashtag_cell, parse_structured_object_cell
+from collectors.url_policy import (
+    canonical_item_url,
+    canonical_profile_url,
+    sanitize_routing_url,
+)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -739,6 +745,163 @@ def _high_low_sort_key(
     )
 
 
+def _canonical_jingxuan_item_url(
+    value: Any, expected_post_id: Any
+) -> Optional[str]:
+    """Validate the official Jingxuan item shape without widening Douyin URLs."""
+    expected = str(expected_post_id or "").strip()
+    if not expected.isdigit():
+        return None
+    safe_url = sanitize_routing_url(value)
+    if safe_url is None:
+        return None
+    parsed = urlsplit(safe_url)
+    if parsed.hostname != "jingxuan.douyin.com":
+        return None
+    segments = parsed.path.strip("/").split("/")
+    if segments != ["m", "video", expected]:
+        return None
+    return f"https://jingxuan.douyin.com/m/video/{expected}"
+
+
+def _canonical_post_evidence_url(p: Dict[str, Any]) -> Optional[str]:
+    item_url_known = p.get("item_url_known", bool(p.get("post_url")))
+    if item_url_known is not True:
+        return None
+    candidate = p.get("post_url")
+    if p.get("collection_source") == "douyin_jingxuan":
+        if p.get("platform") != "douyin":
+            return None
+        return _canonical_jingxuan_item_url(candidate, p.get("post_id"))
+    platform = p.get("platform")
+    if not isinstance(platform, str) or not platform:
+        return None
+    return canonical_item_url(platform, candidate, p.get("post_id"))
+
+
+def _is_coherent_search_index_record(p: Dict[str, Any]) -> bool:
+    return (
+        p.get("platform") == "douyin"
+        and p.get("collection_source") == "douyin_search_index"
+        and p.get("item_url_known") is False
+        and p.get("platform_post_id_known") is False
+        and p.get("local_record_key") is True
+    )
+
+
+def _resolve_post_evidence(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Return canonical item evidence or the frozen search-index exception."""
+    source_url = p.get("source_url") or p.get("post_url")
+    item_url = _canonical_post_evidence_url(p)
+    if item_url is not None:
+        return {
+            "post_url": item_url,
+            "evidence_url": item_url,
+            "source_url": source_url,
+            "item_url_known": True,
+            "url_kind": "item",
+        }
+    if _is_coherent_search_index_record(p):
+        profile_anchor = canonical_profile_url("douyin", source_url)
+        if profile_anchor is not None:
+            return {
+                "post_url": None,
+                "evidence_url": profile_anchor,
+                "source_url": source_url,
+                "item_url_known": False,
+                "url_kind": "profile_index",
+            }
+    return {
+        "post_url": None,
+        "evidence_url": None,
+        "source_url": source_url,
+        "item_url_known": False,
+        "url_kind": "missing",
+    }
+
+
+def _has_auditable_collection_time(value: Any) -> bool:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    else:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _item_has_complete_evidence(item: Dict[str, Any]) -> bool:
+    return (
+        item.get("url_kind") == "item"
+        and item.get("item_url_known") is True
+        and isinstance(item.get("post_url"), str)
+        and item.get("post_url") == item.get("evidence_url")
+        and _has_auditable_collection_time(item.get("collected_at"))
+        and isinstance(item.get("metrics"), dict)
+        and item.get("value") is not None
+        and isinstance(item.get("main_metric"), str)
+    )
+
+
+def _empty_evidence_coverage() -> Dict[str, Any]:
+    return {
+        "selected_count": 0,
+        "complete_count": 0,
+        "missing_count": 0,
+        "missing_post_ids": [],
+        "rate": None,
+        "status": "COMPLETE",
+    }
+
+
+def _evidence_coverage(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not items:
+        return _empty_evidence_coverage()
+    missing = [item for item in items if not _item_has_complete_evidence(item)]
+    complete_count = len(items) - len(missing)
+    return {
+        "selected_count": len(items),
+        "complete_count": complete_count,
+        "missing_count": len(missing),
+        "missing_post_ids": [item.get("post_id") for item in missing],
+        "rate": rnd(complete_count / len(items), 4),
+        "status": "PARTIAL_EVIDENCE" if missing else "COMPLETE",
+    }
+
+
+def _core_insight(
+    insight_id: str,
+    kind: str,
+    label: str,
+    main_metric: str,
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    evidence = [
+        {
+            "post_id": item.get("post_id"),
+            "url": item.get("evidence_url"),
+            "url_kind": item.get("url_kind"),
+            "collected_at": item.get("collected_at"),
+            "metrics": copy.deepcopy(item.get("metrics") or {}),
+            "rank": item.get("rank"),
+            "value": item.get("value"),
+        }
+        for item in items
+    ]
+    return {
+        "id": insight_id,
+        "kind": kind,
+        "statement": (
+            f"样本中主指标 {main_metric} 的{label}组包含 {len(items)} 条被选记录。"
+        ),
+        "main_metric": main_metric,
+        "evidence": evidence,
+    }
+
+
 def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[Dict[str, Any]]:
     measured_items = _measured_metric_items(valid, main_metric)
     n_meas = len(measured_items)
@@ -760,8 +923,7 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
 
     def to_item(t: Tuple[Dict, Optional[float]], rank: int) -> Dict[str, Any]:
         p, v = t
-        item_url_known = p.get("item_url_known", bool(p.get("post_url")))
-        source_url = p.get("source_url") or p.get("post_url")
+        evidence = _resolve_post_evidence(p)
         published_at = p.get("published_at")
         if isinstance(published_at, datetime):
             published_at = published_at.isoformat()
@@ -774,9 +936,9 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
             "platform": p.get("platform"),
             "post_id": p["post_id"],
             "title": p.get("title"),
-            "post_url": p.get("post_url") if item_url_known else None,
-            "evidence_url": source_url,
-            "source_url": source_url,
+            "post_url": evidence["post_url"],
+            "evidence_url": evidence["evidence_url"],
+            "source_url": evidence["source_url"],
             "published_at": published_at,
             "published_at_precision": p.get("published_at_precision", "unknown"),
             "collection_status": p.get("collection_status"),
@@ -787,7 +949,7 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
                 "platform_post_id_known", bool(p.get("post_id"))
             ),
             "local_record_key": p.get("local_record_key", False),
-            "item_url_known": item_url_known,
+            "item_url_known": evidence["item_url_known"],
             "source_rank": p.get("source_rank"),
             "metrics": {metric: p.get(metric) for metric in METRIC_FIELDS},
             "value": rnd(v, 6) if v is not None else None,
@@ -803,10 +965,12 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
             "platform_metrics": copy.deepcopy(p.get("platform_metrics") or {}),
             "field_visibility": copy.deepcopy(p.get("field_visibility") or {}),
             "main_metric": main_metric,
+            "url_kind": evidence["url_kind"],
         }
 
     high_items = [to_item(t, i + 1) for i, t in enumerate(high)]
     low_items = [to_item(t, n_meas - k + i + 1) for i, t in enumerate(low)]
+    selected_items = high_items + low_items
     return {
         "high": high_items,
         "low": low_items,
@@ -815,6 +979,23 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
         "main_metric_median": main_metric_median,
         "main_metric": main_metric,
         "note": "高低表现仅描述样本中的相关特征,不构成因果结论(§6.4)",
+        "evidence_coverage": _evidence_coverage(selected_items),
+        "core_insights": [
+            _core_insight(
+                "performance-high",
+                "high_performance",
+                "高表现",
+                main_metric,
+                high_items,
+            ),
+            _core_insight(
+                "performance-low",
+                "low_performance",
+                "低表现",
+                main_metric,
+                low_items,
+            ),
+        ],
     }
 
 
@@ -836,13 +1017,13 @@ def build_post_records(
                 rel[m] = None  # 禁止用 0 做分母(§4)
             else:
                 rel[m] = rnd(p[m] / med, 4) if p[m] is not None else None
-        item_url_known = p.get("item_url_known", bool(p.get("post_url")))
+        evidence = _resolve_post_evidence(p)
         recs.append({
             "platform": p.get("platform"),
             "post_id": p["post_id"],
-            "post_url": p["post_url"] if item_url_known else None,
-            "evidence_url": p.get("source_url") or p.get("post_url"),
-            "source_url": p.get("source_url") or p.get("post_url"),
+            "post_url": evidence["post_url"],
+            "evidence_url": evidence["evidence_url"],
+            "source_url": evidence["source_url"],
             "title": p.get("title"),
             "text": p.get("text"),
             "content_type": p.get("content_type"),
@@ -863,7 +1044,8 @@ def build_post_records(
                 "platform_post_id_known", bool(p.get("post_id"))
             ),
             "local_record_key": p.get("local_record_key", False),
-            "item_url_known": item_url_known,
+            "item_url_known": evidence["item_url_known"],
+            "url_kind": evidence["url_kind"],
             "source_rank": p.get("source_rank"),
             "metrics": {m: p[m] for m in METRIC_FIELDS},
             "relative_performance": rel,
@@ -1306,6 +1488,8 @@ def analyze_in_memory(
     if hl is None:
         high_performance: Any = "INSUFFICIENT_SAMPLE"
         low_performance: Any = "INSUFFICIENT_SAMPLE"
+        evidence_coverage = _empty_evidence_coverage()
+        core_insights: List[Dict[str, Any]] = []
         if measured_count == 0:
             status_reason = (
                 f"主排序指标 {main_metric} 全为 null,遵循 §6.1 安全约束跳过高低表现模块"
@@ -1325,6 +1509,8 @@ def analyze_in_memory(
     else:
         high_performance = hl["high"]
         low_performance = hl["low"]
+        evidence_coverage = hl["evidence_coverage"]
+        core_insights = hl["core_insights"]
         performance_meta = {
             "status": "ok",
             "main_metric": main_metric,
@@ -1334,6 +1520,7 @@ def analyze_in_memory(
             "note": hl["note"],
             "metric_note": metric_note,
         }
+    performance_meta["evidence_coverage"] = copy.deepcopy(evidence_coverage)
 
     requested = params.get("requested_limit")
     requested_is_derived = False
@@ -1439,6 +1626,8 @@ def analyze_in_memory(
         "high_performance": high_performance,
         "low_performance": low_performance,
         "performance_meta": performance_meta,
+        "evidence_coverage": copy.deepcopy(evidence_coverage),
+        "core_insights": core_insights,
         "posts": post_records,
         "classification_status": meta["classification_status"],
     }
@@ -1502,6 +1691,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if hl is None:
         high_performance: Any = "INSUFFICIENT_SAMPLE"
         low_performance: Any = "INSUFFICIENT_SAMPLE"
+        evidence_coverage = _empty_evidence_coverage()
+        core_insights: List[Dict[str, Any]] = []
         if measured_count == 0:
             status_reason = (
                 f"主排序指标 {main_metric} 全为 null,遵循 §6.1 安全约束跳过高低表现模块"
@@ -1519,6 +1710,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         high_performance = hl["high"]
         low_performance = hl["low"]
+        evidence_coverage = hl["evidence_coverage"]
+        core_insights = hl["core_insights"]
         performance_meta = {
             "status": "ok",
             "main_metric": main_metric,
@@ -1528,6 +1721,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "note": hl["note"],
             "metric_note": metric_note,
         }
+    performance_meta["evidence_coverage"] = copy.deepcopy(evidence_coverage)
 
     # 样本边界(§2)
     requested = task_params.get("requested_limit")
@@ -1631,6 +1825,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "high_performance": high_performance,
         "low_performance": low_performance,
         "performance_meta": performance_meta,
+        "evidence_coverage": copy.deepcopy(evidence_coverage),
+        "core_insights": core_insights,
         "posts": post_records,
         "classification_status": meta["classification_status"],
     }

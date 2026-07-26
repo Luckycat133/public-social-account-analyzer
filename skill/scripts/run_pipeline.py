@@ -163,8 +163,15 @@ def _normalization_status(result: NormalizationResult) -> str:
 
 
 def _analysis_status(result: AnalysisResult) -> str:
-    status = result.analysis.get("classification_status")
-    return "COMPLETED" if status not in {None, "pending-model"} else "PARTIAL"
+    classification_status = result.analysis.get("classification_status")
+    evidence_status = (result.analysis.get("evidence_coverage") or {}).get(
+        "status"
+    )
+    complete = (
+        classification_status not in {None, "pending-model"}
+        and evidence_status == "COMPLETE"
+    )
+    return "COMPLETED" if complete else "PARTIAL"
 
 
 def _validate_output_payloads(
@@ -377,9 +384,16 @@ def run_pipeline(
         if normalization_status != "COMPLETED":
             partial_reasons.append("NORMALIZATION_PARTIAL")
         if analysis_status != "COMPLETED":
+            analysis_reason_added = False
             if analysis.analysis.get("classification_status") == "pending-model":
                 partial_reasons.append("PENDING_CLASSIFICATION")
-            else:
+                analysis_reason_added = True
+            if (analysis.analysis.get("evidence_coverage") or {}).get(
+                "status"
+            ) == "PARTIAL_EVIDENCE":
+                partial_reasons.append("EVIDENCE_INCOMPLETE")
+                analysis_reason_added = True
+            if not analysis_reason_added:
                 partial_reasons.append("ANALYSIS_PARTIAL")
         task_status = "PARTIAL" if partial_reasons else "COMPLETED"
         analysis_payload = dict(analysis.analysis)
