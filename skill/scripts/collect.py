@@ -86,6 +86,7 @@ from task_contract import (  # noqa: E402
     validate_analysis_goal,
 )
 from csv_contract import deserialize_csv_row, serialize_csv_row  # noqa: E402
+from normalize import dedup_posts, to_bool_flag  # noqa: E402
 
 # 北京时间为中国平台默认时区(见 references/data-schema.md §1)
 _BEIJING = timezone(timedelta(hours=8))
@@ -338,7 +339,26 @@ def _set_detail_status(post: dict, status: str) -> None:
     post["platform_metrics"]["detail_status"] = status
 
 
+def _comment_parent_is_analysis_eligible(platform: str, post: dict) -> bool:
+    if not isinstance(post, dict) or post.get("platform") != platform:
+        return False
+    post_id = str(post.get("post_id") or "").strip()
+    if not post_id:
+        return False
+    status = BaseCollector._canon_status_with_source(
+        post.get("collection_status")
+    )[0]
+    if status not in {"SUCCESS", "PARTIAL"}:
+        return False
+    return not any(
+        to_bool_flag(post.get(field)) is True
+        for field in ("is_pinned", "is_repost", "is_promoted")
+    )
+
+
 def _valid_comment_parent(platform: str, post: dict) -> tuple[str, str] | None:
+    if not _comment_parent_is_analysis_eligible(platform, post):
+        return None
     post_id = str(post.get("post_id") or "").strip()
     post_url = post.get("post_url")
     if not post_id or not isinstance(post_url, str):
@@ -701,8 +721,14 @@ def _collect_and_persist_comments(
     }
     seen: set[tuple[str, str]] = set()
     failed_parents: set[str] = set()
-    for post in posts:
-        parent = _valid_comment_parent(str(adapter.platform), post)
+    eligible_parents: dict[str, str] = {}
+    ambiguous_parents: set[str] = set()
+    first_wins_posts, _ = dedup_posts(posts)
+    for post in first_wins_posts:
+        platform = str(adapter.platform)
+        if not _comment_parent_is_analysis_eligible(platform, post):
+            continue
+        parent = _valid_comment_parent(platform, post)
         if parent is None:
             outcome["failures"] += 1
             error_log.append({
@@ -715,6 +741,25 @@ def _collect_and_persist_comments(
             })
             continue
         post_id, post_url = parent
+        existing_url = eligible_parents.get(post_id)
+        if existing_url is not None and existing_url != post_url:
+            ambiguous_parents.add(post_id)
+            continue
+        eligible_parents.setdefault(post_id, post_url)
+
+    for post_id in ambiguous_parents:
+        eligible_parents.pop(post_id, None)
+        outcome["failures"] += 1
+        error_log.append({
+            "url": None,
+            "stage": "collect_comments",
+            "error_code": "COMMENTS_UNAVAILABLE",
+            "message": "公开评论采样不可用",
+            "occurred_at": occurred_at,
+            "retryable": False,
+        })
+
+    for post_id, post_url in eligible_parents.items():
         outcome["attempted_posts"] += 1
         try:
             returned = adapter.collect_comments(post_url, limit=per_post_limit)

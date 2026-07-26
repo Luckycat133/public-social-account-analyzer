@@ -229,6 +229,7 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 | `empty_results` | integer | 适配器明确返回空列表的作品数；不得描述为已采到评论 |
 | `failures` | integer | 适配器报告不可用或抛错的作品数 |
 | `per_post_limit` | integer | 固定为 20 |
+| `stop_reason` | enum | 可选；评论请求遇到 `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `ACCESS_RESTRICTED` 时记录，未中止时省略 |
 
 空结果与失败必须分开计数。评论失败只写清洗后的 `COMMENTS_UNAVAILABLE` 内容级错误，不能
 改变账号任务状态或写入任务级 `stop_reason`。只有适配器确认上游请求成功且明确返回空评论
@@ -507,6 +508,91 @@ selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
 正式 Markdown/HTML 渲染器必须在既有 12 个章节占位符内完整呈现上述高/低条目与
 `core_insights`，不增加模板占位符，也不以主页 `profile_index` 冒充作品链接。
 证据顺序必须与确定性高/低组选取顺序一致，不得引用组外记录或补充因果解释。
+
+### 7.2 评论证据确定性输出
+
+`analysis.json` 根对象始终包含 `comment_analysis`。该对象不执行评论语义分类，只描述经过
+严格核验的公开评论证据：
+
+```json
+{
+  "schema_version": 1,
+  "status": "not_requested | empty | unavailable | collected_pending_model",
+  "requested": false,
+  "sampled_comment_count": 0,
+  "eligible_parent_posts": 0,
+  "covered_parent_posts": 0,
+  "parent_coverage_rate": null,
+  "collection_ledger": {
+    "attempted_posts": 0,
+    "comments_collected": 0,
+    "empty_results": 0,
+    "failures": 0,
+    "per_post_limit": 20,
+    "stop_reason": null
+  },
+  "field_coverage": {
+    "author": {"present": 0, "total": 0, "rate": null},
+    "text": {"present": 0, "total": 0, "rate": null},
+    "likes": {"present": 0, "total": 0, "rate": null},
+    "published_at": {"present": 0, "total": 0, "rate": null},
+    "collected_at": {"present": 0, "total": 0, "rate": null}
+  },
+  "representative_selection": {
+    "max_parent_posts": 3,
+    "max_per_parent": 1,
+    "order": "visible_likes_desc_then_source_line"
+  },
+  "representative_comments": [],
+  "semantic": {
+    "status": "pending-model",
+    "model_version": null,
+    "insights": null
+  },
+  "limitations": []
+}
+```
+
+状态判定固定如下：
+
+- `include_comments=false` 且不存在评论文件/账本时为 `not_requested`；此时若
+  `source/comments.jsonl` 存在或账本非空，分析在创建任何输出前失败。
+- 至少一条有效评论时为 `collected_pending_model`，即使同时存在评论级失败。
+- 已请求、评论文件明确为空、所有可分析父作品都已尝试且明确空结果、`failures=0`、
+  `stop_reason=null` 时才为 `empty`。
+- 其他零评论证据均为 `unavailable`，包括文件缺失、保护中止、失败或覆盖不完整；不得把
+  “不可用”写成“明确没有评论”。
+
+可分析父作品仅来自归一化后的 `SUCCESS` / `PARTIAL` 内容，并且
+`is_pinned`、`is_repost`、`is_promoted` 均未明确为真；还必须具有与平台、`post_id`
+精确绑定的规范作品 URL。父作品按 `post_id` 去重，重复 ID 指向不同规范 URL 时视为模糊并
+排除。`FAILED` / `DELETED` / `RESTRICTED`、三类明确标记、主页或非作品锚点均不得进入评论
+采集或分析；公共采集器在调用平台评论适配器前采用同一资格规则。
+评论文件按 UTF-8 严格 JSONL 解析：只有物理 LF（U+000A）分隔记录，CRLF 可接受；合法 JSON
+字符串内的 U+2028 / U+2029 必须原样保留，不能充当记录分隔符，仅以 U+2028 / U+2029
+隔开的两个对象必须拒绝。禁止空行、`NaN` / `Infinity`、重复 JSON 键、非对象、未知/缺失
+字段；每行字段清单必须与 §6.1 的八个字段完全一致。ID、可空文本、非负整数 `likes`、带
+时区时间、父 ID/URL 都须通过类型和一致性校验；同父重复 `comment_id` 或每父超过 20 行均
+整体失败。
+
+账本计数字段必须为非负整数（boolean 不算 integer），`per_post_limit=20`，且
+`comments_collected` 等于文件有效行数。`attempted_posts` 不得超过可分析父作品数，评论覆盖
+父数不得超过尝试数，覆盖父数与明确空结果数之和不得超过尝试数。没有评论保护中止时，
+未覆盖全部父作品的账本形成 `unavailable`，不能据此声称空结果；保护中止必须对应至少一个
+失败尝试。缺失的旧版账本可兼容读取，但只能形成 `unavailable`，不能据此声称空结果。`failures` 可与“已有有效评论但
+同一响应还含畸形记录”的父作品重叠，因此不强制与覆盖数、空结果数构成互斥分区。
+
+代表评论只考虑非空 `text`。每个父作品先按
+`(likes is null, -likes when known, source_line)` 选择一条，再按相同顺序从不同父作品中最多
+保留三条；真实 `likes=0` 是已知值，排在 `null` 前，同值按 1 基源行号破平。每条代表评论
+复制八个已核验字段，并增加固定 `source_artifact=source/comments.jsonl` 与 `source_line`。
+评论字段覆盖率按全部有效评论行计算，零评论时各字段 `rate=null`。
+
+`semantic` 在确定性阶段始终为 `pending-model` / `model_version=null` / `insights=null`。
+脚本不得生成高频问题、争议点或需求等评论语义结论；评论语义待处理不改变全局分析
+`PARTIAL` / `COMPLETED` 完成门。Markdown 与 HTML 在既有“内容模式”章节同步展示状态、
+父覆盖、账本、字段覆盖、代表评论、语义状态与限制；空值显示 `—`，父作品只有通过平台与
+ID 精确绑定后才能成为链接。
 
 ## 8. 空值规则（field_visibility）
 

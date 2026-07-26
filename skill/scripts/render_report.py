@@ -1324,28 +1324,279 @@ def _dist_table(posts, key, label) -> tuple[str, str]:
     return md, html
 
 
+def _comment_scalar(value) -> str:
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _comment_parent_reference(
+    item: dict,
+    *,
+    default_platform,
+    default_collection_source,
+) -> tuple[MdRaw, Raw]:
+    parent_id = item.get("parent_post_id")
+    parent_url = item.get("parent_post_url")
+    record = {
+        "platform": default_platform,
+        "post_id": parent_id,
+        "collection_source": default_collection_source,
+    }
+    canonical = _canonical_report_item_url(
+        record,
+        parent_url,
+        default_platform,
+        default_collection_source,
+    )
+    label = f"作品 {_comment_scalar(parent_id)}"
+    if canonical is not None and canonical == parent_url:
+        ref_post(canonical)
+        return link_md(canonical, label), link_html(canonical, label)
+    return MdRaw(md_escape_text(label)), Raw(h_esc(label))
+
+
+def _comment_evidence_block(analysis: dict) -> tuple[str, str]:
+    comments = analysis.get("comment_analysis")
+    if not isinstance(comments, dict):
+        return "", ""
+
+    meta = analysis.get("meta") if isinstance(analysis.get("meta"), dict) else {}
+    default_platform = meta.get("platform")
+    default_collection_source = meta.get("collection_source")
+    eligible = comments.get("eligible_parent_posts")
+    covered = comments.get("covered_parent_posts")
+    coverage_rate = comments.get("parent_coverage_rate")
+    coverage_label = (
+        f"{_comment_scalar(covered)}/{_comment_scalar(eligible)} "
+        f"(rate={fmt_float(coverage_rate, 4)})"
+    )
+    summary_rows = [
+        ["schema_version", _comment_scalar(comments.get("schema_version"))],
+        ["status", _comment_scalar(comments.get("status"))],
+        ["requested", _comment_scalar(comments.get("requested"))],
+        [
+            "sampled_comment_count",
+            _comment_scalar(comments.get("sampled_comment_count")),
+        ],
+        ["parent_coverage", coverage_label],
+    ]
+    md_parts = ["### 评论证据（确定性）", "", md_table(["字段", "值"], summary_rows)]
+    html_parts = [
+        '<h3 class="subsection">评论证据（确定性）</h3>',
+        html_table(
+            ["字段", "值"],
+            [
+                [Raw(h_esc(field)), Raw(h_esc(value))]
+                for field, value in summary_rows
+            ],
+        ),
+    ]
+
+    ledger = comments.get("collection_ledger")
+    if isinstance(ledger, dict):
+        ledger_fields = (
+            "attempted_posts",
+            "comments_collected",
+            "empty_results",
+            "failures",
+            "per_post_limit",
+            "stop_reason",
+        )
+        rows = [
+            [field, _comment_scalar(ledger.get(field))]
+            for field in ledger_fields
+        ]
+        md_parts.extend(["", "**采集账本**", "", md_table(["字段", "值"], rows)])
+        html_parts.extend(
+            [
+                '<p class="note">采集账本</p>',
+                html_table(
+                    ["字段", "值"],
+                    [
+                        [Raw(h_esc(field)), Raw(h_esc(value))]
+                        for field, value in rows
+                    ],
+                ),
+            ]
+        )
+
+    field_coverage = comments.get("field_coverage")
+    if isinstance(field_coverage, dict) and field_coverage:
+        rows = []
+        for field in ("author", "text", "likes", "published_at", "collected_at"):
+            evidence = field_coverage.get(field)
+            if not isinstance(evidence, dict):
+                continue
+            rows.append(
+                [
+                    field,
+                    _comment_scalar(evidence.get("present")),
+                    _comment_scalar(evidence.get("total")),
+                    fmt_float(evidence.get("rate"), 4),
+                ]
+            )
+        if rows:
+            md_parts.extend(
+                [
+                    "",
+                    "**字段覆盖率**",
+                    "",
+                    md_table(["字段", "present", "total", "rate"], rows),
+                ]
+            )
+            html_parts.extend(
+                [
+                    '<p class="note">字段覆盖率</p>',
+                    html_table(
+                        ["字段", "present", "total", "rate"],
+                        [
+                            [Raw(h_esc(value)) for value in row]
+                            for row in rows
+                        ],
+                    ),
+                ]
+            )
+
+    selection = comments.get("representative_selection")
+    if isinstance(selection, dict):
+        selection_text = (
+            "max_parent_posts="
+            f"{_comment_scalar(selection.get('max_parent_posts'))}; "
+            "max_per_parent="
+            f"{_comment_scalar(selection.get('max_per_parent'))}; "
+            f"order={_comment_scalar(selection.get('order'))}"
+        )
+        md_parts.extend(["", f"> 代表评论选择：{md_escape_text(selection_text)}"])
+        html_parts.append(
+            f'<p class="note">代表评论选择：{h_esc(selection_text)}</p>'
+        )
+
+    representatives = comments.get("representative_comments")
+    if isinstance(representatives, list) and representatives:
+        md_rows = []
+        html_rows = []
+        for item in representatives:
+            if not isinstance(item, dict):
+                continue
+            parent_md, parent_html = _comment_parent_reference(
+                item,
+                default_platform=default_platform,
+                default_collection_source=default_collection_source,
+            )
+            artifact = item.get("source_artifact")
+            source_line = item.get("source_line")
+            source = f"{_comment_scalar(artifact)}:{_comment_scalar(source_line)}"
+            values = [
+                _comment_scalar(item.get("comment_id")),
+                parent_md,
+                _comment_scalar(item.get("author")),
+                _comment_scalar(item.get("text")),
+                _comment_scalar(item.get("likes")),
+                _comment_scalar(item.get("published_at")),
+                _comment_scalar(item.get("collected_at")),
+                source,
+            ]
+            md_rows.append(values)
+            html_rows.append(
+                [
+                    Raw(h_esc(values[0])),
+                    parent_html,
+                    Raw(h_esc(values[2])),
+                    Raw(h_esc(values[3])),
+                    Raw(h_esc(values[4])),
+                    Raw(h_esc(values[5])),
+                    Raw(h_esc(values[6])),
+                    Raw(h_esc(values[7])),
+                ]
+            )
+        if md_rows:
+            headers = [
+                "comment_id",
+                "父作品",
+                "author",
+                "text",
+                "likes",
+                "published_at",
+                "collected_at",
+                "source",
+            ]
+            md_parts.extend(["", "**代表评论**", "", md_table(headers, md_rows)])
+            html_parts.extend(
+                [
+                    '<p class="note">代表评论</p>',
+                    html_table(headers, html_rows),
+                ]
+            )
+
+    semantic = comments.get("semantic")
+    semantic_status = (
+        semantic.get("status") if isinstance(semantic, dict) else None
+    )
+    semantic_version = (
+        semantic.get("model_version") if isinstance(semantic, dict) else None
+    )
+    semantic_note = (
+        "语义洞察待模型处理"
+        f"（status={_comment_scalar(semantic_status)}, "
+        f"model_version={_comment_scalar(semantic_version)}）；"
+        "确定性阶段不生成评论语义结论。"
+    )
+    md_parts.extend(["", f"> {md_escape_text(semantic_note)}"])
+    html_parts.append(f'<p class="note">{h_esc(semantic_note)}</p>')
+
+    limitations = comments.get("limitations")
+    if isinstance(limitations, list) and limitations:
+        safe_limitations = [
+            item for item in limitations if isinstance(item, str) and item
+        ]
+        if safe_limitations:
+            md_parts.extend(
+                [
+                    "",
+                    "**限制**",
+                    "",
+                    "\n".join(f"- {md_escape_text(item)}" for item in safe_limitations),
+                ]
+            )
+            html_parts.extend(
+                [
+                    '<p class="note">限制</p>',
+                    "<ul class='tight'>"
+                    + "".join(f"<li>{h_esc(item)}</li>" for item in safe_limitations)
+                    + "</ul>",
+                ]
+            )
+    return "\n".join(md_parts), "".join(html_parts)
+
+
 def build_content_patterns(analysis) -> tuple[str, str]:
     posts = analysis.get("posts", []) if isinstance(analysis, dict) else []
-    if not posts:
-        return EMPTY_MD, EMPTY_HTML
     blocks = []
-    for key, label in [("topic", "主题"), ("format", "内容形式"),
-                       ("funnel_stage", "漏斗阶段"), ("hook_type", "开头钩子")]:
-        md, html = _dist_table(posts, key, label)
-        if md:
+    if posts:
+        for key, label in [("topic", "主题"), ("format", "内容形式"),
+                           ("funnel_stage", "漏斗阶段"), ("hook_type", "开头钩子")]:
+            md, html = _dist_table(posts, key, label)
+            if md:
+                blocks.append((md, html))
+        # 栏目 / 合集
+        series = Counter()
+        for p in posts:
+            s = p.get("series_name")
+            if s:
+                series[str(s)] += 1
+        if series:
+            rows = [[k, fmt_int(v)] for k, v in series.most_common(10)]
+            md = "**栏目 / 合集 分布**\n\n" + md_table(["栏目", "数量"], rows)
+            html = '<p class="note">栏目 / 合集 分布</p>' + html_table(
+                ["栏目", "数量"], [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
             blocks.append((md, html))
-    # 栏目 / 合集
-    series = Counter()
-    for p in posts:
-        s = p.get("series_name")
-        if s:
-            series[str(s)] += 1
-    if series:
-        rows = [[k, fmt_int(v)] for k, v in series.most_common(10)]
-        md = "**栏目 / 合集 分布**\n\n" + md_table(["栏目", "数量"], rows)
-        html = '<p class="note">栏目 / 合集 分布</p>' + html_table(
-            ["栏目", "数量"], [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
-        blocks.append((md, html))
+
+    comment_md, comment_html = _comment_evidence_block(analysis)
+    if comment_md:
+        blocks.append((comment_md, comment_html))
 
     if not blocks:
         return EMPTY_MD, EMPTY_HTML

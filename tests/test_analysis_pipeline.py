@@ -64,24 +64,24 @@ def _collection(
     posts: list[dict] | None = None,
     include_posts: bool = True,
     extra_artifacts: dict[str, bytes] | None = None,
+    task_overrides: dict | None = None,
 ) -> tuple[Path, str]:
     target = tmp_path / name
     source_posts = [_sample_post()] if posts is None else posts
+    task = {
+        "task_id": "douyin-source-task",
+        "platform": "douyin",
+        "task_status": task_status,
+        "requested_limit": 1,
+        "collected_count": len(source_posts),
+        "analysis_goal": None,
+    }
+    task.update(task_overrides or {})
     artifacts = {
         "source/profile.json": json.dumps(
             _sample_profile(), ensure_ascii=False
         ).encode("utf-8"),
-        "task.json": json.dumps(
-            {
-                "task_id": "douyin-source-task",
-                "platform": "douyin",
-                "task_status": task_status,
-                "requested_limit": 1,
-                "collected_count": len(source_posts),
-                "analysis_goal": None,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8"),
+        "task.json": json.dumps(task, ensure_ascii=False).encode("utf-8"),
         "collection-report.md": b"# collection\n",
     }
     if include_posts:
@@ -1141,8 +1141,9 @@ def test_complete_classification_is_validated_applied_and_copied_exactly(tmp_pat
         "rate": 1.0,
     }
     assert analysis_payload["posts"][0]["topic"] == "示例主题"
-    assert "pending-model" not in json.dumps(
-        analysis_payload, ensure_ascii=False
+    assert analysis_payload["meta"]["classification_status"] == "completed"
+    assert analysis_payload["comment_analysis"]["semantic"]["status"] == (
+        "pending-model"
     )
     pipeline_report = (output / "pipeline-report.md").read_text(encoding="utf-8")
     assert "- partial_reasons: none" in pipeline_report
@@ -1393,15 +1394,147 @@ def test_cli_accepts_classification_results_file(tmp_path):
     assert (output / ".complete").is_file()
 
 
+@pytest.mark.parametrize(
+    ("first_parent_override", "expected_failures"),
+    [
+        ({"is_pinned": True}, 0),
+        ({"collection_status": "FAILED"}, 0),
+        ({"post_url": "https://www.douyin.com/user/not-an-item"}, 1),
+    ],
+    ids=("pinned-first", "failed-first", "invalid-url-first"),
+)
+def test_comment_collection_first_wins_duplicate_parent_before_pipeline_analysis(
+    monkeypatch, tmp_path, first_parent_override, expected_failures
+):
+    """A later duplicate cannot make normalization's first parent eligible."""
+    import collect
+
+    pipeline = _pipeline_module()
+
+    def post(post_id, **overrides):
+        value = {
+            "platform": "douyin",
+            "post_id": post_id,
+            "post_url": f"https://www.douyin.com/video/{post_id}",
+            "published_at": "2026-07-01T08:00:00+08:00",
+            "content_type": "video",
+            "collection_status": "SUCCESS",
+            "likes": 10,
+            "views": 100,
+        }
+        value.update(overrides)
+        return value
+
+    class DuplicateParentAdapter:
+        platform = "douyin"
+
+        def __init__(self):
+            self.comment_calls = []
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_profile(self, url):
+            return {
+                "platform": "douyin",
+                "account_name": "重复父作品账号",
+                "field_visibility": {},
+            }
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            return [
+                post("9001", **first_parent_override),
+                post("9001"),
+                post("9000"),
+            ]
+
+        def collect_comments(self, post_url, limit=20):
+            self.comment_calls.append(post_url)
+            post_id = post_url.rsplit("/", 1)[-1]
+            return [{"comment_id": f"c-{post_id}", "text": "公开评论"}]
+
+    adapter = DuplicateParentAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    collection = tmp_path / "collection"
+
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(collection),
+        include_comments=True,
+    ) == 0
+
+    collection_before = _tree_snapshot(collection)
+    output = tmp_path / "analysis"
+    pipeline.run_pipeline(
+        str(collection), str(output), template_text=_minimal_template()
+    )
+
+    assert adapter.comment_calls == ["https://www.douyin.com/video/9000"]
+    assert _tree_snapshot(collection) == collection_before
+    comments = [
+        json.loads(line)
+        for line in (collection / "source" / "comments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [comment["parent_post_id"] for comment in comments] == ["9000"]
+    task = json.loads((collection / "task.json").read_text(encoding="utf-8"))
+    assert task["comment_collection"] == {
+        "attempted_posts": 1,
+        "comments_collected": 1,
+        "empty_results": 0,
+        "failures": expected_failures,
+        "per_post_limit": 20,
+    }
+    comment_analysis = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )["comment_analysis"]
+    assert comment_analysis["status"] == "collected_pending_model"
+    assert comment_analysis["eligible_parent_posts"] == 1
+    assert comment_analysis["covered_parent_posts"] == 1
+    assert comment_analysis["collection_ledger"] == {
+        **task["comment_collection"],
+        "stop_reason": None,
+    }
+
+
 def test_pipeline_copies_only_verified_optional_source_evidence(tmp_path):
     pipeline = _pipeline_module()
-    comments = b'{"comment_id":"c1","text":"ok"}\n'
+    comments = (
+        json.dumps(
+            {
+                "comment_id": "c1",
+                "parent_post_id": "1",
+                "parent_post_url": "https://www.douyin.com/video/1",
+                "author": None,
+                "text": "原样\u2028字节\u2029保留",
+                "likes": 0,
+                "published_at": None,
+                "collected_at": "2026-07-03T10:00:00+08:00",
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\r\n"
+    )
     index = b'{"schema_version":1}\n'
     collection, _ = _collection(
         tmp_path,
         extra_artifacts={
             "source/comments.jsonl": comments,
             "source/index-evidence.json": index,
+        },
+        task_overrides={
+            "include_comments": True,
+            "comment_collection": {
+                "attempted_posts": 1,
+                "comments_collected": 1,
+                "empty_results": 0,
+                "failures": 0,
+                "per_post_limit": 20,
+            },
         },
     )
     output = tmp_path / "analysis"
@@ -1413,6 +1546,158 @@ def test_pipeline_copies_only_verified_optional_source_evidence(tmp_path):
     assert (output / "source" / "comments.jsonl").read_bytes() == comments
     assert (output / "source" / "index-evidence.json").read_bytes() == index
     assert not (output / "collection-report.md").exists()
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+def test_pipeline_rejects_unicode_separator_as_jsonl_record_delimiter_before_reserve(
+    monkeypatch, tmp_path, separator
+):
+    pipeline = _pipeline_module()
+    def comment(comment_id):
+        return {
+            "comment_id": comment_id,
+            "parent_post_id": "1",
+            "parent_post_url": "https://www.douyin.com/video/1",
+            "author": None,
+            "text": "公开评论",
+            "likes": 0,
+            "published_at": None,
+            "collected_at": "2026-07-03T10:00:00+08:00",
+        }
+
+    comments = (
+        json.dumps(comment("c1"), ensure_ascii=False)
+        + separator
+        + json.dumps(comment("c2"), ensure_ascii=False)
+    ).encode("utf-8")
+    collection, _ = _collection(
+        tmp_path,
+        extra_artifacts={"source/comments.jsonl": comments},
+        task_overrides={
+            "include_comments": True,
+            "comment_collection": {
+                "attempted_posts": 1,
+                "comments_collected": 2,
+                "empty_results": 0,
+                "failures": 0,
+                "per_post_limit": 20,
+            },
+        },
+    )
+    output = tmp_path / "analysis"
+    reserve_calls = []
+    original_reserve = pipeline.ImmutableWorkspace.reserve
+
+    def recording_reserve(*args, **kwargs):
+        reserve_calls.append(args[0])
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline.ImmutableWorkspace, "reserve", recording_reserve)
+
+    with pytest.raises(pipeline.PipelineError, match="invalid JSON"):
+        pipeline.run_pipeline(
+            str(collection), str(output), template_text=_minimal_template()
+        )
+
+    assert reserve_calls == []
+    assert not output.exists()
+
+
+def test_pipeline_rejects_comment_file_when_sampling_not_requested_before_reserve(
+    monkeypatch, tmp_path
+):
+    pipeline = _pipeline_module()
+    comments = json.dumps(
+        {
+            "comment_id": "c1",
+            "parent_post_id": "1",
+            "parent_post_url": "https://www.douyin.com/video/1",
+            "author": None,
+            "text": "unexpected",
+            "likes": 0,
+            "published_at": None,
+            "collected_at": "2026-07-03T10:00:00+08:00",
+        }
+    ).encode() + b"\n"
+    collection, _ = _collection(
+        tmp_path,
+        extra_artifacts={"source/comments.jsonl": comments},
+        task_overrides={"include_comments": False},
+    )
+    output = tmp_path / "analysis"
+    reserve_calls = []
+    original_reserve = pipeline.ImmutableWorkspace.reserve
+
+    def recording_reserve(*args, **kwargs):
+        reserve_calls.append(args[0])
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline.ImmutableWorkspace, "reserve", recording_reserve)
+
+    with pytest.raises(pipeline.PipelineError, match="not requested"):
+        pipeline.run_pipeline(
+            str(collection), str(output), template_text=_minimal_template()
+        )
+
+    assert reserve_calls == []
+    assert not output.exists()
+
+
+def test_pipeline_rejects_malformed_comments_before_output_reservation(
+    monkeypatch, tmp_path
+):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(
+        tmp_path,
+        extra_artifacts={"source/comments.jsonl": b'{"comment_id": NaN}\n'},
+        task_overrides={
+            "include_comments": True,
+            "comment_collection": {
+                "attempted_posts": 1,
+                "comments_collected": 1,
+                "empty_results": 0,
+                "failures": 0,
+                "per_post_limit": 20,
+            },
+        },
+    )
+    output = tmp_path / "analysis"
+    reserve_calls = []
+    original_reserve = pipeline.ImmutableWorkspace.reserve
+
+    def recording_reserve(*args, **kwargs):
+        reserve_calls.append(args[0])
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline.ImmutableWorkspace, "reserve", recording_reserve)
+
+    with pytest.raises(pipeline.PipelineError, match="JSON"):
+        pipeline.run_pipeline(
+            str(collection), str(output), template_text=_minimal_template()
+        )
+
+    assert reserve_calls == []
+    assert not output.exists()
+
+
+def test_comment_semantic_status_does_not_change_global_analysis_completion():
+    pipeline = _pipeline_module()
+    result = analyze.AnalysisResult(
+        analysis={
+            "classification_status": "completed",
+            "evidence_coverage": {"status": "COMPLETE"},
+            "comment_analysis": {
+                "status": "unavailable",
+                "semantic": {
+                    "status": "pending-model",
+                    "model_version": None,
+                    "insights": None,
+                },
+            },
+        }
+    )
+
+    assert pipeline._analysis_status(result) == "COMPLETED"
 
 
 @pytest.mark.parametrize(

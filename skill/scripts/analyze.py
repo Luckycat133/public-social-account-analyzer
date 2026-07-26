@@ -11,6 +11,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -55,6 +56,37 @@ FLAG_FIELDS = ["is_pinned", "is_repost", "is_promoted"]
 MIN_SAMPLE_FOR_HIGH_LOW = 15
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+COMMENT_FIELDS = (
+    "comment_id",
+    "parent_post_id",
+    "parent_post_url",
+    "author",
+    "text",
+    "likes",
+    "published_at",
+    "collected_at",
+)
+COMMENT_COVERAGE_FIELDS = (
+    "author",
+    "text",
+    "likes",
+    "published_at",
+    "collected_at",
+)
+COMMENT_LEDGER_FIELDS = (
+    "attempted_posts",
+    "comments_collected",
+    "empty_results",
+    "failures",
+    "per_post_limit",
+)
+COMMENT_STOP_REASONS = frozenset(
+    {"LOGIN_REQUIRED", "VERIFICATION_REQUIRED", "ACCESS_RESTRICTED"}
+)
+COMMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+COMMENT_PER_POST_LIMIT = 20
+COMMENT_REPRESENTATIVE_PARENT_LIMIT = 3
 
 
 def die(msg: str) -> None:
@@ -298,6 +330,404 @@ def collection_status_counts(all_posts: List[Dict[str, Any]]) -> Dict[str, int]:
         if status in counts:
             counts[status] += 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# 评论证据（确定性结构与代表样本；语义洞察保留给模型）
+# ---------------------------------------------------------------------------
+
+
+def _default_comment_ledger() -> Dict[str, Any]:
+    return {
+        "attempted_posts": 0,
+        "comments_collected": 0,
+        "empty_results": 0,
+        "failures": 0,
+        "per_post_limit": COMMENT_PER_POST_LIMIT,
+        "stop_reason": None,
+    }
+
+
+def _comment_field_coverage(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(records)
+    result: Dict[str, Any] = {}
+    for field in COMMENT_COVERAGE_FIELDS:
+        present = sum(1 for record in records if record.get(field) is not None)
+        result[field] = {
+            "present": present,
+            "total": total,
+            "rate": rnd(present / total, 4) if total else None,
+        }
+    return result
+
+
+def _eligible_comment_parents(
+    valid_posts: List[Dict[str, Any]], platform: Any
+) -> Dict[str, str]:
+    """Return distinct, unambiguous ID-bound item URLs from normalized rows."""
+    if not isinstance(platform, str) or not platform:
+        return {}
+    candidates: Dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for post in valid_posts:
+        if post.get("platform") != platform:
+            continue
+        post_id = post.get("post_id")
+        if not isinstance(post_id, str):
+            post_id = str(post_id) if post_id is not None else ""
+        post_id = post_id.strip()
+        if not post_id:
+            continue
+        item_url = _canonical_post_evidence_url(post)
+        if item_url is None:
+            continue
+        existing = candidates.get(post_id)
+        if existing is not None and existing != item_url:
+            ambiguous.add(post_id)
+            continue
+        candidates.setdefault(post_id, item_url)
+    for post_id in ambiguous:
+        candidates.pop(post_id, None)
+    return candidates
+
+
+class _DuplicateCommentJSONKey(ValueError):
+    pass
+
+
+def _strict_comment_json(line: str, source_line: int) -> Dict[str, Any]:
+    def reject_constant(value: str):
+        raise ValueError(f"non-standard numeric constant {value}")
+
+    def reject_duplicate_keys(pairs):
+        value: Dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise _DuplicateCommentJSONKey(key)
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            line,
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except _DuplicateCommentJSONKey as exc:
+        raise ValueError(
+            f"comments JSONL line {source_line} has duplicate JSON keys"
+        ) from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(
+            f"comments JSONL line {source_line} is not strict UTF-8 JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"comments JSONL line {source_line} must be an object")
+    return value
+
+
+def _validate_comment_timestamp(
+    value: Any, *, field: str, source_line: int
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"comments JSONL line {source_line} has invalid {field}"
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"comments JSONL line {source_line} has invalid {field}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(
+            f"comments JSONL line {source_line} has invalid {field} timezone"
+        )
+
+
+def _parse_comments_payload(
+    payload: bytes | None,
+    eligible_parents: Dict[str, str],
+) -> List[Tuple[Dict[str, Any], int]]:
+    if payload is None:
+        return []
+    if not isinstance(payload, bytes):
+        raise ValueError("comments payload must be bytes")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("comments JSONL is not strict UTF-8 JSON") from exc
+
+    records: List[Tuple[Dict[str, Any], int]] = []
+    seen: set[Tuple[str, str]] = set()
+    per_parent: Dict[str, int] = {}
+    expected_fields = set(COMMENT_FIELDS)
+    lines = [] if text == "" else text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for source_line, line in enumerate(lines, start=1):
+        if not line.strip():
+            raise ValueError(f"comments JSONL line {source_line} is blank")
+        record = _strict_comment_json(line, source_line)
+        if set(record) != expected_fields:
+            raise ValueError(
+                f"comments JSONL line {source_line} has invalid fields"
+            )
+
+        comment_id = record["comment_id"]
+        if (
+            not isinstance(comment_id, str)
+            or COMMENT_ID_PATTERN.fullmatch(comment_id) is None
+        ):
+            raise ValueError(
+                f"comments JSONL line {source_line} has invalid comment_id"
+            )
+        parent_post_id = record["parent_post_id"]
+        parent_post_url = record["parent_post_url"]
+        if (
+            not isinstance(parent_post_id, str)
+            or not parent_post_id
+            or not isinstance(parent_post_url, str)
+            or eligible_parents.get(parent_post_id) != parent_post_url
+        ):
+            raise ValueError(
+                f"comments JSONL line {source_line} has invalid parent anchor"
+            )
+
+        for field in ("author", "text"):
+            value = record[field]
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"comments JSONL line {source_line} has invalid {field}"
+                )
+        likes = record["likes"]
+        if likes is not None and (
+            isinstance(likes, bool)
+            or not isinstance(likes, int)
+            or likes < 0
+        ):
+            raise ValueError(
+                f"comments JSONL line {source_line} has invalid likes"
+            )
+        for field in ("published_at", "collected_at"):
+            _validate_comment_timestamp(
+                record[field], field=field, source_line=source_line
+            )
+
+        key = (parent_post_id, comment_id)
+        if key in seen:
+            raise ValueError(
+                f"comments JSONL line {source_line} is a duplicate comment"
+            )
+        seen.add(key)
+        count = per_parent.get(parent_post_id, 0) + 1
+        if count > COMMENT_PER_POST_LIMIT:
+            raise ValueError(
+                f"comments JSONL parent {parent_post_id} exceeds 20 records"
+            )
+        per_parent[parent_post_id] = count
+        records.append((copy.deepcopy(record), source_line))
+    return records
+
+
+def _validated_comment_ledger(
+    raw: Any,
+    *,
+    requested: bool,
+    eligible_count: int,
+    covered_count: int,
+    comment_count: int,
+    file_present: bool,
+) -> Dict[str, Any]:
+    missing_ledger = raw is None or raw == {}
+    if missing_ledger:
+        ledger = _default_comment_ledger()
+    else:
+        if not isinstance(raw, dict):
+            raise ValueError("comment collection ledger must be an object")
+        allowed = set(COMMENT_LEDGER_FIELDS) | {"stop_reason"}
+        if set(raw) not in (set(COMMENT_LEDGER_FIELDS), allowed):
+            raise ValueError("comment collection ledger fields are invalid")
+        ledger = {key: raw[key] for key in COMMENT_LEDGER_FIELDS}
+        ledger["stop_reason"] = raw.get("stop_reason")
+
+    if not requested:
+        if not missing_ledger:
+            raise ValueError(
+                "comment collection ledger exists although comments were not requested"
+            )
+        return ledger
+
+    for field in COMMENT_LEDGER_FIELDS:
+        value = ledger[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"comment collection ledger has invalid {field}"
+            )
+    if ledger["per_post_limit"] != COMMENT_PER_POST_LIMIT:
+        raise ValueError("comment collection ledger per_post_limit must be 20")
+    stop_reason = ledger["stop_reason"]
+    if stop_reason is not None and stop_reason not in COMMENT_STOP_REASONS:
+        raise ValueError("comment collection ledger stop_reason is invalid")
+
+    attempted = ledger["attempted_posts"]
+    empty = ledger["empty_results"]
+    failures = ledger["failures"]
+    if ledger["comments_collected"] != comment_count:
+        raise ValueError(
+            "comment collection ledger comments_collected does not match file"
+        )
+    if comment_count and not file_present:
+        raise ValueError(
+            "comment collection ledger reports comments without a file"
+        )
+    if attempted > eligible_count:
+        raise ValueError(
+            "comment collection ledger attempted_posts exceeds eligible parents"
+        )
+    if covered_count > attempted:
+        raise ValueError(
+            "comment collection ledger covered parents exceed attempted_posts"
+        )
+    if empty > attempted - covered_count:
+        raise ValueError(
+            "comment collection ledger empty_results contradict covered parents"
+        )
+    if stop_reason is not None and (attempted < 1 or failures < 1):
+        raise ValueError(
+            "comment collection ledger stop_reason lacks a failed attempt"
+        )
+    return ledger
+
+
+def _comment_sort_key(item: Tuple[Dict[str, Any], int]):
+    record, source_line = item
+    likes = record.get("likes")
+    return (
+        likes is None,
+        -likes if likes is not None else 0,
+        source_line,
+    )
+
+
+def _representative_comments(
+    records: List[Tuple[Dict[str, Any], int]]
+) -> List[Dict[str, Any]]:
+    by_parent: Dict[str, List[Tuple[Dict[str, Any], int]]] = {}
+    for item in records:
+        record = item[0]
+        text = record.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        by_parent.setdefault(record["parent_post_id"], []).append(item)
+    winners = [min(items, key=_comment_sort_key) for items in by_parent.values()]
+    selected = sorted(winners, key=_comment_sort_key)[
+        :COMMENT_REPRESENTATIVE_PARENT_LIMIT
+    ]
+    result: List[Dict[str, Any]] = []
+    for record, source_line in selected:
+        result.append(
+            {
+                **copy.deepcopy(record),
+                "source_artifact": "source/comments.jsonl",
+                "source_line": source_line,
+            }
+        )
+    return result
+
+
+def analyze_comments_in_memory(
+    normalized_posts: List[Dict[str, Any]],
+    task_params: Dict[str, Any],
+    *,
+    platform: Any,
+    comments_payload: bytes | None = None,
+) -> Dict[str, Any]:
+    """Validate and summarize verified public comment evidence deterministically."""
+    include_value = task_params.get("include_comments", False)
+    if not isinstance(include_value, bool):
+        raise ValueError("include_comments must be a boolean")
+    requested = include_value
+    raw_ledger = task_params.get("comment_collection")
+    eligible_parents = _eligible_comment_parents(normalized_posts, platform)
+
+    if not requested and comments_payload is not None:
+        raise ValueError("comments file exists although comments were not requested")
+    parsed = (
+        _parse_comments_payload(comments_payload, eligible_parents)
+        if requested
+        else []
+    )
+    records = [record for record, _ in parsed]
+    covered_count = len({record["parent_post_id"] for record in records})
+    ledger = _validated_comment_ledger(
+        raw_ledger,
+        requested=requested,
+        eligible_count=len(eligible_parents),
+        covered_count=covered_count,
+        comment_count=len(records),
+        file_present=comments_payload is not None,
+    )
+
+    if not requested:
+        status = "not_requested"
+    elif records:
+        status = "collected_pending_model"
+    elif (
+        comments_payload is not None
+        and len(eligible_parents) > 0
+        and ledger["attempted_posts"] == len(eligible_parents)
+        and ledger["empty_results"] == len(eligible_parents)
+        and ledger["failures"] == 0
+        and ledger["stop_reason"] is None
+    ):
+        status = "empty"
+    else:
+        status = "unavailable"
+
+    limitations = [
+        "评论仅为公开页面采样，不代表全部评论或账号受众总体观点。",
+        "评论语义洞察待模型处理；确定性阶段不生成评论语义结论。",
+    ]
+    if status == "not_requested":
+        limitations.insert(0, "本任务未请求评论采样。")
+    elif status == "empty":
+        limitations.insert(0, "所有可分析父作品均明确返回空评论结果。")
+    elif status == "unavailable":
+        limitations.insert(0, "评论证据缺失、受限或未覆盖全部可分析父作品。")
+    else:
+        limitations.insert(
+            0, "代表评论按可见点赞数与源文件行号选择，不代表语义重要性。"
+        )
+
+    eligible_count = len(eligible_parents)
+    return {
+        "schema_version": 1,
+        "status": status,
+        "requested": requested,
+        "sampled_comment_count": len(records),
+        "eligible_parent_posts": eligible_count,
+        "covered_parent_posts": covered_count,
+        "parent_coverage_rate": (
+            rnd(covered_count / eligible_count, 4) if eligible_count else None
+        ),
+        "collection_ledger": copy.deepcopy(ledger),
+        "field_coverage": _comment_field_coverage(records),
+        "representative_selection": {
+            "max_parent_posts": COMMENT_REPRESENTATIVE_PARENT_LIMIT,
+            "max_per_parent": 1,
+            "order": "visible_likes_desc_then_source_line",
+        },
+        "representative_comments": _representative_comments(parsed),
+        "semantic": {
+            "status": "pending-model",
+            "model_version": None,
+            "insights": None,
+        },
+        "limitations": limitations,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1506,6 +1936,7 @@ def analyze_in_memory(
     *,
     classification_results: Any = None,
     with_taxonomy_prompt: bool = False,
+    comments_payload: bytes | None = None,
 ) -> AnalysisResult:
     """Build analysis from verified values without filesystem side effects."""
     if not isinstance(profile, dict):
@@ -1522,6 +1953,13 @@ def analyze_in_memory(
     collected = len(all_posts)
     _, valid, flagged, missing, restricted = split_samples(all_posts)
     valid_count = len(valid)
+    platform = profile.get("platform") or params.get("platform")
+    comment_analysis = analyze_comments_in_memory(
+        valid,
+        params,
+        platform=platform,
+        comments_payload=comments_payload,
+    )
 
     cadence = compute_cadence(valid)
     if (
@@ -1649,7 +2087,7 @@ def analyze_in_memory(
 
     meta = {
         "task_id": params.get("task_id"),
-        "platform": profile.get("platform") or params.get("platform"),
+        "platform": platform,
         "profile_url": profile.get("profile_url"),
         "account_name": profile.get("account_name"),
         "requested_limit": params.get("requested_limit"),
@@ -1688,6 +2126,7 @@ def analyze_in_memory(
         "performance_meta": performance_meta,
         "evidence_coverage": copy.deepcopy(evidence_coverage),
         "core_insights": core_insights,
+        "comment_analysis": comment_analysis,
         "posts": post_records,
         **copy.deepcopy(classification),
     }
@@ -1721,6 +2160,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     profile = load_profile(task_dir)
     normalized_rows = load_posts(task_dir)
     task_params = load_task_params(task_dir, args)
+    comments_payload: bytes | None = None
+    comments_path = os.path.join(task_dir, "source", "comments.jsonl")
+    if os.path.exists(comments_path):
+        try:
+            with open(comments_path, "rb") as fh:
+                comments_payload = fh.read()
+        except OSError as e:
+            print(f"ERROR: 评论证据读取失败: {e}", file=sys.stderr)
+            return 2
     classification_results: Any = None
     if args.llm_tax_results:
         try:
@@ -1737,9 +2185,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             task_params,
             classification_results=classification_results,
             with_taxonomy_prompt=args.with_llm_tax,
+            comments_payload=comments_payload,
         )
     except (TypeError, ValueError) as e:
-        print(f"ERROR: 分类结果校验失败: {e}", file=sys.stderr)
+        print(f"ERROR: 分析输入校验失败: {e}", file=sys.stderr)
         return 2
 
     analysis = result.analysis

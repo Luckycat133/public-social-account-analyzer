@@ -420,6 +420,161 @@ def test_content_patterns_separate_pending_from_model_unknown_and_other():
     assert "&lt;script&gt;topic&lt;/script&gt;" in html
 
 
+def test_content_patterns_render_comment_evidence_contract_in_both_formats():
+    analysis = {
+        "meta": {"platform": "douyin"},
+        "posts": [],
+        "comment_analysis": {
+            "schema_version": 1,
+            "status": "collected_pending_model",
+            "requested": True,
+            "sampled_comment_count": 2,
+            "eligible_parent_posts": 3,
+            "covered_parent_posts": 1,
+            "parent_coverage_rate": 1 / 3,
+            "collection_ledger": {
+                "attempted_posts": 3,
+                "comments_collected": 2,
+                "empty_results": 1,
+                "failures": 1,
+                "per_post_limit": 20,
+                "stop_reason": None,
+            },
+            "field_coverage": {
+                "author": {"present": 1, "total": 2, "rate": 0.5},
+                "text": {"present": 2, "total": 2, "rate": 1.0},
+                "likes": {"present": 1, "total": 2, "rate": 0.5},
+                "published_at": {"present": 0, "total": 2, "rate": 0.0},
+                "collected_at": {"present": 2, "total": 2, "rate": 1.0},
+            },
+            "representative_selection": {
+                "max_parent_posts": 3,
+                "max_per_parent": 1,
+                "order": "visible_likes_desc_then_source_line",
+            },
+            "representative_comments": [
+                {
+                    "comment_id": "c1",
+                    "parent_post_id": "1001",
+                    "parent_post_url": "https://www.douyin.com/video/1001",
+                    "author": None,
+                    "text": "公开问题",
+                    "likes": None,
+                    "published_at": None,
+                    "collected_at": "2026-07-03T10:00:00+08:00",
+                    "source_artifact": "source/comments.jsonl",
+                    "source_line": 2,
+                }
+            ],
+            "semantic": {
+                "status": "pending-model",
+                "model_version": None,
+                "insights": None,
+            },
+            "limitations": ["仅为公开评论样本。"],
+        },
+    }
+
+    md, html = render_report.build_content_patterns(analysis)
+
+    for rendered in (md, html):
+        for expected in (
+            "评论证据",
+            "collected_pending_model",
+            "2",
+            "1/3",
+            "0.3333",
+            "attempted_posts",
+            "comments_collected",
+            "empty_results",
+            "failures",
+            "per_post_limit",
+            "stop_reason",
+            "字段覆盖率",
+            "author",
+            "published_at",
+            "代表评论",
+            "c1",
+            "公开问题",
+            "source/comments.jsonl:2",
+            "pending-model",
+            "语义洞察待模型处理",
+            "仅为公开评论样本。",
+        ):
+            assert expected in rendered
+        assert "高频问题" not in rendered
+        assert "争议点" not in rendered
+        assert "需求洞察" not in rendered
+    assert "—" in md
+    assert "—" in html
+    assert (
+        "[作品 1001](https://www.douyin.com/video/1001)" in md
+    )
+    assert (
+        'href="https://www.douyin.com/video/1001"' in html
+    )
+
+
+def test_comment_report_escapes_hostile_fields_and_drops_noncanonical_link():
+    hostile = '<script>alert(1)</script>|![x](javascript:y)'
+    analysis = {
+        "meta": {"platform": "douyin"},
+        "posts": [],
+        "comment_analysis": {
+            "schema_version": 1,
+            "status": "collected_pending_model",
+            "requested": True,
+            "sampled_comment_count": 1,
+            "eligible_parent_posts": 1,
+            "covered_parent_posts": 1,
+            "parent_coverage_rate": 1.0,
+            "collection_ledger": {
+                "attempted_posts": 1,
+                "comments_collected": 1,
+                "empty_results": 0,
+                "failures": 0,
+                "per_post_limit": 20,
+                "stop_reason": None,
+            },
+            "field_coverage": {},
+            "representative_selection": {
+                "max_parent_posts": 3,
+                "max_per_parent": 1,
+                "order": "visible_likes_desc_then_source_line",
+            },
+            "representative_comments": [{
+                "comment_id": hostile,
+                "parent_post_id": hostile,
+                "parent_post_url": "https://evil.example/video/1001",
+                "author": hostile,
+                "text": hostile,
+                "likes": 1,
+                "published_at": None,
+                "collected_at": None,
+                "source_artifact": "source/comments.jsonl",
+                "source_line": 1,
+            }],
+            "semantic": {
+                "status": "pending-model",
+                "model_version": None,
+                "insights": None,
+            },
+            "limitations": [hostile],
+        },
+    }
+
+    md, html = render_report.build_content_patterns(analysis)
+
+    for rendered in (md, html):
+        assert "<script>" not in rendered
+        assert "https://evil.example" not in rendered
+    assert "[x](javascript:" not in md
+    assert 'href="javascript:' not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in md
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert "href=" not in html
+
+
 def _auditable_performance_item(**overrides):
     item = {
         "platform": "douyin",

@@ -697,33 +697,39 @@ class _SafeCommentAdapter:
         (
             "douyin",
             {
+                "platform": "douyin",
                 "post_id": "7001",
                 "post_url": (
                     "https://iesdouyin.com/video/7001?token=QUERY_SECRET"
                     "#FRAGMENT_SECRET"
                 ),
+                "collection_status": "SUCCESS",
             },
             ("7001", "https://www.douyin.com/video/7001"),
         ),
         (
             "bilibili",
             {
+                "platform": "bilibili",
                 "post_id": "BV1abc",
                 "post_url": (
                     "https://bilibili.com/video/BV1abc?token=QUERY_SECRET"
                     "#FRAGMENT_SECRET"
                 ),
+                "collection_status": "SUCCESS",
             },
             ("BV1abc", "https://www.bilibili.com/video/BV1abc"),
         ),
         (
             "weibo",
             {
+                "platform": "weibo",
                 "post_id": "a1",
                 "post_url": (
                     "https://www.weibo.com/123456/a1?token=QUERY_SECRET"
                     "#FRAGMENT_SECRET"
                 ),
+                "collection_status": "SUCCESS",
             },
             ("a1", "https://weibo.com/123456/a1"),
         ),
@@ -733,6 +739,110 @@ def test_comment_parent_urls_are_platform_canonical(platform, post, expected):
     import collect
 
     assert collect._valid_comment_parent(platform, post) == expected
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"collection_status": "FAILED"},
+        {"collection_status": "DELETED"},
+        {"collection_status": "RESTRICTED"},
+        {"is_pinned": True},
+        {"is_repost": True},
+        {"is_promoted": True},
+    ],
+    ids=("failed", "deleted", "restricted", "pinned", "repost", "promoted"),
+)
+def test_comment_parent_rejects_six_analysis_ineligible_classes(overrides):
+    import collect
+
+    post = {
+        "platform": "douyin",
+        "post_id": "7001",
+        "post_url": "https://www.douyin.com/video/7001",
+        "collection_status": "SUCCESS",
+    }
+    post.update(overrides)
+
+    assert collect._valid_comment_parent("douyin", post) is None
+
+
+def test_comment_collection_attempts_only_distinct_valid_unflagged_parents(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class EligibilityAdapter(_SafeCommentAdapter):
+        def __init__(self):
+            self.calls = []
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            posts = [
+                {
+                    "platform": "douyin",
+                    "post_id": "7001",
+                    "post_url": "https://www.douyin.com/video/7001",
+                    "collection_status": "SUCCESS",
+                },
+                {
+                    "platform": "douyin",
+                    "post_id": "7002",
+                    "post_url": "https://www.douyin.com/video/7002",
+                    "collection_status": "PARTIAL",
+                },
+                {
+                    "platform": "douyin",
+                    "post_id": "7001",
+                    "post_url": "https://www.douyin.com/video/7001",
+                    "collection_status": "SUCCESS",
+                },
+            ]
+            excluded = (
+                {"collection_status": "FAILED"},
+                {"collection_status": "DELETED"},
+                {"collection_status": "RESTRICTED"},
+                {"is_pinned": True},
+                {"is_repost": True},
+                {"is_promoted": True},
+            )
+            for offset, overrides in enumerate(excluded, start=3):
+                post = {
+                    "platform": "douyin",
+                    "post_id": str(7000 + offset),
+                    "post_url": f"https://www.douyin.com/video/{7000 + offset}",
+                    "collection_status": "SUCCESS",
+                }
+                post.update(overrides)
+                posts.append(post)
+            return posts
+
+        def collect_comments(self, post_url, limit=20):
+            self.calls.append(post_url)
+            post_id = post_url.rsplit("/", 1)[-1]
+            return [{"comment_id": f"c-{post_id}", "text": "公开评论"}]
+
+    adapter = EligibilityAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "task"
+
+    assert collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(out),
+        include_comments=True,
+    ) == 0
+
+    assert adapter.calls == [
+        "https://www.douyin.com/video/7001",
+        "https://www.douyin.com/video/7002",
+    ]
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["comment_collection"] == {
+        "attempted_posts": 2,
+        "comments_collected": 2,
+        "empty_results": 0,
+        "failures": 0,
+        "per_post_limit": 20,
+    }
 
 
 def test_douyin_item_url_is_canonical_before_calls_and_persistence(

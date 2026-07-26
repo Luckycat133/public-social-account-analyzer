@@ -4,7 +4,7 @@
 它分三层：
 
 1. **MVP 验收标准 + 11 条端到端用例摘要**（见 `evals/evals.json` 机器可读子集）。
-2. **单元测试（§单元测试）**：15 条确定性、可自动化、离线的单元用例，对应脚本
+2. **单元测试（§单元测试）**：16 条确定性、可自动化、离线的单元用例，对应脚本
    `scripts/normalize.py` 与 `scripts/analyze.py` 的纯函数，以及 `scripts/collectors/*.py`
    的路由/降级行为。每条均给出 **输入** 与 **预期**，可直接映射为 pytest 用例
    （见 `tests/`）。
@@ -49,7 +49,7 @@
 | 6 | 登录墙中途 | PARTIAL + stop_reason 拆分、不绕过、保留已采数据 |
 | 7 | 不可见字段 | null 而非 0、field_visibility |
 | 8 | 数量+日期双约束 | 取交集、执行前回显 |
-| 9 | 评论采样 | 每篇≤20条、失败不阻塞 |
+| 9 | 评论采样与确定性证据 | 每篇≤20条、四状态、代表评论、语义待模型处理 |
 | 10 | 拒绝虚假完成 | 无采集不出报告 |
 | 11 | 抖音无登录沙箱索引降级 | Agent 来源核验 + 脚本字段一致性校验、PARTIAL、本地键披露、不伪造链接 |
 
@@ -57,7 +57,7 @@
 
 # 单元测试
 
-> 以下 15 条用例为 **确定性、离线、可自动化** 的单元测试，覆盖 `scripts/normalize.py`、
+> 以下 16 条用例为 **确定性、离线、可自动化** 的单元测试，覆盖 `scripts/normalize.py`、
 > `scripts/analyze.py` 的纯函数与 `scripts/collectors/*.py` 的路由/降级逻辑。
 > 每条用例给出「输入（Input）」与「预期（Expected）」，已落地为 `tests/` 下的 pytest
 > 用例并全部通过（见报告 `.workbuddy/sdd/task-13-report.md`）。
@@ -170,6 +170,24 @@
 - **预期**：任务**继续**采集其余内容；失效条被隔离为 `missing`（进入 `missing` 分组），
   不污染整体；任务级 `stop_reason` 保持 `null`，仅 `task_status` 降级为 `PARTIAL`
   （内容级原因不写入任务级 `stop_reason`，见 exceptions.md §1.1）。
+
+### CASE-016 评论证据、代表样本与语义边界
+
+- **输入**：已请求评论，严格 8 字段 JSONL 含多个父作品、同父多条评论、可见
+  `likes=0`、`likes=null`、相同点赞及部分评论级失败；账本与文件行数一致。
+- **预期**：
+  - 至少一条有效评论即为 `collected_pending_model`，失败不覆盖已有证据；明确全空与不可用
+    分别为 `empty` / `unavailable`，未请求为 `not_requested`。
+  - 仅 `SUCCESS` / `PARTIAL`、未明确置顶/转载/推广且具有规范 ID 绑定作品 URL 的不同
+    父作品进入采集与覆盖；`FAILED` / `DELETED` / `RESTRICTED`、三类明确标记、错父锚点、
+    重复 ID、每父超过 20 条、`NaN` / `Infinity`、缺失/额外字段、无时区时间或账本矛盾
+    整体失败。
+  - JSONL 仅以物理 LF 分隔记录并接受 CRLF；合法字符串中的 U+2028 / U+2029 原样保留，
+    不能用作两个对象之间的记录分隔符。
+  - 每父按可见点赞降序、源行号升序选一条，再跨父取前三；`likes=0` 优先于 `null`，输出
+    保留 `source/comments.jsonl:<line>`。
+  - `semantic.status=pending-model`、`model_version=null`、`insights=null`；确定性脚本不生成
+    高频问题、争议点、需求或情绪结论，且该 pending 状态不改变全局完成门。
 
 ---
 

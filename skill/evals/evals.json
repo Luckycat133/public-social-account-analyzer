@@ -100,12 +100,16 @@
       "id": 9,
       "name": "comments-sampling-capped",
       "prompt": "分析这个B站账号最近30条视频，顺便看看评论区大家在问什么：https://space.bilibili.com/946974",
-      "expected_output": "开启评论采样，每篇最多采20条公开可见评论；评论采集失败不阻塞主任务；输出用户高频问题/需求清单。",
+      "expected_output": "开启评论采样，每篇最多采20条公开可见评论；只有未明确置顶/转载/推广的 SUCCESS/PARTIAL 规范父作品进入采集和分析，评论采集失败不阻塞主任务。严格 JSONL 只以物理 LF 分隔记录并接受 CRLF。确定性报告输出评论状态、父作品覆盖、采集账本、字段覆盖和最多3条跨父代表评论；评论语义保持 pending-model，等待模型处理，不由脚本补造高频问题或需求结论。",
       "assertions": [
         "每篇内容采集的评论不超过20条",
         "仅采集公开可见评论，未展开无限加载",
+        "只有 SUCCESS/PARTIAL、未明确置顶/转载/推广且具有规范 ID 绑定 URL 的不同父作品调用评论适配器并计入分析；FAILED/DELETED/RESTRICTED 和三类标记内容均排除",
+        "JSONL 仅以 LF 分隔记录、接受 CRLF；字符串内 U+2028/U+2029 被保留且不能分隔两个对象",
         "单条内容评论不可见/失败时跳过并继续，主流程未中断",
-        "评论洞察输出了高频问题或需求线索"
+        "至少一条有效评论时 comment_analysis.status=collected_pending_model；明确全空与不可用没有混淆",
+        "报告同步展示父作品覆盖、采集账本、字段覆盖及带 source/comments.jsonl 行号的代表评论",
+        "semantic.status=pending-model 且 model_version/insights 为 null；确定性脚本没有生成高频问题、争议点或需求结论"
       ]
     },
     {

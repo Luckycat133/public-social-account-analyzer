@@ -112,7 +112,10 @@ def _validate_jsonl(payload: bytes, label: str) -> None:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise PipelineError(f"{label} is not UTF-8") from exc
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    lines = [] if text == "" else text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
@@ -397,6 +400,11 @@ def run_pipeline(
             analysis_params,
             classification_results=classification_results,
             with_taxonomy_prompt=with_taxonomy_prompt,
+            comments_payload=(
+                reads["source/comments.jsonl"].payload
+                if "source/comments.jsonl" in reads
+                else None
+            ),
         )
         if (analysis.analysis.get("sample_boundary") or {}).get("valid", 0) < 1:
             raise PipelineError("ANALYZE failed: no analyzable rows")

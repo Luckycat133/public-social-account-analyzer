@@ -57,11 +57,13 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
    - **季节性 / 学期检测**：输出 `monthly_distribution`、`seasonal_intensity`（月变异系数）、`break_month_share`（寒暑假月份 1/2/7/8 占比）。
    - **内联可视化**：报告含发布时间-播放量散点图、高低表现雷达图、字段覆盖率徽章、发布时段分布（24 小时）柱状图（零依赖 SVG/HTML）。
    - **LLM 协同分类（可选）**：`--with-llm-tax` 在分析工作区生成分类 Prompt 模版（`taxonomy-prompt.md`）。`--classification-results <json>` 仅接受覆盖全部有效父作品的严格 JSON 数组；逐条核验 `post_id`、字段类型、枚举与置信度后，把原字节封存为 `source/classification-results.json`。没有经过校验的完整分类时保持 `classification_status = pending-model` 且 `classification_version = null`，分析任务为 `PARTIAL`，不得臆造分类。
+   - **评论证据（可选采集、确定性分析）**：`--comments` 开启后，流水线从同一已核验提交读取严格 8 字段 `source/comments.jsonl`；仅未明确置顶/转载/推广的 `SUCCESS` / `PARTIAL` 规范父作品可进入采集与分析。记录只以物理 LF 分隔（接受 CRLF，字符串内 U+2028 / U+2029 不分行），并校验父作品、账本、每父 20 条上限与四种状态（`not_requested` / `empty` / `unavailable` / `collected_pending_model`），再按可见点赞数与源行号最多选择 3 个父作品的代表评论。原始评论字节只复制、不重写。
+   - **评论语义待模型处理**：确定性脚本只输出状态、覆盖、账本、字段覆盖和代表评论；`semantic.status=pending-model`、版本与洞察为 `null`，不得自动生成高频问题、争议点、需求或情绪结论。该状态不改变全局分析完成门。
    - 标注主题、形式、钩子类型等策略维度，提取高低表现对比特征。
 
 6. **报告渲染与独立提交**
    - 流水线在内存中生成 `account-analysis-report.md`、`dashboard.html` 与 `analysis.json`；缺输入、任一章节异常、坏链接或输出校验失败均为致命错误。
-   - Markdown 与 HTML 在既有 12 个章节中同步显示平台账号字段、五类采集状态、分类生命周期、高/低表现完整证据及 `core_insights`；待分类不与模型 `unknown`/`other` 混用，主页锚点不渲染为作品链接。
+   - Markdown 与 HTML 在既有 12 个章节中同步显示平台账号字段、五类采集状态、分类生命周期、高/低表现完整证据、`core_insights` 及评论证据状态/覆盖/账本/代表样本；待分类不与模型 `unknown`/`other` 混用，主页锚点不渲染为作品链接。
    - 校验通过后才排他预留分析目录，create-only 写入精确白名单并创建新的 `manifest.json` / `.complete`。`.complete` 表示持久提交；`task.json.task_status` 表示业务完整性。
    - 报告中显著标记声明：“公开页面快照，不代表账号后台真实曝光和转化”。
 
@@ -84,6 +86,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - **不跨平台打总分**：不同平台指标可见度不同，不构造统一总分。
 - **中位数优先**：聚合指标优先采用中位数与四分位数，避免极值拉偏平均数。
 - **证据 100% 覆盖**：报告中每项核心洞察必须有可复核证据；正常/A 级数据使用具体作品 URL，B 级搜索索引只能使用精确账号主页并明确“无单条详情链接”。
+- **评论空结果 ≠ 不可用**：只有已请求、明确空文件、所有合格父作品均返回空、无失败且无中止时才写 `empty`；文件缺失、保护中止或覆盖不完整写 `unavailable`。未请求却出现评论文件或非空账本必须在输出前失败。
 - **抖音动态 JS 虚拟机渲染与降级（实验性）**：SSR 缺失或作品列表结构无法识别时默认自动降级：使用新的临时用户目录启动可选系统浏览器，先观察公开 CDP 网络响应，再从可见作品卡片提取最小字段；不附着或复用登录状态。已识别的空列表返回 `NO_PUBLIC_CONTENT`。`SOCIAL_BROWSER_FALLBACK=0` 和 `--no-browser-fallback` 仅控制抖音浏览器降级。B站收到登录、验证、限流或访问限制等平台保护响应时立即停止当前任务，不重试、不轮换身份、不转浏览器。抖音未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外仍为 `PARSER_FAILED`。不复现签名或绕过登录、验证码、滑块、频控。
 - **抖音 Web 索引降级（实验性）**：仅在直连已经诚实停止后由 Agent 编排；优先官方精选真实作品页，其次精确主页搜索索引。Agent 核验来源/作品区，离线脚本全批校验结构与字段一致性；零 Python 第三方依赖，始终 `PARTIAL`。搜索索引不计算精确发布时段或衍生互动率，详见专门参考。
 
@@ -122,6 +125,7 @@ legacy 目录；不得用它们原地修改已提交的采集或分析工作区�
 - [ ] 采集与分析目录分别通过自身 `manifest.json` / `.complete` 核验，采集目录字节未改变
 - [ ] `source/collection-provenance.json` 记录采集 commit SHA-256，且不含本机绝对路径
 - [ ] 索引降级的来源、快照年龄、ID/链接语义与非穷尽限制已进入最终报告
+- [ ] `comment_analysis` 四状态、父覆盖、账本与代表评论已同步进入 Markdown/HTML；评论语义明确为 `pending-model`，未由脚本补造结论
 
 ## 参考文件索引
 
