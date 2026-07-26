@@ -795,6 +795,89 @@ def test_default_douyin_output_hashes_the_canonical_sec_uid(
     assert not list((repo / "workspace").glob("douyin-4-*"))
 
 
+def test_public_task_preserves_comment_platform_protection_reason(
+    monkeypatch, tmp_path
+):
+    from collectors.bilibili import BilibiliError, STOP_VERIFICATION
+
+    class VerificationCommentAdapter(RecordingBilibiliAdapter):
+        def __init__(self):
+            super().__init__()
+            self.comment_calls = 0
+
+        def collect_comments(self, post_url, limit=20):
+            self.comment_calls += 1
+            raise BilibiliError(STOP_VERIFICATION, "verification required")
+
+    adapter = VerificationCommentAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "comment-protection"
+
+    assert collect.run(
+        BILIBILI_URL,
+        out_dir=str(out),
+        include_comments=True,
+    ) == 0
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] == STOP_VERIFICATION
+    assert adapter.comment_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("existing", "candidate", "expected"),
+    [
+        (None, "VERIFICATION_REQUIRED", "VERIFICATION_REQUIRED"),
+        ("PARSER_FAILED", "VERIFICATION_REQUIRED", "VERIFICATION_REQUIRED"),
+        ("NO_PUBLIC_CONTENT", "ACCESS_RESTRICTED", "ACCESS_RESTRICTED"),
+        ("LOGIN_REQUIRED", "VERIFICATION_REQUIRED", "LOGIN_REQUIRED"),
+        ("PARSER_FAILED", "COMMENTS_UNAVAILABLE", "PARSER_FAILED"),
+        (None, "COMMENTS_UNAVAILABLE", "COMMENTS_UNAVAILABLE"),
+    ],
+)
+def test_dominant_stop_reason_prioritizes_task_protection(
+    existing, candidate, expected
+):
+    assert collect._dominant_stop_reason(existing, candidate) == expected
+
+
+def test_comment_protection_dominates_earlier_parser_failure(
+    monkeypatch, tmp_path
+):
+    from collectors.bilibili import (
+        BilibiliError,
+        STOP_PARSER_FAILED,
+        STOP_VERIFICATION,
+    )
+
+    class ParserThenVerificationAdapter(RecordingBilibiliAdapter):
+        def collect_profile(self, url):
+            self.network_calls.append(("collect_profile", url))
+            raise BilibiliError(STOP_PARSER_FAILED, "profile parser failed")
+
+        def collect_comments(self, post_url, limit=20):
+            raise BilibiliError(STOP_VERIFICATION, "verification required")
+
+    adapter = ParserThenVerificationAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "parser-then-comment-protection"
+
+    assert collect.run(
+        BILIBILI_URL,
+        out_dir=str(out),
+        include_comments=True,
+    ) == 0
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] == STOP_VERIFICATION
+    assert task["comment_collection"]["stop_reason"] == STOP_VERIFICATION
+    assert "error_code=PARSER_FAILED" in report
+    assert "error_code=VERIFICATION_REQUIRED" in report
+
+
 def test_default_reservation_creates_source_before_returning(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

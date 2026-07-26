@@ -43,8 +43,8 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 - `--date-from / --date-to`：采集时间范围（YYYY-MM-DD 或 ISO 8601，北京时间）。两者与 `--limit` 共同限定结果。
 - `--resume`：增量续采。读取 `--out` 指定目录既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧）。**必须配合 `--out`**，否则直接报错退出。
 - `--since`：增量续采起点（YYYY-MM-DD 或 ISO 8601），覆盖由既有数据推导的起始时间；仅与 `--resume` 联用。
-- `--browser-fallback`：显式启用浏览器降级。抖音默认已启用：SSR 缺失或作品列表结构无法识别时，按 CDP 网络响应观察、可见 DOM 卡片的顺序尝试；已识别的空列表返回 `NO_PUBLIC_CONTENT`。该参数同时显式启用 B站既有的浏览器传输层降级。
-- `--no-browser-fallback`：最高优先级的全局禁用；同时禁止 B站和抖音启动系统浏览器，即使 `BILIBILI_BROWSER_FALLBACK=1`，也只使用各平台的 HTTP/SSR 快速路径。
+- `--browser-fallback`：显式启用抖音浏览器降级。抖音默认已启用：SSR 缺失或作品列表结构无法识别时，按 CDP 网络响应观察、可见 DOM 卡片的顺序尝试；已识别的空列表返回 `NO_PUBLIC_CONTENT`。B站不使用该降级处理平台保护响应。
+- `--no-browser-fallback`：最高优先级地禁止抖音启动系统浏览器，只使用 HTTP/SSR 快速路径。B站遇到登录、验证、限流或访问限制时始终立即停止。
 
 抖音浏览器降级是实验性能力，不代表任何账号均可采集成功。它只读取无需登录可见的公开页面：每次运行创建并在退出时删除临时用户目录，不附着或复用本机 Chrome 的登录状态、Cookie 或用户配置。系统不会复现签名、绕过登录/验证码/滑块，或尝试规避频控；遇到这些限制会如实停止。
 
@@ -101,9 +101,9 @@ python skill/scripts/render_report.py --input <WORKSPACE_DIR>
 
 | 环境变量 | 默认值 | 作用说明 |
 |:---|:---|:---|
-| `BILIBILI_BROWSER_FALLBACK` | `0` | 设置为 `1` 启用 B站 传输层浏览器降级重试机制。 |
-| `SOCIAL_BROWSER_FALLBACK` | `1` | 抖音浏览器降级策略：`0` 禁用，`1` 启用；未设置时默认启用。命令行显式开关为全局策略并优先于此变量和 B站兼容变量。 |
-| `BROWSER_BIN` / `CHROME_BIN` | 空 | 指定用于传输层降级重试的 Chrome/Chromium/Edge 可执行文件路径。 |
+| `BILIBILI_BROWSER_FALLBACK` | `0` | 兼容保留；B站平台保护响应不会触发浏览器重试。 |
+| `SOCIAL_BROWSER_FALLBACK` | `1` | 抖音浏览器降级策略：`0` 禁用，`1` 启用；未设置时默认启用。命令行显式开关优先于此变量。 |
+| `BROWSER_BIN` / `CHROME_BIN` | 空 | 指定抖音浏览器降级使用的 Chrome/Chromium/Edge 可执行文件路径。 |
 
 浏览器为可选的系统前置条件，不新增 Python 运行时依赖。未发现可用浏览器时，抖音采集对外仍返回 `PARSER_FAILED`；采集报告可包含经过清理的诊断码 `BROWSER_UNAVAILABLE`，不记录 Cookie、请求头、签名查询参数或响应正文。
 
@@ -214,11 +214,8 @@ python skill/scripts/render_report.py --input workspace/douyin-index-<account>-<
 **原因**：遵守“未公开字段写 `null`”的合规原则。页面未展示的数据与真实“零值”（0）具有本质区别，填充 0 会严重拉低统计平均值与中位数。
 
 ### Q3: B站 采集遭遇 IP 拦截 (-799 / -412) 怎么办？
-**解决**：可开启传输层浏览器重试机制：
-```bash
-BILIBILI_BROWSER_FALLBACK=1 python skill/scripts/collect.py "https://space.bilibili.com/123456" --browser-fallback
-```
-系统将通过同机安装的浏览器真实出口网络进行重新重试。
+**解决**：当前任务立即停止并记录 `ACCESS_RESTRICTED`。不要在同一任务中重试、轮换
+`buvid` 或切换端点；请稍后创建新任务重新采集，并以已提交的部分数据和覆盖说明为准。
 
 ### Q4: macOS 下把 `--out` 指向 `/tmp` 或 `/var` 为什么被拒绝？
 

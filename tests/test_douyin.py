@@ -136,7 +136,8 @@ def test_docs_describe_zero_python_dependency_browser_fallback():
     assert "SSR 作品列表缺失" not in docs
     assert "若 `RENDER_DATA` 存在但无法识别作品列表，仍返回 `PARSER_FAILED`" not in docs
     assert "仅在主页没有可解析的 `RENDER_DATA`" not in docs
-    assert "同时禁止 B站和抖音" in usage
+    assert "B站遇到登录、验证、限流或访问限制时始终立即停止" in usage
+    assert "同时禁止 B站和抖音" not in usage
     assert "Headless Chrome" not in skill
     assert "urllib-only" not in module_text
     assert "不模拟浏览器" not in module_text

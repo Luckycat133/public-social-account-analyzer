@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,8 @@ from collectors.bilibili import (
     BilibiliError,
     STOP_ACCESS_RESTRICTED,
     STOP_LOGIN,
+    STOP_NO_PUBLIC_CONTENT,
+    STOP_PARSER_FAILED,
     STOP_VERIFICATION,
     Session,
 )
@@ -93,6 +96,90 @@ def test_protection_html_stops_after_one_response(
     assert len(calls) == 1
     assert rotations == []
     assert browser_calls == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not-json without platform-protection evidence",
+        "<html>an article about captcha design and verification workflows</html>",
+    ],
+)
+def test_plain_non_json_is_parser_failure_without_opening_circuit(
+    monkeypatch, body
+):
+    session = Session(browser_fallback=False)
+    calls: list[str] = []
+    responses = iter([
+        body,
+        json.dumps({"code": 0, "data": {"ok": True}}),
+    ])
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: calls.append(url) or next(responses),
+    )
+
+    with pytest.raises(BilibiliError) as first:
+        session.get_json("/x/web-interface/view", retry=1)
+    assert first.value.stop_reason == STOP_PARSER_FAILED
+
+    result = session.get_json("/x/web-interface/card", retry=1)
+    assert result["data"]["ok"] is True
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<html>captcha required</html>",
+        "<html>verification required</html>",
+    ],
+)
+def test_explicit_english_verification_page_opens_circuit(monkeypatch, body):
+    session = Session(browser_fallback=False)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: calls.append(url) or body,
+    )
+
+    with pytest.raises(BilibiliError) as first:
+        session.get_json("/x/web-interface/view", retry=1)
+    assert first.value.stop_reason == STOP_VERIFICATION
+
+    with pytest.raises(BilibiliError) as second:
+        session.get_json("/x/web-interface/card", retry=1)
+    assert second.value.stop_reason == STOP_VERIFICATION
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<html>WAF request was banned</html>",
+        "<html>rate limit: too many requests</html>",
+        "<html>access denied</html>",
+    ],
+)
+def test_explicit_non_json_access_protection_opens_circuit(monkeypatch, body):
+    session = Session(browser_fallback=False)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: calls.append(url) or body,
+    )
+
+    with pytest.raises(BilibiliError) as first:
+        session.get_json("/x/web-interface/view", retry=1)
+    assert first.value.stop_reason == STOP_ACCESS_RESTRICTED
+
+    with pytest.raises(BilibiliError) as second:
+        session.get_json("/x/web-interface/card", retry=1)
+    assert second.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert len(calls) == 1
 
 
 def test_platform_block_opens_session_circuit_breaker(monkeypatch):
@@ -272,3 +359,234 @@ def test_collect_tags_propagates_platform_protection(monkeypatch):
         session.collect_tags("BV1restricted")
 
     assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
+
+
+def test_comments_use_the_shared_task_session_for_view_and_reply(monkeypatch):
+    collector = BilibiliCollector(browser_fallback=False)
+    session = collector._new_session()
+    session.cookies = {"buvid3": "stable-public-id"}
+    calls: list[tuple[str, dict | None]] = []
+
+    def get_json(path, params=None, **kwargs):
+        calls.append((path, params))
+        if path == "/x/web-interface/view":
+            return {"code": 0, "data": {"aid": 123}}
+        if path == "/x/v2/reply":
+            return {"code": 0, "data": {"replies": []}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(session, "get_json", get_json)
+    assert collector.collect_comments(
+        "https://www.bilibili.com/video/BV1abc"
+    ) == []
+    assert calls == [
+        ("/x/web-interface/view", {"bvid": "BV1abc"}),
+        (
+            "/x/v2/reply",
+            {"type": 1, "oid": 123, "mode": 3, "next": 0},
+        ),
+    ]
+
+
+def test_comments_preserve_verification_and_open_task_circuit(monkeypatch):
+    collector = BilibiliCollector(browser_fallback=False)
+    session = collector._new_session()
+    session.cookies = {"buvid3": "stable-public-id"}
+    calls: list[str] = []
+    bodies = iter([
+        json.dumps({"code": 0, "data": {"aid": 123}}),
+        json.dumps({"code": -401, "message": "verification required"}),
+    ])
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: calls.append(url) or next(bodies),
+    )
+
+    with pytest.raises(BilibiliError) as exc_info:
+        collector.collect_comments("https://www.bilibili.com/video/BV1abc")
+
+    assert exc_info.value.stop_reason == STOP_VERIFICATION
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: calls.append(url) or json.dumps({"code": 0}),
+    )
+    with pytest.raises(BilibiliError) as later:
+        collector.collect_profile("https://space.bilibili.com/123")
+    assert later.value.stop_reason == STOP_VERIFICATION
+    assert len(calls) == 2
+
+
+def test_comments_check_existing_task_circuit_before_any_network(monkeypatch):
+    collector = BilibiliCollector(browser_fallback=False)
+    session = collector._new_session()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: (
+            calls.append(url)
+            or json.dumps({"code": -412, "message": "request was banned"})
+        ),
+    )
+    with pytest.raises(BilibiliError):
+        session.get_json("/x/web-interface/card", retry=1)
+
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: calls.append(url) or json.dumps({"code": 0}),
+    )
+    with pytest.raises(BilibiliError) as exc_info:
+        collector.collect_comments("https://www.bilibili.com/video/BV1abc")
+
+    assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert len(calls) == 1
+
+
+def test_missing_wbi_keys_are_parser_failure_not_platform_protection(
+    monkeypatch,
+):
+    session = Session(browser_fallback=False)
+    calls: list[str] = []
+    bodies = iter([
+        json.dumps({"code": 0, "data": {}}),
+        json.dumps({"code": 0, "data": {"ok": True}}),
+    ])
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: calls.append(url) or next(bodies),
+    )
+
+    with pytest.raises(BilibiliError) as exc_info:
+        session.get_json("/x/space/wbi/arc/search", wbi=True, retry=1)
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+
+    result = session.get_json("/x/web-interface/card", retry=1)
+    assert result["data"]["ok"] is True
+    assert len(calls) == 2
+
+
+def test_search_response_protection_trips_circuit_even_outside_get_json(
+    monkeypatch,
+):
+    session = Session(browser_fallback=False)
+    responses = iter([
+        {"code": 0, "data": {"card": {"name": "safe"}}},
+        {"code": -401, "message": "verification required"},
+    ])
+    monkeypatch.setattr(session, "get_json", lambda *args, **kwargs: next(responses))
+
+    with pytest.raises(BilibiliError) as exc_info:
+        session.discover_search("123", "https://space.bilibili.com/123", 30)
+    assert exc_info.value.stop_reason == STOP_VERIFICATION
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        session,
+        "_curl",
+        lambda url, referer: calls.append(url) or json.dumps({"code": 0}),
+    )
+    with pytest.raises(BilibiliError) as later:
+        Session.get_json(session, "/x/web-interface/card", retry=1)
+    assert later.value.stop_reason == STOP_VERIFICATION
+    assert calls == []
+
+
+def test_local_empty_and_parser_states_do_not_claim_access_restriction(
+    monkeypatch,
+):
+    session = Session(browser_fallback=False)
+    monkeypatch.setattr(
+        session,
+        "get_json",
+        lambda *args, **kwargs: {"code": 0, "data": {"card": {}}},
+    )
+    with pytest.raises(BilibiliError) as search_error:
+        session.discover_search("123", "https://space.bilibili.com/123", 30)
+    assert search_error.value.stop_reason == STOP_PARSER_FAILED
+
+    class EmptySession:
+        def ensure_buvid(self):
+            return None
+
+        def collect_pinned(self, mid):
+            return None
+
+        def discover_medialist(self, mid, limit):
+            return []
+
+        def discover_arc(self, mid, limit):
+            return []
+
+        def discover_search(self, mid, url, limit):
+            return []
+
+    collector = BilibiliCollector(browser_fallback=False)
+    monkeypatch.setattr(collector, "_new_session", EmptySession)
+    with pytest.raises(BilibiliError) as empty_error:
+        collector.collect_post_list("https://space.bilibili.com/123")
+    assert empty_error.value.stop_reason == STOP_NO_PUBLIC_CONTENT
+
+
+def test_empty_view_payload_is_parser_failure(monkeypatch):
+    class EmptyViewSession:
+        def ensure_buvid(self):
+            return None
+
+        def get_json(self, path, params):
+            return {"code": 0, "data": None}
+
+    collector = BilibiliCollector(browser_fallback=False)
+    monkeypatch.setattr(collector, "_new_session", EmptyViewSession)
+
+    with pytest.raises(BilibiliError) as exc_info:
+        collector.collect_post_detail("https://www.bilibili.com/video/BV1abc")
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+
+
+def test_usage_never_promises_bilibili_browser_retry_after_protection():
+    usage = (
+        Path(__file__).resolve().parents[1] / "USAGE.md"
+    ).read_text(encoding="utf-8")
+
+    assert "该参数同时显式启用 B站既有的浏览器传输层降级" not in usage
+    assert "设置为 `1` 启用 B站 传输层浏览器降级重试机制" not in usage
+    faq = usage.split("### Q3:", 1)[1].split("### Q4:", 1)[0]
+    assert "立即停止" in faq
+    assert "浏览器" not in faq
+
+
+def test_authoritative_docs_keep_bilibili_protection_and_comment_contracts_exact():
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    skill = (root / "skill/SKILL.md").read_text(encoding="utf-8")
+    bilibili = (
+        root / "skill/references/platform-bilibili.md"
+    ).read_text(encoding="utf-8")
+    douyin = (
+        root / "skill/references/platform-douyin.md"
+    ).read_text(encoding="utf-8")
+    exceptions = (
+        root / "skill/references/exceptions.md"
+    ).read_text(encoding="utf-8")
+
+    assert "`--no-browser-fallback` 会同时禁止 B站和抖音" not in readme
+    assert "`--no-browser-fallback` 同时禁止 B站和抖音" not in skill
+    assert "同时禁止 B站和抖音启动浏览器" not in douyin
+    assert "第 3 层：浏览器降级路径" not in bilibili
+    assert "BILIBILI_BROWSER_FALLBACK=1" not in bilibili
+
+    assert "B站" in readme and "平台保护" in readme and "立即停止" in readme
+    assert "仅控制抖音" in skill
+    assert "仅控制抖音" in douyin
+    assert "第 3 层：平台保护停止策略" in bilibili
+    assert "同一任务" in bilibili and "浏览器" in bilibili
+    assert "COMMENTS_UNAVAILABLE" in exceptions
+    assert "LOGIN_REQUIRED" in exceptions
+    assert "VERIFICATION_REQUIRED" in exceptions
+    assert "ACCESS_RESTRICTED" in exceptions
+    assert "优先于此前的非平台保护原因" in exceptions

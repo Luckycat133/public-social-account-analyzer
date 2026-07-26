@@ -115,6 +115,11 @@ _KNOWN_STOP_REASONS = frozenset({
     SR_ACCOUNT_UNAVAILABLE, SR_ACCESS_RESTRICTED, SR_PARSER_FAILED,
     SR_NO_PUBLIC_CONTENT, SR_INTERNAL,
 })
+_TASK_PROTECTION_REASONS = frozenset({
+    SR_LOGIN,
+    SR_VERIFICATION,
+    SR_ACCESS_RESTRICTED,
+})
 
 _ERROR_STAGE_MESSAGES = {
     "check_access": "访问检查不可用",
@@ -152,6 +157,23 @@ def _stop_reason_from_exc(e: Exception) -> str:
     if m and m.group(1) in _KNOWN_STOP_REASONS:
         return m.group(1)
     return SR_INTERNAL
+
+
+def _dominant_stop_reason(
+    existing: str | None,
+    candidate: str | None,
+) -> str | None:
+    """Keep the first reason unless a later platform protection must dominate."""
+    if candidate is None:
+        return existing
+    if existing is None:
+        return candidate
+    if (
+        candidate in _TASK_PROTECTION_REASONS
+        and existing not in _TASK_PROTECTION_REASONS
+    ):
+        return candidate
+    return existing
 
 
 def _load_adapters(
@@ -698,9 +720,21 @@ def _collect_and_persist_comments(
             returned = adapter.collect_comments(post_url, limit=per_post_limit)
             if not isinstance(returned, list):
                 raise ValueError("invalid comments result")
-        except Exception:
+        except Exception as error:
+            reason = _stop_reason_from_exc(error)
             outcome["failures"] += 1
             failed_parents.add(post_id)
+            if reason in _TASK_PROTECTION_REASONS:
+                outcome["stop_reason"] = reason
+                error_log.append({
+                    "url": post_url or None,
+                    "stage": "collect_comments",
+                    "error_code": reason,
+                    "message": _ERROR_STAGE_MESSAGES["collect_comments"],
+                    "occurred_at": occurred_at,
+                    "retryable": False,
+                })
+                break
             error_log.append({
                 "url": post_url or None,
                 "stage": "collect_comments",
@@ -1278,8 +1312,9 @@ def run(
     # Keep the default zero-argument loader call compatible with integrations
     # that replace it, while passing the policy only when it disables Douyin.
     if browser_fallback is not None:
-        # An explicit CLI policy is global: False overrides even the legacy
-        # BILIBILI_BROWSER_FALLBACK=1 environment setting.
+        # Preserve the legacy Bilibili configuration value for API compatibility.
+        # Bilibili never uses it after a platform-protection response; the CLI's
+        # observable browser-fallback behavior is Douyin-only.
         adapters = _load_adapters(
             douyin_browser_fallback=browser_fallback,
             bilibili_browser_fallback=browser_fallback,
@@ -1599,6 +1634,12 @@ def run(
                 collected_at,
                 reservation=reservation,
             )
+            comment_stop_reason = comment_collection.get("stop_reason")
+            if comment_stop_reason in _TASK_PROTECTION_REASONS:
+                stop_reason = _dominant_stop_reason(
+                    stop_reason,
+                    comment_stop_reason,
+                )
             print(
                 "[OK] 评论采样: "
                 f"attempted_posts={comment_collection['attempted_posts']} "

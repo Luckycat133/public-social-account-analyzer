@@ -26,20 +26,6 @@ from collectors.bilibili import (
 from collectors.weibo import WeiboCollector, ADAPTER_UNAVAILABLE
 
 
-class _CommentResponse:
-    def __init__(self, body):
-        self.body = body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
-
-    def read(self):
-        return self.body
-
-
 # ---------------------------------------------------------------------------
 # BilibiliCollector.supports 路由
 # ---------------------------------------------------------------------------
@@ -83,48 +69,65 @@ def test_bilibili_comments_return_empty_only_for_explicit_valid_empty(
     monkeypatch
 ):
     collector = BilibiliCollector()
-    monkeypatch.setattr(collector, "_bv_to_aid_urllib", lambda _bvid: 123)
-    monkeypatch.setattr(
-        "collectors.bilibili.urllib.request.urlopen",
-        lambda *_args, **_kwargs: _CommentResponse(
-            json.dumps({"code": 0, "data": {"replies": []}}).encode()
-        ),
-    )
+    session = collector._new_session()
+    session.cookies = {"buvid3": "stable-public-id"}
+    responses = iter([
+        {"code": 0, "data": {"aid": 123}},
+        {"code": 0, "data": {"replies": []}},
+    ])
+    monkeypatch.setattr(session, "get_json", lambda *args, **kwargs: next(responses))
 
     assert collector.collect_comments("https://www.bilibili.com/video/BV1abc") == []
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "reason"),
     [
-        json.dumps({"code": -101, "message": "secret restricted body"}).encode(),
-        json.dumps({"code": 0, "data": {"cursor": "missing replies"}}).encode(),
-        b"not-json secret response",
+        (
+            json.dumps({"code": -101, "message": "secret restricted body"}),
+            "ACCESS_RESTRICTED",
+        ),
+        (
+            json.dumps({"code": 0, "data": {"cursor": "missing replies"}}),
+            "COMMENTS_UNAVAILABLE",
+        ),
+        ("not-json secret response", "COMMENTS_UNAVAILABLE"),
+        ("<html>WAF access denied: request was banned</html>", "ACCESS_RESTRICTED"),
     ],
 )
-def test_bilibili_comments_raise_sanitized_unavailable_for_nonempty_failures(
-    monkeypatch, body
+def test_bilibili_comments_preserve_protection_or_sanitize_other_failures(
+    monkeypatch, body, reason
 ):
     collector = BilibiliCollector()
-    monkeypatch.setattr(collector, "_bv_to_aid_urllib", lambda _bvid: 123)
+    session = collector._new_session()
+    session.cookies = {"buvid3": "stable-public-id"}
+    responses = iter([
+        json.dumps({"code": 0, "data": {"aid": 123}}),
+        body,
+    ])
     monkeypatch.setattr(
-        "collectors.bilibili.urllib.request.urlopen",
-        lambda *_args, **_kwargs: _CommentResponse(body),
+        session,
+        "_curl",
+        lambda *_args, **_kwargs: next(responses),
     )
 
     with pytest.raises(BilibiliError) as exc_info:
         collector.collect_comments("https://www.bilibili.com/video/BV1abc")
 
-    assert exc_info.value.stop_reason == "COMMENTS_UNAVAILABLE"
+    assert exc_info.value.stop_reason == reason
     assert "secret" not in str(exc_info.value)
 
 
 def test_bilibili_comments_sanitize_aid_resolution_failure(monkeypatch):
     collector = BilibiliCollector()
+    session = collector._new_session()
+    session.cookies = {"buvid3": "stable-public-id"}
     monkeypatch.setattr(
-        collector,
-        "_bv_to_aid_urllib",
-        lambda _bvid: (_ for _ in ()).throw(RuntimeError("secret aid failure")),
+        session,
+        "get_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("secret aid failure")
+        ),
     )
 
     with pytest.raises(BilibiliError) as exc_info:
@@ -173,12 +176,6 @@ def test_direct_bilibili_item_methods_reject_untrusted_hosts(
         "_new_session",
         lambda: pytest.fail("invalid item URL must not create a session"),
     )
-    monkeypatch.setattr(
-        collector,
-        "_bv_to_aid_urllib",
-        lambda _bvid: pytest.fail("invalid item URL must not resolve aid"),
-    )
-
     with pytest.raises(BilibiliError):
         getattr(collector, method_name)(
             "https://evil.example/path/BV1abc?token=EVIL_HOST_SECRET"

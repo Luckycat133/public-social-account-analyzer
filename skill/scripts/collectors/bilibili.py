@@ -27,7 +27,6 @@ import re
 import subprocess
 import time
 import urllib.parse
-import urllib.request
 from datetime import datetime, timezone, timedelta
 from functools import reduce
 from typing import Any
@@ -49,10 +48,7 @@ STOP_LOGIN = "LOGIN_REQUIRED"
 STOP_VERIFICATION = "VERIFICATION_REQUIRED"
 STOP_ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
 STOP_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
-# 以下两个枚举在当前 B站路径下暂无触发点，保留以对齐 SKILL.md 全量枚举：
-#   PARSER_FAILED   —— 字段缺失/结构解析失败时应上抛（当前 JSON 解析失败已统一归
-#                      VERIFICATION_REQUIRED/ACCESS_RESTRICTED，未单独使用）。
-#   NO_PUBLIC_CONTENT —— 账号存在但无任何公开投稿时应上抛（当前降级链未单独判定）。
+# 本地结构缺失使用 PARSER_FAILED；端点均明确返回空列表使用 NO_PUBLIC_CONTENT。
 STOP_PARSER_FAILED = "PARSER_FAILED"
 STOP_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
 STOP_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
@@ -141,7 +137,7 @@ def _stop_reason_for_code(code: Any) -> str:
         -352: STOP_VERIFICATION,
         -403: STOP_ACCESS_RESTRICTED,
         -404: STOP_ACCOUNT_UNAVAILABLE,
-        -400: STOP_ACCESS_RESTRICTED,  # 间歇型风控拒绝，重试耗尽归访问受限而非账号不可用
+        -400: STOP_ACCESS_RESTRICTED,
         -101: STOP_ACCESS_RESTRICTED,
     }.get(code, STOP_ACCESS_RESTRICTED)
 
@@ -223,6 +219,17 @@ class Session:
     def _trip_circuit(self, error: BilibiliError) -> None:
         if error.stop_reason in PLATFORM_PROTECTION_REASONS:
             self._blocked_reason = error.stop_reason
+
+    def raise_for_task(
+        self,
+        stop_reason: str,
+        message: str,
+        raw: Any = None,
+    ) -> None:
+        """Raise a task error and trip the circuit for protection reasons."""
+        error = BilibiliError(stop_reason, message, raw)
+        self._trip_circuit(error)
+        raise error
 
     def get_json(
         self,
@@ -308,18 +315,51 @@ class Session:
             return b.fetch_text(full, headers)
 
     def _non_json_error(self, path: str, body: str) -> BilibiliError:
-        """响应体非 JSON（大概率是验证码/拦截 HTML 页）。轻量检测关键字：
-        命中 verify_captcha/验证码/滑块/geetest → VERIFICATION_REQUIRED；
-        命中 login/登录 → LOGIN_REQUIRED；否则归 ACCESS_RESTRICTED。"""
+        """Classify non-JSON only when the body contains explicit evidence."""
         low = (body or "").lower()
-        if any(k in low for k in ("verify_captcha", "验证码", "滑块", "geetest")):
+        if any(
+            marker in low
+            for marker in (
+                "verify_captcha",
+                "captcha required",
+                "verification required",
+                "验证码",
+                "滑块",
+                "geetest",
+            )
+        ):
             return BilibiliError(
                 STOP_VERIFICATION, f"非 JSON 响应疑似验证码/滑块拦截页: {path}"
             )
         if "login" in low or "登录" in low:
             return BilibiliError(STOP_LOGIN, f"非 JSON 响应疑似登录墙: {path}")
+        if any(
+            marker in low
+            for marker in (
+                "waf",
+                "request was banned",
+                "access denied",
+                "forbidden",
+                "too many requests",
+                "rate limit",
+                "rate-limit",
+                "ratelimit",
+                "precondition failed",
+                "请求过于频繁",
+                "访问受限",
+                "拒绝访问",
+                "请求被拦截",
+                "频控",
+                "限流",
+            )
+        ):
+            return BilibiliError(
+                STOP_ACCESS_RESTRICTED,
+                f"非 JSON 响应含平台访问限制证据: {path}",
+            )
         return BilibiliError(
-            STOP_ACCESS_RESTRICTED, f"非 JSON 响应: {path}", (body or "")[:500]
+            STOP_PARSER_FAILED,
+            f"非 JSON 响应无法解析: {path}",
         )
 
     def _refresh_wbi(self) -> None:
@@ -328,7 +368,7 @@ class Session:
         img = re.sub(r"\.png$", "", (wbi.get("img_url") or "").rsplit("/", 1)[-1])
         sub = re.sub(r"\.png$", "", (wbi.get("sub_url") or "").rsplit("/", 1)[-1])
         if not img or not sub:
-            raise BilibiliError(STOP_ACCESS_RESTRICTED, "nav 未返回 wbi_img 密钥")
+            self.raise_for_task(STOP_PARSER_FAILED, "nav 未返回 wbi_img 密钥")
         self._wbi = (img, sub)
 
     def ensure_buvid(self, force: bool = False) -> None:
@@ -381,7 +421,7 @@ class Session:
                 retry=3,
             )
             if data.get("code") != 0:
-                raise BilibiliError(
+                self.raise_for_task(
                     _stop_reason_for_code(data.get("code")),
                     f"medialist 失败: {data.get('message')}",
                 )
@@ -417,8 +457,9 @@ class Session:
             )
             if data.get("code") == 0 and data.get("data"):
                 return data["data"].get("bvid")
-        except BilibiliError:
-            pass
+        except BilibiliError as error:
+            if _is_platform_protection(error):
+                raise
         return None
 
     def collect_tags(self, bvid: str) -> list[str]:
@@ -463,7 +504,7 @@ class Session:
                 retry=3,
             )
             if data.get("code") != 0:
-                raise BilibiliError(
+                self.raise_for_task(
                     _stop_reason_for_code(data.get("code")), "arc/search 失败"
                 )
             vlist = (data.get("data") or {}).get("list", {}).get("vlist", [])
@@ -480,15 +521,18 @@ class Session:
         card = self.get_json("/x/web-interface/card", {"mid": mid})
         name = (card.get("data") or {}).get("card", {}).get("name", "")
         if not name:
-            raise BilibiliError(
-                STOP_ACCESS_RESTRICTED, f"无法解析昵称进行 search 降级 (mid={mid})"
+            self.raise_for_task(
+                STOP_PARSER_FAILED, f"无法解析昵称进行 search 降级 (mid={mid})"
             )
         data = self.get_json(
             "/x/web-interface/search/type",
             {"search_type": "bili_user", "keyword": name, "page": 1},
         )
         if data.get("code") != 0:
-            raise BilibiliError(STOP_ACCESS_RESTRICTED, "search/type 降级失败")
+            self.raise_for_task(
+                _stop_reason_for_code(data.get("code")),
+                "search/type 降级失败",
+            )
         res_data = data.get("data") or {}
         target = next(
             (r for r in res_data.get("result", [])
@@ -496,7 +540,7 @@ class Session:
             None,
         )
         if not target:
-            raise BilibiliError(STOP_ACCESS_RESTRICTED, "search/type 未匹配到该账号")
+            self.raise_for_task(STOP_PARSER_FAILED, "search/type 未匹配到该账号")
         return [it["bvid"] for it in target.get("res", []) if it.get("bvid")][:limit]
 
     def discover_dynamics(self, mid: str, limit: int) -> list:
@@ -504,7 +548,7 @@ class Session:
 
         分页用 offset + has_more；B站动态 feed 偶发返回空页（has_more 仍为 true），
         故用 empty_streak 守卫避免死循环。仅视频类动态（含 bvid）入列；转发卡
-        (orig 非空) 也保留 bvid 但标记 is_forward。失败（风控）则已采到的先返回。
+        (orig 非空) 也保留 bvid 但标记 is_forward。平台保护响应立即上抛并打开断路器。
         """
         out: list = []
         offset = ""
@@ -524,7 +568,10 @@ class Session:
                 retry=3,
             )
             if data.get("code") != 0:
-                break  # 风控/失败：返回已采到的
+                self.raise_for_task(
+                    _stop_reason_for_code(data.get("code")),
+                    "动态 feed 请求失败",
+                )
             d = data.get("data") or {}
             items = d.get("items") or []
             for it in items:
@@ -801,8 +848,7 @@ class BilibiliCollector(BaseCollector):
                         raise
                     pass
 
-            # 权威标签补全：tag API（/x/tag/archive/tags）更权威，合并进 base.hashtags。
-            # 仅作增量增强，失败不影响主流程（collect_tags 内部已吞异常返回 []）。
+            # 权威标签补全：普通不可用不影响主流程；平台保护响应必须立即停止。
             try:
                 api_tags = s.collect_tags(bvid)
             except BilibiliError as error:
@@ -829,7 +875,7 @@ class BilibiliCollector(BaseCollector):
 
         if not posts:
             raise BilibiliError(
-                STOP_ACCESS_RESTRICTED,
+                STOP_NO_PUBLIC_CONTENT,
                 f"三级降级链均无可用投稿 (mid={mid})",
             )
 
@@ -849,7 +895,7 @@ class BilibiliCollector(BaseCollector):
         # search 降级且全部 view 补全失败 → 空骨架无指标，如实上抛
         if source == "search" and not any_view_ok and posts:
             raise BilibiliError(
-                STOP_ACCESS_RESTRICTED,
+                STOP_PARSER_FAILED,
                 f"search 降级且全部 view 补全失败 (mid={mid})",
             )
         return posts
@@ -864,17 +910,17 @@ class BilibiliCollector(BaseCollector):
         s.ensure_buvid()
         data = s.get_json("/x/web-interface/view", {"bvid": bv})
         if data.get("code") != 0:
-            raise BilibiliError(
+            s.raise_for_task(
                 _stop_reason_for_code(data.get("code")),
                 f"view 失败: {data.get('message')}",
                 data,
             )
         view_data = data.get("data")
         if not view_data:
-            raise BilibiliError(STOP_ACCESS_RESTRICTED, "view 响应数据为空")
+            raise BilibiliError(STOP_PARSER_FAILED, "view 响应数据为空")
         return self.normalize_post(_build_post_raw_from_view(view_data, canonical_url))
 
-    # -- 评论采集（best-effort，urllib-only，免登录） --
+    # -- 评论采集（best-effort，与任务共享 curl Session，免登录） --
     def collect_comments(self, post_url: str, limit: int = 20) -> list[dict]:
         """取公开评论；仅明确成功的空 replies 可返回空列表。"""
         canonical_url = canonical_item_url("bilibili", post_url)
@@ -883,23 +929,33 @@ class BilibiliCollector(BaseCollector):
                 STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
             )
         bvid = canonical_url.rsplit("/", 1)[-1]
+        session = self._new_session()
         try:
-            aid = self._bv_to_aid_urllib(bvid)
-            if aid is None:
+            session._raise_if_blocked()
+            session.ensure_buvid()
+            view = session.get_json(
+                "/x/web-interface/view",
+                {"bvid": bvid},
+                retry=2,
+            )
+            view_data = view.get("data")
+            aid = view_data.get("aid") if isinstance(view_data, dict) else None
+            if isinstance(aid, bool) or not isinstance(aid, int) or aid <= 0:
                 raise BilibiliError(
                     STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
                 )
-            api = (
-                "https://api.bilibili.com/x/v2/reply"
-                f"?type=1&oid={aid}&mode=3&next=0"
+            data = session.get_json(
+                "/x/v2/reply",
+                {"type": 1, "oid": aid, "mode": 3, "next": 0},
+                referer=canonical_url,
+                retry=2,
             )
-            req = urllib.request.Request(
-                api,
-                headers={"User-Agent": UA, "Referer": VIDEO},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
             if not isinstance(data, dict) or data.get("code") != 0:
+                if isinstance(data, dict) and data.get("code") is not None:
+                    session.raise_for_task(
+                        _stop_reason_for_code(data.get("code")),
+                        "公开评论请求被平台拒绝",
+                    )
                 raise BilibiliError(
                     STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
                 )
@@ -929,8 +985,12 @@ class BilibiliCollector(BaseCollector):
                     }
                 )
             return out
-        except BilibiliError:
-            raise
+        except BilibiliError as error:
+            if _is_platform_protection(error):
+                raise
+            raise BilibiliError(
+                STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
+            ) from None
         except Exception:
             raise BilibiliError(
                 STOP_COMMENTS_UNAVAILABLE, "公开评论采样不可用"
@@ -942,8 +1002,7 @@ class BilibiliCollector(BaseCollector):
 
         走与主路径相同的 curl+wbi Session；动态 feed 端点为
         x/polymer/web-dynamic/v1/feed/space（web_location=333.1007，见 discover_dynamics）。
-        受风控时 discover_dynamics 返回已采到的子集，此处原样透传；若全部失败
-        （返回空），由上层判定 PARTIAL/停止，绝不伪装成功。
+        平台保护响应立即停止；普通空结果由上层按真实覆盖情况判定，绝不伪装成功。
         """
         mid = _mid_from_url(url)
         s = self._new_session()
@@ -953,24 +1012,6 @@ class BilibiliCollector(BaseCollector):
         except BilibiliError as e:
             raise e
         return [self.normalize_post(_build_dynamic_raw(c)) for c in cards]
-
-    @staticmethod
-    def _bv_to_aid_urllib(bvid: str) -> int | None:
-        """用 view 接口（urllib）把 BV 号解析为 aid；失败返回 None。"""
-        try:
-            api = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
-            req = urllib.request.Request(
-                api,
-                headers={"User-Agent": UA, "Referer": VIDEO},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            if data.get("code") != 0:
-                return None
-            return data.get("data", {}).get("aid")
-        except Exception:
-            return None
-
 
 # --------------------------------------------------------------------------
 # 内部构建（统一字段名，供 base.normalize_* 使用）

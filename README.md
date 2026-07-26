@@ -57,11 +57,11 @@ public-social-account-analyzer/             # 项目根目录
 
 | 平台 | 成熟度 | 适配器路径 | 核心能力 |
 |:---|:---|:---|:---|
-| **B站 (Bilibili)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/bilibili.py` | 三级接口降级链、WBI 签名、置顶/合集标识、传输层降级重试 |
+| **B站 (Bilibili)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/bilibili.py` | 三级接口降级链、WBI 签名、置顶/合集标识、任务级平台保护断路器 |
 | **抖音 (Douyin)** | 🟡 P0（实验性支持） | `skill/scripts/collectors/douyin.py` | SSR → 临时浏览器 CDP；直连受登录墙限制时可由 Agent 用公开 Web 索引证据生成诚实的 `PARTIAL` 快照 |
 | **微博 (Weibo)** | 🟡 P1 (条件支持) | `skill/scripts/collectors/weibo.py` | 需显式启用适配器；未启用时返回 `ADAPTER_UNAVAILABLE` |
 
-抖音浏览器降级默认自动尝试：当 SSR 缺失或作品列表结构无法识别时，依次使用公开的 CDP 网络响应和可见 DOM 卡片；已识别的空列表不会启动浏览器，而是返回 `NO_PUBLIC_CONTENT`。如果直连被登录墙/验证/空响应阻断，Agent 环境有 Web 连接器时还可导入官方精选页或精确主页搜索索引；该数据始终标记 `PARTIAL`，不把本地 ID、账号主页或陈旧索引冒充真实单条作品。`--no-browser-fallback` 会同时禁止 B站和抖音启动系统浏览器，详见 [USAGE.md](USAGE.md)。
+抖音浏览器降级默认自动尝试：当 SSR 缺失或作品列表结构无法识别时，依次使用公开的 CDP 网络响应和可见 DOM 卡片；已识别的空列表不会启动浏览器，而是返回 `NO_PUBLIC_CONTENT`。如果直连被登录墙/验证/空响应阻断，Agent 环境有 Web 连接器时还可导入官方精选页或精确主页搜索索引；该数据始终标记 `PARTIAL`，不把本地 ID、账号主页或陈旧索引冒充真实单条作品。`--no-browser-fallback` 仅控制抖音是否启动系统浏览器；B站收到平台保护响应会立即停止当前任务，不重试、不轮换身份，也不转浏览器，详见 [USAGE.md](USAGE.md)。
 
 ---
 
@@ -148,7 +148,7 @@ python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 pytest tests/
 ```
 
-当前包含 233 项离线单元测试，覆盖适配器解析、日期时间计算、去重映射、指标统计算法、抖音浏览器降级与索引证据导入策略。
+项目包含完整的离线单元测试套件，覆盖适配器解析、任务级断路器、日期时间计算、去重映射、指标统计算法、抖音浏览器降级与索引证据导入策略。
 
 ---
 
