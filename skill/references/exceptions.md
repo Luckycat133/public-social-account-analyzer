@@ -71,8 +71,17 @@
 
 ### 2.1 抖音授权 OpenAPI 的边界与失败语义
 
-- 独立授权命令只读取环境变量 `DOUYIN_OPENAPI_ACCESS_TOKEN`，且只采集该令牌所有者；缺少
-  令牌或输出目录已经存在时，在任何网络请求和目录写入前以参数错误退出。
+- 独立授权命令同时读取环境变量 `DOUYIN_OPENAPI_ACCESS_TOKEN` 与
+  `DOUYIN_OPENAPI_OPEN_ID`，且只采集这组 OAuth 凭据对应的账号；缺少、空白或含空白/
+  控制字符的任一值，以及输出目录已经存在时，都在任何网络请求和目录写入前以参数错误退出。
+- `POST /oauth/userinfo/` 只向固定官方端点发送
+  `application/x-www-form-urlencoded` 请求体中的 `access_token` 与 `open_id`；响应顶层
+  `err_no` 必须是整数 `0`，且响应 `data.open_id` 必须与输入逐字一致，否则关闭失败。
+  `GET /video/list/` 仍只在 `access-token` 请求头携带令牌。
+- 授权入口不得接受已构造、可携带其他账号状态的 client 实例；它必须始终用上述两项环境
+  凭据构造 client，测试缝最多注入无账号状态的 transport。即使 client 层已经校验身份，
+  编排层仍须在请求作品页前再次确认归一化资料的 `account_id` 与输入 `open_id` 逐字一致；
+  不一致时写 `FAILED / OPENAPI_ERROR`、保持非穷尽且不得请求作品页。
 - OpenAPI 在第一页前失败时写标准空内容产物并标记 `FAILED / OPENAPI_ERROR`；已完成至少
   一页后失败时保留既有作品并标记 `PARTIAL / OPENAPI_ERROR`。
 - `--all` 遇游标不前进或连续两页没有新增作品时，以 `PARSER_FAILED` 停止；有既有作品为
@@ -80,9 +89,9 @@
   `COMPLETED`。
 - 错误描述只写固定的清洗后分类，不写服务端描述、请求头、查询字符串、响应正文或底层
   transport 异常。令牌不得进入 URL、文件、stdout/stderr、异常链或诊断字段。
-- 不实现 OAuth 登录、授权码交换、token refresh 或第三方账号查询。由于当前官方参数表
-  未给出可在本仓库无凭据验证的完整样例，在线令牌验证保持 **pending**；仅集中构造已确认
-  的 `cursor` / `count` 查询参数，不推测其他接口或参数。
+- 不实现 OAuth 登录、授权码交换、token refresh 或第三方账号查询。当前仍未提供真实
+  token/open_id 做在线授权验收，因此端到端在线验证保持 **pending**；仅集中构造已确认的
+  `cursor` / `count` 查询参数，不推测其他接口或参数。
 
 ### 2.2 工作区提交不确定态
 

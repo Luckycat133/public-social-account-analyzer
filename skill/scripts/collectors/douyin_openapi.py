@@ -1,8 +1,8 @@
 """Official Douyin OpenAPI client for the access-token owner only.
 
 This module deliberately implements neither OAuth login nor token lifecycle
-operations.  The credential is sent only in the ``access-token`` header to
-the two fixed official endpoints below.
+operations.  ``oauth/userinfo`` receives the documented form credentials;
+``video/list`` receives the access token only in its documented header.
 """
 
 from __future__ import annotations
@@ -28,6 +28,15 @@ _SAFE_ERROR_CODES = frozenset({
     "SECRET_ECHO",
     "TRANSPORT_ERROR",
 })
+
+
+def _valid_credential(value: Any) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value.isprintable()
+        and not any(character.isspace() for character in value)
+    )
 
 
 class DouyinOpenAPIError(RuntimeError):
@@ -286,18 +295,24 @@ def _map_video(item: Any) -> dict[str, Any]:
 
 
 class DouyinOpenAPIClient:
-    """Minimal client for the account that owns the supplied access token."""
+    """Minimal client for the account identified by the OAuth credentials."""
 
     def __init__(
         self,
         access_token: str,
+        open_id: str | None = None,
         transport: Callable[..., Any] | None = None,
     ) -> None:
-        if not isinstance(access_token, str) or not access_token.strip():
+        if not _valid_credential(access_token):
             raise DouyinOpenAPIError(
                 "TOKEN_MISSING", "DOUYIN_OPENAPI_ACCESS_TOKEN is required"
             )
+        if not _valid_credential(open_id):
+            raise DouyinOpenAPIError(
+                "OPEN_ID_MISSING", "DOUYIN_OPENAPI_OPEN_ID is required"
+            )
         self._access_token = access_token
+        self._open_id = open_id
         self._transport = transport or _urllib_transport
 
     @staticmethod
@@ -334,12 +349,26 @@ class DouyinOpenAPIClient:
             and query["count"][0].isdigit()
         )
 
-    def _request(self, method: str, url: str, data: bytes | None = None) -> dict[str, Any]:
+    def _request(self, method: str, url: str) -> dict[str, Any]:
         if not self._is_fixed_endpoint(method, url):
             raise DouyinOpenAPIError(
                 "INVALID_ENDPOINT", "Douyin OpenAPI request endpoint is not allowed"
             )
-        headers = {"Accept": "application/json", "access-token": self._access_token}
+        if method == "POST":
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            data = urllib.parse.urlencode({
+                "access_token": self._access_token,
+                "open_id": self._open_id,
+            }).encode("ascii")
+        else:
+            headers = {
+                "Accept": "application/json",
+                "access-token": self._access_token,
+            }
+            data = None
         transport_failed = False
         raw = None
         try:
@@ -351,6 +380,13 @@ class DouyinOpenAPIClient:
                 "TRANSPORT_ERROR", "Douyin OpenAPI request failed"
             )
         payload = _decode_payload(raw)
+        if method == "POST" and (
+            type(payload.get("err_no")) is not int
+            or payload["err_no"] != 0
+        ):
+            raise DouyinOpenAPIError(
+                "OPENAPI_ERROR", "Douyin OpenAPI userinfo reported an error"
+            )
         if _contains_secret(payload, self._access_token):
             raise DouyinOpenAPIError(
                 "SECRET_ECHO", "Douyin OpenAPI response contained credential data"
@@ -358,16 +394,16 @@ class DouyinOpenAPIClient:
         return payload
 
     def collect_profile(self) -> dict[str, Any]:
-        payload = self._request("POST", _PROFILE_URL, b"")
+        payload = self._request("POST", _PROFILE_URL)
         data = payload.get("data")
         if not isinstance(data, dict):
             raise DouyinOpenAPIError(
                 "INVALID_RESPONSE", "Douyin OpenAPI returned invalid profile data"
             )
         open_id = data.get("open_id")
-        if not isinstance(open_id, str) or not open_id:
+        if not isinstance(open_id, str) or open_id != self._open_id:
             raise DouyinOpenAPIError(
-                "INVALID_RESPONSE", "Douyin OpenAPI profile is missing open_id"
+                "INVALID_RESPONSE", "Douyin OpenAPI profile identity did not match"
             )
         account_name = data.get("nickname") or data.get("display_name")
         if not isinstance(account_name, str) or not account_name:
@@ -444,7 +480,7 @@ class DouyinOpenAPIClient:
             page_error_code = None
             try:
                 payload = self._request(
-                    "GET", _video_list_request_url(cursor, count), None
+                    "GET", _video_list_request_url(cursor, count)
                 )
                 data = payload.get("data")
                 if not isinstance(data, dict):

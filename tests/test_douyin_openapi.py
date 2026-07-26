@@ -20,19 +20,27 @@ from collectors.douyin_openapi import DouyinOpenAPIClient, DouyinOpenAPIError
 
 
 TOKEN = "secret-openapi-token-123"
+OPEN_ID = "owner-open-id"
+AUTHORIZED_ENV = {
+    "DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN,
+    "DOUYIN_OPENAPI_OPEN_ID": OPEN_ID,
+}
+
+
+class _CredentialSubclass(str):
+    pass
 
 
 def _profile_response():
     return {
+        "err_no": 0,
         "data": {
-            "error_code": 0,
-            "open_id": "owner-open-id",
+            "open_id": OPEN_ID,
             "union_id": "owner-union-id",
             "nickname": "授权账号",
             "description": "公开简介",
             "avatar": "https://example.test/avatar.png",
         },
-        "extra": {"error_code": 0},
     }
 
 
@@ -58,11 +66,13 @@ def _video(video_id, *, title, create_time, is_top, play_count):
 
 
 class FakeTransport:
-    def __init__(self, responses):
+    def __init__(self, responses, hook=None):
         self.responses = list(responses)
         self.requests = []
+        self.hook = hook or (lambda stage: None)
 
     def __call__(self, *, method, url, headers, data=None):
+        self.hook("profile" if url.endswith("/oauth/userinfo/") else "pages")
         self.requests.append(
             {"method": method, "url": url, "headers": dict(headers), "data": data}
         )
@@ -72,19 +82,21 @@ class FakeTransport:
         return response
 
 
-def test_profile_uses_fixed_official_endpoint_and_header_token():
+def test_profile_uses_fixed_official_endpoint_and_form_credentials():
     transport = FakeTransport([_profile_response()])
 
-    profile = DouyinOpenAPIClient(TOKEN, transport=transport).collect_profile()
+    profile = DouyinOpenAPIClient(
+        TOKEN, OPEN_ID, transport=transport
+    ).collect_profile()
 
     assert transport.requests == [{
         "method": "POST",
         "url": "https://open.douyin.com/oauth/userinfo/",
         "headers": {
             "Accept": "application/json",
-            "access-token": TOKEN,
+            "Content-Type": "application/x-www-form-urlencoded",
         },
-        "data": b"",
+        "data": b"access_token=secret-openapi-token-123&open_id=owner-open-id",
     }]
     assert profile["account_id"] == "owner-open-id"
     assert profile["account_name"] == "授权账号"
@@ -92,6 +104,60 @@ def test_profile_uses_fixed_official_endpoint_and_header_token():
     assert profile["platform_metrics"]["union_id"] == "owner-union-id"
     assert TOKEN not in transport.requests[0]["url"]
     assert TOKEN not in json.dumps(profile, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    ("access_token", "open_id", "error_code"),
+    [
+        ("", OPEN_ID, "TOKEN_MISSING"),
+        (" ", OPEN_ID, "TOKEN_MISSING"),
+        (_CredentialSubclass(TOKEN), OPEN_ID, "TOKEN_MISSING"),
+        (TOKEN, "", "OPEN_ID_MISSING"),
+        (TOKEN, " ", "OPEN_ID_MISSING"),
+        (TOKEN, "owner\nopen-id", "OPEN_ID_MISSING"),
+        (TOKEN, _CredentialSubclass(OPEN_ID), "OPEN_ID_MISSING"),
+        (TOKEN, None, "OPEN_ID_MISSING"),
+    ],
+)
+def test_client_rejects_missing_or_blank_credentials(
+    access_token, open_id, error_code
+):
+    with pytest.raises(DouyinOpenAPIError) as exc_info:
+        DouyinOpenAPIClient(access_token, open_id)
+
+    assert exc_info.value.error_code == error_code
+    assert TOKEN not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("err_no", [None, 1, "0", 0.0, False])
+def test_profile_requires_exact_top_level_integer_zero_err_no(err_no):
+    response = _profile_response()
+    if err_no is None:
+        response.pop("err_no")
+    else:
+        response["err_no"] = err_no
+    response["err_tips"] = f"untrusted server detail {TOKEN}"
+
+    with pytest.raises(DouyinOpenAPIError) as exc_info:
+        DouyinOpenAPIClient(
+            TOKEN, OPEN_ID, transport=FakeTransport([response])
+        ).collect_profile()
+
+    assert exc_info.value.error_code == "OPENAPI_ERROR"
+    _assert_exception_tree_is_sanitized(exc_info.value)
+
+
+def test_profile_rejects_response_for_a_different_open_id():
+    response = _profile_response()
+    response["data"]["open_id"] = "different-owner"
+
+    with pytest.raises(DouyinOpenAPIError) as exc_info:
+        DouyinOpenAPIClient(
+            TOKEN, OPEN_ID, transport=FakeTransport([response])
+        ).collect_profile()
+
+    assert exc_info.value.error_code == "INVALID_RESPONSE"
+    assert "different-owner" not in str(exc_info.value)
 
 
 def test_two_video_pages_map_deduplicate_and_prove_exhaustive():
@@ -126,7 +192,7 @@ def test_two_video_pages_map_deduplicate_and_prove_exhaustive():
     ])
 
     posts, coverage = DouyinOpenAPIClient(
-        TOKEN, transport=transport
+        TOKEN, OPEN_ID, transport=transport
     ).collect_video_pages(limit=None, page_size=20)
 
     assert [post["post_id"] for post in posts] == ["7001", "7002"]
@@ -174,6 +240,11 @@ def test_two_video_pages_map_deduplicate_and_prove_exhaustive():
         "https://open.douyin.com/video/list/?cursor=0&count=20",
         "https://open.douyin.com/video/list/?cursor=20&count=20",
     ]
+    assert all(request["headers"] == {
+        "Accept": "application/json",
+        "access-token": TOKEN,
+    } for request in transport.requests)
+    assert all(request["data"] is None for request in transport.requests)
     assert all(TOKEN not in request["url"] for request in transport.requests)
 
 
@@ -196,7 +267,9 @@ def test_rejects_non_douyin_https_share_urls_without_leaking_token(share_url):
     }])
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
-        DouyinOpenAPIClient(TOKEN, transport=transport).collect_video_pages()
+        DouyinOpenAPIClient(
+            TOKEN, OPEN_ID, transport=transport
+        ).collect_video_pages()
 
     assert TOKEN not in str(exc_info.value)
 
@@ -240,7 +313,7 @@ def test_rejects_non_douyin_https_share_urls_without_leaking_token(share_url):
 def test_rejects_invalid_list_has_more_cursor_and_video_id(response):
     with pytest.raises(DouyinOpenAPIError) as exc_info:
         DouyinOpenAPIClient(
-            TOKEN, transport=FakeTransport([response])
+            TOKEN, OPEN_ID, transport=FakeTransport([response])
         ).collect_video_pages()
 
     assert exc_info.value.error_code == "INVALID_RESPONSE"
@@ -251,7 +324,9 @@ def test_api_errors_never_include_token_even_when_transport_echoes_it():
     transport = FakeTransport([RuntimeError(f"failed header access-token={TOKEN}")])
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
-        DouyinOpenAPIClient(TOKEN, transport=transport).collect_profile()
+        DouyinOpenAPIClient(
+            TOKEN, OPEN_ID, transport=transport
+        ).collect_profile()
 
     assert TOKEN not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
@@ -292,7 +367,7 @@ def test_token_bearing_transport_openapi_error_is_replaced_without_context():
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
         DouyinOpenAPIClient(
-            TOKEN, transport=FakeTransport([raw_error])
+            TOKEN, OPEN_ID, transport=FakeTransport([raw_error])
         ).collect_profile()
 
     assert exc_info.value.error_code == "TRANSPORT_ERROR"
@@ -306,7 +381,7 @@ def test_malformed_json_token_is_not_retained_in_json_error_or_context():
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
         DouyinOpenAPIClient(
-            TOKEN, transport=FakeTransport([malformed])
+            TOKEN, OPEN_ID, transport=FakeTransport([malformed])
         ).collect_profile()
 
     assert exc_info.value.error_code == "INVALID_RESPONSE"
@@ -350,7 +425,7 @@ def test_default_transport_rejects_redirect_without_forwarding_token(monkeypatch
     )
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
-        DouyinOpenAPIClient(TOKEN).collect_profile()
+        DouyinOpenAPIClient(TOKEN, OPEN_ID).collect_profile()
 
     assert observed["opener_used"] is True
     assert observed["forwarded_headers"] == []
@@ -359,7 +434,7 @@ def test_default_transport_rejects_redirect_without_forwarding_token(monkeypatch
 
 def test_request_rejects_non_fixed_endpoint_before_transport():
     transport = FakeTransport([_profile_response()])
-    client = DouyinOpenAPIClient(TOKEN, transport=transport)
+    client = DouyinOpenAPIClient(TOKEN, OPEN_ID, transport=transport)
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
         client._request("GET", "https://redirect.example/video/list/")
@@ -374,7 +449,7 @@ def test_rejects_token_echoed_in_mapped_response_fields():
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
         DouyinOpenAPIClient(
-            TOKEN, transport=FakeTransport([response])
+            TOKEN, OPEN_ID, transport=FakeTransport([response])
         ).collect_profile()
 
     assert TOKEN not in str(exc_info.value)
@@ -399,7 +474,7 @@ def test_top_level_and_data_level_api_errors_are_sanitized():
     ):
         with pytest.raises(DouyinOpenAPIError) as exc_info:
             DouyinOpenAPIClient(
-                TOKEN, transport=FakeTransport([response])
+                TOKEN, OPEN_ID, transport=FakeTransport([response])
             ).collect_profile()
         assert exc_info.value.error_code == "OPENAPI_ERROR"
         assert TOKEN not in str(exc_info.value)
@@ -409,6 +484,7 @@ def test_float_zero_error_code_is_not_accepted_as_exact_success():
     with pytest.raises(DouyinOpenAPIError) as exc_info:
         DouyinOpenAPIClient(
             TOKEN,
+            OPEN_ID,
             transport=FakeTransport([{
                 "data": {**_profile_response()["data"], "error_code": 0.0}
             }]),
@@ -421,7 +497,9 @@ def test_api_error_before_first_page_has_no_partial_items():
     transport = FakeTransport([_page([], cursor=0, has_more=0, error_code=2190008)])
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
-        DouyinOpenAPIClient(TOKEN, transport=transport).collect_video_pages()
+        DouyinOpenAPIClient(
+            TOKEN, OPEN_ID, transport=transport
+        ).collect_video_pages()
 
     assert exc_info.value.partial_posts == []
     assert exc_info.value.coverage["observed_page_count"] == 0
@@ -436,7 +514,9 @@ def test_api_error_after_first_page_preserves_first_page_items():
     ])
 
     with pytest.raises(DouyinOpenAPIError) as exc_info:
-        DouyinOpenAPIClient(TOKEN, transport=transport).collect_video_pages()
+        DouyinOpenAPIClient(
+            TOKEN, OPEN_ID, transport=transport
+        ).collect_video_pages()
 
     assert [post["post_id"] for post in exc_info.value.partial_posts] == ["7001"]
     assert exc_info.value.coverage["observed_page_count"] == 1
@@ -448,6 +528,7 @@ def test_repeated_cursor_is_a_non_exhaustive_partial_stop():
     first = _video(7001, title="第一条", create_time=1700000000, is_top=0, play_count=1)
     posts, coverage = DouyinOpenAPIClient(
         TOKEN,
+        OPEN_ID,
         transport=FakeTransport([_page([first], cursor=0, has_more=1)]),
     ).collect_video_pages()
 
@@ -466,7 +547,7 @@ def test_two_zero_new_pages_stop_even_when_cursor_advances():
     ])
 
     posts, coverage = DouyinOpenAPIClient(
-        TOKEN, transport=transport
+        TOKEN, OPEN_ID, transport=transport
     ).collect_video_pages()
 
     assert [post["post_id"] for post in posts] == ["7001"]
@@ -480,7 +561,7 @@ def test_requested_limit_stops_without_claiming_exhaustive():
     transport = FakeTransport([_page([first], cursor=20, has_more=1)])
 
     posts, coverage = DouyinOpenAPIClient(
-        TOKEN, transport=transport
+        TOKEN, OPEN_ID, transport=transport
     ).collect_video_pages(limit=1, page_size=20)
 
     assert [post["post_id"] for post in posts] == ["7001"]
@@ -505,6 +586,7 @@ def test_media_type_maps_only_recognized_official_values(media_type, expected_ty
 
     posts, _ = DouyinOpenAPIClient(
         TOKEN,
+        OPEN_ID,
         transport=FakeTransport([_page([video], cursor=20, has_more=0)]),
     ).collect_video_pages()
 
@@ -522,6 +604,7 @@ def test_unknown_media_type_is_rejected_instead_of_defaulting_to_video(media_typ
     with pytest.raises(DouyinOpenAPIError) as exc_info:
         DouyinOpenAPIClient(
             TOKEN,
+            OPEN_ID,
             transport=FakeTransport([_page([video], cursor=20, has_more=0)]),
         ).collect_video_pages()
 
@@ -553,6 +636,27 @@ def test_missing_token_fails_before_creating_workspace(tmp_path, capsys):
     assert "DOUYIN_OPENAPI_ACCESS_TOKEN" in captured.err
 
 
+@pytest.mark.parametrize(
+    "open_id",
+    [None, "", " ", "owner\nopen-id", _CredentialSubclass(OPEN_ID)],
+)
+def test_missing_or_blank_open_id_fails_before_creating_workspace(
+    tmp_path, capsys, open_id
+):
+    out_dir = tmp_path / "authorized"
+    environ = {"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN}
+    if open_id is not None:
+        environ["DOUYIN_OPENAPI_OPEN_ID"] = open_id
+
+    rc = run(out_dir=str(out_dir), environ=environ)
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert not out_dir.exists()
+    assert "DOUYIN_OPENAPI_OPEN_ID" in captured.err
+    assert TOKEN not in captured.out + captured.err
+
+
 def test_refuses_to_overwrite_existing_workspace_before_api_calls(tmp_path):
     out_dir = tmp_path / "authorized"
     out_dir.mkdir()
@@ -562,8 +666,8 @@ def test_refuses_to_overwrite_existing_workspace_before_api_calls(tmp_path):
 
     rc = run(
         out_dir=str(out_dir),
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=DouyinOpenAPIClient(TOKEN, transport=transport),
+        environ=AUTHORIZED_ENV,
+        transport=transport,
     )
 
     assert rc == 2
@@ -581,6 +685,7 @@ class _CompletedAuthorizedClient:
         self.hook("profile")
         return {
             "platform": "douyin",
+            "account_id": OPEN_ID,
             "profile_url": "https://open.douyin.com/oauth/userinfo/",
             "field_visibility": {},
         }
@@ -598,6 +703,103 @@ class _CompletedAuthorizedClient:
             "zero_new_page_count": 0,
             "stop_condition": "terminal_page",
         }
+
+
+def _completed_transport(hook=None):
+    return FakeTransport(
+        [_profile_response(), _page([], cursor=0, has_more=0)],
+        hook=hook,
+    )
+
+
+class _ForeignAuthorizedClient(_CompletedAuthorizedClient):
+    def collect_profile(self):
+        self.calls.append("profile")
+        return {
+            "platform": "douyin",
+            "account_id": "foreign-open-id",
+            "profile_url": "https://open.douyin.com/oauth/userinfo/",
+            "field_visibility": {},
+        }
+
+
+def test_public_entry_rejects_stateful_client_injection_before_output(tmp_path):
+    out_dir = tmp_path / "authorized"
+    foreign_client = _ForeignAuthorizedClient()
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ=AUTHORIZED_ENV,
+        client=foreign_client,
+    )
+
+    assert rc == 3
+    assert foreign_client.calls == []
+    assert not out_dir.exists()
+
+
+def test_orchestration_rejects_foreign_profile_before_video_pages(
+    monkeypatch, tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized"
+    foreign_client = _ForeignAuthorizedClient()
+    monkeypatch.setattr(
+        authorized,
+        "DouyinOpenAPIClient",
+        lambda *args, **kwargs: foreign_client,
+    )
+
+    rc = run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ=AUTHORIZED_ENV,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert foreign_client.calls == ["profile"]
+    task = json.loads((out_dir / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "FAILED"
+    assert task["stop_reason"] == "OPENAPI_ERROR"
+    assert task["diagnostic_code"] == "INVALID_RESPONSE"
+    assert task["collection_coverage"]["is_exhaustive"] is False
+    assert task["collection_coverage"]["terminal_page_observed"] is False
+    profile = json.loads(
+        (out_dir / "source" / "profile.json").read_text(encoding="utf-8")
+    )
+    assert profile == {}
+    assert "foreign-open-id" not in _artifact_text(out_dir)
+    assert "foreign-open-id" not in captured.out + captured.err
+    report = (out_dir / "collection-report.md").read_text(encoding="utf-8")
+    assert "stage=collect_profile" in report
+    assert "stage=collect_video_pages" not in report
+
+
+def test_authorized_entry_builds_client_from_both_environment_credentials(
+    monkeypatch, tmp_path
+):
+    observed = {}
+
+    def build_client(access_token, open_id, transport=None):
+        observed.update({
+            "access_token": access_token,
+            "open_id": open_id,
+            "transport": transport,
+        })
+        return _CompletedAuthorizedClient()
+
+    monkeypatch.setattr(authorized, "DouyinOpenAPIClient", build_client)
+
+    assert run(
+        out_dir=str(tmp_path / "authorized"),
+        environ=AUTHORIZED_ENV,
+    ) == 0
+    assert observed == {
+        "access_token": TOKEN,
+        "open_id": OPEN_ID,
+        "transport": None,
+    }
 
 
 @pytest.mark.parametrize("stage", ["serialization", "commit"])
@@ -633,8 +835,8 @@ def test_authorized_ordinary_output_failure_is_sanitized_and_never_cleans_up(
     rc = run(
         out_dir=str(out_dir),
         collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=_CompletedAuthorizedClient(),
+        environ=AUTHORIZED_ENV,
+        transport=_completed_transport(),
     )
 
     captured = capsys.readouterr()
@@ -670,8 +872,8 @@ def test_authorized_indeterminate_commit_has_dedicated_sanitized_exit_and_closes
     rc = run(
         out_dir=str(out_dir),
         collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=_CompletedAuthorizedClient(),
+        environ=AUTHORIZED_ENV,
+        transport=_completed_transport(),
     )
 
     assert rc == 4
@@ -724,8 +926,8 @@ def test_authorized_control_flow_propagates_after_workspace_handles_close(
         run(
             out_dir=str(out_dir),
             collect_all=True,
-            environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-            client=_CompletedAuthorizedClient(),
+            environ=AUTHORIZED_ENV,
+            transport=_completed_transport(),
         )
 
     assert closed == [True]
@@ -744,8 +946,8 @@ def test_authorized_leaf_conflict_preserves_concurrent_bytes(tmp_path):
     rc = run(
         out_dir=str(out_dir),
         collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=_CompletedAuthorizedClient(conflict),
+        environ=AUTHORIZED_ENV,
+        transport=_completed_transport(conflict),
     )
 
     assert rc == 2
@@ -767,8 +969,8 @@ def test_authorized_workspace_swap_preserves_replacement_uncommitted(tmp_path):
     rc = run(
         out_dir=str(out_dir),
         collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=_CompletedAuthorizedClient(swap),
+        environ=AUTHORIZED_ENV,
+        transport=_completed_transport(swap),
     )
 
     assert rc == 2
@@ -788,8 +990,8 @@ def test_authorized_preexisting_complete_marker_is_not_overwritten(tmp_path):
     rc = run(
         out_dir=str(out_dir),
         collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=_CompletedAuthorizedClient(add_marker),
+        environ=AUTHORIZED_ENV,
+        transport=_completed_transport(add_marker),
     )
 
     assert rc == 2
@@ -800,34 +1002,31 @@ def test_authorized_missing_backend_fails_before_workspace_and_api(
     monkeypatch, tmp_path
 ):
     out_dir = tmp_path / "authorized"
-    client = _CompletedAuthorizedClient()
+    transport = _completed_transport()
     monkeypatch.setattr(immutable, "_backend_kind", lambda: "unsupported")
 
     assert run(
         out_dir=str(out_dir),
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=client,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
     ) == 2
     assert not out_dir.exists()
-    assert client.calls == []
+    assert transport.requests == []
 
 
 def test_all_writes_standard_completed_artifacts_without_token(tmp_path, capsys):
     out_dir = tmp_path / "authorized"
     video = _video(7001, title="#授权作品", create_time=1700000000, is_top=0, play_count=10)
-    client = DouyinOpenAPIClient(
-        TOKEN,
-        transport=FakeTransport([
-            _profile_response(),
-            _page([video], cursor=20, has_more=0),
-        ]),
-    )
+    transport = FakeTransport([
+        _profile_response(),
+        _page([video], cursor=20, has_more=0),
+    ])
 
     rc = run(
         out_dir=str(out_dir),
         collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=client,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
     )
 
     captured = capsys.readouterr()
@@ -866,19 +1065,16 @@ def test_all_writes_standard_completed_artifacts_without_token(tmp_path, capsys)
 
 def test_authorized_task_persists_task_id_and_analysis_goal(tmp_path):
     out_dir = tmp_path / "authorized-goal"
-    client = DouyinOpenAPIClient(
-        TOKEN,
-        transport=FakeTransport([
-            _profile_response(),
-            _page([], cursor=0, has_more=0),
-        ]),
-    )
+    transport = FakeTransport([
+        _profile_response(),
+        _page([], cursor=0, has_more=0),
+    ])
 
     assert run(
         out_dir=str(out_dir),
         analysis_goal="分析授权账号作品节奏",
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=client,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
     ) == 0
 
     task = json.loads((out_dir / "task.json").read_text(encoding="utf-8"))
@@ -887,19 +1083,18 @@ def test_authorized_task_persists_task_id_and_analysis_goal(tmp_path):
 
 
 @pytest.mark.parametrize("goal", [123, "", " ", "x" * 501, "a\nb", "a\x00b"])
-def test_authorized_rejects_invalid_analysis_goal_before_output_or_client(
+def test_authorized_rejects_invalid_analysis_goal_before_output_or_transport(
     tmp_path, goal
 ):
-    class MustNotRun:
-        def collect_profile(self):
-            pytest.fail("client must not run")
+    def must_not_run(**kwargs):
+        pytest.fail("transport must not run")
 
     out_dir = tmp_path / "invalid-goal"
     assert run(
         out_dir=str(out_dir),
         analysis_goal=goal,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=MustNotRun(),
+        environ=AUTHORIZED_ENV,
+        transport=must_not_run,
     ) == 2
     assert not out_dir.exists()
 
@@ -932,20 +1127,17 @@ def test_authorized_cli_forwards_analysis_goal(monkeypatch):
 def test_api_error_after_page_writes_partial_artifacts(tmp_path):
     out_dir = tmp_path / "authorized"
     video = _video(7001, title="已保留", create_time=1700000000, is_top=0, play_count=10)
-    client = DouyinOpenAPIClient(
-        TOKEN,
-        transport=FakeTransport([
-            _profile_response(),
-            _page([video], cursor=20, has_more=1),
-            _page([], cursor=40, has_more=0, error_code=2190008),
-        ]),
-    )
+    transport = FakeTransport([
+        _profile_response(),
+        _page([video], cursor=20, has_more=1),
+        _page([], cursor=40, has_more=0, error_code=2190008),
+    ])
 
     rc = run(
         out_dir=str(out_dir),
         collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=client,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
     )
 
     assert rc == 0
@@ -958,19 +1150,16 @@ def test_api_error_after_page_writes_partial_artifacts(tmp_path):
 
 def test_api_error_before_page_writes_failed_standard_artifacts(tmp_path):
     out_dir = tmp_path / "authorized"
-    client = DouyinOpenAPIClient(
-        TOKEN,
-        transport=FakeTransport([
-            _profile_response(),
-            _page([], cursor=0, has_more=0, error_code=2190008),
-        ]),
-    )
+    transport = FakeTransport([
+        _profile_response(),
+        _page([], cursor=0, has_more=0, error_code=2190008),
+    ])
 
     rc = run(
         out_dir=str(out_dir),
         collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=client,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
     )
 
     assert rc == 3
@@ -984,31 +1173,25 @@ def test_all_repeated_cursor_is_partial_but_limited_request_is_complete(tmp_path
     video = _video(7001, title="作品", create_time=1700000000, is_top=0, play_count=10)
 
     all_out = tmp_path / "all"
-    all_client = DouyinOpenAPIClient(
-        TOKEN,
-        transport=FakeTransport([
-            _profile_response(),
-            _page([video], cursor=0, has_more=1),
-        ]),
-    )
+    all_transport = FakeTransport([
+        _profile_response(),
+        _page([video], cursor=0, has_more=1),
+    ])
     assert run(
         out_dir=str(all_out), collect_all=True,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN}, client=all_client,
+        environ=AUTHORIZED_ENV, transport=all_transport,
     ) == 0
     all_task = json.loads((all_out / "task.json").read_text(encoding="utf-8"))
     assert all_task["task_status"] == "PARTIAL"
 
     limited_out = tmp_path / "limited"
-    limited_client = DouyinOpenAPIClient(
-        TOKEN,
-        transport=FakeTransport([
-            _profile_response(),
-            _page([video], cursor=20, has_more=1),
-        ]),
-    )
+    limited_transport = FakeTransport([
+        _profile_response(),
+        _page([video], cursor=20, has_more=1),
+    ])
     assert run(
         out_dir=str(limited_out), limit=1,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN}, client=limited_client,
+        environ=AUTHORIZED_ENV, transport=limited_transport,
     ) == 0
     limited_task = json.loads(
         (limited_out / "task.json").read_text(encoding="utf-8")
@@ -1022,19 +1205,16 @@ def test_limited_loop_below_requested_count_is_partial(tmp_path):
     video = _video(
         7001, title="不足一页", create_time=1700000000, is_top=0, play_count=10
     )
-    client = DouyinOpenAPIClient(
-        TOKEN,
-        transport=FakeTransport([
-            _profile_response(),
-            _page([video], cursor=0, has_more=1),
-        ]),
-    )
+    transport = FakeTransport([
+        _profile_response(),
+        _page([video], cursor=0, has_more=1),
+    ])
 
     assert run(
         out_dir=str(out_dir),
         limit=30,
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": TOKEN},
-        client=client,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
     ) == 0
     task = json.loads((out_dir / "task.json").read_text(encoding="utf-8"))
     assert task["task_status"] == "PARTIAL"

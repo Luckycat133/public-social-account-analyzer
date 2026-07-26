@@ -942,6 +942,7 @@ class AuthorizedClient:
     def collect_profile(self):
         return {
             "platform": "douyin",
+            "account_id": "test-open-id",
             "profile_url": "https://open.douyin.com/oauth/userinfo/",
             "field_visibility": {},
         }
@@ -966,10 +967,17 @@ def test_authorized_default_output_uses_repository_workspace(
     repo.mkdir()
     fake_file = repo / "skill" / "scripts" / "collect_douyin_authorized.py"
     monkeypatch.setattr(authorized, "__file__", str(fake_file))
+    monkeypatch.setattr(
+        authorized,
+        "DouyinOpenAPIClient",
+        lambda access_token, open_id, transport=None: AuthorizedClient(),
+    )
 
     assert authorized.run(
-        environ={"DOUYIN_OPENAPI_ACCESS_TOKEN": "test-token"},
-        client=AuthorizedClient(),
+        environ={
+            "DOUYIN_OPENAPI_ACCESS_TOKEN": "test-token",
+            "DOUYIN_OPENAPI_OPEN_ID": "test-open-id",
+        },
     ) == 0
 
     tasks = list((repo / "workspace").glob("douyin-authorized-*"))

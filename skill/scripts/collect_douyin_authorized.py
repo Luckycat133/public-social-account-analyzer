@@ -10,7 +10,7 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from collectors.douyin_openapi import DouyinOpenAPIClient, DouyinOpenAPIError
 from immutable_workspace import (
@@ -37,6 +37,7 @@ from csv_contract import serialize_csv_row
 _BEIJING = timezone(timedelta(hours=8))
 _PROFILE_ENDPOINT = "https://open.douyin.com/oauth/userinfo/"
 _TOKEN_ENV = "DOUYIN_OPENAPI_ACCESS_TOKEN"
+_OPEN_ID_ENV = "DOUYIN_OPENAPI_OPEN_ID"
 _INDETERMINATE_EXIT_CODE = 4
 _INDETERMINATE_MESSAGE = (
     "[INDETERMINATE] 输出目录可能已有可见提交，但持久化或最终验证未确认；"
@@ -49,6 +50,15 @@ _AUTHORIZED_ARTIFACTS = frozenset({
     "task.json",
     "collection-report.md",
 })
+
+
+def _valid_credential(value: Any) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value.isprintable()
+        and not any(character.isspace() for character in value)
+    )
 
 
 def _write_csv(
@@ -86,6 +96,7 @@ def _serialize_artifacts(
     task_id: str,
     analysis_goal: str | None,
     diagnostic_code: str | None = None,
+    diagnostic_stage: str = "collect_video_pages",
 ) -> None:
     with reservation.open_text("source/profile.json") as handle:
         json.dump(profile, handle, ensure_ascii=False, indent=2)
@@ -140,7 +151,7 @@ def _serialize_artifacts(
             "",
             "## 错误日志",
             "",
-            f"- stage=collect_video_pages error_code={stop_reason} "
+            f"- stage={diagnostic_stage} error_code={stop_reason} "
             f"diagnostic_code={diagnostic_code}",
         ])
     with reservation.open_text("collection-report.md") as handle:
@@ -197,6 +208,7 @@ def _run_reserved_collection(
     reservation: ImmutableWorkspace,
     *,
     api: DouyinOpenAPIClient,
+    expected_open_id: str,
     limit: int,
     collect_all: bool,
     page_size: int,
@@ -217,7 +229,22 @@ def _run_reserved_collection(
     }
 
     try:
-        profile = api.collect_profile()
+        candidate_profile = api.collect_profile()
+        account_id = (
+            candidate_profile.get("account_id")
+            if isinstance(candidate_profile, dict)
+            else None
+        )
+        if (
+            not isinstance(candidate_profile, dict)
+            or type(account_id) is not str
+            or account_id != expected_open_id
+        ):
+            raise DouyinOpenAPIError(
+                "INVALID_RESPONSE",
+                "Douyin OpenAPI profile identity did not match",
+            )
+        profile = candidate_profile
     except DouyinOpenAPIError as exc:
         _write_artifacts(
             reservation,
@@ -230,6 +257,7 @@ def _run_reserved_collection(
             task_id=task_id,
             analysis_goal=analysis_goal,
             diagnostic_code=exc.error_code,
+            diagnostic_stage="collect_profile",
         )
         print("[FAILED] 授权账号资料请求失败", file=sys.stderr)
         return 3
@@ -320,7 +348,7 @@ def run(
     collect_all: bool = False,
     page_size: int = 20,
     environ: Mapping[str, str] | None = None,
-    client: DouyinOpenAPIClient | None = None,
+    transport: Callable[..., Any] | None = None,
     analysis_goal: str | None = None,
 ) -> int:
     """Run an authorized-owner collection without OAuth lifecycle operations."""
@@ -340,17 +368,22 @@ def run(
 
     env = os.environ if environ is None else environ
     access_token = env.get(_TOKEN_ENV)
-    if not isinstance(access_token, str) or not access_token.strip():
+    if not _valid_credential(access_token):
         print(f"[FAILED] 缺少环境变量 {_TOKEN_ENV}", file=sys.stderr)
+        return 2
+    open_id = env.get(_OPEN_ID_ENV)
+    if not _valid_credential(open_id):
+        print(f"[FAILED] 缺少环境变量 {_OPEN_ID_ENV}", file=sys.stderr)
         return 2
 
     task_id = new_task_id("douyin")
+    api = DouyinOpenAPIClient(access_token, open_id, transport=transport)
     reservation = _reserve_authorized_output(out_dir)
     try:
-        api = client or DouyinOpenAPIClient(access_token)
         return _run_reserved_collection(
             reservation,
             api=api,
+            expected_open_id=open_id,
             limit=limit,
             collect_all=collect_all,
             page_size=page_size,

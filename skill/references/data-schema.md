@@ -199,10 +199,16 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 
 ### 3.2 授权账号 OpenAPI 覆盖账本
 
-独立命令 `collect_douyin_authorized.py` 只采集 `DOUYIN_OPENAPI_ACCESS_TOKEN` 所有者：
-`POST https://open.douyin.com/oauth/userinfo/` 确认该授权账号，随后
+独立命令 `collect_douyin_authorized.py` 只采集
+`DOUYIN_OPENAPI_ACCESS_TOKEN` 与 `DOUYIN_OPENAPI_OPEN_ID` 共同标识的授权账号：
+`POST https://open.douyin.com/oauth/userinfo/` 以
+`application/x-www-form-urlencoded` 请求体提交 `access_token` 与 `open_id`，响应顶层
+`err_no` 必须是整数 `0`，且 `data.open_id` 必须与输入逐字一致；确认后再
 `GET https://open.douyin.com/video/list/` 仅以集中构造的 `cursor` / `count` 查询分页。
 它不是任意公开账号主页采集的降级路径，也不支持按第三方账号查找。
+授权入口不接受已构造的 client 实例，必须始终由这两项环境凭据构造 client；测试缝只允许
+注入不携带账号身份的 transport。编排层在作品分页前还要独立确认归一化资料的
+`account_id` 与输入 `open_id` 逐字一致；不一致时不得请求作品页或声明穷尽。
 
 授权账本复用 `requested_all`、`is_exhaustive`、`terminal_page_observed`、
 `observed_page_count`、`observed_post_count`、`repeated_cursor_count` 和
@@ -212,10 +218,12 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 新增作品或 API 错误均非穷尽停止。`--all` 只有在上述官方末页证据存在时才能
 `COMPLETED`；中途失败必须保留此前已经验证并映射的作品。
 
-访问令牌只允许从 `DOUYIN_OPENAPI_ACCESS_TOKEN` 读取并放入 `access-token` 请求头，禁止
-出现在 URL、产物、标准输出/错误、异常或诊断信息中。账本同样不得保存请求头、原始游标、
-查询字符串、响应正文或令牌。当前官方在线令牌的端到端验证仍为 **pending**；在完成该
-验证前，不增加 OAuth 登录、授权码交换、刷新令牌或未文档化内部接口。
+访问令牌只允许从 `DOUYIN_OPENAPI_ACCESS_TOKEN` 读取：userinfo 请求放在固定官方端点的
+form-urlencoded 请求体，video.list 请求放在 `access-token` 请求头；禁止出现在 URL、
+产物、标准输出/错误、异常或诊断信息中。`DOUYIN_OPENAPI_OPEN_ID` 仅用于绑定账号，并由
+userinfo 响应精确回证。账本不得保存请求头、原始游标、查询字符串、响应正文或请求体。
+当前仍无真实 token/open_id 在线授权验收，端到端验证保持 **pending**；在完成该验证前，
+不增加 OAuth 登录、授权码交换、刷新令牌或未文档化内部接口。
 
 ### 3.3 comment_collection 评论采样账本
 
