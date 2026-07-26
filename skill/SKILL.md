@@ -56,7 +56,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
    - **IQR 散布比**：对每项可见指标额外输出 `iqr = p75-p25` 与 `dispersion_ratio = iqr/median`（`median` 为 0/`null` 时置 `null`）。
    - **季节性 / 学期检测**：输出 `monthly_distribution`、`seasonal_intensity`（月变异系数）、`break_month_share`（寒暑假月份 1/2/7/8 占比）。
    - **内联可视化**：报告含发布时间-播放量散点图、高低表现雷达图、字段覆盖率徽章、发布时段分布（24 小时）柱状图（零依赖 SVG/HTML）。
-   - **LLM 协同分类（可选）**：`--with-llm-tax` 在分析工作区生成分类 Prompt 模版（`taxonomy-prompt.md`）。`--classification-results <json>` 仅接受覆盖全部有效父作品的严格 JSON 数组；逐条核验 `post_id`、字段类型、枚举与置信度后，把原字节封存为 `source/classification-results.json`。没有经过校验的完整分类时保持 `classification_version = pending-model`，分析任务为 `PARTIAL`，不得臆造分类。
+   - **LLM 协同分类（可选）**：`--with-llm-tax` 在分析工作区生成分类 Prompt 模版（`taxonomy-prompt.md`）。`--classification-results <json>` 仅接受覆盖全部有效父作品的严格 JSON 数组；逐条核验 `post_id`、字段类型、枚举与置信度后，把原字节封存为 `source/classification-results.json`。没有经过校验的完整分类时保持 `classification_status = pending-model` 且 `classification_version = null`，分析任务为 `PARTIAL`，不得臆造分类。
    - 标注主题、形式、钩子类型等策略维度，提取高低表现对比特征。
 
 6. **报告渲染与独立提交**

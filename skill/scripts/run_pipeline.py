@@ -168,10 +168,34 @@ def _analysis_status(result: AnalysisResult) -> str:
         "status"
     )
     complete = (
-        classification_status not in {None, "pending-model"}
+        classification_status == "completed"
         and evidence_status == "COMPLETE"
     )
     return "COMPLETED" if complete else "PARTIAL"
+
+
+def _analysis_partial_reasons(analysis: dict[str, Any]) -> list[str]:
+    """Return stable, independent reasons for an incomplete analysis."""
+    reasons: list[str] = []
+    needs_generic_reason = False
+
+    classification_status = analysis.get("classification_status")
+    if classification_status == "pending-model":
+        reasons.append("PENDING_CLASSIFICATION")
+    elif classification_status == "partial-model":
+        reasons.append("PARTIAL_CLASSIFICATION")
+    elif classification_status != "completed":
+        needs_generic_reason = True
+
+    evidence_status = (analysis.get("evidence_coverage") or {}).get("status")
+    if evidence_status == "PARTIAL_EVIDENCE":
+        reasons.append("EVIDENCE_INCOMPLETE")
+    elif evidence_status != "COMPLETE":
+        needs_generic_reason = True
+
+    if needs_generic_reason:
+        reasons.append("ANALYSIS_PARTIAL")
+    return reasons
 
 
 def _validate_output_payloads(
@@ -384,17 +408,11 @@ def run_pipeline(
         if normalization_status != "COMPLETED":
             partial_reasons.append("NORMALIZATION_PARTIAL")
         if analysis_status != "COMPLETED":
-            analysis_reason_added = False
-            if analysis.analysis.get("classification_status") == "pending-model":
-                partial_reasons.append("PENDING_CLASSIFICATION")
-                analysis_reason_added = True
-            if (analysis.analysis.get("evidence_coverage") or {}).get(
-                "status"
-            ) == "PARTIAL_EVIDENCE":
-                partial_reasons.append("EVIDENCE_INCOMPLETE")
-                analysis_reason_added = True
-            if not analysis_reason_added:
-                partial_reasons.append("ANALYSIS_PARTIAL")
+            partial_reasons.extend(
+                reason
+                for reason in _analysis_partial_reasons(analysis.analysis)
+                if reason not in partial_reasons
+            )
         task_status = "PARTIAL" if partial_reasons else "COMPLETED"
         analysis_payload = dict(analysis.analysis)
         analysis_payload["meta"] = {

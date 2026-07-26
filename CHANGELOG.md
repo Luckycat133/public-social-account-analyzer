@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a zero-runtime-dependency `import_index_snapshot.py` path for public Douyin Web-index evidence after direct collection is blocked. The Agent verifies source/item ownership, while the importer validates official URLs and field consistency; it supports official Jingxuan item URLs and explicitly disclosed profile-index records.
 
 ### Changed
+- Semantic classification now separates lifecycle state, classifier version, and exact coverage at both the analysis root and `meta`. Pending slots remain `null` (with empty labels), strict legacy and immutable file inputs share the same atomic validation path, and pipeline completion additionally requires complete selected-item evidence.
 - High/low item evidence now requires a canonical, post-ID-bound platform item URL, collection timestamp, and metrics. Ordinary profile/off-platform/source-only links are rejected; the strict Douyin search-index profile exception remains disclosed but incomplete, while exact official Jingxuan item URLs are supported.
 - Derived analysis now remains `PARTIAL` with `EVIDENCE_INCOMPLETE` when any selected high/low record lacks complete item evidence, even after semantic classification is complete.
 - High/low analysis now thresholds and sizes groups from non-null measured values (including zero), reports measured count and median, resolves ties deterministically, and preserves the exact selected-item provenance contract with median-relative performance.

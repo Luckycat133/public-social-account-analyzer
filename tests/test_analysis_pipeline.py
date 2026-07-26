@@ -490,21 +490,184 @@ def test_analyze_in_memory_has_no_filesystem_side_effects(tmp_path):
 
     assert result.analysis["sample_boundary"]["valid"] == 1
     assert result.analysis["classification_status"] == "pending-model"
+    assert result.analysis["classification_version"] is None
+    assert result.analysis["classification_coverage"] == {
+        "total_count": 1,
+        "classified_count": 0,
+        "pending_count": 1,
+        "rate": 0.0,
+    }
+    assert {
+        key: result.analysis["meta"][key]
+        for key in (
+            "classification_status",
+            "classification_version",
+            "classification_coverage",
+        )
+    } == {
+        key: result.analysis[key]
+        for key in (
+            "classification_status",
+            "classification_version",
+            "classification_coverage",
+        )
+    }
     assert list(tmp_path.iterdir()) == before
 
 
-@pytest.mark.parametrize(
-    "analysis_payload",
-    [
-        {"classification_status": "llm-1"},
-        {
-            "classification_status": "llm-1",
-            "evidence_coverage": {"status": "UNKNOWN"},
+def test_pending_classification_slots_are_null_not_model_unknown():
+    result = analyze.analyze_in_memory(
+        _sample_profile(),
+        _normalized_rows(),
+        {"task_id": "pending-slots", "platform": "douyin"},
+    ).analysis
+
+    post = result["posts"][0]
+    assert {
+        field: post[field]
+        for field in (
+            "topic",
+            "format",
+            "funnel_stage",
+            "hook_type",
+            "series_name",
+            "is_original",
+            "has_product_placement",
+            "classification_confidence",
+            "classification_version",
+        )
+    } == {
+        "topic": None,
+        "format": None,
+        "funnel_stage": None,
+        "hook_type": None,
+        "series_name": None,
+        "is_original": None,
+        "has_product_placement": None,
+        "classification_confidence": None,
+        "classification_version": None,
+    }
+    assert post["analysis_labels"] == []
+
+
+def test_classification_contract_distinguishes_pending_partial_and_completed():
+    pending = analyze.build_post_records(
+        analyze.build_posts(
+            [
+                _normalized_rows()[0],
+                normalize.normalize_post(_sample_post("2"))[0],
+            ]
+        ),
+        {field: None for field in analyze.METRIC_FIELDS},
+        followers=None,
+    )
+
+    assert analyze.classification_contract(pending) == {
+        "classification_status": "pending-model",
+        "classification_version": None,
+        "classification_coverage": {
+            "total_count": 2,
+            "classified_count": 0,
+            "pending_count": 2,
+            "rate": 0.0,
         },
+    }
+
+    analyze.apply_taxonomy(
+        pending,
+        [
+            _classification(
+                "1",
+                topic="unknown",
+                format="other",
+                funnel_stage="unknown",
+                hook_type="unknown",
+            )
+        ],
+    )
+    assert pending[0]["topic"] == "unknown"
+    assert pending[0]["format"] == "other"
+    assert pending[0]["classification_version"] == "llm-1"
+    assert analyze.classification_contract(pending) == {
+        "classification_status": "partial-model",
+        "classification_version": "llm-1",
+        "classification_coverage": {
+            "total_count": 2,
+            "classified_count": 1,
+            "pending_count": 1,
+            "rate": 0.5,
+        },
+    }
+
+    analyze.apply_taxonomy(pending, [_classification("2")])
+    assert analyze.classification_contract(pending) == {
+        "classification_status": "completed",
+        "classification_version": "llm-1",
+        "classification_coverage": {
+            "total_count": 2,
+            "classified_count": 2,
+            "pending_count": 0,
+            "rate": 1.0,
+        },
+    }
+
+
+def test_empty_classification_contract_has_null_rate():
+    assert analyze.classification_contract([]) == {
+        "classification_status": "pending-model",
+        "classification_version": None,
+        "classification_coverage": {
+            "total_count": 0,
+            "classified_count": 0,
+            "pending_count": 0,
+            "rate": None,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("analysis_payload", "expected"),
+    [
+        ({"classification_status": "completed"}, "PARTIAL"),
+        (
+            {
+                "classification_status": "completed",
+                "evidence_coverage": {"status": "UNKNOWN"},
+            },
+            "PARTIAL",
+        ),
+        (
+            {
+                "classification_status": "pending-model",
+                "evidence_coverage": {"status": "COMPLETE"},
+            },
+            "PARTIAL",
+        ),
+        (
+            {
+                "classification_status": "partial-model",
+                "evidence_coverage": {"status": "COMPLETE"},
+            },
+            "PARTIAL",
+        ),
+        (
+            {
+                "classification_status": "UNKNOWN",
+                "evidence_coverage": {"status": "COMPLETE"},
+            },
+            "PARTIAL",
+        ),
+        (
+            {
+                "classification_status": "completed",
+                "evidence_coverage": {"status": "COMPLETE"},
+            },
+            "COMPLETED",
+        ),
     ],
 )
-def test_analysis_status_fails_closed_without_exact_complete_evidence(
-    analysis_payload,
+def test_analysis_status_requires_completed_taxonomy_and_complete_evidence(
+    analysis_payload, expected
 ):
     pipeline = _pipeline_module()
     result = analyze.AnalysisResult(
@@ -512,7 +675,62 @@ def test_analysis_status_fails_closed_without_exact_complete_evidence(
         taxonomy_prompt=None,
     )
 
-    assert pipeline._analysis_status(result) == "PARTIAL"
+    assert pipeline._analysis_status(result) == expected
+
+
+@pytest.mark.parametrize(
+    ("analysis_payload", "expected"),
+    [
+        (
+            {
+                "classification_status": "pending-model",
+                "evidence_coverage": {"status": "COMPLETE"},
+            },
+            ["PENDING_CLASSIFICATION"],
+        ),
+        (
+            {
+                "classification_status": "partial-model",
+                "evidence_coverage": {"status": "COMPLETE"},
+            },
+            ["PARTIAL_CLASSIFICATION"],
+        ),
+        (
+            {
+                "classification_status": "completed",
+                "evidence_coverage": {"status": "PARTIAL_EVIDENCE"},
+            },
+            ["EVIDENCE_INCOMPLETE"],
+        ),
+        (
+            {
+                "classification_status": "partial-model",
+                "evidence_coverage": {"status": "PARTIAL_EVIDENCE"},
+            },
+            ["PARTIAL_CLASSIFICATION", "EVIDENCE_INCOMPLETE"],
+        ),
+        (
+            {
+                "classification_status": "UNKNOWN",
+                "evidence_coverage": {"status": "UNKNOWN"},
+            },
+            ["ANALYSIS_PARTIAL"],
+        ),
+        (
+            {
+                "classification_status": "completed",
+                "evidence_coverage": {"status": "COMPLETE"},
+            },
+            [],
+        ),
+    ],
+)
+def test_analysis_partial_reasons_are_independent_and_deterministic(
+    analysis_payload, expected
+):
+    pipeline = _pipeline_module()
+
+    assert pipeline._analysis_partial_reasons(analysis_payload) == expected
 
 
 def test_analyzer_reads_historical_collection_python_repr_cells():
@@ -870,6 +1088,13 @@ def test_pending_classification_status_is_consistent_in_analysis_and_reports(
     assert task_payload["partial_reasons"] == ["PENDING_CLASSIFICATION"]
     assert analysis_payload["meta"]["task_status"] == "PARTIAL"
     assert analysis_payload["classification_status"] == "pending-model"
+    assert analysis_payload["classification_version"] is None
+    assert analysis_payload["classification_coverage"] == {
+        "total_count": 1,
+        "classified_count": 0,
+        "pending_count": 1,
+        "rate": 0.0,
+    }
     assert "- partial_reasons: PENDING_CLASSIFICATION" in pipeline_report
     assert "\nPENDING_CLASSIFICATION\n" not in pipeline_report
     assert "PARTIAL" in markdown
@@ -904,7 +1129,14 @@ def test_complete_classification_is_validated_applied_and_copied_exactly(tmp_pat
     assert result.task_status == task_payload["task_status"] == "COMPLETED"
     assert task_payload["partial_reasons"] == []
     assert task_payload["phase_results"]["analysis"] == "COMPLETED"
-    assert analysis_payload["classification_status"] == "llm-1"
+    assert analysis_payload["classification_status"] == "completed"
+    assert analysis_payload["classification_version"] == "llm-1"
+    assert analysis_payload["classification_coverage"] == {
+        "total_count": 1,
+        "classified_count": 1,
+        "pending_count": 0,
+        "rate": 1.0,
+    }
     assert analysis_payload["posts"][0]["topic"] == "示例主题"
     assert "pending-model" not in json.dumps(
         analysis_payload, ensure_ascii=False
@@ -953,7 +1185,8 @@ def test_complete_classification_with_incomplete_evidence_stays_partial(tmp_path
     assert result.task_status == task["task_status"] == "PARTIAL"
     assert task["phase_results"]["analysis"] == "PARTIAL"
     assert task["partial_reasons"] == ["EVIDENCE_INCOMPLETE"]
-    assert analysis_payload["classification_status"] == "llm-1"
+    assert analysis_payload["classification_status"] == "completed"
+    assert analysis_payload["classification_version"] == "llm-1"
     assert analysis_payload["evidence_coverage"]["status"] == (
         "PARTIAL_EVIDENCE"
     )
@@ -1035,6 +1268,98 @@ def test_invalid_or_incomplete_classification_creates_no_output(
         )
 
     assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "classification_results",
+    [
+        [],
+        [_classification("not-a-parent-post")],
+        [_classification(), _classification()],
+        [_classification(format="unsupported-format")],
+        [_classification(analysis_labels=[1])],
+    ],
+)
+def test_legacy_cli_rejects_invalid_classification_without_outputs(
+    tmp_path, classification_results
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "profile.json").write_text(
+        json.dumps(_sample_profile(), ensure_ascii=False), encoding="utf-8"
+    )
+    normalize.write_csv(_normalized_rows(), str(tmp_path / "normalized-posts.csv"))
+    classification_path = tmp_path / "incomplete-classification.json"
+    classification_path.write_text(
+        json.dumps(classification_results, ensure_ascii=False), encoding="utf-8"
+    )
+
+    code = analyze.main(
+        [
+            "--input",
+            str(tmp_path),
+            "--llm-tax-results",
+            str(classification_path),
+            "--with-llm-tax",
+        ]
+    )
+
+    assert code != 0
+    assert not (tmp_path / "analysis.json").exists()
+    assert not (tmp_path / "account-analysis-report.md").exists()
+    assert not (tmp_path / "taxonomy-prompt.md").exists()
+
+
+def test_legacy_cli_complete_classification_matches_in_memory_contract(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    profile = _sample_profile()
+    rows = _normalized_rows()
+    (source / "profile.json").write_text(
+        json.dumps(profile, ensure_ascii=False), encoding="utf-8"
+    )
+    normalize.write_csv(rows, str(tmp_path / "normalized-posts.csv"))
+    classification = [_classification()]
+    classification_path = tmp_path / "classification.json"
+    classification_path.write_text(
+        json.dumps(classification, ensure_ascii=False), encoding="utf-8"
+    )
+    expected = analyze.analyze_in_memory(
+        profile,
+        rows,
+        {},
+        classification_results=classification,
+    ).analysis
+
+    code = analyze.main(
+        [
+            "--input",
+            str(tmp_path),
+            "--llm-tax-results",
+            str(classification_path),
+        ]
+    )
+    actual = json.loads(
+        (tmp_path / "analysis.json").read_text(encoding="utf-8")
+    )
+    report = (tmp_path / "account-analysis-report.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert code == 0
+    for field in (
+        "classification_status",
+        "classification_version",
+        "classification_coverage",
+        "posts",
+    ):
+        assert actual[field] == expected[field]
+    assert actual["meta"]["classification_status"] == "completed"
+    assert actual["meta"]["classification_version"] == "llm-1"
+    assert "- classification_status = completed" in report
+    assert "- classification_version = llm-1" in report
+    assert "- classification_coverage = 1/1 (rate=1.0)" in report
+    assert "classification_version = pending-model" not in report
 
 
 def test_cli_accepts_classification_results_file(tmp_path):

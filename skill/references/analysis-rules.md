@@ -236,9 +236,23 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
 
 ### 5.5 分类一致性与再分类
 
-- 每次重新分类须更新 `classification_version`（见 data-schema §7 约束）；
+- 未运行模型的语义槽位必须为 `null`，`analysis_labels=[]`；`unknown` 只能是模型已运行后的合法判断；
+- 已校验的模型结果写入 `classification_version=llm-1`。后续引入新版本时，每次重新分类须更新该版本（见 data-schema §7 约束）；
 - 确定性数字（排名、中位数、分位数）由脚本计算，**不写入** `analysis_*` 结构；
 - 分类置信度写入 `classification_confidence`（0–1），用于标注低置信结果。
+
+### 5.6 分类生命周期与完成门
+
+- `classification_status` 是状态，只取 `pending-model`、`partial-model`、`completed`；
+  `classification_version` 是版本，无已分类内容时为 `null`，否则为 `llm-1`。两者不得混用。
+- `classification_coverage` 以作品级 `classification_version=llm-1` 作为唯一已分类判据，
+  记录总数、已分类数、待分类数与四位小数覆盖率；零样本覆盖率为 `null`。
+- 根对象与 `meta` 中的上述三项必须完全一致。分析阶段只在
+  `classification_status=completed` 且 `evidence_coverage.status=COMPLETE` 时完成。
+- 待分类、部分分类与证据不完整分别记录 `PENDING_CLASSIFICATION`、
+  `PARTIAL_CLASSIFICATION` 与 `EVIDENCE_INCOMPLETE`；这些独立原因可并存，不得相互覆盖或重复。
+- `--classification-results` 与 `--llm-tax-results` 均要求一次性覆盖全部有效作品；
+  任一结构、类型、枚举、父作品或覆盖错误都必须整体失败且不写入产物。
 
 ---
 

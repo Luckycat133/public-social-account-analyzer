@@ -33,5 +33,6 @@ Task 3C-B: complete — immutable derived analysis pipeline; independent review 
 Task 3C-C1A: complete — schema fidelity, tri-state evidence, status provenance, canonical/backward-compatible CSV, and metrics closure; independent review clean; final full suite 743 passed
 Task 3C-C1B1-A: complete — measured high/low grouping, deterministic ties, exact selected-item provenance, and CLI parity; independent review clean; final full suite 756 passed
 Task 3C-C1B1-B: complete — strict selected-item evidence, deterministic coverage/core insights, and evidence-aware pipeline lifecycle; independent review clean; final full suite 779 passed
+Task 3C-C1B2-A: complete — taxonomy state/version/coverage lifecycle, null pending slots, strict atomic legacy parity, and exact pipeline completion reasons; independent review clean; final full suite 798 passed
 Task 4: pending — consolidated documentation and acceptance refresh
 Task 5: pending — whole-branch review and delivery

@@ -1053,15 +1053,15 @@ def build_post_records(
             "follower_based_engagement_ratio": rnd(follower_based_ratio(p, followers), 6),
             # —— 以下为模型分类槽位(§5),本脚本仅准备结构 ——
             "topic": None,
-            "format": "unknown",
-            "funnel_stage": "unknown",
-            "hook_type": "unknown",
+            "format": None,
+            "funnel_stage": None,
+            "hook_type": None,
             "series_name": None,
             "is_original": None,
             "has_product_placement": None,
             "analysis_labels": [],
             "classification_confidence": None,
-            "classification_version": "pending-model",
+            "classification_version": None,
         })
     return recs
 
@@ -1090,6 +1090,41 @@ _CLASSIFICATION_REQUIRED_FIELDS = frozenset(
     }
 )
 _CLASSIFICATION_OPTIONAL_FIELDS = frozenset({"classification_version"})
+
+
+def classification_contract(
+    post_records: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize taxonomy lifecycle without conflating state and version."""
+    total_count = len(post_records)
+    classified_count = sum(
+        record.get("classification_version") == "llm-1"
+        for record in post_records
+    )
+    pending_count = total_count - classified_count
+    if classified_count == 0:
+        status = "pending-model"
+        version = None
+    elif classified_count == total_count:
+        status = "completed"
+        version = "llm-1"
+    else:
+        status = "partial-model"
+        version = "llm-1"
+    return {
+        "classification_status": status,
+        "classification_version": version,
+        "classification_coverage": {
+            "total_count": total_count,
+            "classified_count": classified_count,
+            "pending_count": pending_count,
+            "rate": (
+                None
+                if total_count == 0
+                else rnd(classified_count / total_count, 4)
+            ),
+        },
+    }
 
 
 def build_taxonomy_prompt(valid: List[Dict[str, Any]], followers: Optional[int]) -> str:
@@ -1287,12 +1322,26 @@ def generate_report(
     metric_note: Optional[str] = None,
 ) -> str:
     L: List[str] = []
+    classification_status = meta.get("classification_status") or "pending-model"
+    classification_version = meta.get("classification_version")
+    classification_coverage = meta.get("classification_coverage") or {}
+    classification_version_label = (
+        "null" if classification_version is None else str(classification_version)
+    )
+    coverage_total = classification_coverage.get("total_count")
+    coverage_classified = classification_coverage.get("classified_count")
+    coverage_rate = classification_coverage.get("rate")
+    coverage_rate_label = "null" if coverage_rate is None else str(coverage_rate)
     L.append("# 账号内容分析报告(公开页面快照)")
     L.append("")
     L.append("> 本报告基于无需登录即可查看的公开页面数据生成,代表公开页面快照,")
     L.append("> **不代表账号后台真实曝光、触达、完播或转化**。")
     L.append("> 分类字段(topic/format/funnel_stage/hook_type 等)由模型在运行时填充,")
-    L.append("> 当前状态:分类待模型填充(classification_version = pending-model)。")
+    L.append(
+        f"> 当前状态:{classification_status};"
+        f"classification_version = {classification_version_label};"
+        f"覆盖 {coverage_classified}/{coverage_total}(比例 {coverage_rate_label})。"
+    )
     if meta.get("collection_source"):
         L.append(
             f"> 采集状态:{meta.get('task_status') or '未知'};停止原因:"
@@ -1421,10 +1470,19 @@ def generate_report(
 
     L.append("## 模型分类状态(§5)")
     L.append("")
-    L.append("- classification_status = pending-model")
-    L.append("- 每条有效内容已准备分类槽位(topic/format/funnel_stage/hook_type/series_name/"
-             "is_original/has_product_placement),当前值为 null 或 `unknown` 占位符,")
-    L.append("  由模型在运行时填充并写入 classification_version。确定性指标不写入分类结构。")
+    L.append(f"- classification_status = {classification_status}")
+    L.append(f"- classification_version = {classification_version_label}")
+    L.append(
+        f"- classification_coverage = {coverage_classified}/{coverage_total} "
+        f"(rate={coverage_rate_label})"
+    )
+    if classification_status == "completed":
+        L.append("- 所有有效内容已通过父作品、字段类型、枚举与覆盖校验。")
+    elif classification_status == "partial-model":
+        L.append("- 仅 classification_version = llm-1 的内容计为已分类;其余分类槽位保持 null,analysis_labels 保持 []。")
+    else:
+        L.append("- 每条有效内容的分类槽位保持 null,analysis_labels 保持 [],等待模型填充。")
+    L.append("- 确定性指标不写入分类结构。")
     L.append("")
 
     return "\n".join(L)
@@ -1573,6 +1631,7 @@ def analyze_in_memory(
             post_records, classification_results
         )
         post_records = apply_taxonomy(post_records, classification_results)
+    classification = classification_contract(post_records)
     taxonomy_prompt = (
         build_taxonomy_prompt(valid, followers) if with_taxonomy_prompt else None
     )
@@ -1583,7 +1642,8 @@ def analyze_in_memory(
         else (
             "确定性指标由脚本计算;topic/format/funnel_stage/hook_type/series_name/"
             "is_original/has_product_placement 等分类字段由模型在运行时填充"
-            "(classification_version='pending-model'),本脚本仅准备结构。"
+            "(classification_status='pending-model', classification_version=null),"
+            "本脚本仅准备结构。"
         )
     )
 
@@ -1607,7 +1667,7 @@ def analyze_in_memory(
         "snapshot_age_label": params.get("snapshot_age_label"),
         "evidence_is_exhaustive": params.get("evidence_is_exhaustive"),
         "main_sort_metric": main_metric,
-        "classification_status": "llm-1" if taxonomy_applied else "pending-model",
+        **copy.deepcopy(classification),
         "note": classification_note,
     }
     if with_taxonomy_prompt or taxonomy_applied:
@@ -1629,7 +1689,7 @@ def analyze_in_memory(
         "evidence_coverage": copy.deepcopy(evidence_coverage),
         "core_insights": core_insights,
         "posts": post_records,
-        "classification_status": meta["classification_status"],
+        **copy.deepcopy(classification),
     }
     return AnalysisResult(analysis=analysis, taxonomy_prompt=taxonomy_prompt)
 
@@ -1659,177 +1719,49 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     profile = load_profile(task_dir)
-    raw_rows = load_posts(task_dir)
-    all_posts = build_posts(raw_rows)
-    collected = len(all_posts)
-
-    _, valid, flagged, missing, restricted = split_samples(all_posts)
-    valid_count = len(valid)
-
+    normalized_rows = load_posts(task_dir)
     task_params = load_task_params(task_dir, args)
-    cadence = compute_cadence(valid)
-    if (
-        task_params.get("collection_source") in ("douyin_jingxuan", "douyin_search_index")
-        and task_params.get("evidence_is_exhaustive") is False
-    ):
-        cadence = restrict_nonexhaustive_index_cadence(cadence)
-    metric_summary = compute_metric_summary(valid, profile)
-    medians = compute_medians(valid)
-    followers = parse_int(profile.get("followers"))
-    engagement = compute_engagement(valid, profile)
-
-    # §6 主排序指标 + 高低表现
-    main_metric, metric_note = choose_main_metric(task_params.get("analysis_goal"), valid)
-    if metric_note:
-        print(f"NOTE: 主排序指标回退/跳过 -> {metric_note}", file=sys.stderr)
-
-    # §6.1 安全约束:主指标不可用(全 null)时跳过高低表现,不补造结论
-    measured_items = _measured_metric_items(valid, main_metric)
-    measured_count = len(measured_items)
-    main_metric_median = _main_metric_median(measured_items)
-    hl = None if measured_count == 0 else compute_high_low(valid, main_metric)
-    if hl is None:
-        high_performance: Any = "INSUFFICIENT_SAMPLE"
-        low_performance: Any = "INSUFFICIENT_SAMPLE"
-        evidence_coverage = _empty_evidence_coverage()
-        core_insights: List[Dict[str, Any]] = []
-        if measured_count == 0:
-            status_reason = (
-                f"主排序指标 {main_metric} 全为 null,遵循 §6.1 安全约束跳过高低表现模块"
-            )
-        else:
-            status_reason = f"主指标实测样本 {measured_count} < {MIN_SAMPLE_FOR_HIGH_LOW}"
-        performance_meta = {
-            "status": "INSUFFICIENT_SAMPLE",
-            "main_metric": main_metric,
-            "measured_count": measured_count,
-            "main_metric_median": main_metric_median,
-            "reason": status_reason,
-            "metric_note": metric_note,
-        }
-    else:
-        high_performance = hl["high"]
-        low_performance = hl["low"]
-        evidence_coverage = hl["evidence_coverage"]
-        core_insights = hl["core_insights"]
-        performance_meta = {
-            "status": "ok",
-            "main_metric": main_metric,
-            "group_size": hl["group_size"],
-            "measured_count": hl["measured_count"],
-            "main_metric_median": hl["main_metric_median"],
-            "note": hl["note"],
-            "metric_note": metric_note,
-        }
-    performance_meta["evidence_coverage"] = copy.deepcopy(evidence_coverage)
-
-    # 样本边界(§2)
-    requested = task_params.get("requested_limit")
-    requested_is_derived = False
-    if requested is None:
-        requested = collected
-        requested_is_derived = True
-    dated_posts = [p for p in valid if p["published_at"]]
-    min_post = min(dated_posts, key=lambda p: p["published_at"]) if dated_posts else None
-    max_post = max(dated_posts, key=lambda p: p["published_at"]) if dated_posts else None
-    content_min = format_published_at_for_boundary(min_post) if min_post else None
-    content_max = format_published_at_for_boundary(max_post) if max_post else None
-    field_coverage = {}
-    for m in METRIC_FIELDS:
-        nn = sum(1 for p in valid if p[m] is not None)
-        field_coverage[m] = rnd(nn / valid_count, 4) if valid_count else None
-
-    sample_boundary = {
-        "requested": requested,
-        "requested_is_derived": requested_is_derived,
-        "collected": collected,
-        "status_counts": collection_status_counts(all_posts),
-        "valid": valid_count,
-        "time_range": {
-            "task_date_from": task_params.get("date_from"),
-            "task_date_to": task_params.get("date_to"),
-            "content_earliest": content_min,
-            "content_latest": content_max,
-        },
-        "missing": len(missing),
-        "restricted": len(restricted),
-        "excluded_flagged": len(flagged),
-        "excluded_flagged_post_ids": [p["post_id"] for p in flagged],
-        "field_coverage": field_coverage,
-    }
-
-    # 模型分类槽位(§5)
-    post_records = build_post_records(valid, medians, followers)
-
-    # §5 LLM 协同分类（确定性 + 语义标注 标准接口）
-    taxonomy_applied = False
+    classification_results: Any = None
     if args.llm_tax_results:
         try:
             with open(args.llm_tax_results, encoding="utf-8") as fh:
-                tax_results = json.load(fh)
-            post_records = apply_taxonomy(post_records, tax_results)
-            taxonomy_applied = True
-            print(f"OK: 已回填 LLM 分类结果 -> {args.llm_tax_results}", file=sys.stderr)
+                classification_results = json.load(fh)
         except (OSError, json.JSONDecodeError) as e:
-            print(f"WARN: 应用 LLM 分类结果失败({e})，保留 pending-model 占位", file=sys.stderr)
-    if args.with_llm_tax:
-        prompt = build_taxonomy_prompt(valid, followers)
+            print(f"ERROR: 分类结果读取失败: {e}", file=sys.stderr)
+            return 2
+
+    try:
+        result = analyze_in_memory(
+            profile,
+            normalized_rows,
+            task_params,
+            classification_results=classification_results,
+            with_taxonomy_prompt=args.with_llm_tax,
+        )
+    except (TypeError, ValueError) as e:
+        print(f"ERROR: 分类结果校验失败: {e}", file=sys.stderr)
+        return 2
+
+    analysis = result.analysis
+    meta = analysis["meta"]
+    sample_boundary = analysis["sample_boundary"]
+    cadence = analysis["publish_cadence"]
+    metric_summary = analysis["metric_summary"]
+    engagement = analysis["engagement"]
+    high_performance = analysis["high_performance"]
+    low_performance = analysis["low_performance"]
+    main_metric = meta["main_sort_metric"]
+    metric_note = (analysis.get("performance_meta") or {}).get("metric_note")
+
+    if metric_note:
+        print(f"NOTE: 主排序指标回退/跳过 -> {metric_note}", file=sys.stderr)
+    if classification_results is not None:
+        print(f"OK: 已回填 LLM 分类结果 -> {args.llm_tax_results}", file=sys.stderr)
+    if result.taxonomy_prompt is not None:
         prompt_path = os.path.join(task_dir, "taxonomy-prompt.md")
         with open(prompt_path, "w", encoding="utf-8") as fh:
-            fh.write(prompt)
+            fh.write(result.taxonomy_prompt)
         print(f"OK: LLM 分类 Prompt 已生成 -> {prompt_path}", file=sys.stderr)
-
-    meta = {
-        "task_id": task_params.get("task_id"),
-        "platform": profile.get("platform") or task_params.get("platform"),
-        "profile_url": profile.get("profile_url"),
-        "account_name": profile.get("account_name"),
-        "requested_limit": task_params.get("requested_limit"),
-        "date_from": task_params.get("date_from"),
-        "date_to": task_params.get("date_to"),
-        "analysis_goal": task_params.get("analysis_goal"),
-        "include_comments": task_params.get("include_comments"),
-        "task_status": task_params.get("task_status"),
-        "stop_reason": task_params.get("stop_reason"),
-        "diagnostic_code": task_params.get("diagnostic_code"),
-        "collection_source": task_params.get("collection_source"),
-        "source_kind": task_params.get("source_kind"),
-        "source_url": task_params.get("source_url"),
-        "snapshot_crawled_at": task_params.get("snapshot_crawled_at"),
-        "snapshot_age_label": task_params.get("snapshot_age_label"),
-        "evidence_is_exhaustive": task_params.get("evidence_is_exhaustive"),
-        "main_sort_metric": main_metric,
-        "classification_status": "pending-model",
-        "note": (
-            "确定性指标由脚本计算;topic/format/funnel_stage/hook_type/series_name/"
-            "is_original/has_product_placement 等分类字段由模型在运行时填充"
-            "(classification_version='pending-model'),本脚本仅准备结构。"
-        ),
-    }
-
-    if args.with_llm_tax or taxonomy_applied:
-        meta["llm_taxonomy"] = {
-            "enabled": True,
-            "prompt_file": "taxonomy-prompt.md" if args.with_llm_tax else None,
-            "backfilled": taxonomy_applied,
-        }
-        if taxonomy_applied:
-            meta["classification_status"] = "llm-1"
-
-    analysis = {
-        "meta": meta,
-        "sample_boundary": sample_boundary,
-        "publish_cadence": cadence,
-        "metric_summary": metric_summary,
-        "engagement": engagement,
-        "high_performance": high_performance,
-        "low_performance": low_performance,
-        "performance_meta": performance_meta,
-        "evidence_coverage": copy.deepcopy(evidence_coverage),
-        "core_insights": core_insights,
-        "posts": post_records,
-        "classification_status": meta["classification_status"],
-    }
 
     out_json = os.path.join(task_dir, "analysis.json")
     with open(out_json, "w", encoding="utf-8") as f:
@@ -1845,8 +1777,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"OK: 分析完成 -> {out_json}")
     print(f"OK: 报告完成 -> {out_md}")
-    print(f"     有效样本={valid_count}, 主排序指标={main_metric}, "
-          f"高低表现={'INSUFFICIENT_SAMPLE' if hl is None else 'ok'}")
+    print(
+        f"     有效样本={sample_boundary['valid']}, 主排序指标={main_metric}, "
+        f"高低表现={analysis['performance_meta']['status']}"
+    )
     return 0
 
 

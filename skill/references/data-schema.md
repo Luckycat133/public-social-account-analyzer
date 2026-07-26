@@ -73,11 +73,15 @@ workspace/<platform>-<account>-analysis/
 
 分析工作区的 `.complete` 只代表文件集合已持久提交。`task.json.task_status=COMPLETED` 还要求
 上游采集完整、归一化无损、语义分类完整且渲染校验全部通过；有效但受限的采集输入或
-`pending-model` 分类写 `PARTIAL`。`task.json.phase_results` 必须包含
+`pending-model` / `partial-model` 分类写 `PARTIAL`。分析阶段只在语义分类为
+`completed` 且高低表现证据覆盖明确为 `COMPLETE` 时才能为 `COMPLETED`。
+`task.json.phase_results` 必须包含
 `collection_input=VERIFIED`、`normalization/analysis=COMPLETED|PARTIAL`、
 `render=COMPLETED`、`validation=COMPLETED`。`task.json.partial_reasons` 按实际情况列出
-`UPSTREAM_COLLECTION_PARTIAL`、`NORMALIZATION_PARTIAL`、`PENDING_CLASSIFICATION` 或
-`ANALYSIS_PARTIAL`；无部分原因时为空数组。相同状态与原因必须同步进入 `analysis.json.meta`
+`UPSTREAM_COLLECTION_PARTIAL`、`NORMALIZATION_PARTIAL`、`PENDING_CLASSIFICATION`、
+`PARTIAL_CLASSIFICATION`、`EVIDENCE_INCOMPLETE` 或无法更具体归因时的
+`ANALYSIS_PARTIAL`；多个独立原因按稳定顺序并存且不得重复。无部分原因时为空数组。
+相同状态与原因必须同步进入 `analysis.json.meta`
 和最终报告，不能让派生任务与报告继续显示上游任务状态。
 
 ### 2.1 完整语义分类输入
@@ -91,7 +95,8 @@ workspace/<platform>-<account>-analysis/
 - `analysis_labels`（字符串数组）和 `classification_confidence`（0–1 的有限数字）。
 
 可选 `classification_version` 只能为 `llm-1`。校验通过才可令
-`classification_status=llm-1` / `analysis=COMPLETED`；原输入字节作为
+`classification_status=completed` 且 `classification_version=llm-1`；分析阶段是否为
+`COMPLETED` 还取决于证据覆盖完整性。原输入字节作为
 `source/classification-results.json` 纳入分析清单，不记录其本地路径。
 
 最终标记的 `fsync` 最多尝试三次；提交后的用户路径核验遇 I/O 错误时也最多尝试三次。
@@ -424,6 +429,18 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 约束：
 - 分类结果可重新分类；每次重新分类须更新 `classification_version`。
 - 确定性数字（排名、中位数、分位数）由脚本计算，不写入本结构。
+- `analysis.json` 根对象与 `meta` 必须保存完全相同的分类生命周期字段：
+  `classification_status` 只取 `pending-model` / `partial-model` / `completed`；
+  `classification_version` 在无已分类作品时为 `null`，只要存在已分类作品则为 `llm-1`；
+  `classification_coverage` 包含 `total_count`、`classified_count`、`pending_count` 和
+  四位小数的 `rate`，总数为 0 时 `rate=null`。
+- 待分类作品的 `topic`、`format`、`funnel_stage`、`hook_type`、`series_name`、
+  `is_original`、`has_product_placement`、`classification_confidence` 和
+  `classification_version` 均为 `null`，`analysis_labels=[]`；不得用 `unknown` 表示尚未运行模型。
+  模型实际输出的 `unknown` 或其他合法枚举值仍按 `llm-1` 计入已分类覆盖。
+- 纯函数或兼容读取可表达部分覆盖；但 `--classification-results` 与历史
+  `--llm-tax-results` 文件输入均为全量原子合同，缺失、重复、额外父作品、未知字段、
+  错误类型或非法枚举必须在任何输出写入前失败，不得回退为待分类。
 
 ### 7.1 高低表现确定性输出
 
