@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 import re
 import sys
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
+
+from immutable_workspace import WorkspaceError, reject_sealed_workspace
 
 # 中国平台默认时区（无 tz 时区信息时标注 +08:00）。
 CST = timezone(timedelta(hours=8))
@@ -101,6 +105,13 @@ COLLECTION_STATUS_CANON = {
     "deleted": "DELETED",
     "restricted": "RESTRICTED",
 }
+
+
+@dataclass(frozen=True)
+class NormalizationResult:
+    rows: list[dict]
+    csv_text: str
+    coverage: dict
 
 
 # ---------------------------------------------------------------------------
@@ -490,34 +501,119 @@ def dedup_posts(raw_posts: list[dict]) -> tuple[list[dict], int]:
     return kept, duplicate_count
 
 
+def _write_csv_rows(rows: list[dict], handle) -> None:
+    writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        out = {}
+        for col in CSV_COLUMNS:
+            value = row.get(col)
+            if col in (
+                "is_pinned",
+                "is_repost",
+                "is_promoted",
+                "platform_post_id_known",
+                "local_record_key",
+                "item_url_known",
+            ):
+                out[col] = "true" if value else "false"
+            elif value is None:
+                out[col] = ""
+            elif col == "duration_seconds":
+                try:
+                    fval = float(value)
+                    out[col] = (
+                        "" if math.isnan(fval) or math.isinf(fval) else int(fval)
+                    )
+                except (ValueError, TypeError, OverflowError):
+                    out[col] = ""
+            else:
+                out[col] = value
+        writer.writerow(out)
+
+
 def write_csv(rows: list[dict], path: str) -> None:
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            out = {}
-            for col in CSV_COLUMNS:
-                value = row.get(col)
-                if col in (
-                    "is_pinned",
-                    "is_repost",
-                    "is_promoted",
-                    "platform_post_id_known",
-                    "local_record_key",
-                    "item_url_known",
-                ):
-                    out[col] = "true" if value else "false"
-                elif value is None:
-                    out[col] = ""
-                elif col == "duration_seconds":
-                    try:
-                        fval = float(value)
-                        out[col] = "" if math.isnan(fval) or math.isinf(fval) else int(fval)
-                    except (ValueError, TypeError, OverflowError):
-                        out[col] = ""
-                else:
-                    out[col] = value
-            writer.writerow(out)
+        _write_csv_rows(rows, fh)
+
+
+def normalize_in_memory(
+    profile: dict | None, posts_jsonl: bytes | str
+) -> NormalizationResult:
+    """Normalize verified JSONL bytes without reading from or writing to disk."""
+    if profile is not None and not isinstance(profile, dict):
+        raise ValueError("profile must be an object")
+    if isinstance(posts_jsonl, bytes):
+        try:
+            text = posts_jsonl.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("posts JSONL is not UTF-8") from exc
+    elif isinstance(posts_jsonl, str):
+        text = posts_jsonl
+    else:
+        raise TypeError("posts_jsonl must be bytes or text")
+
+    raw_posts: list[dict] = []
+    parse_errors: list[str] = []
+    input_line_count = 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        input_line_count += 1
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            parse_errors.append(f"line {lineno}: {exc}")
+            continue
+        if not isinstance(value, dict):
+            parse_errors.append(f"line {lineno}: post must be an object")
+            continue
+        raw_posts.append(value)
+
+    kept_raw, duplicate_count = dedup_posts(raw_posts)
+    normalized: list[dict] = []
+    per_post_visibility: dict[str, dict] = {}
+    errors: list[dict] = []
+    for raw in kept_raw:
+        row, post_errors = normalize_post(raw)
+        errors.extend(post_errors)
+        normalized.append(row)
+        key = f"{row.get('platform')}:{row.get('post_id')}"
+        per_post_visibility[key] = row["_visibility"]
+
+    platforms: dict[str, int] = {}
+    for row in normalized:
+        platform = row.get("platform") or "unknown"
+        platforms[platform] = platforms.get(platform, 0) + 1
+
+    coverage = {
+        "input_line_count": input_line_count,
+        "raw_count": len(raw_posts),
+        "parse_errors": len(parse_errors),
+        "duplicate_count": duplicate_count,
+        "post_count": len(normalized),
+        "valid_count": sum(1 for row in normalized if post_is_valid(row)),
+        "platforms": platforms,
+        "metric_coverage": compute_metric_coverage(normalized),
+        "per_post_field_visibility": per_post_visibility,
+        "errors": errors,
+        "profile_field_visibility": (
+            profile.get("field_visibility") if isinstance(profile, dict) else None
+        ),
+        "profile": (
+            {
+                "platform": profile.get("platform"),
+                "account_name": profile.get("account_name"),
+                "account_id": profile.get("account_id"),
+                "collected_at": profile.get("collected_at"),
+            }
+            if isinstance(profile, dict)
+            else None
+        ),
+    }
+    output = io.StringIO(newline="")
+    _write_csv_rows(normalized, output)
+    return NormalizationResult(normalized, output.getvalue(), coverage)
 
 
 def run(input_dir: str, output_dir: str) -> dict:
@@ -620,8 +716,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     output_dir = args.output or args.input
     try:
+        reject_sealed_workspace(args.input)
+        if os.path.abspath(output_dir) != os.path.abspath(args.input):
+            reject_sealed_workspace(output_dir)
         summary = run(args.input, output_dir)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, WorkspaceError) as exc:
         sys.stderr.write(f"[error] {exc}\n")
         return 2
 

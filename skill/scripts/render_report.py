@@ -30,8 +30,12 @@ import math
 import re
 import sys
 from collections import Counter
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+from immutable_workspace import WorkspaceError, reject_sealed_workspace
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +70,9 @@ SECTION_DEFS = [
     ("sources", "来源链接"),
 ]
 PLACEHOLDERS = [name for name, _ in SECTION_DEFS]
+_PLACEHOLDER_PATTERN = re.compile(
+    r"\{\{(" + "|".join(re.escape(name) for name in PLACEHOLDERS) + r")\}\}"
+)
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 DISCLAIMER = "本报告基于公开页面快照，不代表账号后台真实曝光、触达、完播或转化数据。"
@@ -78,11 +85,42 @@ KNOWN_POST_URLS: set[str] = set()
 REFERENCED_POST_URLS: set[str] = set()
 
 
+@dataclass
+class _RenderState:
+    diagnostics: list[str] = field(default_factory=list)
+    known_post_urls: set[str] = field(default_factory=set)
+    referenced_post_urls: set[str] = field(default_factory=set)
+
+
+_RENDER_STATE: ContextVar[_RenderState | None] = ContextVar(
+    "render_state", default=None
+)
+
+
+class RenderError(RuntimeError):
+    """Rendering failed validation and must not be published."""
+
+    def __init__(self, message: str, diagnostics=()) -> None:
+        super().__init__(message)
+        self.diagnostics = tuple(diagnostics)
+
+
+@dataclass(frozen=True)
+class RenderResult:
+    markdown: str
+    html: str
+    diagnostics: tuple[str, ...]
+
+
 # ---------------------------------------------------------------------------
 # 基础工具
 # ---------------------------------------------------------------------------
 
 def warn(msg: str) -> None:
+    state = _RENDER_STATE.get()
+    if state is not None:
+        state.diagnostics.append(msg)
+        return
     WARNINGS.append(msg)
     print(f"[WARN] {msg}", file=sys.stderr)
 
@@ -202,7 +240,11 @@ def link_html(url: str, text: str) -> Raw:
 def ref_post(url) -> None:
     """登记被报告引用的内容 URL，供坏链检查。"""
     if url:
-        REFERENCED_POST_URLS.add(str(url))
+        state = _RENDER_STATE.get()
+        if state is not None:
+            state.referenced_post_urls.add(str(url))
+        else:
+            REFERENCED_POST_URLS.add(str(url))
 
 
 # 表格 ---------------------------------------------------------------------
@@ -486,7 +528,11 @@ def load_posts_csv(path: Path) -> list[dict]:
                 rows.append(row)
                 url = (row.get("post_url") or "").strip()
                 if url:
-                    KNOWN_POST_URLS.add(url)
+                    state = _RENDER_STATE.get()
+                    if state is not None:
+                        state.known_post_urls.add(url)
+                    else:
+                        KNOWN_POST_URLS.add(url)
     except Exception as exc:  # noqa: BLE001
         warn(f"读取 CSV 失败 {path}: {exc}")
     return rows
@@ -523,6 +569,10 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         ["请求采集数量", fmt_int(meta.get("requested_limit"))],
         ["采集时间范围", f"{meta.get('date_from') or '—'} ~ {meta.get('date_to') or '—'}"],
         ["分析目的", meta.get("analysis_goal") or "—"],
+        [
+            "部分状态原因",
+            ", ".join(meta.get("partial_reasons") or []) or "—",
+        ],
         ["任务状态", meta.get("task_status") or "—"],
         ["停止原因", meta.get("stop_reason") or "—"],
         ["采集来源", meta.get("collection_source") or "—"],
@@ -811,8 +861,7 @@ def _render_perf_group(
         pub = p.get("published_at") or "—"
         metrics = p.get("metrics", {}) or {}
         rp = p.get("relative_performance", {}) or {}
-        # 主指标：优先使用调用方给定的 main_metric
-        mm = main_metric or _PERF_MAIN_METRIC
+        mm = main_metric
         mm_label = metric_label or (METRIC_LABELS.get(mm, mm) if mm else "—")
         raw_mm_value = p.get("value") if "value" in p else metrics.get(mm)
         mm_val = fmt_metric(raw_mm_value) if mm else "—"
@@ -830,9 +879,6 @@ def _render_perf_group(
     if not rows_md:
         return EMPTY_MD, EMPTY_HTML
     return md_table(headers, rows_md), html_table(headers, rows_html)
-
-
-_PERF_MAIN_METRIC = None  # 由 build_high/low 设置
 
 
 def _performance_metric_context(analysis) -> tuple[str | None, str | None, str | None]:
@@ -860,9 +906,7 @@ def _append_performance_note(md: str, html: str, note: str | None) -> tuple[str,
 
 
 def build_high_performance(analysis) -> tuple[str, str]:
-    global _PERF_MAIN_METRIC
     main_metric, metric_label, metric_note = _performance_metric_context(analysis)
-    _PERF_MAIN_METRIC = main_metric
     high = analysis.get("high_performance")
     low = analysis.get("low_performance")
     md, html = _render_perf_group(high, main_metric, metric_label)
@@ -876,9 +920,7 @@ def build_high_performance(analysis) -> tuple[str, str]:
 
 
 def build_low_performance(analysis) -> tuple[str, str]:
-    global _PERF_MAIN_METRIC
     main_metric, metric_label, metric_note = _performance_metric_context(analysis)
-    _PERF_MAIN_METRIC = main_metric
     group = analysis.get("low_performance")
     md, html = _render_perf_group(group, main_metric, metric_label)
     return _append_performance_note(md, html, metric_note)
@@ -1074,23 +1116,131 @@ def build_sources(analysis, profile) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def render_dashboard(template: str, sections_html: dict[str, str]) -> str:
-    out = template
-    for name in PLACEHOLDERS:
-        content = sections_html.get(name) or EMPTY_HTML
-        out = out.replace("{{" + name + "}}", content)
-    # 兜底：任何残留占位符
-    out = re.sub(r"\{\{[^}]*\}\}", '<span class="empty">暂无数据</span>', out)
-    return out
+    return _PLACEHOLDER_PATTERN.sub(
+        lambda match: sections_html.get(match.group(1)) or EMPTY_HTML,
+        template,
+    )
 
 
 def post_render_checks(html: str) -> None:
     # 坏链检查：被引用的内容 URL 不在 known 集合中
-    for url in REFERENCED_POST_URLS:
-        if url not in KNOWN_POST_URLS:
+    state = _RENDER_STATE.get()
+    referenced = (
+        state.referenced_post_urls
+        if state is not None
+        else REFERENCED_POST_URLS
+    )
+    known = state.known_post_urls if state is not None else KNOWN_POST_URLS
+    for url in referenced:
+        if url not in known:
             warn(f"bad_link: 报告引用了不在 normalized-posts.csv 中的 post_url: {url}")
     # 空图检查：残留外部图片
     for m in re.finditer(r'<img[^>]+src=["\']http', html, re.IGNORECASE):
         warn(f"empty_image: 发现未替换的外部图片标签: {m.group(0)[:80]}")
+
+
+def render_in_memory(
+    *,
+    profile: dict,
+    posts_csv: list[dict],
+    analysis: dict,
+    template: str,
+) -> RenderResult:
+    """Render and validate reports without filesystem or process-global state."""
+    if not isinstance(profile, dict):
+        raise RenderError("missing or invalid profile input")
+    if not isinstance(posts_csv, list) or not all(
+        isinstance(row, dict) for row in posts_csv
+    ):
+        raise RenderError("missing or invalid normalized posts input")
+    if not isinstance(analysis, dict):
+        raise RenderError("missing or invalid analysis input")
+    if not isinstance(template, str) or not template:
+        raise RenderError("missing or invalid report template")
+    template_without_comments = re.sub(
+        r"<!--.*?-->", "", template, flags=re.DOTALL
+    )
+    template_tokens = re.findall(
+        r"\{\{([^{}]+)\}\}", template_without_comments
+    )
+    if sorted(template_tokens) != sorted(PLACEHOLDERS):
+        raise RenderError("report template placeholder inventory is invalid")
+
+    state = _RenderState(
+        known_post_urls={
+            str(row.get("post_url")).strip()
+            for row in posts_csv
+            if row.get("post_url")
+        }
+    )
+    token = _RENDER_STATE.set(state)
+    try:
+        builders = {
+            "task_info": lambda: build_task_info(analysis, profile, posts_csv),
+            "quality_summary": lambda: build_quality_summary(analysis),
+            "account_card": lambda: build_account_card(profile),
+            "content_structure": lambda: build_content_structure(
+                analysis, posts_csv
+            ),
+            "publish_cadence": lambda: build_publish_cadence(analysis),
+            "metrics_dashboard": lambda: build_metrics_dashboard(analysis),
+            "high_performance": lambda: build_high_performance(analysis),
+            "low_performance": lambda: build_low_performance(analysis),
+            "content_patterns": lambda: build_content_patterns(analysis),
+            "strategy": lambda: build_strategy(analysis, profile),
+            "sample_limits": lambda: build_sample_limits(analysis, profile),
+            "sources": lambda: build_sources(analysis, profile),
+        }
+
+        sections_md: dict[str, str] = {}
+        sections_html: dict[str, str] = {}
+        for name, function in builders.items():
+            try:
+                markdown, html = function()
+            except Exception as exc:  # noqa: BLE001
+                raise RenderError(f"render section {name} failed") from exc
+            sections_md[name] = markdown or EMPTY_MD
+            sections_html[name] = html or EMPTY_HTML
+
+        account_name = (
+            (analysis.get("meta", {}) or {}).get("account_name")
+            or profile.get("account_name")
+            or "未知账号"
+        )
+        platform = (
+            (analysis.get("meta", {}) or {}).get("platform")
+            or profile.get("platform")
+            or ""
+        )
+        safe_account_name = md_escape_text(account_name)
+        safe_platform = md_escape_text(platform)
+        title = (
+            f"公开社媒账号分析报告：{safe_account_name}（{safe_platform}）"
+            if platform
+            else f"公开社媒账号分析报告：{safe_account_name}"
+        )
+        md_parts = [f"# {title}", "", DISCLAIMER, ""]
+        for index, (name, section_title) in enumerate(SECTION_DEFS, 1):
+            md_parts.extend(
+                [
+                    f"## {index}. {section_title}",
+                    "",
+                    sections_md[name],
+                    "",
+                ]
+            )
+        markdown_text = "\n".join(md_parts).rstrip() + "\n"
+        html_text = render_dashboard(template, sections_html)
+        post_render_checks(html_text)
+        if state.diagnostics:
+            raise RenderError(
+                "; ".join(state.diagnostics), state.diagnostics
+            )
+        if not markdown_text.strip() or not html_text.strip():
+            raise RenderError("render output is empty")
+        return RenderResult(markdown_text, html_text, ())
+    finally:
+        _RENDER_STATE.reset(token)
 
 
 def main(argv=None) -> int:
@@ -1107,86 +1257,61 @@ def main(argv=None) -> int:
     input_dir = Path(args.input).resolve()
     output_dir = Path(args.output).resolve() if args.output else input_dir
 
-    # 模板：默认取脚本所在目录的上级 assets
+    try:
+        reject_sealed_workspace(str(input_dir))
+        if output_dir != input_dir:
+            reject_sealed_workspace(str(output_dir))
+    except WorkspaceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    WARNINGS.clear()
+    KNOWN_POST_URLS.clear()
+    REFERENCED_POST_URLS.clear()
+
     if args.template:
         template_path = Path(args.template).resolve()
     else:
         template_path = Path(__file__).resolve().parent.parent / "assets" / "report-template.html"
 
-    if not template_path.exists():
-        warn(f"模板不存在: {template_path}；将输出未填充的占位符。")
-        template_text = ""
-    else:
+    try:
         template_text = template_path.read_text(encoding="utf-8")
+        profile = json.loads(
+            (input_dir / "source" / "profile.json").read_text(encoding="utf-8")
+        )
+        analysis = json.loads(
+            (input_dir / "analysis.json").read_text(encoding="utf-8")
+        )
+        with (input_dir / "normalized-posts.csv").open(
+            encoding="utf-8", newline=""
+        ) as handle:
+            posts_csv = list(csv.DictReader(handle))
+        rendered = render_in_memory(
+            profile=profile,
+            posts_csv=posts_csv,
+            analysis=analysis,
+            template=template_text,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, csv.Error) as exc:
+        print(f"[ERROR] renderer input failed: {exc}", file=sys.stderr)
+        return 2
+    except RenderError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
 
-    # 加载数据
-    profile = load_json(input_dir / "source" / "profile.json") or {}
-    posts_csv = load_posts_csv(input_dir / "normalized-posts.csv")
-    analysis = load_json(input_dir / "analysis.json") or {}
-
-    # 构建各节
-    builders = {
-        "task_info": lambda: build_task_info(analysis, profile, posts_csv),
-        "quality_summary": lambda: build_quality_summary(analysis),
-        "account_card": lambda: build_account_card(profile),
-        "content_structure": lambda: build_content_structure(analysis, posts_csv),
-        "publish_cadence": lambda: build_publish_cadence(analysis),
-        "metrics_dashboard": lambda: build_metrics_dashboard(analysis),
-        "high_performance": lambda: build_high_performance(analysis),
-        "low_performance": lambda: build_low_performance(analysis),
-        "content_patterns": lambda: build_content_patterns(analysis),
-        "strategy": lambda: build_strategy(analysis, profile),
-        "sample_limits": lambda: build_sample_limits(analysis, profile),
-        "sources": lambda: build_sources(analysis, profile),
-    }
-
-    sections_md: dict[str, str] = {}
-    sections_html: dict[str, str] = {}
-    for name, fn in builders.items():
-        try:
-            md, html = fn()
-        except Exception as exc:  # noqa: BLE001
-            warn(f"渲染节 {name} 失败: {exc}")
-            md, html = EMPTY_MD, EMPTY_HTML
-        sections_md[name] = md or EMPTY_MD
-        sections_html[name] = html or EMPTY_HTML
-
-    # 组装 Markdown
-    account_name = ((analysis.get("meta", {}) or {}).get("account_name")
-                    or (profile or {}).get("account_name") or "未知账号")
-    platform = ((analysis.get("meta", {}) or {}).get("platform")
-                or (profile or {}).get("platform") or "")
-    safe_account_name = md_escape_text(account_name)
-    safe_platform = md_escape_text(platform)
-    title = f"公开社媒账号分析报告：{safe_account_name}（{safe_platform}）" if platform else \
-        f"公开社媒账号分析报告：{safe_account_name}"
-    md_parts = [f"# {title}", "", DISCLAIMER, ""]
-    for idx, (name, sec_title) in enumerate(SECTION_DEFS, 1):
-        md_parts.append(f"## {idx}. {sec_title}")
-        md_parts.append("")
-        md_parts.append(sections_md[name])
-        md_parts.append("")
-    md_text = "\n".join(md_parts).rstrip() + "\n"
-
-    # 组装 HTML
-    html_text = render_dashboard(template_text, sections_html)
-
-    # 输出
-    output_dir.mkdir(parents=True, exist_ok=True)
-    md_path = output_dir / "account-analysis-report.md"
-    html_path = output_dir / "dashboard.html"
-    md_path.write_text(md_text, encoding="utf-8")
-    html_path.write_text(html_text, encoding="utf-8")
-
-    # 后置检查
-    post_render_checks(html_text)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        md_path = output_dir / "account-analysis-report.md"
+        html_path = output_dir / "dashboard.html"
+        md_path.write_text(rendered.markdown, encoding="utf-8")
+        html_path.write_text(rendered.html, encoding="utf-8")
+    except OSError as exc:
+        print(f"[ERROR] renderer output failed: {exc}", file=sys.stderr)
+        return 2
 
     print(f"已生成: {md_path}")
     print(f"已生成: {html_path}")
-    if WARNINGS:
-        print(f"完成，含 {len(WARNINGS)} 条告警。", file=sys.stderr)
-    else:
-        print("完成，无告警。")
+    print("完成，无告警。")
     return 0
 
 

@@ -305,6 +305,42 @@ def test_windows_native_leaf_open_uses_create_new_without_delete_sharing(
     assert calls[0][5] & 0x00200000
 
 
+def test_windows_directory_handle_requests_list_directory_access(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    class FakeCreateFile:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *args):
+            calls.append(args)
+            return 42
+
+    class FakeKernel32:
+        CreateFileW = FakeCreateFile()
+
+    monkeypatch.setattr(workspace, "_windows_kernel32", lambda: FakeKernel32())
+    monkeypatch.setattr(
+        workspace,
+        "_windows_handle_metadata",
+        lambda handle: {
+            "identity": (7, 12),
+            "directory": True,
+            "reparse": False,
+            "links": 1,
+            "size": 0,
+        },
+    )
+
+    workspace._open_windows_path(
+        str(tmp_path), create_new=False, directory=True
+    )
+
+    assert calls[0][1] & 0x00000001
+
+
 def test_simulated_windows_backend_builds_and_verifies_create_only_workspace(
     monkeypatch, tmp_path
 ):

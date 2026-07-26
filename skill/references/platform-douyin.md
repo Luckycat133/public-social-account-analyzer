@@ -145,7 +145,7 @@
   2. 降级不会声称加载“完整 DOM”。实现会先观察来自公开 Douyin/iesdouyin 域名的 CDP XHR/Fetch JSON 响应并提取已验证的作品结构；不足时才从可见的 `/video/<id>` 或 `/note/<id>` 卡片提取最小字段。浏览器不参与签名生成或保护绕过。
   3. 系统 Chrome、Chromium、Edge 或 Brave 是可选前置条件，可通过 `BROWSER_BIN` / `CHROME_BIN` 指定。未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外 `stop_reason` 仍为 `PARSER_FAILED`。
   4. 浏览器运行不新增 pip 或其他 Python 运行时依赖。每次启动均创建并删除临时用户目录，不附着或复用本机浏览器的登录状态、Cookie 或用户配置；不持久化 Cookie、请求头、带签名 URL、完整响应或媒体。
-  5. 遇到登录、验证码、滑块、频控或其他限制立即停止；已规范化的公开作品可作为部分结果保留。后续 `normalize.py` / `analyze.py` / `render_report.py` 在 0 条数据时仍可生成标准产物。
+  5. 遇到登录、验证码、滑块、频控或其他限制立即停止；已采集的公开作品可作为部分结果保留。后续 `run_pipeline.py` 仅在至少有 1 条有效可分析作品时提交独立分析工作区；0 条有效数据会在输出预留前失败，不发布空分析。
 - **绝不**刷新、重试破解、伪造签名或模拟浏览器绕过；`urllib` 直连或浏览器传输层拿到的风控页即如实认定。
 - 单条内容级问题（`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE`）只下钻到内容级，
   **不**写入任务级 `stop_reason`（见 `exceptions.md` §1.1）。

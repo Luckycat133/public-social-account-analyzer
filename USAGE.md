@@ -16,13 +16,14 @@
 
 ## 命令行流水线说明
 
-分析流程分为四个独立解耦的步骤：
+分析流程包含两个不可变提交：
 
 ```text
-[网页 URL] ➔ (1) collect.py ➔ [原始 JSON/JSONL]
-                          ➔ (2) normalize.py ➔ [normalized-posts.csv]
-                                            ➔ (3) analyze.py ➔ [analysis.json]
-                                                             ➔ (4) render_report.py ➔ [MD / HTML 报告]
+[网页 URL] ➔ collect.py ➔ [只读 collection workspace + .complete]
+                              │ 同一 commit digest 的 identity-bound reads
+                              ▼
+             run_pipeline.py ➔ [独立 analysis workspace + .complete]
+                                normalize → analyze → render → validate
 ```
 
 ### 1. 采集脚本 (`skill/scripts/collect.py`)
@@ -50,7 +51,41 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 
 ---
 
-### 2. 归一化脚本 (`skill/scripts/normalize.py`)
+### 2. 不可变分析流水线 (`skill/scripts/run_pipeline.py`)
+
+先核验采集工作区的 `.complete`、`manifest.json`、精确文件清单、大小与 SHA-256；随后在内存
+中重新归一化 `source/posts.jsonl`、计算分析、渲染并校验报告。全部校验完成后才排他创建新的
+分析目录，逐文件 create-only 写入并提交。
+
+```bash
+python skill/scripts/run_pipeline.py \
+  --input <COLLECTION_WORKSPACE> \
+  --output <NEW_ANALYSIS_WORKSPACE> \
+  [--with-llm-tax] [--classification-results <JSON_FILE>]
+```
+
+#### 必备参数：
+
+- `--input PATH`：带有效 `.complete` 的采集工作区。
+- `--output PATH`：尚不存在的分析工作区最终路径；普通目录、文件或符号链接均不会被复用。
+
+#### 可选参数：
+
+- `--with-llm-tax`：生成 `taxonomy-prompt.md`，但不调用模型；没有分类结果时分析保持 `PARTIAL`。
+- `--classification-results PATH`：读取严格 JSON 数组。每个有效父作品必须且只能出现一次，
+  `post_id` 必须匹配分析样本，分类枚举、布尔值、标签数组和 0–1 置信度均须合法。校验成功后
+  原始字节写入 `source/classification-results.json`；路径本身不会写入产物。
+
+前五个阶段（采集核验、归一化、分析、渲染、输出验证）失败时不会创建输出路径。预留之后
+发生序列化或提交失败时可保留无有效 `.complete` 的目录，但流水线不会删除、覆盖或发布它。
+分类文件缺失、JSON 非法、记录不完整、父作品不匹配或枚举越界同样在预留前失败。
+
+### 3. Legacy 分阶段脚本
+
+以下脚本只用于尚无 `manifest.json` / `.complete` 的旧格式目录。它们不能修改已提交的采集
+或分析工作区；新任务应使用 `run_pipeline.py`。
+
+#### 归一化脚本 (`skill/scripts/normalize.py`)
 
 读取原始 JSON 节点，校验去重，并映射至统一数据模型（Schema 见 `skill/references/data-schema.md`）。
 
@@ -63,7 +98,7 @@ python skill/scripts/normalize.py --input <WORKSPACE_DIR>
 
 ---
 
-### 3. 指标分析脚本 (`skill/scripts/analyze.py`)
+#### 指标分析脚本 (`skill/scripts/analyze.py`)
 
 使用确定性算法计算互动中位数、四分位距、发布节奏，并提取高低表现内容差异。
 
@@ -85,7 +120,7 @@ python skill/scripts/analyze.py --input <WORKSPACE_DIR> --platform <PLATFORM> [O
 
 ---
 
-### 4. 报告渲染脚本 (`skill/scripts/render_report.py`)
+#### 报告渲染脚本 (`skill/scripts/render_report.py`)
 
 渲染生成 Markdown 报告、HTML 动态仪表盘及标准化分析数据。
 
@@ -117,16 +152,12 @@ python skill/scripts/render_report.py --input <WORKSPACE_DIR>
 # 1. 采集前 50 条公开投稿
 python skill/scripts/collect.py "https://space.bilibili.com/123456" --limit 50
 
-# 假设生成的输出目录为 workspace/bilibili-123456-20260724
+# 假设采集输出为 workspace/bilibili-123456-collection
 
-# 2. 归一化
-python skill/scripts/normalize.py --input workspace/bilibili-123456-20260724
-
-# 3. 分析
-python skill/scripts/analyze.py --input workspace/bilibili-123456-20260724 --platform bilibili --requested-limit 50
-
-# 4. 渲染报告
-python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
+# 2. 在新目录完成归一化、分析、渲染与提交
+python skill/scripts/run_pipeline.py \
+  --input workspace/bilibili-123456-collection \
+  --output workspace/bilibili-123456-analysis
 ```
 
 ---
@@ -161,14 +192,18 @@ python skill/scripts/import_index_snapshot.py \
   --evidence /path/to/douyin-evidence.json \
   --out workspace/douyin-index-<account>-<date> \
   --limit 30
-python skill/scripts/normalize.py --input workspace/douyin-index-<account>-<date>
-python skill/scripts/analyze.py --input workspace/douyin-index-<account>-<date>
-python skill/scripts/render_report.py --input workspace/douyin-index-<account>-<date>
+python skill/scripts/run_pipeline.py \
+  --input workspace/douyin-index-<account>-<date> \
+  --output workspace/douyin-index-<account>-analysis
 ```
 
 这不是匿名抖音 API：Python 导入器不联网。官方精选页可保留真实作品 ID/URL；搜索索引
 没有单条 ID/URL 时只生成已披露的 `idx-*` 本地键并以账号主页作为证据锚点。两者始终
 `PARTIAL`、非实时、非穷尽；没有 Web 连接器的离线沙箱无法取得新数据。
+
+分析工作区即使已存在有效 `.complete`，也可能是 `PARTIAL`：当前没有完整语义分类结果时
+`analysis=PARTIAL`；索引证据等上游受限输入也会保持 `PARTIAL`。`.complete` 表示持久提交，
+不等同于业务数据完备。
 
 ---
 

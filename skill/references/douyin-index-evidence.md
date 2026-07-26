@@ -102,12 +102,9 @@ python3 skill/scripts/import_index_snapshot.py \
   --out workspace/douyin-index-<account>-<date> \
   --limit 30
 
-python3 skill/scripts/normalize.py \
-  --input workspace/douyin-index-<account>-<date>
-python3 skill/scripts/analyze.py \
-  --input workspace/douyin-index-<account>-<date>
-python3 skill/scripts/render_report.py \
-  --input workspace/douyin-index-<account>-<date>
+python3 skill/scripts/run_pipeline.py \
+  --input workspace/douyin-index-<account>-<date> \
+  --output workspace/douyin-index-<account>-analysis
 ```
 
 Agent 必须先完成来源与作品区核验。导入器随后对将要导入的条目检查官方域名、账号 ID、
@@ -119,9 +116,11 @@ Agent 必须先完成来源与作品区核验。导入器随后对将要导入�
 记录同样会导致整批拒绝。主页只接受 `douyin.com` / `www.douyin.com` 的安全 `/user/<id>`
 路径；快照时间、作品时间和账号最新发布时间均不得晚于 `observed_at`。
 
-成功导入会写入 `task.json`、`source/profile.json`、`source/posts.jsonl`、
+成功导入会提交只读采集工作区，写入 `task.json`、`source/profile.json`、`source/posts.jsonl`、
 `collection-report.md`，以及经过白名单规范化的 `source/index-evidence.json`。最后一项不是
 搜索引擎 HTML 或连接器原始转储，不含内部引用、Cookie、请求头或签名查询参数。
+`run_pipeline.py` 不修改该目录；它核验同一采集提交后，在新的分析目录重新生成 CSV、分析与
+报告。索引来源和 pending 语义分类都会使派生任务保持 `PARTIAL`。
 
 ## 4. 报告解释
 

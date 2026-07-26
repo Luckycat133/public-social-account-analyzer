@@ -15,23 +15,43 @@
 
 ## 2. 存储与文件命名约定
 
-每个账号 + 分析周期在**仓库根目录**创建独立任务目录，避免不同账号或采集批次混写；
-不得把默认产物写到 `skill/workspace/`：
+每个采集批次与每次派生分析分别在**仓库根目录**创建独立任务目录；不得把默认产物写到
+`skill/workspace/`。已提交采集工作区只保存采集证据与采集报告：
 
 ```
-workspace/<platform>-<account>-<date>/
+workspace/<platform>-<account>-collection/
   task.json                  # 任务参数、状态与来源元数据
   source/profile.json        # 账号原始快照
   source/posts.jsonl         # 内容原始快照（每行一条）
   source/comments.jsonl      # 启用评论采样时的评论记录（每行一条）
   source/index-evidence.json # 仅 Web 索引降级；经过白名单规范化的证据副本
-  normalized-posts.csv       # 归一化内容表
+  normalized-posts.csv       # 部分采集器的兼容快照；分析流水线忽略并重建
   collection-report.md       # 采集质量报告
   manifest.json              # 已提交采集产物的确定性大小与 SHA-256 清单
   .complete                  # 固定格式提交标记；最后且排他创建
+```
+
+`run_pipeline.py` 只读核验上述提交，并把派生结果写入另一个不可变工作区：
+
+```
+workspace/<platform>-<account>-analysis/
+  source/profile.json              # 同一已核验采集提交的逐字节副本
+  source/posts.jsonl               # 同上；归一化的唯一事实输入
+  source/comments.jsonl            # 可选；仅复制已核验的评论证据
+  source/index-evidence.json        # 可选；仅复制已核验的索引证据
+  source/collection-task.json       # 原采集 task.json 的逐字节副本
+  source/collection-provenance.json # 来源格式、task_id、commit 与 artifact digests
+  source/classification-results.json # 可选；严格核验后按原字节封存
+  normalized-posts.csv             # 从 source/posts.jsonl 重新生成
+  normalized-coverage.json         # 归一化覆盖与损失说明
+  analysis.json                    # 结构化分析结果
   account-analysis-report.md # 分析报告（Markdown）
   dashboard.html             # 可视化报告（HTML）
-  analysis.json              # 结构化分析结果
+  task.json                  # 派生任务状态与 phase_results
+  pipeline-report.md         # 流水线阶段摘要
+  taxonomy-prompt.md         # 可选；请求分类提示时生成
+  manifest.json              # 分析产物的确定性清单
+  .complete                  # 分析工作区的独立提交点
 ```
 
 默认目录名已存在（包括符号链接）时**不得覆盖或跟随**。采集器以原子目录创建操作直接
@@ -43,6 +63,36 @@ workspace/<platform>-<account>-<date>/
 的新任务若显式指定 `--out`，任何已存在目标（包括空目录）都必须在
 适配器网络调用或产物写入前退出。授权采集器和 Web 索引证据导入器遵循相同的最终目录
 预留、白名单提交和不覆盖语义。
+
+分析流水线顺序固定为
+`VERIFY_COLLECTION → NORMALIZE → ANALYZE → RENDER → VALIDATE → RESERVE → SERIALIZE_CREATE_ONLY → COMMIT`。
+前五个阶段只在内存中运行；失败不得创建输出目录。预留后的失败可留下无有效 `.complete`
+的目录，但不得删除、替换、覆盖或发布它。所有采集输入都由一次打开的 identity-bound reader
+读取并报告同一个采集 commit SHA-256；完成核验后不得按路径重新打开采集文件。采集快照中
+即使存在旧 `normalized-posts.csv` 也必须忽略，以 `source/posts.jsonl` 重建。
+
+分析工作区的 `.complete` 只代表文件集合已持久提交。`task.json.task_status=COMPLETED` 还要求
+上游采集完整、归一化无损、语义分类完整且渲染校验全部通过；有效但受限的采集输入或
+`pending-model` 分类写 `PARTIAL`。`task.json.phase_results` 必须包含
+`collection_input=VERIFIED`、`normalization/analysis=COMPLETED|PARTIAL`、
+`render=COMPLETED`、`validation=COMPLETED`。`task.json.partial_reasons` 按实际情况列出
+`UPSTREAM_COLLECTION_PARTIAL`、`NORMALIZATION_PARTIAL`、`PENDING_CLASSIFICATION` 或
+`ANALYSIS_PARTIAL`；无部分原因时为空数组。相同状态与原因必须同步进入 `analysis.json.meta`
+和最终报告，不能让派生任务与报告继续显示上游任务状态。
+
+### 2.1 完整语义分类输入
+
+`--classification-results` 只接受 UTF-8 严格 JSON 数组。每个有效分析样本的 `post_id` 必须
+恰好出现一次；缺失、重复、额外父作品或未知字段均拒绝。每条记录必须包含：
+
+- `post_id`、非空 `topic`；
+- `format`、`funnel_stage`、`hook_type`（取值见分析规则中的固定枚举）；
+- `series_name`（字符串或 `null`）、`is_original` / `has_product_placement`（布尔值或 `null`）；
+- `analysis_labels`（字符串数组）和 `classification_confidence`（0–1 的有限数字）。
+
+可选 `classification_version` 只能为 `llm-1`。校验通过才可令
+`classification_status=llm-1` / `analysis=COMPLETED`；原输入字节作为
+`source/classification-results.json` 纳入分析清单，不记录其本地路径。
 
 最终标记的 `fsync` 最多尝试三次；提交后的用户路径核验遇 I/O 错误时也最多尝试三次。
 最终标记 `fsync` 持续失败，或标记已经成功同步但用户路径核验持续发生 I/O 错误时，提交状态为

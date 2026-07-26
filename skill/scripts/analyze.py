@@ -11,8 +11,11 @@ import json
 import math
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+
+from immutable_workspace import WorkspaceError, reject_sealed_workspace
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -734,6 +737,21 @@ _TAX_FORMAT = {"talking_head", "tutorial", "commentary", "interview", "vlog", "n
 _TAX_FUNNEL = {"awareness", "education", "engagement", "conversion", "retention", "unknown"}
 _TAX_HOOK = {"question", "contradiction", "result_first", "pain_point", "controversy",
              "list", "curiosity", "authority", "story", "none", "unknown"}
+_CLASSIFICATION_REQUIRED_FIELDS = frozenset(
+    {
+        "post_id",
+        "topic",
+        "format",
+        "funnel_stage",
+        "hook_type",
+        "series_name",
+        "is_original",
+        "has_product_placement",
+        "analysis_labels",
+        "classification_confidence",
+    }
+)
+_CLASSIFICATION_OPTIONAL_FIELDS = frozenset({"classification_version"})
 
 
 def build_taxonomy_prompt(valid: List[Dict[str, Any]], followers: Optional[int]) -> str:
@@ -803,6 +821,85 @@ def apply_taxonomy(post_records: List[Dict[str, Any]], results) -> List[Dict[str
             rec["classification_confidence"] = r["classification_confidence"]
         rec["classification_version"] = r.get("classification_version") or "llm-1"
     return post_records
+
+
+def validate_classification_results(
+    post_records: List[Dict[str, Any]], results: Any
+) -> List[Dict[str, Any]]:
+    """Require one complete, typed taxonomy record per analyzed parent post."""
+    if not isinstance(results, list):
+        raise ValueError("classification results must be a JSON array")
+    expected_ids = {
+        record.get("post_id")
+        for record in post_records
+        if isinstance(record.get("post_id"), str) and record.get("post_id")
+    }
+    if len(expected_ids) != len(post_records):
+        raise ValueError("classification parent post IDs are invalid")
+
+    validated: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    allowed_fields = (
+        _CLASSIFICATION_REQUIRED_FIELDS | _CLASSIFICATION_OPTIONAL_FIELDS
+    )
+    for index, result in enumerate(results):
+        label = f"classification result {index + 1}"
+        if not isinstance(result, dict):
+            raise ValueError(f"{label} must be an object")
+        missing = _CLASSIFICATION_REQUIRED_FIELDS - set(result)
+        unknown = set(result) - allowed_fields
+        if missing or unknown:
+            raise ValueError(f"{label} has an invalid field inventory")
+
+        post_id = result.get("post_id")
+        if not isinstance(post_id, str) or not post_id:
+            raise ValueError(f"{label} has an invalid parent post_id")
+        if post_id in seen_ids:
+            raise ValueError("classification results contain duplicate post_id")
+        if post_id not in expected_ids:
+            raise ValueError(f"{label} does not reference an analyzed parent post")
+        seen_ids.add(post_id)
+
+        topic = result.get("topic")
+        if not isinstance(topic, str) or not topic.strip():
+            raise ValueError(f"{label} has an invalid topic")
+        if topic != "unknown" and not 2 <= len(topic) <= 10:
+            raise ValueError(f"{label} has an invalid topic")
+        if result.get("format") not in _TAX_FORMAT:
+            raise ValueError(f"{label} has an invalid format")
+        if result.get("funnel_stage") not in _TAX_FUNNEL:
+            raise ValueError(f"{label} has an invalid funnel_stage")
+        if result.get("hook_type") not in _TAX_HOOK:
+            raise ValueError(f"{label} has an invalid hook_type")
+
+        series_name = result.get("series_name")
+        if series_name is not None and not isinstance(series_name, str):
+            raise ValueError(f"{label} has an invalid series_name")
+        for field in ("is_original", "has_product_placement"):
+            value = result.get(field)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{label} has an invalid {field}")
+        labels = result.get("analysis_labels")
+        if not isinstance(labels, list) or not all(
+            isinstance(value, str) for value in labels
+        ):
+            raise ValueError(f"{label} has invalid analysis_labels")
+        confidence = result.get("classification_confidence")
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(confidence)
+            or not 0 <= confidence <= 1
+        ):
+            raise ValueError(f"{label} has invalid classification_confidence")
+        version = result.get("classification_version")
+        if version is not None and version != "llm-1":
+            raise ValueError(f"{label} has an invalid classification_version")
+        validated.append(dict(result))
+
+    if seen_ids != expected_ids:
+        raise ValueError("classification results do not cover every parent post")
+    return validated
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +1096,196 @@ def generate_report(
 # 主流程
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+
+@dataclass(frozen=True)
+class AnalysisResult:
+    analysis: Dict[str, Any]
+    taxonomy_prompt: Optional[str] = None
+
+
+def analyze_in_memory(
+    profile: Dict[str, Any],
+    normalized_rows: List[Dict[str, Any]],
+    task_params: Dict[str, Any],
+    *,
+    classification_results: Any = None,
+    with_taxonomy_prompt: bool = False,
+) -> AnalysisResult:
+    """Build analysis from verified values without filesystem side effects."""
+    if not isinstance(profile, dict):
+        raise ValueError("profile must be an object")
+    if not isinstance(normalized_rows, list) or not all(
+        isinstance(row, dict) for row in normalized_rows
+    ):
+        raise ValueError("normalized rows must be a list of objects")
+    if not isinstance(task_params, dict):
+        raise ValueError("task parameters must be an object")
+
+    params = dict(task_params)
+    all_posts = build_posts(normalized_rows)
+    collected = len(all_posts)
+    _, valid, flagged, missing, restricted = split_samples(all_posts)
+    valid_count = len(valid)
+
+    cadence = compute_cadence(valid)
+    if (
+        params.get("collection_source")
+        in ("douyin_jingxuan", "douyin_search_index")
+        and params.get("evidence_is_exhaustive") is False
+    ):
+        cadence = restrict_nonexhaustive_index_cadence(cadence)
+    metric_summary = compute_metric_summary(valid, profile)
+    medians = compute_medians(valid)
+    followers = parse_int(profile.get("followers"))
+    engagement = compute_engagement(valid, profile)
+
+    main_metric, metric_note = choose_main_metric(
+        params.get("analysis_goal"), valid
+    )
+
+    def metric_usable(metric: str) -> bool:
+        return any(post_metric_value(post, metric) is not None for post in valid)
+
+    hl = None if not metric_usable(main_metric) else compute_high_low(
+        valid, main_metric
+    )
+    if hl is None:
+        high_performance: Any = "INSUFFICIENT_SAMPLE"
+        low_performance: Any = "INSUFFICIENT_SAMPLE"
+        if not metric_usable(main_metric):
+            status_reason = (
+                f"主排序指标 {main_metric} 全为 null,遵循 §6.1 安全约束跳过高低表现模块"
+            )
+        else:
+            status_reason = (
+                f"有效样本 {valid_count} < {MIN_SAMPLE_FOR_HIGH_LOW}"
+            )
+        performance_meta = {
+            "status": "INSUFFICIENT_SAMPLE",
+            "main_metric": main_metric,
+            "reason": status_reason,
+            "metric_note": metric_note,
+        }
+    else:
+        high_performance = hl["high"]
+        low_performance = hl["low"]
+        performance_meta = {
+            "status": "ok",
+            "main_metric": main_metric,
+            "group_size": hl["group_size"],
+            "note": hl["note"],
+            "metric_note": metric_note,
+        }
+
+    requested = params.get("requested_limit")
+    requested_is_derived = False
+    if requested is None:
+        requested = collected
+        requested_is_derived = True
+    dated_posts = [post for post in valid if post["published_at"]]
+    min_post = (
+        min(dated_posts, key=lambda post: post["published_at"])
+        if dated_posts
+        else None
+    )
+    max_post = (
+        max(dated_posts, key=lambda post: post["published_at"])
+        if dated_posts
+        else None
+    )
+    content_min = format_published_at_for_boundary(min_post) if min_post else None
+    content_max = format_published_at_for_boundary(max_post) if max_post else None
+    field_coverage = {}
+    for metric in METRIC_FIELDS:
+        nonnull = sum(1 for post in valid if post[metric] is not None)
+        field_coverage[metric] = (
+            rnd(nonnull / valid_count, 4) if valid_count else None
+        )
+
+    sample_boundary = {
+        "requested": requested,
+        "requested_is_derived": requested_is_derived,
+        "collected": collected,
+        "valid": valid_count,
+        "time_range": {
+            "task_date_from": params.get("date_from"),
+            "task_date_to": params.get("date_to"),
+            "content_earliest": content_min,
+            "content_latest": content_max,
+        },
+        "missing": len(missing),
+        "restricted": len(restricted),
+        "excluded_flagged": len(flagged),
+        "excluded_flagged_post_ids": [post["post_id"] for post in flagged],
+        "field_coverage": field_coverage,
+    }
+
+    post_records = build_post_records(valid, medians, followers)
+    taxonomy_applied = classification_results is not None
+    if taxonomy_applied:
+        classification_results = validate_classification_results(
+            post_records, classification_results
+        )
+        post_records = apply_taxonomy(post_records, classification_results)
+    taxonomy_prompt = (
+        build_taxonomy_prompt(valid, followers) if with_taxonomy_prompt else None
+    )
+    classification_note = (
+        "确定性指标由脚本计算;语义分类结果已完成严格父作品、字段类型、"
+        "枚举与覆盖校验(classification_version='llm-1')。"
+        if taxonomy_applied
+        else (
+            "确定性指标由脚本计算;topic/format/funnel_stage/hook_type/series_name/"
+            "is_original/has_product_placement 等分类字段由模型在运行时填充"
+            "(classification_version='pending-model'),本脚本仅准备结构。"
+        )
+    )
+
+    meta = {
+        "task_id": params.get("task_id"),
+        "platform": profile.get("platform") or params.get("platform"),
+        "profile_url": profile.get("profile_url"),
+        "account_name": profile.get("account_name"),
+        "requested_limit": params.get("requested_limit"),
+        "date_from": params.get("date_from"),
+        "date_to": params.get("date_to"),
+        "analysis_goal": params.get("analysis_goal"),
+        "include_comments": params.get("include_comments"),
+        "task_status": params.get("task_status"),
+        "stop_reason": params.get("stop_reason"),
+        "diagnostic_code": params.get("diagnostic_code"),
+        "collection_source": params.get("collection_source"),
+        "source_kind": params.get("source_kind"),
+        "source_url": params.get("source_url"),
+        "snapshot_crawled_at": params.get("snapshot_crawled_at"),
+        "snapshot_age_label": params.get("snapshot_age_label"),
+        "evidence_is_exhaustive": params.get("evidence_is_exhaustive"),
+        "main_sort_metric": main_metric,
+        "classification_status": "llm-1" if taxonomy_applied else "pending-model",
+        "note": classification_note,
+    }
+    if with_taxonomy_prompt or taxonomy_applied:
+        meta["llm_taxonomy"] = {
+            "enabled": True,
+            "prompt_file": "taxonomy-prompt.md" if with_taxonomy_prompt else None,
+            "backfilled": taxonomy_applied,
+        }
+
+    analysis = {
+        "meta": meta,
+        "sample_boundary": sample_boundary,
+        "publish_cadence": cadence,
+        "metric_summary": metric_summary,
+        "engagement": engagement,
+        "high_performance": high_performance,
+        "low_performance": low_performance,
+        "performance_meta": performance_meta,
+        "posts": post_records,
+        "classification_status": meta["classification_status"],
+    }
+    return AnalysisResult(analysis=analysis, taxonomy_prompt=taxonomy_prompt)
+
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="确定性账号内容分析 + 模型分类槽位准备")
     parser.add_argument("--input", required=True, help="任务目录(含 normalized-posts.csv 与 source/profile.json)")
     parser.add_argument("--analysis-goal", default=None, help="分析目的(用于 §6 主排序指标选择)")
@@ -1012,11 +1298,17 @@ def main() -> None:
                         help="生成 LLM 分类标注 Prompt 模版(taxonomy-prompt.md)；仅做语义标注，不调用模型")
     parser.add_argument("--llm-tax-results", default=None,
                         help="LLM 返回的分类结果 JSON 路径，回填进分类槽位(classification_version=llm-1)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     task_dir = args.input
     if not os.path.isdir(task_dir):
-        die(f"ERROR: 任务目录不存在: {task_dir}")
+        print(f"ERROR: 任务目录不存在: {task_dir}", file=sys.stderr)
+        return 2
+    try:
+        reject_sealed_workspace(task_dir)
+    except WorkspaceError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     profile = load_profile(task_dir)
     raw_rows = load_posts(task_dir)
@@ -1195,7 +1487,8 @@ def main() -> None:
     print(f"OK: 报告完成 -> {out_md}")
     print(f"     有效样本={valid_count}, 主排序指标={main_metric}, "
           f"高低表现={'INSUFFICIENT_SAMPLE' if hl is None else 'ok'}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -8,17 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `run_pipeline.py`, which verifies a committed collection through one identity-bound reader and publishes normalization, analysis, provenance, Markdown, and HTML as a separate create-only immutable workspace.
+- Added explicit required/optional analysis artifact inventories, create-only binary writes, call-local renderer diagnostics, and pure in-memory normalize/analyze/render interfaces.
+- Added strict, complete semantic-classification input via `--classification-results`; validated source bytes are preserved in the immutable analysis workspace and can advance analysis status to `COMPLETED`.
 - Added an experimental Douyin browser fallback when SSR is absent or its post-list structure is unrecognized. It observes eligible public CDP network responses and falls back to visible post cards when needed; a recognized empty list remains `NO_PUBLIC_CONTENT`, and no Python runtime package is added.
 - Added offline Douyin tests for browser-response parsing, bounded collection, CLI policy, retained partial posts, and documentation coverage.
 - Added a zero-runtime-dependency `import_index_snapshot.py` path for public Douyin Web-index evidence after direct collection is blocked. The Agent verifies source/item ownership, while the importer validates official URLs and field consistency; it supports official Jingxuan item URLs and explicitly disclosed profile-index records.
 
 ### Changed
+- Committed collection workspaces are now read-only inputs. Legacy `normalize.py`, `analyze.py`, and `render_report.py` refuse immutable workspaces instead of adding or replacing files in place.
+- Analysis lifecycle now distinguishes durable publication (`.complete`) from business completeness (`task_status` and `phase_results`); limited collection input or pending semantic classification produces a committed `PARTIAL` analysis.
 - Douyin collection now defaults to the experimental fallback. `SOCIAL_BROWSER_FALLBACK=0` disables its default, while explicit `--no-browser-fallback` globally overrides both Douyin and Bilibili browser paths. Each browser run uses a temporary profile and does not reuse login state.
 - When browser collection is stopped by a public access restriction, normalized posts already collected are preserved as partial results. Diagnostics are limited to safe codes and sanitized response paths.
 - Index provenance, platform-ID/link availability, source rank, and timestamp precision now survive normalization and analysis. Reports disclose partial/stale/non-exhaustive index data, suppress profile anchors as item links, and do not infer total engagement from index-visible likes.
 - Cadence analysis no longer fabricates a weekly average when all publication dates are unknown, and date-only evidence is excluded from hour-of-day and exact-hour interval claims.
 
 ### Security
+- Analysis input reads retain directory and artifact identities, recheck the source commit digest, and never reopen collection artifacts by pathname after validation. Existing or symlink output targets fail before processing, and post-reservation failures never overwrite or delete nodes.
+- Windows readers re-enumerate exact inventories through held directory handles, and HTML template replacement is single-pass so public text cannot be reinterpreted as template syntax.
 - The fallback does not reproduce signatures or bypass login, CAPTCHA, slider, rate-limit, or other access protections. It does not persist cookies, request headers, signed URLs, response bodies, or media.
 - The Web-index importer rejects non-Douyin/lookalike hosts, credentials, ports, query strings, author mismatches, ID/URL mismatches, and non-integer metrics; persisted evidence is field-whitelisted.
 

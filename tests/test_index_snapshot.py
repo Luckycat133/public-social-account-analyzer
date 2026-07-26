@@ -7,8 +7,6 @@
 import copy
 import csv
 import json
-import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +17,7 @@ import import_index_snapshot as importer
 import immutable_workspace as immutable
 import normalize
 import render_report
+import run_pipeline
 
 
 PROFILE_ID = "MS4wLjABAAAAexample-sec-uid"
@@ -629,30 +628,32 @@ def test_render_discloses_partial_index_source_and_suppresses_fake_item_links():
     assert sources_md.count(PROFILE_URL) == 1
 
 
-def test_search_index_runs_through_normalize_analyze_and_render(tmp_path):
+def test_search_index_runs_through_immutable_analysis_pipeline(tmp_path):
     evidence_path = tmp_path / "evidence.json"
     evidence_path.write_text(
         json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
     )
     out = tmp_path / "task"
     importer.run(str(evidence_path), str(out), limit=2)
+    collection_digest = immutable.verify_committed_workspace(
+        str(out), allowed_artifacts=importer._INDEX_ARTIFACTS
+    )["commit_sha256"]
+    derived = tmp_path / "analysis"
 
-    normalize.run(str(out), str(out))
-    with (out / "normalized-posts.csv").open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+    result = run_pipeline.run_pipeline(str(out), str(derived))
+    rows = list(
+        csv.DictReader(
+            (derived / "normalized-posts.csv").read_text(encoding="utf-8").splitlines()
+        )
+    )
     assert rows[0]["collection_source"] == "douyin_search_index"
     assert rows[0]["item_url_known"] == "false"
+    assert result.task_status == "PARTIAL"
+    assert immutable.verify_committed_workspace(
+        str(out), allowed_artifacts=importer._INDEX_ARTIFACTS
+    )["commit_sha256"] == collection_digest
 
-    scripts = Path(importer.__file__).resolve().parent
-    completed = subprocess.run(
-        [sys.executable, str(scripts / "analyze.py"), "--input", str(out)],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-
-    analysis = json.loads((out / "analysis.json").read_text(encoding="utf-8"))
+    analysis = json.loads((derived / "analysis.json").read_text(encoding="utf-8"))
     assert analysis["meta"]["task_status"] == "PARTIAL"
     assert analysis["meta"]["collection_source"] == "douyin_search_index"
     assert analysis["meta"]["main_sort_metric"] == "likes"
@@ -661,9 +662,8 @@ def test_search_index_runs_through_normalize_analyze_and_render(tmp_path):
     assert all(post["post_url"] is None for post in analysis["posts"])
     assert all(post["title"] for post in analysis["posts"])
 
-    assert render_report.main(["--input", str(out)]) == 0
-    report = (out / "account-analysis-report.md").read_text(encoding="utf-8")
-    dashboard = (out / "dashboard.html").read_text(encoding="utf-8")
+    report = (derived / "account-analysis-report.md").read_text(encoding="utf-8")
+    dashboard = (derived / "dashboard.html").read_text(encoding="utf-8")
     for rendered in (report, dashboard):
         assert "douyin_search_index" in rendered
         assert "PARTIAL" in rendered

@@ -44,7 +44,7 @@ public-social-account-analyzer/             # 项目根目录
 ├── workspace/                             # 任务运行产物输出目录
 └── skill/                                 # AI Agent 纯净技能包 (Agent Skills 规范)
     ├── SKILL.md                           # Agent 技能指令与执行契约
-    ├── scripts/                           # Python 执行脚本 (collect/normalize/analyze/render)
+    ├── scripts/                           # Python 执行脚本（采集、不可变分析流水线）
     │   └── collectors/                    # 平台适配器 (bilibili / douyin / weibo)
     ├── references/                        # 领域数据模型与分析规则规范
     ├── assets/                            # HTML 仪表盘模版 (report-template.html)
@@ -104,21 +104,30 @@ pip install -e ".[dev]"
 
 ## 快速上手
 
-系统通过四步标准化流水线完成账号分析：
+系统先提交只读采集快照，再把所有派生结果提交到另一个不可变分析工作区：
 
 ```bash
 # 步骤 1：采集公开账号数据（以 B站 为例）
-python skill/scripts/collect.py "https://space.bilibili.com/123456" --limit 30
+python skill/scripts/collect.py "https://space.bilibili.com/123456" \
+  --limit 30 --out workspace/bilibili-123456-collection
 
-# 步骤 2：数据归一化
-python skill/scripts/normalize.py --input workspace/bilibili-123456-20260724
-
-# 步骤 3：计算确定性指标与分类策略
-python skill/scripts/analyze.py --input workspace/bilibili-123456-20260724 --platform bilibili
-
-# 步骤 4：生成报告与 HTML 仪表盘
-python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
+# 步骤 2：核验采集提交，在新目录中完成归一化、分析与渲染
+python skill/scripts/run_pipeline.py \
+  --input workspace/bilibili-123456-collection \
+  --output workspace/bilibili-123456-analysis
 ```
+
+如需把语义分类也纳入完整性判定，可提供覆盖每个有效作品且通过严格枚举/类型校验的 JSON：
+
+```bash
+python skill/scripts/run_pipeline.py \
+  --input workspace/bilibili-123456-collection \
+  --output workspace/bilibili-123456-analysis-classified \
+  --classification-results /path/to/classification-results.json
+```
+
+带 `.complete` 的采集目录永不原地修改。旧的 `normalize.py`、`analyze.py` 与
+`render_report.py` 仅兼容未提交的 legacy 目录；输入或输出是 immutable workspace 时会拒绝。
 
 详细命令行参数与配置说明请参见 [USAGE.md](USAGE.md)。
 
@@ -126,17 +135,31 @@ python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
 
 ## 产物结构
 
-执行完成后，在 `workspace/<platform>-<account>-<date>/` 目录下生成以下标准化产物：
+执行完成后会保留两个提交边界。
+
+采集工作区包含：
 
 - `source/profile.json` — 原始公开账号资料快照
 - `source/posts.jsonl` — 原始公开内容列表
-- `normalized-posts.csv` — 遵循统一数据模型的归一化 CSV 表格
 - `collection-report.md` — 采集质量与字段覆盖率说明
 - `task.json` — 任务状态、范围、覆盖账本与续采来源摘要
 - `manifest.json` / `.complete` — 采集阶段白名单产物的大小、SHA-256 与最终提交标记；无有效标记的目录是不完整任务。若采集命令以退出码 `4` 报告提交不确定，即使标记当前可见也不得视为本次成功，须保留目录并重新核验
+
+独立分析工作区包含：
+
+- `source/profile.json` / `source/posts.jsonl` — 从同一已核验采集提交复制的证据
+- `source/collection-task.json` — 原采集任务的逐字节副本
+- `source/collection-provenance.json` — 来源格式、来源任务 ID、采集提交 SHA-256 与清单摘要
+- `source/classification-results.json` — 可选；已严格核验并按原字节封存的完整语义分类输入
+- `normalized-posts.csv` / `normalized-coverage.json` — 从 `source/posts.jsonl` 重新生成的归一化结果
 - `account-analysis-report.md` — 完整 Markdown 账号分析报告（含具体证据 URL）
 - `dashboard.html` — 可视化 HTML 仪表盘
 - `analysis.json` — 机器可读的统计指标与分类分析 JSON
+- `task.json` / `pipeline-report.md` — 派生任务状态与各阶段结果
+- `manifest.json` / `.complete` — 分析产物的独立、create-only 提交
+
+分析工作区的 `.complete` 只表示上述文件已持久提交；业务完整性由 `task.json.task_status`
+表达。上游采集受限、归一化有损或语义分类仍为 `pending-model` 时，分析结果为 `PARTIAL`。
 
 ---
 

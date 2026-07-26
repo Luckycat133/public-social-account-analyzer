@@ -44,21 +44,24 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
    - 平台降级逻辑与数据映射详见 [references/platform-bilibili.md](references/platform-bilibili.md) / [platform-douyin.md](references/platform-douyin.md) / [platform-weibo.md](references/platform-weibo.md)。
    - 抖音直连以既有受限原因停止且 Web 连接器可用时，按 [references/douyin-index-evidence.md](references/douyin-index-evidence.md) 由 Agent 核验公开来源/作品区，再用离线脚本校验结构与字段一致性并导入；无连接器则保留原失败结果。
 
-4. **数据归一化**
-   - 调用 `scripts/normalize.py`，去重并映射至统一结构（详见 [references/data-schema.md](references/data-schema.md)）。
-   - 输出 `normalized-posts.csv` 并生成采集质量报告。
+4. **核验采集提交并创建分析任务**
+   - 已提交采集目录是只读证据，禁止在其中运行写入型归一化、分析或渲染命令。
+   - 调用 `scripts/run_pipeline.py --input <collection> --output <new-analysis>`。流水线通过同一组 identity-bound 句柄核验 `.complete`、`manifest.json`、精确清单与摘要；所有输入读取必须报告相同的采集 commit SHA-256。
+   - 输出路径必须尚不存在。核验、归一化、分析、渲染和输出校验均在预留输出目录前完成；失败时不得创建分析目录。
 
-5. **指标计算与模型分类**
-   - 调用 `scripts/analyze.py`，使用确定性算法计算中位数/分位数分布（详见 [references/analysis-rules.md](references/analysis-rules.md)）。
+5. **内存归一化、指标计算与模型分类**
+   - 流水线从已核验的 `source/posts.jsonl` 重新生成 `normalized-posts.csv`，忽略采集快照中任何旧派生 CSV；详见 [references/data-schema.md](references/data-schema.md)。
+   - 使用确定性算法计算中位数/分位数分布（详见 [references/analysis-rules.md](references/analysis-rules.md)）。
    - **互动率四分法（分母透明、独立命名）**：`view_based_engagement_rate`（互动/播放）、`follower_based_engagement_ratio`（互动/粉丝）、`deep_approval_rate`（(投币+收藏)/播放）、`community_discussion_rate`（(评论+弹幕)/播放），均独立计算 `count/median/p25/p75/min/max/missing_rate`。
    - **IQR 散布比**：对每项可见指标额外输出 `iqr = p75-p25` 与 `dispersion_ratio = iqr/median`（`median` 为 0/`null` 时置 `null`）。
    - **季节性 / 学期检测**：输出 `monthly_distribution`、`seasonal_intensity`（月变异系数）、`break_month_share`（寒暑假月份 1/2/7/8 占比）。
    - **内联可视化**：报告含发布时间-播放量散点图、高低表现雷达图、字段覆盖率徽章、发布时段分布（24 小时）柱状图（零依赖 SVG/HTML）。
-   - **LLM 协同分类（可选）**：`--with-llm-tax` 生成分类 Prompt 模版（`taxonomy-prompt.md`），交给外部 LLM 打标后用 `--llm-tax-results` 回填；回填内容经枚举校验后写入 `analysis.json`，`classification_version = llm-1`。不得在无 `--llm-tax-results` 时臆造分类。
+   - **LLM 协同分类（可选）**：`--with-llm-tax` 在分析工作区生成分类 Prompt 模版（`taxonomy-prompt.md`）。`--classification-results <json>` 仅接受覆盖全部有效父作品的严格 JSON 数组；逐条核验 `post_id`、字段类型、枚举与置信度后，把原字节封存为 `source/classification-results.json`。没有经过校验的完整分类时保持 `classification_version = pending-model`，分析任务为 `PARTIAL`，不得臆造分类。
    - 标注主题、形式、钩子类型等策略维度，提取高低表现对比特征。
 
-6. **报告渲染**
-   - 调用 `scripts/render_report.py`，生成 `account-analysis-report.md`、`dashboard.html`、`analysis.json`。
+6. **报告渲染与独立提交**
+   - 流水线在内存中生成 `account-analysis-report.md`、`dashboard.html` 与 `analysis.json`；缺输入、任一章节异常、坏链接或输出校验失败均为致命错误。
+   - 校验通过后才排他预留分析目录，create-only 写入精确白名单并创建新的 `manifest.json` / `.complete`。`.complete` 表示持久提交；`task.json.task_status` 表示业务完整性。
    - 报告中显著标记声明：“公开页面快照，不代表账号后台真实曝光和转化”。
 
 ## 平台适配器统一接口
@@ -97,12 +100,13 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 必须通过项目脚本执行真实采集与分析，严禁虚构或推测数据：
 
 1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--no-browser-fallback] [--resume --out <old-dir> [--resume-out <new-dir>] [--since ...]]`
-2. `python scripts/normalize.py --input <workspace_path>`
-3. `python scripts/analyze.py --input <workspace_path> [--with-llm-tax | --llm-tax-results <file>]`
-4. `python scripts/render_report.py --input <workspace_path>`
+2. `python scripts/run_pipeline.py --input <committed_collection> --output <new_analysis_workspace> [--with-llm-tax] [--classification-results <json>]`
 
 抖音 Web 索引替代入口：先按专门参考生成 evidence JSON，再运行
-`python scripts/import_index_snapshot.py --evidence <json> --out <new_workspace> --limit <N>`，随后执行上述第 2–4 步。
+`python scripts/import_index_snapshot.py --evidence <json> --out <new_collection> --limit <N>`，随后把该已提交目录作为 `run_pipeline.py --input`。
+
+`normalize.py`、`analyze.py`、`render_report.py` 只兼容没有 `manifest.json` / `.complete` 的
+legacy 目录；不得用它们原地修改已提交的采集或分析工作区。
 
 在数据有效样本少于 15 条时，标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现归纳。
 
@@ -114,6 +118,8 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - [ ] 核心洞察证据 URL 覆盖率达 100%
 - [ ] 附带“公开页面快照”免责声明
 - [ ] `task_status` 与 `stop_reason` 设置准确
+- [ ] 采集与分析目录分别通过自身 `manifest.json` / `.complete` 核验，采集目录字节未改变
+- [ ] `source/collection-provenance.json` 记录采集 commit SHA-256，且不含本机绝对路径
 - [ ] 索引降级的来源、快照年龄、ID/链接语义与非穷尽限制已进入最终报告
 
 ## 参考文件索引
