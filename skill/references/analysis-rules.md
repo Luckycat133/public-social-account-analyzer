@@ -249,19 +249,21 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
 - 根据任务 `analysis_goal`（分析目的）选择**主排序指标**；
 - 若 `analysis_goal` 未指定或无法确定，默认使用 `view_based_engagement_rate` 作为主排序指标（须满足 §4 分母透明与计算前置条件）；
 - 主排序指标须是已成功计算的可见指标之一，禁止使用 `null` 充斥的字段排序。
+- “实测样本”仅指主指标不为 `null` 的有效内容；真实值 `0` 计入，`null` 排除。
 
 ### 6.2 分组规则
 
-- 按主排序指标对有效内容**降序**排列；
-- **前 20%** 为高表现组（high performers）；
-- **后 20%** 为低表现组（low performers）；
+- 按主排序指标对实测样本**降序**排列；同值时依次按有效的 1 基 `source_rank`、`post_id` 升序破平，无效 `source_rank` 排在有效值之后；跨平台 `post_id` 仍相同时再按平台标识字符串升序，禁止依赖输入顺序；
+- 每组数量为 `ceil(实测样本数 × 20%)`；**前 20%** 为高表现组（high performers），**后 20%** 为低表现组（low performers）；
 - 两组**原则上各至少 3 条**；
 - 若 20% 折算不足 3 条，按"至少 3 条"向上补足边界（即在总样本允许范围内各取 3 条），但须在报告中标注实际取数比例。
+- 高低组必须互不重叠，`rank` 使用全局排名；所选条目保留 data-schema §7.1 的精确字段与来源证据。
 
 ### 6.3 样本不足标记
 
-- 当有效样本数量 **< 15 条** 时，本模块标记 `INSUFFICIENT_SAMPLE`，**不输出高低表现组**，不补造结论；
+- 当主指标实测样本数量 **< 15 条** 时，本模块标记 `INSUFFICIENT_SAMPLE`，**不输出高低表现组**，不补造结论；
 - `INSUFFICIENT_SAMPLE` 须在报告中明确呈现，不得静默跳过。
+- `performance_meta` 始终输出 `measured_count` 与 `main_metric_median`；样本不足原因使用实测数，不得使用有效内容总数替代。
 
 ### 6.4 排除与因果约束
 

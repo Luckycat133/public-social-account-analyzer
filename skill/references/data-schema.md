@@ -425,6 +425,32 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 - 分类结果可重新分类；每次重新分类须更新 `classification_version`。
 - 确定性数字（排名、中位数、分位数）由脚本计算，不写入本结构。
 
+### 7.1 高低表现确定性输出
+
+`performance_meta` 始终包含 `status`、`main_metric`、`measured_count` 和
+`main_metric_median`。实测样本少于 15 时，`high_performance` 与
+`low_performance` 均为 `INSUFFICIENT_SAMPLE`；否则两者是互不重叠的条目数组，
+分组规则见 `analysis-rules.md` §6。
+
+每个高/低表现条目**严格仅**包含下列字段（不包含 `text`）：
+
+```text
+platform, post_id, title, post_url, evidence_url, source_url,
+published_at, published_at_precision, collection_status,
+collection_status_source, collected_at, collection_source,
+platform_post_id_known, local_record_key, item_url_known, source_rank,
+metrics, value, rank, reason, relative_to_main_median, duration_seconds,
+hashtags, content_type, is_pinned, is_repost, is_promoted,
+platform_metrics, field_visibility, main_metric
+```
+
+`rank` 是实测样本的全局排名。`relative_to_main_median = value /
+main_metric_median`，保留 4 位小数；中位数为 `0` 或 `null` 时该值为
+`null`。`published_at` 输出 ISO 8601 字符串。`item_url_known=false`
+时 `post_url` 为 `null`，但保留已验证的 `source_url` / `evidence_url`
+来源锚点。`hashtags`、`platform_metrics` 和 `field_visibility` 须按值复制，
+不得丢失来源证据或平台扩展字段。
+
 ## 8. 空值规则（field_visibility）
 
 `field_visibility` 记录每个顶层字段是否对当前采集可见，便于计算字段覆盖率与诚实报告。示例：

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a zero-runtime-dependency `import_index_snapshot.py` path for public Douyin Web-index evidence after direct collection is blocked. The Agent verifies source/item ownership, while the importer validates official URLs and field consistency; it supports official Jingxuan item URLs and explicitly disclosed profile-index records.
 
 ### Changed
+- High/low analysis now thresholds and sizes groups from non-null measured values (including zero), reports measured count and median, resolves ties deterministically, and preserves the exact selected-item provenance contract with median-relative performance.
 - Normalized posts now preserve `hashtags`, `platform_metrics`, `field_visibility`, provenance, collection timestamps, source URLs, and nullable public flags across memory, canonical JSON CSV, and analysis outputs; bounded, type-checked readers retain compatibility with legacy delimited hashtags and historical Python-repr structured cells.
 - Missing or invalid per-post collection status now becomes auditable `PARTIAL` data with source provenance and a normalization warning. Analysis exposes fixed zero-filled `status_counts`, and warnings downgrade the normalization phase instead of inventing success.
 - Bilibili pin status now distinguishes a successful no-pin response from an unobserved endpoint, while Bilibili, Douyin index evidence, and Weibo keep unsupported public flags as `null`.

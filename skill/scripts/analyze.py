@@ -237,7 +237,7 @@ def build_posts(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "is_promoted": parse_bool(row.get("is_promoted")),
             "collection_status": collection_status,
             "collection_status_source": collection_status_source,
-            "collected_at": row.get("collected_at"),
+            "collected_at": row.get("collected_at") or None,
             "source_url": row.get("source_url") or row.get("post_url"),
             "collection_source": row.get("collection_source") or None,
             "platform_post_id_known": parse_bool(
@@ -701,13 +701,53 @@ def choose_main_metric(analysis_goal: Optional[str], valid: List[Dict[str, Any]]
     return metric, (f"指定指标 {metric} 及所有回退指标均不可用,跳过高低表现")
 
 
+def _measured_metric_items(
+    valid: List[Dict[str, Any]], main_metric: str
+) -> List[Tuple[Dict[str, Any], float]]:
+    return [
+        (post, value)
+        for post, value in (
+            (post, post_metric_value(post, main_metric)) for post in valid
+        )
+        if value is not None
+    ]
+
+
+def _main_metric_median(
+    measured_items: List[Tuple[Dict[str, Any], float]],
+) -> Optional[float]:
+    values = sorted(float(value) for _, value in measured_items)
+    return percentile(values, 0.5) if values else None
+
+
+def _high_low_sort_key(
+    item: Tuple[Dict[str, Any], float],
+) -> Tuple[float, int, int, str, str]:
+    post, value = item
+    source_rank = post.get("source_rank")
+    has_valid_source_rank = (
+        isinstance(source_rank, int)
+        and not isinstance(source_rank, bool)
+        and source_rank >= 1
+    )
+    return (
+        -float(value),
+        0 if has_valid_source_rank else 1,
+        source_rank if has_valid_source_rank else 0,
+        str(post.get("post_id") or ""),
+        str(post.get("platform") or ""),
+    )
+
+
 def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[Dict[str, Any]]:
-    measured_items = [(p, v) for p, v in ((p, post_metric_value(p, main_metric)) for p in valid) if v is not None]
+    measured_items = _measured_metric_items(valid, main_metric)
     n_meas = len(measured_items)
     if n_meas < MIN_SAMPLE_FOR_HIGH_LOW:
         return None  # 标记 INSUFFICIENT_SAMPLE
 
-    items_sorted = sorted(measured_items, key=lambda t: t[1], reverse=True)
+    main_metric_median = _main_metric_median(measured_items)
+
+    items_sorted = sorted(measured_items, key=_high_low_sort_key)
 
     k = math.ceil(n_meas * 0.2)
     if k < 3:
@@ -721,16 +761,48 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
     def to_item(t: Tuple[Dict, Optional[float]], rank: int) -> Dict[str, Any]:
         p, v = t
         item_url_known = p.get("item_url_known", bool(p.get("post_url")))
+        source_url = p.get("source_url") or p.get("post_url")
+        published_at = p.get("published_at")
+        if isinstance(published_at, datetime):
+            published_at = published_at.isoformat()
+        relative_to_main_median = (
+            None
+            if main_metric_median in (None, 0)
+            else rnd(float(v) / main_metric_median, 4)
+        )
         return {
+            "platform": p.get("platform"),
             "post_id": p["post_id"],
             "title": p.get("title"),
-            "post_url": p["post_url"] if item_url_known else None,
-            "evidence_url": p.get("source_url") or p.get("post_url"),
+            "post_url": p.get("post_url") if item_url_known else None,
+            "evidence_url": source_url,
+            "source_url": source_url,
+            "published_at": published_at,
+            "published_at_precision": p.get("published_at_precision", "unknown"),
+            "collection_status": p.get("collection_status"),
+            "collection_status_source": p.get("collection_status_source"),
+            "collected_at": p.get("collected_at"),
+            "collection_source": p.get("collection_source"),
+            "platform_post_id_known": p.get(
+                "platform_post_id_known", bool(p.get("post_id"))
+            ),
+            "local_record_key": p.get("local_record_key", False),
             "item_url_known": item_url_known,
+            "source_rank": p.get("source_rank"),
             "metrics": {metric: p.get(metric) for metric in METRIC_FIELDS},
             "value": rnd(v, 6) if v is not None else None,
             "rank": rank,
             "reason": f"主指标 {main_metric} = {rnd(v, 6) if v is not None else 'null'}",
+            "relative_to_main_median": relative_to_main_median,
+            "duration_seconds": p.get("duration_seconds"),
+            "hashtags": list(p.get("hashtags") or []),
+            "content_type": p.get("content_type"),
+            "is_pinned": p.get("is_pinned"),
+            "is_repost": p.get("is_repost"),
+            "is_promoted": p.get("is_promoted"),
+            "platform_metrics": copy.deepcopy(p.get("platform_metrics") or {}),
+            "field_visibility": copy.deepcopy(p.get("field_visibility") or {}),
+            "main_metric": main_metric,
         }
 
     high_items = [to_item(t, i + 1) for i, t in enumerate(high)]
@@ -739,6 +811,8 @@ def compute_high_low(valid: List[Dict[str, Any]], main_metric: str) -> Optional[
         "high": high_items,
         "low": low_items,
         "group_size": k,
+        "measured_count": n_meas,
+        "main_metric_median": main_metric_median,
         "main_metric": main_metric,
         "note": "高低表现仅描述样本中的相关特征,不构成因果结论(§6.4)",
     }
@@ -1225,26 +1299,26 @@ def analyze_in_memory(
         params.get("analysis_goal"), valid
     )
 
-    def metric_usable(metric: str) -> bool:
-        return any(post_metric_value(post, metric) is not None for post in valid)
-
-    hl = None if not metric_usable(main_metric) else compute_high_low(
-        valid, main_metric
-    )
+    measured_items = _measured_metric_items(valid, main_metric)
+    measured_count = len(measured_items)
+    main_metric_median = _main_metric_median(measured_items)
+    hl = None if measured_count == 0 else compute_high_low(valid, main_metric)
     if hl is None:
         high_performance: Any = "INSUFFICIENT_SAMPLE"
         low_performance: Any = "INSUFFICIENT_SAMPLE"
-        if not metric_usable(main_metric):
+        if measured_count == 0:
             status_reason = (
                 f"主排序指标 {main_metric} 全为 null,遵循 §6.1 安全约束跳过高低表现模块"
             )
         else:
             status_reason = (
-                f"有效样本 {valid_count} < {MIN_SAMPLE_FOR_HIGH_LOW}"
+                f"主指标实测样本 {measured_count} < {MIN_SAMPLE_FOR_HIGH_LOW}"
             )
         performance_meta = {
             "status": "INSUFFICIENT_SAMPLE",
             "main_metric": main_metric,
+            "measured_count": measured_count,
+            "main_metric_median": main_metric_median,
             "reason": status_reason,
             "metric_note": metric_note,
         }
@@ -1255,6 +1329,8 @@ def analyze_in_memory(
             "status": "ok",
             "main_metric": main_metric,
             "group_size": hl["group_size"],
+            "measured_count": hl["measured_count"],
+            "main_metric_median": hl["main_metric_median"],
             "note": hl["note"],
             "metric_note": metric_note,
         }
@@ -1418,23 +1494,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     if metric_note:
         print(f"NOTE: 主排序指标回退/跳过 -> {metric_note}", file=sys.stderr)
 
-    def metric_usable(m: str) -> bool:
-        return any(post_metric_value(p, m) is not None for p in valid)
-
     # §6.1 安全约束:主指标不可用(全 null)时跳过高低表现,不补造结论
-    hl = None if not metric_usable(main_metric) else compute_high_low(valid, main_metric)
+    measured_items = _measured_metric_items(valid, main_metric)
+    measured_count = len(measured_items)
+    main_metric_median = _main_metric_median(measured_items)
+    hl = None if measured_count == 0 else compute_high_low(valid, main_metric)
     if hl is None:
         high_performance: Any = "INSUFFICIENT_SAMPLE"
         low_performance: Any = "INSUFFICIENT_SAMPLE"
-        if not metric_usable(main_metric):
+        if measured_count == 0:
             status_reason = (
                 f"主排序指标 {main_metric} 全为 null,遵循 §6.1 安全约束跳过高低表现模块"
             )
         else:
-            status_reason = f"有效样本 {valid_count} < {MIN_SAMPLE_FOR_HIGH_LOW}"
+            status_reason = f"主指标实测样本 {measured_count} < {MIN_SAMPLE_FOR_HIGH_LOW}"
         performance_meta = {
             "status": "INSUFFICIENT_SAMPLE",
             "main_metric": main_metric,
+            "measured_count": measured_count,
+            "main_metric_median": main_metric_median,
             "reason": status_reason,
             "metric_note": metric_note,
         }
@@ -1445,6 +1523,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "status": "ok",
             "main_metric": main_metric,
             "group_size": hl["group_size"],
+            "measured_count": hl["measured_count"],
+            "main_metric_median": hl["main_metric_median"],
             "note": hl["note"],
             "metric_note": metric_note,
         }
