@@ -31,6 +31,7 @@ from task_contract import (
     new_task_id,
     validate_analysis_goal,
 )
+from csv_contract import serialize_csv_row
 
 
 _BEIJING = timezone(timedelta(hours=8))
@@ -69,7 +70,8 @@ def _write_csv(
     with reservation.open_text("normalized-posts.csv", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(posts)
+        for post in posts:
+            writer.writerow(serialize_csv_row(post, fields))
 
 
 def _serialize_artifacts(

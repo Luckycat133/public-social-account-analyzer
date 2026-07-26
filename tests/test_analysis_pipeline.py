@@ -480,6 +480,111 @@ def test_analyze_in_memory_has_no_filesystem_side_effects(tmp_path):
     assert list(tmp_path.iterdir()) == before
 
 
+def test_analyzer_reads_historical_collection_python_repr_cells():
+    posts = analyze.build_posts(
+        [
+            {
+                "platform": "bilibili",
+                "post_id": "BVlegacy",
+                "hashtags": "['甲', '乙']",
+                "platform_metrics": "{'a': 1}",
+                "field_visibility": "{'views': 'visible'}",
+                "collection_status": "SUCCESS",
+                "collection_status_source": "declared",
+            }
+        ]
+    )
+
+    assert posts[0]["hashtags"] == ["甲", "乙"]
+    assert posts[0]["platform_metrics"] == {"a": 1}
+    assert posts[0]["field_visibility"] == {"views": "visible"}
+    assert analyze.parse_json_object("{'tuple': (1, True, None)}") == {
+        "tuple": [1, True, None]
+    }
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        "{'a': {1}}",
+        "{'a': b'bytes'}",
+        "{'a': 1e999}",
+        "{1: 'non-string-key'}",
+        "{'a': __import__('os')}",
+    ],
+)
+def test_analyzer_rejects_unsafe_or_non_json_legacy_structured_cells(cell):
+    assert analyze.parse_json_object(cell) == {}
+
+
+def test_analyzer_rejects_oversized_or_non_scalar_legacy_hashtag_cells():
+    assert analyze.parse_hashtags("[b'bytes']") == []
+    assert analyze.parse_hashtags("[__import__('os')]") == []
+    assert analyze.parse_hashtags("['" + ("x" * 16_385) + "']") == []
+
+
+def test_analyzer_rejects_deeply_nested_canonical_json_cells_without_crashing():
+    deeply_nested_array = ("[" * 1_200) + '"tag"' + ("]" * 1_200)
+    deeply_nested_object = ('{"a":' * 1_200) + "1" + ("}" * 1_200)
+
+    assert analyze.parse_hashtags(deeply_nested_array) == []
+    assert analyze.parse_json_object(deeply_nested_object) == {}
+
+
+def test_sample_boundary_has_fixed_zero_filled_collection_status_counts():
+    result = analyze.analyze_in_memory(
+        _sample_profile(),
+        _normalized_rows(),
+        {"task_id": "status-counts", "platform": "douyin"},
+    )
+
+    assert result.analysis["sample_boundary"]["status_counts"] == {
+        "SUCCESS": 1,
+        "PARTIAL": 0,
+        "FAILED": 0,
+        "DELETED": 0,
+        "RESTRICTED": 0,
+    }
+
+
+def test_collection_status_counts_keep_compatibility_totals_and_flag_exclusion():
+    specs = [
+        ("success", "SUCCESS", None),
+        ("pinned-success", "SUCCESS", True),
+        ("partial", "PARTIAL", None),
+        ("failed", "FAILED", None),
+        ("deleted", "DELETED", None),
+        ("restricted", "RESTRICTED", None),
+    ]
+    rows = []
+    for post_id, status, pinned in specs:
+        raw = _sample_post(post_id)
+        raw["collection_status"] = status
+        raw["is_pinned"] = pinned
+        rows.append(normalize.normalize_post(raw)[0])
+
+    result = analyze.analyze_in_memory(
+        _sample_profile(),
+        rows,
+        {"task_id": "status-counts", "platform": "douyin"},
+    )
+    boundary = result.analysis["sample_boundary"]
+
+    assert boundary["status_counts"] == {
+        "SUCCESS": 2,
+        "PARTIAL": 1,
+        "FAILED": 1,
+        "DELETED": 1,
+        "RESTRICTED": 1,
+    }
+    assert boundary["collected"] == 6
+    assert boundary["valid"] == 2
+    assert boundary["missing"] == 2
+    assert boundary["restricted"] == 1
+    assert boundary["excluded_flagged"] == 1
+    assert boundary["excluded_flagged_post_ids"] == ["pinned-success"]
+
+
 def test_render_in_memory_rejects_missing_required_input():
     with pytest.raises(render_report.RenderError, match="profile"):
         render_report.render_in_memory(
@@ -661,6 +766,50 @@ def test_limited_upstream_commits_partial_analysis(tmp_path):
         "validation": "COMPLETED",
     }
     assert (output / ".complete").is_file()
+
+
+@pytest.mark.parametrize("raw_status", [None, "NOT_A_STATUS"])
+def test_inferred_collection_status_makes_pipeline_normalization_partial(
+    tmp_path, raw_status
+):
+    pipeline = _pipeline_module()
+    post = _sample_post()
+    if raw_status is None:
+        post.pop("collection_status")
+    else:
+        post["collection_status"] = raw_status
+    collection, _ = _collection(
+        tmp_path, task_status="COMPLETED", posts=[post]
+    )
+    output = tmp_path / "analysis"
+    classification_path = tmp_path / "classification-results.json"
+    classification_path.write_text(
+        json.dumps([_classification()], ensure_ascii=False), encoding="utf-8"
+    )
+
+    result = pipeline.run_pipeline(
+        str(collection),
+        str(output),
+        template_text=_minimal_template(),
+        classification_results_path=str(classification_path),
+    )
+
+    task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+    coverage = json.loads(
+        (output / "normalized-coverage.json").read_text(encoding="utf-8")
+    )
+    analysis_payload = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )
+    assert result.task_status == task["task_status"] == "PARTIAL"
+    assert task["partial_reasons"] == ["NORMALIZATION_PARTIAL"]
+    assert task["phase_results"]["normalization"] == "PARTIAL"
+    assert task["phase_results"]["analysis"] == "COMPLETED"
+    assert coverage["warning_count"] == 1
+    assert coverage["warnings"][0]["warning_code"] == (
+        "COLLECTION_STATUS_INFERRED"
+    )
+    assert analysis_payload["sample_boundary"]["status_counts"]["PARTIAL"] == 1
 
 
 def test_pending_classification_status_is_consistent_in_analysis_and_reports(

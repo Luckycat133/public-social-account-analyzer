@@ -133,6 +133,10 @@ def test_jingxuan_evidence_keeps_real_ids_urls_and_partial_status():
     assert post["post_url"].endswith("/7646317821839805739")
     assert post["published_at"] == "2026-07-18T00:00:00+08:00"
     assert post["collection_status"] == "PARTIAL"
+    assert post["collection_status_source"] == "declared"
+    assert post["is_pinned"] is None
+    assert post["is_repost"] is None
+    assert post["is_promoted"] is None
     assert post["platform_metrics"] == {
         "collection_source": "douyin_jingxuan",
         "platform_post_id_known": True,
@@ -158,6 +162,10 @@ def test_search_index_uses_deterministic_disclosed_local_keys():
         assert post["published_at"] is None
         assert post["content_type"] == "other"
         assert post["collection_status"] == "PARTIAL"
+        assert post["collection_status_source"] == "declared"
+        assert post["is_pinned"] is None
+        assert post["is_repost"] is None
+        assert post["is_promoted"] is None
         assert post["platform_metrics"]["platform_post_id_known"] is False
         assert post["platform_metrics"]["local_record_key"] is True
         assert post["platform_metrics"]["item_url_known"] is False

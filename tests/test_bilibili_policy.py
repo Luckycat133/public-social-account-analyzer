@@ -315,6 +315,72 @@ def test_post_list_does_not_change_endpoint_after_access_restriction(
     assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
 
 
+@pytest.mark.parametrize(
+    ("observation", "expected_flags"),
+    [
+        ((False, None), [None, None]),
+        ((True, None), [False, False]),
+        ((True, "BVone"), [True, False]),
+        ("BVone", [True, False]),
+    ],
+)
+def test_post_list_marks_pin_only_from_an_observed_top_response(
+    monkeypatch, observation, expected_flags
+):
+    class PinnedSession:
+        def ensure_buvid(self):
+            return None
+
+        def collect_pinned(self, mid):
+            return observation
+
+        def discover_medialist(self, mid, limit):
+            return [
+                {
+                    "bv_id": "BVone",
+                    "copy_right": 1,
+                    "cnt_info": {},
+                },
+                {
+                    "bv_id": "BVtwo",
+                    "copy_right": 1,
+                    "cnt_info": {},
+                },
+            ]
+
+        def collect_tags(self, bvid):
+            return []
+
+    collector = BilibiliCollector(browser_fallback=False)
+    monkeypatch.setattr(collector, "_new_session", PinnedSession)
+
+    posts = collector.collect_post_list(
+        "https://space.bilibili.com/123", limit=2
+    )
+
+    assert [post["is_pinned"] for post in posts] == expected_flags
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"code": 0, "data": {"bvid": "BVtop"}}, (True, "BVtop")),
+        ({"code": 0, "data": None}, (True, None)),
+        ({"code": 0, "data": {}}, (False, None)),
+        ({"code": 0, "data": {"bvid": ""}}, (False, None)),
+        ({"code": 0, "data": {"bvid": 123}}, (False, None)),
+        ({"code": -1, "data": None}, (False, None)),
+    ],
+)
+def test_collect_pinned_distinguishes_observed_no_pin_from_failure(
+    monkeypatch, response, expected
+):
+    session = Session(browser_fallback=False)
+    monkeypatch.setattr(session, "get_json", lambda *args, **kwargs: response)
+
+    assert session.collect_pinned("123") == expected
+
+
 def test_collector_reuses_one_session_across_task_methods(monkeypatch):
     collector = BilibiliCollector(browser_fallback=False)
     session = collector._new_session()

@@ -179,9 +179,13 @@ def test_deep_approval_rate_null_views_is_null():
     assert analyze.deep_approval_rate(post) is None
 
 
-def test_deep_approval_rate_null_components_treated_as_zero():
-    # coins/favorites 为 null 时按 0 计入分子
+def test_deep_approval_rate_all_unknown_components_stay_null():
     post = {"views": 100, "coins": None, "favorites": None, "likes": 50}
+    assert analyze.deep_approval_rate(post) is None
+
+
+def test_deep_approval_rate_uses_zero_only_after_one_component_is_known():
+    post = {"views": 100, "coins": 0, "favorites": None, "likes": 50}
     assert analyze.deep_approval_rate(post) == 0.0
 
 
@@ -201,9 +205,21 @@ def test_community_discussion_rate_zero_views_is_null():
     assert analyze.community_discussion_rate(post) is None
 
 
-def test_community_discussion_rate_null_components_treated_as_zero():
+def test_community_discussion_rate_all_unknown_components_stay_null():
     post = {"views": 100, "comments": None, "danmaku": None}
+    assert analyze.community_discussion_rate(post) is None
+
+
+def test_community_discussion_rate_uses_zero_only_after_one_component_is_known():
+    post = {"views": 100, "comments": 0, "danmaku": None}
     assert analyze.community_discussion_rate(post) == 0.0
+
+
+def test_engagement_note_discloses_null_numerator_policy():
+    note = analyze.compute_engagement([], {})["denominator_note"]
+
+    assert "分子全部为 null 时比率为 null" in note
+    assert "至少一项已知时其余 null 按 0" in note
 
 
 # ---------------------------------------------------------------------------

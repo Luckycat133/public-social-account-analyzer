@@ -443,10 +443,12 @@ class Session:
             time.sleep(1.0)  # 翻页间隔，降低风控概率
         return out[:limit]
 
-    def collect_pinned(self, mid: str) -> str | None:
-        """获取置顶视频 BV号。端点 /x/space/top/arc（免 wbi、稳定）。
+    def collect_pinned(self, mid: str) -> tuple[bool, str | None]:
+        """获取置顶视频证据，区分“无置顶”与“未观测成功”。
 
-        无置顶时返回 None。失败时返回 None（不阻塞主流程）。
+        返回 ``(observed, bvid)``：端点成功响应时 ``observed=True``，
+        其中 ``bvid=None`` 表示明确无置顶；普通失败返回
+        ``(False, None)``，不得推断为非置顶。
         """
         try:
             data = self.get_json(
@@ -455,12 +457,20 @@ class Session:
                 wbi=False,
                 retry=2,
             )
-            if data.get("code") == 0 and data.get("data"):
-                return data["data"].get("bvid")
+            if data.get("code") == 0:
+                payload = data.get("data")
+                if payload is None:
+                    return True, None
+                if not isinstance(payload, dict):
+                    return False, None
+                bvid = payload.get("bvid")
+                if isinstance(bvid, str) and bvid.strip():
+                    return True, bvid.strip()
+                return False, None
         except BilibiliError as error:
             if _is_platform_protection(error):
                 raise
-        return None
+        return False, None
 
     def collect_tags(self, bvid: str) -> list[str]:
         """获取视频标签。端点 /x/tag/archive/tags（免 wbi、稳定）。
@@ -777,7 +787,19 @@ class BilibiliCollector(BaseCollector):
         s.ensure_buvid()
 
         # 置顶视频检测（top/arc，免 wbi、稳定）——用于标记 is_pinned
-        pinned_bvid = s.collect_pinned(mid)
+        pinned_result = s.collect_pinned(mid)
+        if (
+            isinstance(pinned_result, tuple)
+            and len(pinned_result) == 2
+            and isinstance(pinned_result[0], bool)
+        ):
+            pinned_observed, pinned_bvid = pinned_result
+        elif isinstance(pinned_result, str) and pinned_result.strip():
+            # 旧 Session/测试双直接返回 BV 号，它仍是明确的置顶证据。
+            pinned_observed, pinned_bvid = True, pinned_result.strip()
+        else:
+            # 向下兼容旧测试双/外部适配；无证据必须保持未知。
+            pinned_observed, pinned_bvid = False, None
 
         # 三级降级链：medialist(免wbi+完整指标) → arc/search(wbi) → search/type(BV列表)
         entries = None
@@ -868,8 +890,10 @@ class BilibiliCollector(BaseCollector):
                 base["hashtags"] = merged
 
             # 置顶标记
-            if pinned_bvid and bvid == pinned_bvid:
-                base["is_pinned"] = True
+            if pinned_observed:
+                base["is_pinned"] = bool(
+                    pinned_bvid is not None and bvid == pinned_bvid
+                )
 
             posts.append(self.normalize_post(base))
 
@@ -1052,6 +1076,26 @@ def _build_profile_raw(mid, card, stat, acc) -> dict:
     }
 
 
+def _copyright_repost(value: Any) -> bool | None:
+    """仅当 B 站返回明确 copyright 枚举时标记原创/转载。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        copyright_value = value
+    elif isinstance(value, str):
+        canonical = value.strip()
+        if canonical not in {"1", "2"}:
+            return None
+        copyright_value = int(canonical)
+    else:
+        return None
+    if copyright_value == 1:
+        return False
+    if copyright_value == 2:
+        return True
+    return None
+
+
 def _build_post_raw_from_medialist(p: dict, url: str) -> dict:
     """medialist/resource/list 条目 → 统一原始字典。
 
@@ -1082,9 +1126,9 @@ def _build_post_raw_from_medialist(p: dict, url: str) -> dict:
         "text": intro or None,
         "duration_seconds": _parse_duration(p.get("duration")),
         "hashtags": hashtags,
-        "is_pinned": False,  # 由 collect_post_list 根据 top/arc 结果回填
-        "is_repost": copyright == 2,
-        "is_promoted": False,
+        "is_pinned": None,  # 由 collect_post_list 根据明确 top/arc 结果回填
+        "is_repost": _copyright_repost(copyright),
+        "is_promoted": None,
         "views": _int(cnt.get("play")),
         "likes": _int(cnt.get("thumb_up")),
         "comments": _int(cnt.get("reply")),
@@ -1113,7 +1157,7 @@ def _build_post_raw_from_vlist(p: dict, url: str) -> dict:
     video_review。这些缺失字段保持 None（honest null），由 view 补全。
     """
     bvid = p.get("bvid") or str(p.get("aid"))
-    copyright = _int(p.get("copyright"))
+    copyright = p.get("copyright")
     return {
         "platform": "bilibili",
         "post_id": bvid,
@@ -1124,9 +1168,9 @@ def _build_post_raw_from_vlist(p: dict, url: str) -> dict:
         "text": p.get("description") or p.get("desc"),
         "duration_seconds": _parse_duration(p.get("length") or p.get("duration")),
         "hashtags": _extract_hashtags(p.get("title"), p.get("description") or p.get("desc")),
-        "is_pinned": False,
-        "is_repost": copyright == 2,
-        "is_promoted": False,
+        "is_pinned": None,
+        "is_repost": _copyright_repost(copyright),
+        "is_promoted": None,
         "views": _int(p.get("play")),
         "likes": None,
         "comments": _int(p.get("comment") or p.get("reply")),
@@ -1165,9 +1209,9 @@ def _build_post_raw_from_view(d: dict, url: str) -> dict:
         "text": d.get("desc"),
         "duration_seconds": _parse_duration(d.get("duration")),
         "hashtags": _extract_hashtags(d.get("title"), d.get("desc")),
-        "is_pinned": False,
-        "is_repost": copyright == 2,
-        "is_promoted": False,
+        "is_pinned": None,
+        "is_repost": _copyright_repost(copyright),
+        "is_promoted": None,
         "views": _int(stat.get("view")),
         "likes": _int(stat.get("like")),
         "comments": _int(stat.get("reply")),
@@ -1196,9 +1240,9 @@ def _empty_post(bvid: str) -> dict:
         "post_url": f"{VIDEO}{bvid}",
         "content_type": "video",
         "hashtags": [],
-        "is_pinned": False,
-        "is_repost": False,
-        "is_promoted": False,
+        "is_pinned": None,
+        "is_repost": None,
+        "is_promoted": None,
         "collection_status": "ok",
         "collected_at": _now_iso(),
         "source_url": f"{VIDEO}{bvid}",
@@ -1238,7 +1282,7 @@ def _extract_dynamic_card(it: dict) -> dict | None:
         "desc": desc,
         "pub_ts": pts,
         "pub_time": author.get("pub_time"),
-        "is_forward": bool(it.get("orig")),
+        "is_forward": bool(it.get("orig")) if "orig" in it else None,
         "stat": {
             "play": astat.get("play"),
             "danmaku": astat.get("danmaku"),
@@ -1261,9 +1305,9 @@ def _build_dynamic_raw(card: dict) -> dict:
         "content_type": "dynamic",
         "title": card.get("title"),
         "text": card.get("desc"),
-        "is_pinned": False,
+        "is_pinned": None,
         "is_repost": card.get("is_forward"),
-        "is_promoted": False,
+        "is_promoted": None,
         "collection_status": "ok",
         "collected_at": _now_iso(),
         "source_url": f"{VIDEO}{bv}",

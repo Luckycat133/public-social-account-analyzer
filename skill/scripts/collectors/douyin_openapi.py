@@ -267,6 +267,7 @@ def _map_video(item: Any) -> dict[str, Any]:
         "is_repost": None,
         "is_promoted": None,
         "collection_status": "SUCCESS",
+        "collection_status_source": "declared",
         "collected_at": now,
         "source_url": post_url,
         "views": _safe_int(statistics.get("play_count")),

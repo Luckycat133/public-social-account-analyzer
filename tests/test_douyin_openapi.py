@@ -6,11 +6,13 @@ import json
 import os
 import sys
 import urllib.error
+import csv
 from pathlib import Path
 
 import pytest
 
 import collect_douyin_authorized as authorized
+import analyze
 import immutable_workspace as immutable
 import collectors.douyin_openapi as openapi
 from collect_douyin_authorized import run
@@ -142,6 +144,7 @@ def test_two_video_pages_map_deduplicate_and_prove_exhaustive():
         "is_repost": None,
         "is_promoted": None,
         "collection_status": "SUCCESS",
+        "collection_status_source": "declared",
         "collected_at": posts[0]["collected_at"],
         "source_url": "https://www.douyin.com/video/7001",
         "views": 101,
@@ -811,7 +814,7 @@ def test_authorized_missing_backend_fails_before_workspace_and_api(
 
 def test_all_writes_standard_completed_artifacts_without_token(tmp_path, capsys):
     out_dir = tmp_path / "authorized"
-    video = _video(7001, title="授权作品", create_time=1700000000, is_top=0, play_count=10)
+    video = _video(7001, title="#授权作品", create_time=1700000000, is_top=0, play_count=10)
     client = DouyinOpenAPIClient(
         TOKEN,
         transport=FakeTransport([
@@ -838,6 +841,25 @@ def test_all_writes_standard_completed_artifacts_without_token(tmp_path, capsys)
     assert task["task_status"] == "COMPLETED"
     assert task["collection_coverage"]["is_exhaustive"] is True
     assert task["collection_source"] == "douyin_openapi_token_owner"
+    with (out_dir / "normalized-posts.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        row = next(csv.DictReader(handle))
+    assert row["hashtags"] == '["授权作品"]'
+    assert row["platform_metrics"] == (
+        '{"download_count":5,"forward_count":6,"media_type":2}'
+    )
+    assert row["is_pinned"] == "false"
+    assert row["is_repost"] == ""
+    post = analyze.build_posts([row])[0]
+    assert post["hashtags"] == ["授权作品"]
+    assert post["platform_metrics"] == {
+        "download_count": 5,
+        "forward_count": 6,
+        "media_type": 2,
+    }
+    assert post["is_pinned"] is False
+    assert post["is_repost"] is None
     assert TOKEN not in _artifact_text(out_dir)
     assert TOKEN not in captured.out + captured.err
 

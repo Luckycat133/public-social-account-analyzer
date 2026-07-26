@@ -70,6 +70,7 @@
 ## 特殊处理
 
 - **置顶**：置顶微博标记 `is_pinned = true`，**不混入**近期原创统计（分析层默认排除）。
+- **公开标记空值**：`isTop` / `retweeted_status` 等证据缺失时，对应的 `is_pinned` / `is_repost` 保持 `null`；未取得公开投放证据时 `is_promoted=null`。
 - **转发微博**：标记 `is_repost = true`，记录原博 URL；转发内容**不作为**本账号原创内容计入分析。
 - **长文**：长微博标记 `content_type = text`，完整正文需进入详情采集（`collect_post_detail`）。
 - **图文 / 视频**：按媒体类型分类（`image_text` / `video`）；视频微博如需时长可存 `platform_metrics`。

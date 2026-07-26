@@ -11,6 +11,7 @@ import hashlib
 import os
 import stat
 import sys
+import csv
 
 import pytest
 
@@ -20,6 +21,7 @@ for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT
         sys.path.insert(0, _d)
 
 import collect  # noqa: E402
+import analyze  # noqa: E402
 from collectors.base import BaseCollector  # noqa: E402
 
 
@@ -113,6 +115,43 @@ def test_latest_published_at():
     assert collect._latest_published_at(posts) == "2026-07-20T00:00:00+08:00"
 
 
+def test_collection_csv_round_trips_structured_fields_and_nullable_booleans(
+    tmp_path,
+):
+    path = tmp_path / "normalized-posts.csv"
+    collect._write_csv(
+        [
+            {
+                "platform": "bilibili",
+                "post_id": "BVcsv",
+                "hashtags": ["中文", "tag"],
+                "is_pinned": False,
+                "is_repost": None,
+                "platform_metrics": {"z": 2, "a": True},
+                "field_visibility": {"views": "visible"},
+                "collection_status": "SUCCESS",
+                "collection_status_source": "declared",
+            }
+        ],
+        str(path),
+    )
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["hashtags"] == '["中文","tag"]'
+    assert row["platform_metrics"] == '{"a":true,"z":2}'
+    assert row["field_visibility"] == '{"views":"visible"}'
+    assert row["is_pinned"] == "false"
+    assert row["is_repost"] == ""
+
+    post = analyze.build_posts([row])[0]
+    assert post["hashtags"] == ["中文", "tag"]
+    assert post["platform_metrics"] == {"a": True, "z": 2}
+    assert post["field_visibility"] == {"views": "visible"}
+    assert post["is_pinned"] is False
+    assert post["is_repost"] is None
+
+
 def test_resume_end_to_end_creates_distinct_outputs_and_never_mutates_old(
     monkeypatch, tmp_path
 ):
@@ -152,6 +191,10 @@ def test_resume_end_to_end_creates_distinct_outputs_and_never_mutates_old(
     assert keys == ["BV_KEEP", "BV_NEW1", "BV_OLD1", "BV_PRE"], keys
     by_key = {collect._post_key(p): p for p in merged}
     assert by_key["BV_OLD1"]["views"] == 999        # 新覆盖旧
+    assert all(p["collection_status"] == "PARTIAL" for p in merged)
+    assert all(
+        p["collection_status_source"] == "inferred_missing" for p in merged
+    )
     task = json.loads((new / "task.json").read_text(encoding="utf-8"))
     assert task["incremental"] is True
     assert task["existing_count"] == 3
@@ -165,6 +208,61 @@ def test_resume_end_to_end_creates_distinct_outputs_and_never_mutates_old(
         for path in old.rglob("*")
         if path.is_file()
     } == old_hashes
+
+
+@pytest.mark.parametrize("historical_repr", [False, True])
+def test_csv_only_resume_restores_cell_types_in_new_jsonl(
+    monkeypatch, tmp_path, historical_repr
+):
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
+    monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
+    old = tmp_path / "csv-only"
+    old.mkdir()
+    (old / "source").mkdir()
+    row = {
+        "platform": "bilibili",
+        "post_id": "BV_CSV",
+        "bvid": "BV_CSV",
+        "published_at": "2026-07-15T10:00:00+08:00",
+        "hashtags": ["中文", "tag"],
+        "is_pinned": False,
+        "is_repost": None,
+        "is_promoted": True,
+        "views": 7,
+        "platform_metrics": {"nested": {"ok": True}},
+        "field_visibility": {"views": "visible"},
+        "collection_status": "SUCCESS",
+        "collection_status_source": "declared",
+    }
+    csv_path = old / "normalized-posts.csv"
+    if historical_repr:
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerow(row)
+    else:
+        collect._write_csv([row], str(csv_path))
+
+    assert collect.run(
+        "https://space.bilibili.com/123",
+        limit=30,
+        out_dir=str(old),
+        resume=True,
+    ) == 0
+
+    output = next(tmp_path.glob("csv-only-resume-*"))
+    with (output / "source" / "posts.jsonl").open(encoding="utf-8") as handle:
+        posts = [json.loads(line) for line in handle if line.strip()]
+    resumed = next(post for post in posts if post["post_id"] == "BV_CSV")
+    assert resumed["hashtags"] == ["中文", "tag"]
+    assert resumed["is_pinned"] is False
+    assert resumed["is_repost"] is None
+    assert resumed["is_promoted"] is True
+    assert resumed["views"] == 7
+    assert resumed["platform_metrics"] == {"nested": {"ok": True}}
+    assert resumed["field_visibility"] == {"views": "visible"}
+    assert resumed["collection_status"] == "SUCCESS"
+    assert resumed["collection_status_source"] == "declared"
 
 
 def test_resume_without_out_returns_error_before_adapter_or_workspace(

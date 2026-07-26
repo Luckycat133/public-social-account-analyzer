@@ -85,6 +85,23 @@ def _int(v: Any) -> int | None:
         return None
 
 
+def _optional_public_bool(mapping: dict, key: str) -> bool | None:
+    if key not in mapping:
+        return None
+    value = mapping.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true"}:
+            return True
+        if normalized in {"0", "false"}:
+            return False
+    return None
+
+
 class WeiboError(RuntimeError):
     """携带 stop_reason 的微博采集错误（与 BilibiliError 同构）。"""
 
@@ -207,7 +224,14 @@ def _build_post_raw(it: dict, uid: str) -> dict:
     bid = str(it.get("id") or it.get("bid") or "")
     text_html = it.get("text") or ""
     text = _strip_html(text_html)
-    is_repost = bool(it.get("retweeted_status"))
+    if "retweeted_status" not in it:
+        is_repost = None
+    elif isinstance(it.get("retweeted_status"), dict):
+        is_repost = bool(it.get("retweeted_status"))
+    elif it.get("retweeted_status") in (None, False):
+        is_repost = False
+    else:
+        is_repost = None
     rto = it.get("retweeted_status") or {}
     pi = it.get("page_info") or {}
     ptype = pi.get("type")
@@ -226,9 +250,9 @@ def _build_post_raw(it: dict, uid: str) -> dict:
         "title": (text.split("\n")[0][:50] if text else None),
         "text": text or None,
         "hashtags": _extract_hashtags(text),
-        "is_pinned": bool(it.get("isTop")),
+        "is_pinned": _optional_public_bool(it, "isTop"),
         "is_repost": is_repost,
-        "is_promoted": False,
+        "is_promoted": None,
         "views": _int(it.get("play_count")) if it.get("play_count") is not None else None,
         "likes": _int(it.get("attitudes_count")),
         "comments": _int(it.get("comments_count")),
@@ -240,7 +264,11 @@ def _build_post_raw(it: dict, uid: str) -> dict:
         "collected_at": _now_iso(),
         "source_url": f"https://weibo.com/{uid}/{bid}",
         "platform_metrics": {
-            "repost_source": (rto.get("user") or {}).get("screen_name") if is_repost else None,
+            "repost_source": (
+                (rto.get("user") or {}).get("screen_name")
+                if is_repost is True
+                else None
+            ),
             "pic_num": _int(it.get("pic_num")),
             "source": it.get("source"),
             "page_type": ptype,

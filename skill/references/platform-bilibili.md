@@ -279,10 +279,10 @@ B站账号层 `platform_metrics` 约定为空对象 `{}`（获赞总量非账号
 
 ## 特殊处理
 
-- **置顶视频**：`is_pinned=true`（公开列表接口未稳定暴露置顶标记时，best-effort 默认 `false`，不臆测为 `true`）。
+- **置顶视频**：`top/arc` 成功返回 BV 号时，命中项写 `true`、其余项写 `false`；端点明确成功但无置顶时全部写 `false`；端点失败或结果不可验证时写 `null`。
 - **合集**：统一模型无 `is_in_collection` 字段；合集归属作为分析层 `series_name` 标记（见 data-schema §7），不新增 Post 布尔字段；合集本身不计入近期投稿排序。
 - **动态视频**：标记 `content_type=dynamic`（区别于正式投稿 `video`）。
-- **转载**：`copyright=2` → `is_repost=true`；原创（`copyright=1`）→ `is_repost=false`。
+- **转载**：`copyright=2` → `is_repost=true`；原创（`copyright=1`）→ `is_repost=false`；`copyright` 缺失/非法时写 `null`。未取得公开投放证据时 `is_promoted=null`。
 - **充电专属 / 不可访问内容**：无法公开访问的投稿记 `collection_status=RESTRICTED`（或 `DELETED`），指标写 `null`，不臆测数值。
 - **获赞总量**：B站主页「获赞」为全站累计，非账号层统一字段，且 `web-interface/card` 不含该值，故**不进入 Profile**（`platform_metrics` 保持 `{}`）。
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -16,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from immutable_workspace import WorkspaceError, reject_sealed_workspace
+from csv_contract import parse_hashtag_cell, parse_structured_object_cell
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -24,6 +26,22 @@ from immutable_workspace import WorkspaceError, reject_sealed_workspace
 # 统一指标字段(见 data-schema.md §6)
 METRIC_FIELDS = ["views", "likes", "comments", "favorites", "shares", "coins", "danmaku"]
 VALID_STATUS = {"SUCCESS", "PARTIAL"}  # 参与默认统计的采集状态(§1)
+COLLECTION_STATUS_ORDER = (
+    "SUCCESS",
+    "PARTIAL",
+    "FAILED",
+    "DELETED",
+    "RESTRICTED",
+)
+COLLECTION_STATUS_CANON = {
+    "success": "SUCCESS",
+    "ok": "SUCCESS",
+    "partial": "PARTIAL",
+    "failed": "FAILED",
+    "fail": "FAILED",
+    "deleted": "DELETED",
+    "restricted": "RESTRICTED",
+}
 # 默认排除的标记(§1)
 FLAG_FIELDS = ["is_pinned", "is_repost", "is_promoted"]
 
@@ -58,32 +76,44 @@ def parse_int(v: Any) -> Optional[int]:
     return int(f)
 
 
-def parse_bool(v: Any, default: bool = False) -> bool:
+def parse_bool(
+    v: Any, default: Optional[bool] = None
+) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        if v in (0, 0.0):
+            return False
+        if v in (1, 1.0):
+            return True
+        return default
     if v is None:
         return default
     s = str(v).strip().lower()
     if s in ("true", "1", "yes", "y", "t"):
         return True
-    if s in ("false", "0", "no", "n", "f", ""):
+    if s in ("false", "0", "no", "n", "f"):
         return False
     return default
 
 
 def parse_hashtags(v: Any) -> List[str]:
-    if v is None:
-        return []
-    s = str(v).strip()
-    if s == "":
-        return []
-    if s.startswith("["):
-        try:
-            arr = json.loads(s)
-            if isinstance(arr, list):
-                return [str(x) for x in arr]
-        except (json.JSONDecodeError, TypeError):
-            pass
-    parts = [p.strip().lstrip("#") for p in s.replace(";", ",").split(",") if p.strip()]
-    return parts
+    return parse_hashtag_cell(v)
+
+
+def parse_json_object(v: Any) -> Dict[str, Any]:
+    """Read a structured CSV cell or in-memory object without sharing state."""
+    return parse_structured_object_cell(v)
+
+
+def parse_collection_status(v: Any) -> Tuple[str, str]:
+    """Return a trusted collection status and its provenance."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return "PARTIAL", "inferred_missing"
+    status = COLLECTION_STATUS_CANON.get(str(v).strip().lower())
+    if status is None:
+        return "PARTIAL", "inferred_invalid"
+    return status, "declared"
 
 
 def parse_dt(v: Any) -> Optional[datetime]:
@@ -174,6 +204,24 @@ def build_posts(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """将 CSV 行映射为统一 Post 结构(见 data-schema.md §5 / §6)。"""
     posts: List[Dict[str, Any]] = []
     for row in raw_rows:
+        collection_status, derived_status_source = parse_collection_status(
+            row.get("collection_status")
+        )
+        supplied_status_source = row.get("collection_status_source")
+        if (
+            derived_status_source == "declared"
+            and (
+                supplied_status_source == "declared"
+                or (
+                    collection_status == "PARTIAL"
+                    and supplied_status_source
+                    in {"inferred_missing", "inferred_invalid"}
+                )
+            )
+        ):
+            collection_status_source = supplied_status_source
+        else:
+            collection_status_source = derived_status_source
         post: Dict[str, Any] = {
             "platform": row.get("platform"),
             "post_id": row.get("post_id"),
@@ -187,14 +235,17 @@ def build_posts(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "is_pinned": parse_bool(row.get("is_pinned")),
             "is_repost": parse_bool(row.get("is_repost")),
             "is_promoted": parse_bool(row.get("is_promoted")),
-            "collection_status": (row.get("collection_status") or "SUCCESS").strip().upper(),
+            "collection_status": collection_status,
+            "collection_status_source": collection_status_source,
             "collected_at": row.get("collected_at"),
             "source_url": row.get("source_url") or row.get("post_url"),
             "collection_source": row.get("collection_source") or None,
             "platform_post_id_known": parse_bool(
                 row.get("platform_post_id_known"), default=bool(row.get("post_id"))
             ),
-            "local_record_key": parse_bool(row.get("local_record_key")),
+            "local_record_key": parse_bool(
+                row.get("local_record_key"), default=False
+            ),
             "item_url_known": parse_bool(
                 row.get("item_url_known"), default=bool(row.get("post_url"))
             ),
@@ -204,6 +255,8 @@ def build_posts(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 if row.get("published_at_precision") in ("datetime", "date", "unknown")
                 else ("datetime" if parse_dt(row.get("published_at")) else "unknown")
             ),
+            "platform_metrics": parse_json_object(row.get("platform_metrics")),
+            "field_visibility": parse_json_object(row.get("field_visibility")),
         }
         for m in METRIC_FIELDS:
             post[m] = parse_int(row.get(m))
@@ -229,6 +282,16 @@ def split_samples(all_posts: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dic
     missing = [p for p in all_posts if p["collection_status"] in ("FAILED", "DELETED")]
     restricted = [p for p in all_posts if p["collection_status"] == "RESTRICTED"]
     return all_posts, valid, flagged, missing, restricted
+
+
+def collection_status_counts(all_posts: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Count every collected row before flag-based analysis exclusions."""
+    counts = {status: 0 for status in COLLECTION_STATUS_ORDER}
+    for post in all_posts:
+        status = post.get("collection_status")
+        if status in counts:
+            counts[status] += 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -503,15 +566,17 @@ def deep_approval_rate(p: Dict[str, Any]) -> Optional[float]:
     """四分法·深度认可率 = (coins + favorites) / views（§4 扩展，混合口径）。
 
     分母 views 为 null/0 时该条置 null（分母透明，禁止用 0 做分母）。
-    coins/favorites 为 null 时按 0 计入分子（单条互动指标，非统一互动率分子）。
+    coins/favorites 全部未知时返回 null；至少一项有证据时，另一项 null 按 0 计。
     """
     if _is_search_index_post(p):
         return None
     views = p["views"]
     if views is None or views == 0:
         return None
-    coins = p["coins"] or 0
-    favorites = p["favorites"] or 0
+    if p.get("coins") is None and p.get("favorites") is None:
+        return None
+    coins = p.get("coins") or 0
+    favorites = p.get("favorites") or 0
     return (coins + favorites) / views
 
 
@@ -519,15 +584,17 @@ def community_discussion_rate(p: Dict[str, Any]) -> Optional[float]:
     """四分法·社群讨论率 = (comments + danmaku) / views（§4 扩展）。
 
     分母 views 为 null/0 时该条置 null（分母透明）。
-    comments/danmaku 为 null 时按 0 计入分子。
+    comments/danmaku 全部未知时返回 null；至少一项有证据时，另一项 null 按 0 计。
     """
     if _is_search_index_post(p):
         return None
     views = p["views"]
     if views is None or views == 0:
         return None
-    comments = p["comments"] or 0
-    danmaku = p["danmaku"] or 0
+    if p.get("comments") is None and p.get("danmaku") is None:
+        return None
+    comments = p.get("comments") or 0
+    danmaku = p.get("danmaku") or 0
     return (comments + danmaku) / views
 
 
@@ -563,6 +630,8 @@ def compute_engagement(valid: List[Dict[str, Any]], profile: Dict[str, Any]) -> 
             "follower_based 以 followers 为分母=(likes+comments+favorites+shares)/followers;"
             "deep_approval_rate 以 views 为分母=(coins+favorites)/views;"
             "community_discussion_rate 以 views 为分母=(comments+danmaku)/views。"
+            "所有比率的对应分子全部为 null 时比率为 null；"
+            "至少一项已知时其余 null 按 0 计入。"
             "统一互动率分子 = likes+comments+favorites+shares;coins/danmaku 不并入统一互动率。"
         ),
     }
@@ -695,11 +764,24 @@ def build_post_records(
                 rel[m] = rnd(p[m] / med, 4) if p[m] is not None else None
         item_url_known = p.get("item_url_known", bool(p.get("post_url")))
         recs.append({
+            "platform": p.get("platform"),
             "post_id": p["post_id"],
             "post_url": p["post_url"] if item_url_known else None,
             "evidence_url": p.get("source_url") or p.get("post_url"),
+            "source_url": p.get("source_url") or p.get("post_url"),
             "title": p.get("title"),
             "text": p.get("text"),
+            "content_type": p.get("content_type"),
+            "duration_seconds": p.get("duration_seconds"),
+            "hashtags": list(p.get("hashtags") or []),
+            "is_pinned": p.get("is_pinned"),
+            "is_repost": p.get("is_repost"),
+            "is_promoted": p.get("is_promoted"),
+            "collection_status": p.get("collection_status"),
+            "collection_status_source": p.get("collection_status_source"),
+            "collected_at": p.get("collected_at"),
+            "platform_metrics": copy.deepcopy(p.get("platform_metrics") or {}),
+            "field_visibility": copy.deepcopy(p.get("field_visibility") or {}),
             "published_at": p["published_at"].isoformat() if p["published_at"] else None,
             "published_at_precision": p.get("published_at_precision", "unknown"),
             "collection_source": p.get("collection_source"),
@@ -1206,6 +1288,7 @@ def analyze_in_memory(
         "requested": requested,
         "requested_is_derived": requested_is_derived,
         "collected": collected,
+        "status_counts": collection_status_counts(all_posts),
         "valid": valid_count,
         "time_range": {
             "task_date_from": params.get("date_from"),
@@ -1386,6 +1469,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "requested": requested,
         "requested_is_derived": requested_is_derived,
         "collected": collected,
+        "status_counts": collection_status_counts(all_posts),
         "valid": valid_count,
         "time_range": {
             "task_date_from": task_params.get("date_from"),

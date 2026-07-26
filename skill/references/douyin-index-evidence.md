@@ -93,6 +93,8 @@ Agent 运行环境已有的 Web 搜索/打开连接器；Python 导入脚本本�
 搜索索引版本必须设置 `source_kind=douyin_search_index`、`source_url=profile_url`，并让每条
 `post_id`、`post_url` 为 `null`。相对年龄（如“约 6 个月前”）只能写
 `snapshot_age_label`，不得反推精确日期。
+精选页和搜索索引都不提供可验证的置顶、转载或投放标记，因此导入后
+`is_pinned` / `is_repost` / `is_promoted` 固定为 `null`，不得用 `false` 代替未知。
 
 ## 3. 导入与分析
 

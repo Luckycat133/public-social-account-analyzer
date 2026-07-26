@@ -97,6 +97,24 @@ def test_enabled_collect_post_detail_parses(enabled, monkeypatch):
     post = c.collect_post_detail("https://weibo.com/123456/a1")
     assert post["post_id"] == "a1"
     assert "话题1" in (post.get("hashtags") or [])
+    assert post["is_pinned"] is None
+    assert post["is_repost"] is None
+    assert post["is_promoted"] is None
+
+
+def test_weibo_boolean_evidence_parses_explicit_zero_without_truthiness():
+    raw = weibo._build_post_raw(
+        {
+            "id": "a1",
+            "isTop": "0",
+            "retweeted_status": None,
+        },
+        "123456",
+    )
+
+    assert raw["is_pinned"] is False
+    assert raw["is_repost"] is False
+    assert raw["is_promoted"] is None
 
 
 def test_enabled_detail_rejects_item_id_hidden_in_untrusted_host(

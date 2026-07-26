@@ -7,6 +7,8 @@ import os
 import sys
 import json
 
+import pytest
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
     if os.path.isdir(_d) and _d not in sys.path:
@@ -14,6 +16,7 @@ for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT
 
 from collectors.bilibili import (  # noqa: E402
     BilibiliCollector,
+    _build_post_raw_from_medialist,
     _build_post_raw_from_vlist,
     _build_post_raw_from_view,
     enc_wbi,
@@ -133,6 +136,39 @@ def test_vlist():
     check("published_at ISO", post["published_at"].startswith("20"))
     # I4: vlist 的 typeid=17 应静态映射为子分区「单机游戏」
     check("partition=单机游戏(typeid静态映射)", post["platform_metrics"]["partition"] == "单机游戏")
+
+
+def test_vlist_missing_boolean_evidence_stays_null():
+    item = {"bvid": "BVunknown", "title": "unknown evidence"}
+
+    post = BilibiliCollector().normalize_post(
+        _build_post_raw_from_vlist(item, "https://space.bilibili.com/1")
+    )
+
+    assert post["is_pinned"] is None
+    assert post["is_repost"] is None
+    assert post["is_promoted"] is None
+
+
+@pytest.mark.parametrize("malformed", [True, 1.9, 2.9])
+@pytest.mark.parametrize(
+    ("builder", "field", "identifier"),
+    [
+        (_build_post_raw_from_medialist, "copy_right", "bv_id"),
+        (_build_post_raw_from_vlist, "copyright", "bvid"),
+        (_build_post_raw_from_view, "copyright", "bvid"),
+    ],
+)
+def test_bilibili_builders_do_not_coerce_malformed_copyright_enums(
+    malformed, builder, field, identifier
+):
+    payload = {identifier: "BVmalformed", field: malformed}
+
+    post = BilibiliCollector().normalize_post(
+        builder(payload, "https://space.bilibili.com/1")
+    )
+
+    assert post["is_repost"] is None
 
 
 def test_view():
@@ -272,6 +308,12 @@ def test_dynamics_parse():
     # 转发卡
     fwd = _extract_dynamic_card(_mk_dyn_item("BVdyn02", is_forward=True))
     check("转发卡 is_forward=True", fwd["is_forward"] is True)
+    unknown_forward = _mk_dyn_item("BVdyn03")
+    unknown_forward.pop("orig")
+    unknown_card = _extract_dynamic_card(unknown_forward)
+    check("动态卡缺失 orig → is_forward=None", unknown_card["is_forward"] is None)
+    unknown_post = c.normalize_post(_build_dynamic_raw(unknown_card))
+    check("动态卡缺失 orig → is_repost=None", unknown_post["is_repost"] is None)
     # 非视频类（无 bvid）应被丢弃
     none_card = _extract_dynamic_card(_mk_dyn_item("", with_bvid=False))
     check("非视频动态(无bvid)→None", none_card is None)

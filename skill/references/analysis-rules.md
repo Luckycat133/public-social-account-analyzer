@@ -15,7 +15,7 @@
   - `FAILED` / `DELETED` / `RESTRICTED` 记录一律不参与默认指标、节奏、高低表现计算。
   - 被排除记录仍须在样本边界中明确计数（见 §2）。
 - **默认排除标记内容**：默认排除 `is_pinned = true`、`is_repost = true`、`is_promoted = true` 的内容。
-  - 这三个标记默认为 `false`（见 data-schema §5 约束），未知时不得臆测为 `true`。
+  - 这三个公开标记采用三态语义：只有明确证据才写 `true` / `false`，未知时写 `null`（见 data-schema §5 约束）。
   - 被排除内容不得混入默认发布节奏、公开表现、高低表现比较。
 - **相关模块可单独包含**：如用户需要，可在**单列模块**（如"置顶/投放内容观察"）中包含上述被排除内容，但必须满足：
   - 明确标注其为置顶 / 转载 / 投放样本；
@@ -33,6 +33,7 @@
 |---|---|---|
 | 请求数量（requested） | 任务请求采集的数量上限 `requested_limit`，或 `date_from`~`date_to` 范围内请求的条数 | Task 结构 |
 | 实际采集数量（collected） | 成功抓取到的内容条数（含 `SUCCESS`/`PARTIAL`/`FAILED`/`DELETED`/`RESTRICTED` 等所有尝试） | 采集层 |
+| 采集状态计数（status_counts） | 对全部实际采集记录按五个 `collection_status` 计数；键固定且无样本时补 `0` | 采集层 |
 | 有效数量（valid） | `collection_status ∈ {SUCCESS, PARTIAL}` 且未被 §1 默认排除标记命中的条数 | §1 规则 |
 | 时间范围（time_range） | 有效内容 `published_at` 的最小~最大值，及任务 `date_from`~`date_to` | Post / Task |
 | 缺失内容数量（missing） | `collection_status ∈ {FAILED, DELETED}` 的条数 | 采集层 |
@@ -165,12 +166,14 @@ PRD 明确要求互动率必须分别命名、分母透明，**禁止统一称�
   deep_approval_rate = (coins + favorites) / views
   ```
   - 仅在 `views` 非 `null` 且非 `0` 时计算；分母固定为 `views`（投币 / 收藏相对播放的深度认可强度）。
+  - `coins` 与 `favorites` 全为 `null` 时比率为 `null`；至少一项已知时，其余 `null` 按 `0` 计入分子。
 
 - **社群讨论率** `community_discussion_rate`：
   ```
   community_discussion_rate = (comments + danmaku) / views
   ```
   - 仅在 `views` 非 `null` 且非 `0` 时计算；分母固定为 `views`（评论 + 弹幕相对播放的讨论密度）。
+  - `comments` 与 `danmaku` 全为 `null` 时比率为 `null`；至少一项已知时，其余 `null` 按 `0` 计入分子。
 
 两项均独立计算 `count / median / p25 / p75 / minimum / maximum / missing_rate`，并在报告中与二分法互动率并列、分列呈现（分母透明说明见 `analysis.json` 的 `engagement.denominator_note`）。
 

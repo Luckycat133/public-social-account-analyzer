@@ -430,6 +430,46 @@ def test_normalize_post_preserves_unknown_public_booleans():
     assert normalized["is_promoted"] is None
 
 
+def test_normalize_post_preserves_field_visibility_evidence():
+    visibility = {
+        "title": "partial",
+        "views": "visible",
+        "custom_platform_field": "hidden",
+    }
+
+    normalized = FakeLoginWallCollector().normalize_post(
+        {"post_id": "1", "field_visibility": visibility}
+    )
+
+    assert normalized["field_visibility"] == visibility
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "expected_source"),
+    [(None, "inferred_missing"), ("NOT_A_STATUS", "inferred_invalid")],
+)
+def test_normalize_post_does_not_invent_success_for_untrusted_status(
+    raw_status, expected_source
+):
+    raw = {"post_id": "1"}
+    if raw_status is not None:
+        raw["collection_status"] = raw_status
+
+    normalized = FakeLoginWallCollector().normalize_post(raw)
+
+    assert normalized["collection_status"] == "PARTIAL"
+    assert normalized["collection_status_source"] == expected_source
+
+
+def test_normalize_post_marks_explicit_status_as_declared():
+    normalized = FakeLoginWallCollector().normalize_post(
+        {"post_id": "1", "collection_status": "ok"}
+    )
+
+    assert normalized["collection_status"] == "SUCCESS"
+    assert normalized["collection_status_source"] == "declared"
+
+
 def test_all_comments_persist_returns_parents_and_honest_outcomes(
     monkeypatch, tmp_path
 ):

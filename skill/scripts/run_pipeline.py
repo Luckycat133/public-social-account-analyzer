@@ -157,6 +157,7 @@ def _normalization_status(result: NormalizationResult) -> str:
         and coverage.get("raw_count") == coverage.get("post_count")
         and coverage.get("post_count") == coverage.get("valid_count")
         and not coverage.get("errors")
+        and not coverage.get("warnings")
     )
     return "COMPLETED" if lossless else "PARTIAL"
 

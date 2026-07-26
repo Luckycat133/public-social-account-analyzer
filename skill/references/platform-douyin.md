@@ -90,7 +90,7 @@
 - `content_type`：抖音作品默认 `video`；图文/图文笔记可能为 `image_text`（best-effort 判定）。
 - `title` 取 `desc` 首行（按换行截断）；`text` 取 `desc` 全文。
 - `hashtags` 从 `text_extra` 的 `hashtag_name` 抽取；无话题时为 `[]`。
-- `is_pinned` / `is_repost` / `is_promoted` 默认 `false`；未知不得臆测为 `true`。
+- `is_pinned` / `is_repost` / `is_promoted` 仅在公开证据明确时写 `true` / `false`；字段缺失或不可验证时写 `null`。
 
 ## 公开指标
 

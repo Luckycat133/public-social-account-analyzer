@@ -85,6 +85,7 @@ from task_contract import (  # noqa: E402
     new_task_id,
     validate_analysis_goal,
 )
+from csv_contract import deserialize_csv_row, serialize_csv_row  # noqa: E402
 
 # 北京时间为中国平台默认时区(见 references/data-schema.md §1)
 _BEIJING = timezone(timedelta(hours=8))
@@ -247,8 +248,7 @@ def _write_csv(
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
         for p in posts:
-            row = {k: ("" if p.get(k) is None else p.get(k)) for k in keys}
-            w.writerow(row)
+            w.writerow(serialize_csv_row(p, keys))
 
 
 def _parse_date(s: str | None) -> str | None:
@@ -834,7 +834,7 @@ def _load_existing_posts(ws: str) -> tuple[list[dict], str, str]:
                     csv_payload.decode("utf-8"), newline=""
                 ) as handle:
                     for row in csv.DictReader(handle):
-                        posts.append({k: v for k, v in row.items()})
+                        posts.append(deserialize_csv_row(row))
         except UnicodeDecodeError as exc:
             raise WorkspaceContractError(
                 "resume artifact encoding is invalid"
@@ -884,6 +884,38 @@ def _merge_incremental(existing: list[dict], new: list[dict]) -> tuple[list[dict
             new_count += 1
         merged_map[k] = p  # 新覆盖旧(指标可能更新)
     return list(merged_map.values()) + kept_no_key, new_count
+
+
+def _ensure_post_collection_status_contract(posts: list[dict]) -> None:
+    """Make directly persisted or resumed rows obey the status contract.
+
+    Normal collectors already pass rows through ``BaseCollector.normalize_post``.
+    This boundary guard also covers legacy resume artifacts and third-party
+    adapters that return raw rows directly, without silently promoting an
+    absent or invalid status to success.
+    """
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        status, derived_source = BaseCollector._canon_status_with_source(
+            post.get("collection_status")
+        )
+        supplied_source = post.get("collection_status_source")
+        if (
+            derived_source == "declared"
+            and (
+                supplied_source == "declared"
+                or (
+                    status == "PARTIAL"
+                    and supplied_source in {"inferred_missing", "inferred_invalid"}
+                )
+            )
+        ):
+            status_source = supplied_source
+        else:
+            status_source = derived_source
+        post["collection_status"] = status
+        post["collection_status_source"] = status_source
 
 
 def _sanitize_collection_coverage(value) -> dict:
@@ -1577,6 +1609,7 @@ def run(
     if resume_mode and existing_posts:
         posts, new_count = _merge_incremental(existing_posts, posts)
     _canonicalize_post_urls(platform, posts)
+    _ensure_post_collection_status_contract(posts)
 
     # 3) 资料(失败不阻塞已采内容)
     try:

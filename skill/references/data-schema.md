@@ -289,11 +289,14 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 | is_repost | boolean | 是 | 是 | 是否转载 / 转发；无公开证据时为 `null` |
 | is_promoted | boolean | 是 | 是 | 是否投放 / 推广标记；无公开证据时为 `null` |
 | collection_status | enum | 是 | 否 | 采集状态（§9.3） |
+| collection_status_source | enum | 是 | 否 | `declared` / `inferred_missing` / `inferred_invalid` |
 | collected_at | datetime | 是 | 否 | 采集时间（ISO 8601） |
 | source_url | string | 是 | 否 | 来源 URL（证据锚点） |
 
 约束：
 - `is_pinned` / `is_repost` / `is_promoted` 仅保留明确公开的 `true` / `false`；未知时为 `null`，不得把缺失证据断言为 `false` 或 `true`。
+- `collection_status` 缺失或非法时必须归一为 `PARTIAL`，并分别标记 `inferred_missing` / `inferred_invalid`；禁止默认为 `SUCCESS`。归一化覆盖率须记录 `COLLECTION_STATUS_INFERRED` warning，流水线因此降为 `PARTIAL`。
+- `normalized-posts.csv` 使用紧凑、排序键的 JSON 序列化 `hashtags`、`platform_metrics` 与 `field_visibility`；布尔值统一写小写 `true` / `false`，`null` 写为空单元格。读取端仍兼容旧 CSV 中用 `|` / `,` / `;` 分隔的话题串，以及旧采集器写出的 Python `list` / `tuple` / `dict` 字面量；后者只在严格单元格大小、AST 复杂度、目标类型及 JSON 兼容性校验后读取，绝不执行表达式，也不再以旧格式写出。
 - 默认分析排除置顶、转载、投放内容（见 `analysis-rules.md`），但须在数据中保留标记。
 - 授权 OpenAPI 作品必须使用响应提供的、经校验属于抖音的 HTTPS `share_url`；持久化前移除查询参数与片段。缺失或非法 `video_id` / `share_url` 视为响应错误，不得合成证据 URL。
 - 公开抖音列表仅接受数字平台作品 ID，并按 ID 去重；重复项只能补齐先前缺失字段，不能覆盖
@@ -325,6 +328,8 @@ POSIX 后端从 `/` 起以 no-follow 句柄绑定每一级路径，因此输入�
 | `item_url_known` | boolean | `false` |
 | `source_rank` | integer | 在该索引快照中的 1 基顺序 |
 | `published_at_precision` | enum | `datetime` / `date` / `unknown` |
+
+上表的 `local_record_key` 是来源标识，不是可空的公开标记；旧 CSV 缺列时固定读为 `false`。
 
 下游必须传播这些字段：最终报告显著显示 `PARTIAL`、来源、快照时间/年龄和非穷尽声明；
 `item_url_known=false` 时不得把账号主页渲染为单条作品链接。`published_at_precision=date`
