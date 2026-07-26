@@ -814,6 +814,31 @@ def _container_account_binding(
     return _BINDING_MATCH
 
 
+def _account_post_page_conflicts(
+    data: Any,
+    expected_sec_uid: str,
+    response_binding: str,
+) -> bool:
+    """Reject a whole account-post response on explicit page-level conflict."""
+    if response_binding in {_BINDING_CONFLICT, _BINDING_INVALID}:
+        return True
+    for owner_path in _ACCOUNT_POST_LIST_OWNER_PATHS:
+        owner = data
+        for key in owner_path:
+            if not isinstance(owner, dict):
+                owner = None
+                break
+            owner = owner.get(key)
+        if not isinstance(owner, dict) or not any(
+            isinstance(owner.get(key), list) for key in _ITEM_LIST_KEYS
+        ):
+            continue
+        binding = _container_account_binding(owner, expected_sec_uid)
+        if binding == _BINDING_CONFLICT:
+            return True
+    return False
+
+
 def _item_belongs_to_account(
     item: dict[str, Any], expected_sec_uid: str
 ) -> bool:
@@ -849,6 +874,15 @@ def extract_post_page_observations(
                 and _is_trustworthy_aweme(raw_item)
             ]
             if expected_sec_uid is not None:
+                container_binding = _container_account_binding(
+                    value, expected_sec_uid
+                )
+                if (
+                    container_binding == _BINDING_CONFLICT
+                    or response_binding
+                    in {_BINDING_CONFLICT, _BINDING_INVALID}
+                ):
+                    continue
                 if trustworthy_items:
                     if any(
                         not _item_belongs_to_account(
@@ -861,14 +895,8 @@ def extract_post_page_observations(
                     # A non-empty but unrecognized list is not an empty page.
                     if raw_items:
                         continue
-                    container_binding = _container_account_binding(
-                        value, expected_sec_uid
-                    )
                     if (
-                        container_binding == _BINDING_CONFLICT
-                        or response_binding
-                        in {_BINDING_CONFLICT, _BINDING_INVALID}
-                        or _BINDING_MATCH
+                        _BINDING_MATCH
                         not in {container_binding, response_binding}
                     ):
                         continue
@@ -1322,15 +1350,21 @@ def collect_account_page(
             pending.pop(request_id, None)
             return False
         pending.pop(request_id, None)
+        safe_url = candidate["safe_url"]
+        if safe_url not in safe_paths:
+            safe_paths.append(safe_url)
+        if candidate["is_account_post_response"] and _account_post_page_conflicts(
+            decoded,
+            expected_sec_uid,
+            candidate["account_binding"],
+        ):
+            return False
         discovered_profile = extract_profile_raw(decoded, url)
         if discovered_profile is not None:
             if profile_raw is None:
                 profile_raw = discovered_profile
             else:
                 _merge_profile_evidence(profile_raw, discovered_profile)
-        safe_url = candidate["safe_url"]
-        if safe_url not in safe_paths:
-            safe_paths.append(safe_url)
         before = len(items)
         observations = (
             extract_post_page_observations(

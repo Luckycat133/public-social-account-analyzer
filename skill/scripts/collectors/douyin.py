@@ -1092,7 +1092,12 @@ class DouyinCollector(BaseCollector):
             raise DouyinError(restriction, f"采集列表时命中访问限制: {restriction}")
 
         data = _extract_render_data(html)
-        aweme_list = self._find_aweme_list(data) if data is not None else None
+        expected_sec_uid = self._extract_sec_uid(url)
+        aweme_list = (
+            self._find_aweme_list(data, expected_sec_uid)
+            if data is not None and expected_sec_uid is not None
+            else None
+        )
         if data is None or aweme_list is None:
             return self._collect_posts_via_browser(url, limit, date_range)
 
@@ -1393,19 +1398,68 @@ class DouyinCollector(BaseCollector):
             return found
         return None
 
-    def _find_aweme_list(self, data: dict) -> list | None:
-        """在 RENDER_DATA 中定位作品列表数组。"""
+    def _find_aweme_list(
+        self, data: dict, expected_sec_uid: str
+    ) -> list | None:
+        """Return only a frozen SSR account-post list with exact ownership."""
+        user_root = _dig(data, "user")
+        app_user_root = _dig(data, "app", "user")
+        numbered_user_root = _dig(data, "8", "user")
         candidates = [
-            _dig(data, "user", "post", "data"),
-            _dig(data, "user", "user", "awemeList"),
-            _dig(data, "app", "user", "post", "data"),
-            _dig(data, "8", "user", "post", "data"),
+            (
+                _dig(data, "user", "post"),
+                "data",
+                (user_root, _dig(data, "user", "user")),
+            ),
+            (
+                _dig(data, "user", "user"),
+                "awemeList",
+                (),
+            ),
+            (
+                _dig(data, "app", "user", "post"),
+                "data",
+                (app_user_root, _dig(data, "app", "user", "user")),
+            ),
+            (
+                _dig(data, "8", "user", "post"),
+                "data",
+                (
+                    numbered_user_root,
+                    _dig(data, "8", "user", "user"),
+                ),
+            ),
         ]
-        for c in candidates:
-            if isinstance(c, list):
-                return c
-        found = self._search_list_of_key(data, "aweme_id")
-        return found
+        for owner, list_key, related in candidates:
+            if not isinstance(owner, dict):
+                continue
+            items = owner.get(list_key)
+            if not isinstance(items, list):
+                continue
+            binding_values = [
+                node[key]
+                for node in (owner, *related)
+                if isinstance(node, dict)
+                for key in ("sec_uid", "sec_user_id")
+                if key in node
+            ]
+            if any(
+                not isinstance(value, str) or value != expected_sec_uid
+                for value in binding_values
+            ):
+                continue
+            if items:
+                if all(
+                    isinstance(item, dict)
+                    and isinstance(item.get("author"), dict)
+                    and item["author"].get("sec_uid") == expected_sec_uid
+                    for item in items
+                ):
+                    return items
+                continue
+            if binding_values:
+                return items
+        return None
 
     @staticmethod
     def _aweme_detail_candidates(data: dict) -> list[dict[str, Any]]:

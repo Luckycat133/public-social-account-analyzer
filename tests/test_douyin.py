@@ -154,17 +154,22 @@ def test_ssr_list_skips_invalid_ids_merges_duplicate_gaps_and_uses_item_urls():
 
     first = {
         "aweme_id": "7001",
+        "author": {"sec_uid": "example"},
         "desc": "列表页可靠标题 #列表话题",
         "create_time": None,
         "video": {},
     }
     duplicate = {
         "aweme_id": "7001",
+        "author": {"sec_uid": "example"},
         "desc": "后出现的冲突标题",
         "create_time": 1_700_000_000,
         "video": {"duration": 9_000},
     }
-    invalid = {"desc": "没有 ID，不能以主页充当作品证据"}
+    invalid = {
+        "author": {"sec_uid": "example"},
+        "desc": "没有 ID，不能以主页充当作品证据",
+    }
     collector = DouyinCollector(browser_fallback=False)
     collector._fetch = lambda _url: _ssr_html(
         {"user": {"post": {"data": [first, duplicate, invalid]}}}
@@ -1320,8 +1325,15 @@ def test_limited_ssr_invalid_only_payload_raises_parser_failed():
     collector = DouyinCollector(browser_fallback=False)
     collector._fetch = lambda _url: _ssr_html({
         "user": {"post": {"data": [
-            {"desc": "missing id"},
-            {"aweme_id": "not-numeric", "desc": "invalid id"},
+            {
+                "author": {"sec_uid": "example"},
+                "desc": "missing id",
+            },
+            {
+                "aweme_id": "not-numeric",
+                "author": {"sec_uid": "example"},
+                "desc": "invalid id",
+            },
         ]}}
     })
 
@@ -1632,7 +1644,7 @@ def test_collect_post_list_keeps_ssr_fast_path_without_browser(monkeypatch):
             "user": {
                 "post": {
                     "data": [dict(
-                        AWEME,
+                        ACCOUNT_AWEME,
                         share_url="https://www.douyin.com/note/7001?secret=x",
                     )]
                 }
@@ -1699,6 +1711,136 @@ def test_collect_post_list_uses_browser_when_ssr_shape_is_unrecognized(monkeypat
     assert len(browser_calls) == 1
 
 
+def test_limited_ssr_ignores_arbitrary_recommendation_tree(monkeypatch):
+    """A same-author recommendation list is not an account-post container."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    browser_calls = []
+    browser_item = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7999",
+        "desc": "浏览器账号作品",
+    }
+    collector = DouyinCollector(
+        browser_collect=lambda **request: (
+            browser_calls.append(request)
+            or DouyinBrowserResult(aweme_items=[browser_item], source="network")
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html(
+            {"recommendations": {"items": [ACCOUNT_AWEME]}}
+        ),
+    )
+
+    posts = collector.collect_post_list(ACCOUNT_URL, limit=1)
+
+    assert browser_calls == [
+        {"url": ACCOUNT_URL, "limit": 1, "date_range": None}
+    ]
+    assert [post["post_id"] for post in posts] == ["7999"]
+
+
+@pytest.mark.parametrize(
+    "author",
+    [None, {"sec_uid": "foreign-account"}],
+    ids=["missing-author", "foreign-author"],
+)
+def test_limited_ssr_frozen_nonempty_container_requires_target_author(
+    monkeypatch, author
+):
+    """Every item in a frozen SSR account page must bind to the requested user."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    ssr_item = dict(AWEME)
+    if author is not None:
+        ssr_item["author"] = author
+    browser_item = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7999",
+        "desc": "浏览器账号作品",
+    }
+    browser_calls = []
+    collector = DouyinCollector(
+        browser_collect=lambda **request: (
+            browser_calls.append(request)
+            or DouyinBrowserResult(aweme_items=[browser_item], source="network")
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html(
+            {"user": {"post": {"data": [ssr_item]}}}
+        ),
+    )
+
+    posts = collector.collect_post_list(ACCOUNT_URL, limit=1)
+
+    assert len(browser_calls) == 1
+    assert [post["post_id"] for post in posts] == ["7999"]
+
+
+@pytest.mark.parametrize(
+    "post_container",
+    [
+        {"data": []},
+        {"data": [], "sec_uid": "foreign-account"},
+        {"data": [], "sec_user_id": "foreign-account"},
+    ],
+    ids=["missing-binding", "foreign-sec-uid", "foreign-sec-user-id"],
+)
+def test_limited_empty_ssr_requires_target_account_evidence(
+    monkeypatch, post_container
+):
+    """An empty SSR list without exact account evidence must use the browser."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    browser_calls = []
+    browser_item = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7999",
+        "desc": "浏览器账号作品",
+    }
+    collector = DouyinCollector(
+        browser_collect=lambda **request: (
+            browser_calls.append(request)
+            or DouyinBrowserResult(aweme_items=[browser_item], source="network")
+        )
+    )
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"user": {"post": post_container}}),
+    )
+
+    posts = collector.collect_post_list(ACCOUNT_URL, limit=1)
+
+    assert len(browser_calls) == 1
+    assert [post["post_id"] for post in posts] == ["7999"]
+
+
+def test_limited_unbound_empty_ssr_fails_closed_without_browser(monkeypatch):
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    collector = DouyinCollector(browser_fallback=False)
+    monkeypatch.setattr(
+        collector,
+        "_fetch",
+        lambda _url: _ssr_html({"user": {"post": {"data": []}}}),
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_post_list(ACCOUNT_URL, limit=1)
+
+    assert exc_info.value.stop_reason == "PARSER_FAILED"
+
+
 def test_collect_post_list_maps_recognized_empty_ssr_to_no_public_content(monkeypatch):
     """A real empty list is not a parser failure and does not start Chrome."""
     from collectors.douyin import DouyinCollector, DouyinError
@@ -1709,7 +1851,9 @@ def test_collect_post_list_maps_recognized_empty_ssr_to_no_public_content(monkey
     monkeypatch.setattr(
         collector,
         "_fetch",
-        lambda url: _ssr_html({"user": {"post": {"data": []}}}),
+        lambda url: _ssr_html(
+            {"user": {"post": {"data": [], "sec_uid": "example"}}}
+        ),
     )
 
     with pytest.raises(DouyinError) as exc_info:
@@ -2030,6 +2174,70 @@ def test_account_page_ignores_whole_unbound_page_and_continues(unbound_items):
     assert result.coverage["cursor_fingerprint_count"] == 1
     assert result.coverage["terminal_page_observed"] is True
     assert result.coverage["is_exhaustive"] is True
+
+
+@pytest.mark.parametrize(
+    ("body_binding", "response_url"),
+    [
+        (
+            {},
+            (
+                "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                "?sec_uid=foreign-account"
+            ),
+        ),
+        (
+            {"sec_uid": "foreign-account"},
+            (
+                "https://www.douyin.com/aweme/v1/web/aweme/post/"
+                "?sec_uid=example"
+            ),
+        ),
+        (
+            {"sec_user_id": "foreign-account"},
+            "https://www.douyin.com/aweme/v1/web/aweme/post/",
+        ),
+    ],
+    ids=[
+        "foreign-response-url",
+        "foreign-container-sec-uid",
+        "foreign-container-sec-user-id",
+    ],
+)
+def test_nonempty_account_page_rejects_explicit_foreign_binding(
+    body_binding, response_url
+):
+    """Matching item authors cannot override a foreign page-level identity."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    body = {
+        "aweme_list": [ACCOUNT_AWEME],
+        "has_more": False,
+        "max_cursor": "foreign-terminal-cursor",
+        **body_binding,
+    }
+    browser = FakeBrowser(
+        events=[
+            _response_event("foreign", url=response_url),
+            _loading_event("Network.loadingFinished", "foreign"),
+        ],
+        bodies={"foreign": json.dumps(body)},
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        max_scrolls=1,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.aweme_items == []
+    assert result.profile_raw is None
+    assert result.coverage["observed_page_count"] == 0
+    assert result.coverage["terminal_page_observed"] is False
+    assert result.coverage["is_exhaustive"] is False
 
 
 def test_limited_account_page_does_not_mix_foreign_network_items():
@@ -4063,10 +4271,10 @@ def test_limited_ssr_filters_every_valid_item_before_limit_and_counts_unknown_da
     from collectors.douyin import DouyinCollector
 
     items = [
-        dict(AWEME, aweme_id="6001", create_time=1_640_995_200),
-        dict(AWEME, aweme_id="6002", create_time=None),
-        dict(AWEME, aweme_id="7001", create_time=1_685_577_600),
-        dict(AWEME, aweme_id="7002", create_time=1_690_000_000),
+        dict(ACCOUNT_AWEME, aweme_id="6001", create_time=1_640_995_200),
+        dict(ACCOUNT_AWEME, aweme_id="6002", create_time=None),
+        dict(ACCOUNT_AWEME, aweme_id="7001", create_time=1_685_577_600),
+        dict(ACCOUNT_AWEME, aweme_id="7002", create_time=1_690_000_000),
     ]
     collector = DouyinCollector(browser_fallback=False)
     monkeypatch.setattr(
@@ -4105,6 +4313,7 @@ def test_limited_nonempty_ssr_underfill_merges_browser_evidence_first_seen(
 
     ssr_item = {
         "aweme_id": "7001",
+        "author": {"sec_uid": "example"},
         "desc": "SSR 首见文案",
         "create_time": 1_700_000_000,
         "statistics": {"digg_count": 0},
@@ -4151,7 +4360,7 @@ def test_collection_source_is_internal_allowlisted_evidence(monkeypatch):
     from collectors._douyin_browser_transport import DouyinBrowserResult
     from collectors.douyin import DouyinCollector
 
-    ssr = dict(AWEME, _collection_source="SSR_SECRET")
+    ssr = dict(ACCOUNT_AWEME, _collection_source="SSR_SECRET")
     ssr_collector = DouyinCollector(browser_fallback=False)
     monkeypatch.setattr(
         ssr_collector,
@@ -4273,7 +4482,9 @@ def test_ssr_underfill_keeps_restriction_priority_when_browser_rows_are_invalid(
     monkeypatch.setattr(
         collector,
         "_fetch",
-        lambda _url: _ssr_html({"user": {"post": {"data": [AWEME]}}}),
+        lambda _url: _ssr_html(
+            {"user": {"post": {"data": [ACCOUNT_AWEME]}}}
+        ),
     )
 
     with pytest.raises(DouyinError) as exc_info:
@@ -5354,6 +5565,7 @@ def test_reused_collector_resets_detail_provenance_for_each_top_level_list_call(
                 "post": {
                     "data": [{
                         "aweme_id": str(7000 + call_count),
+                        "author": {"sec_uid": "example"},
                         "desc": "无话题字段的 SSR 作品",
                         "create_time": 1700000000 + call_count,
                         "video": {"duration": 9000},
@@ -5382,6 +5594,7 @@ def test_failed_top_level_list_call_discards_previous_batch_provenance():
             "post": {
                 "data": [{
                     "aweme_id": "7001",
+                    "author": {"sec_uid": "example"},
                     "desc": "无话题字段的 SSR 作品",
                     "create_time": 1700000000,
                     "video": {"duration": 9000},
