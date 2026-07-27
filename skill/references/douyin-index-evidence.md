@@ -102,7 +102,10 @@ Agent 运行环境已有的 Web 搜索/打开连接器；Python 导入脚本本�
 python3 skill/scripts/import_index_snapshot.py \
   --evidence /path/to/evidence.json \
   --out workspace/douyin-index-<account>-<date> \
-  --limit 30
+  --limit 30 \
+  --date-from 2026-04-28 \
+  --date-to 2026-07-27 \
+  --profile-from-collection workspace/douyin-direct-failed
 
 python3 skill/scripts/run_pipeline.py \
   --input workspace/douyin-index-<account>-<date> \
@@ -113,6 +116,20 @@ Agent 必须先完成来源与作品区核验。导入器随后对将要导入�
 `author_name`/账号名一致性、作品 ID/URL、时间和非负整数；字段不一致时拒绝写盘。该检查
 不能替代连接器页面核验，也不能证明同一 JSON 内自报的作者归属。输出目录必须为空。成功
 退出 `0`；无作品退出 `3`；格式、身份、来源或目录冲突退出 `2`。
+
+`--date-from/--date-to` 是用户任务范围，不是 Web 证据字段。导入器会先完整验证 evidence，
+再排除发布时间未知或不在范围内的记录，最后应用 `--limit`。B 级搜索索引的发布时间按契约
+全部未知，因此它不能证明任何卡片属于显式日期窗口；过滤后没有作品时不创建工作区，也不
+生成“最近 N 天”排名。分析层还会再次应用同一范围，防止旧提交或外部输入绕过该约束。
+
+`--profile-from-collection` 可选接收一次较新的匿名直连采集提交，即使该提交因 0 条作品而业务
+状态为 `FAILED`。导入器只通过 identity-bound reader 读取有效 `manifest.json + .complete`，
+要求平台、规范主页和可用 `sec_uid` 与索引目标一致；跨账号、未密封、被篡改、旧于已知索引
+快照或身份冲突的来源在创建输出前拒绝。只用直连的非 `null` 公开字段覆盖索引资料，绝不用
+`null` 擦除已有证据；账号改名不会改写旧索引作品当时的作者证据。新任务仅记录来源提交摘要、
+任务 ID、采集时间和字段来源，不持久化本机路径。本人授权 OpenAPI 提交不得进入该入口，
+防止授权资料被误标为匿名公开资料。资料时间还必须严格晚于索引证据的保守新鲜度基线：至少
+晚于 `observed_at`，日期精度快照则以当天结束为上界；无法证明更新就拒绝覆盖。
 
 导入器会先验证 evidence JSON 中的**全部条目**，再按 `--limit` 截取输出；limit 之后的坏
 记录同样会导致整批拒绝。主页只接受 `douyin.com` / `www.douyin.com` 的安全 `/user/<id>`
@@ -132,4 +149,6 @@ Agent 必须先完成来源与作品区核验。导入器随后对将要导入�
 - 日期级证据不进入 24 小时时段或精确小时级间隔。由于两个等级都是非穷尽子集，即使存在
   日期也只展示样本日期分布，不计算账号周均发布量、发布间隔、断更、季节性或排播建议。
 - 搜索索引只展示点赞时，只能称“索引可见点赞”，不得称总互动，也不计算衍生互动率。
+- 报告若合并了直连 profile，必须同时标明“当前直连公开资料”和“较旧索引作品证据”，两种
+  时间口径不得混为同一快照。
 - 有效样本少于 15 条继续标记 `INSUFFICIENT_SAMPLE`。

@@ -59,7 +59,8 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
    - **IQR 散布比**：对每项可见指标额外输出 `iqr = p75-p25` 与 `dispersion_ratio = iqr/median`（`median` 为 0/`null` 时置 `null`）。
    - **季节性 / 学期检测**：输出 `monthly_distribution`、`seasonal_intensity`（月变异系数）、`break_month_share`（寒暑假月份 1/2/7/8 占比）。
    - **内联可视化**：报告含发布时间-播放量散点图、高低表现雷达图、字段覆盖率徽章、发布时段分布（24 小时）柱状图（零依赖 SVG/HTML）。
-   - **LLM 协同分类（可选）**：`--with-llm-tax` 生成分类 Prompt 模版（`taxonomy-prompt.md`），交给外部 LLM 打标后用 `--llm-tax-results` 回填；回填内容经枚举校验后写入 `analysis.json`，`classification_version = llm-1`。不得在无 `--llm-tax-results` 时臆造分类。
+   - **Agent 协同分类**：脚本接口允许不分类，但当用户要求内容策略、选题分布、高低表现共同点或差异，且采集提交存在有效样本时，执行 Agent 必须走两阶段分类流程。先用 `run_pipeline.py --with-llm-tax` 创建独立 draft 分析提交；读取其中的 `taxonomy-prompt.md`，只填写要求的分类槽位并把完整结果写到 draft 之外的新 JSON；再从同一个原始 collection 运行 `run_pipeline.py --classification-results <JSON>` 创建新的 final 分析提交。final 的 `classification_status` 必须为 `completed`，且 `source/classification-results.json` 已进入 manifest，才能声称完成共同点/策略分析。
+   - draft、原 collection 与 final 都是只读提交；不得在任一已提交目录中补写分类文件。若无法覆盖全部有效父作品、枚举校验失败或 Agent 无法完成分类，则保留 `pending-model/PARTIAL` 并明确该子目标未完成，不得用脚本或规则猜测标签。
    - 标注主题、形式、钩子类型等策略维度，提取高低表现对比特征。
 
 6. **报告渲染与独立提交**
@@ -89,7 +90,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - **证据 100% 覆盖**：报告中每项核心洞察必须有可复核证据；正常/A 级数据使用具体作品 URL，B 级搜索索引只能使用精确账号主页并明确“无单条详情链接”。
 - **评论空结果 ≠ 不可用**：只有已请求、明确空文件、所有合格父作品均返回空、无失败且无中止时才写 `empty`；文件缺失、保护中止或覆盖不完整写 `unavailable`。未请求却出现评论文件或非空账本必须在输出前失败。
 - **抖音动态 JS 虚拟机渲染与降级（实验性）**：SSR 缺失或作品列表结构无法识别时默认自动降级：使用新的临时用户目录启动可选系统浏览器，先观察公开 CDP 网络响应，再从可见作品卡片提取最小字段；不附着或复用登录状态。已识别的空列表返回 `NO_PUBLIC_CONTENT`。`SOCIAL_BROWSER_FALLBACK=0` 和 `--no-browser-fallback` 仅控制抖音浏览器降级。B站收到登录、验证、限流或访问限制等平台保护响应时立即停止当前任务，不重试、不轮换身份、不转浏览器。抖音未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外仍为 `PARSER_FAILED`。不复现签名或绕过登录、验证码、滑块、频控。
-- **抖音 Web 索引降级（实验性）**：仅在直连已经诚实停止后由 Agent 编排；优先官方精选真实作品页，其次精确主页搜索索引。Agent 核验来源/作品区，离线脚本全批校验结构与字段一致性；零 Python 第三方依赖，始终 `PARTIAL`。搜索索引不计算精确发布时段或衍生互动率，详见专门参考。
+- **抖音 Web 索引降级（实验性）**：仅在直连已经诚实停止后由 Agent 编排；优先官方精选真实作品页，其次精确主页搜索索引。Agent 核验来源/作品区，离线脚本全批校验结构与字段一致性；零 Python 第三方依赖，始终 `PARTIAL`。必须把用户的 `--date-from/--date-to` 原样带入导入器；搜索索引日期未知，不能证明属于显式日期窗口，窗口内无可验证作品时应返回空结果，绝不把陈旧未知日期卡片用于该窗口排名。若直连失败提交含同账号的新公开资料，可用导入器的已密封 profile 覆盖入口合并，但必须保留来源摘要与新旧证据边界。详见专门参考。
 
 ## 任务状态与停止原因
 
@@ -104,13 +105,15 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 必须通过项目脚本执行真实采集与分析，严禁虚构或推测数据：
 
-1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--browser-fallback] [--resume --out <dir> [--since ...]]`
-2. `python scripts/normalize.py --input <workspace_path>`
-3. `python scripts/analyze.py --input <workspace_path> [--with-llm-tax | --llm-tax-results <file>]`
-4. `python scripts/render_report.py --input <workspace_path>`
+1. 采集：`python scripts/collect.py "<url>" --limit <N> --out <collection> [--date-from ... --date-to ...] [--comments] [--browser-fallback] [--resume --resume-out <new-collection> [--since ...]]`
+2. 不要求语义共同点时：`python scripts/run_pipeline.py --input <collection> --output <new-analysis>`。
+3. 要求内容策略/共同点且有有效样本时，先创建 draft：`python scripts/run_pipeline.py --input <collection> --output <draft-analysis> --with-llm-tax`。
+4. Agent 读取 `<draft-analysis>/taxonomy-prompt.md`，在所有已提交目录之外创建完整 `taxonomy-results.json`；只填分类槽位，不修改任何确定性数值。
+5. 从同一个 collection 创建 final：`python scripts/run_pipeline.py --input <collection> --output <final-analysis> --classification-results <taxonomy-results.json>`。
+6. 核对 final 的 `classification_status=completed`、`classification_version=llm-1`、原 collection digest 与 draft 相同，并确认 manifest 封存 `source/classification-results.json` 后，才交付共同点结论。
 
-- 当第 3 步产出 `valid_count == 0`（无有效样本可标注）时，跳过第 4-5 步，在报告中显式说明，仍继续第 6 步输出完整空值标准化产物。
-- 在数据有效样本少于 15 条时，标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现归纳（分类仍可执行）。
+- `valid_count == 0` 时不得生成分类结果或空洞策略结论；交付采集失败/部分证据说明。
+- 有效样本少于 15 条时，即使分类完成也标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现共同点归纳。
 
 ## 输出验证清单
 
@@ -120,6 +123,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - [ ] 核心洞察证据 URL 覆盖率达 100%
 - [ ] 附带“公开页面快照”免责声明
 - [ ] `task_status` 与 `stop_reason` 设置准确
+- [ ] 用户要求策略/共同点且样本足够时，final 分类状态为 `completed`，并封存完整分类输入
 
 ## 参考文件索引
 

@@ -319,7 +319,7 @@ class BrowserSession:
         self.browser_bin = browser_bin
         self.port = port or _free_port()
         self.headless = headless
-        self._user_data_dir = tempfile.mkdtemp(prefix="psaa-cdp-")
+        self._user_data_dir: Optional[str] = None
         self._proc: Optional[subprocess.Popen] = None
         self._ws: Optional[_WSClient] = None
         self._ws_url: Optional[str] = None
@@ -339,6 +339,8 @@ class BrowserSession:
                     "未找到可用的浏览器二进制；请安装 Chrome/Chromium/Edge，"
                     "或通过 BROWSER_BIN 环境变量指定路径。"
                 )
+            if self._user_data_dir is None:
+                self._user_data_dir = tempfile.mkdtemp(prefix="psaa-cdp-")
             args = [
                 bin_path,
                 f"--remote-debugging-port={self.port}",
@@ -654,20 +656,24 @@ class BrowserSession:
                         proc.wait(timeout=5)
                     except Exception:  # noqa: BLE001
                         self._record_cleanup_diagnostic("PROCESS_REAP_FAILED")
+        profile_dir = self._user_data_dir
+        if profile_dir is None:
+            return
         try:
-            profile_is_dir = os.path.isdir(self._user_data_dir)
+            profile_is_dir = os.path.isdir(profile_dir)
         except Exception:  # noqa: BLE001 - never replace an active exception
             self._record_cleanup_diagnostic("PROFILE_REMOVE_FAILED")
             return
         if not profile_is_dir:
+            self._user_data_dir = None
             return
         for attempt in range(3):
             try:
-                shutil.rmtree(self._user_data_dir)
+                shutil.rmtree(profile_dir)
                 break
             except Exception:  # noqa: BLE001 - bounded cleanup retry
                 try:
-                    profile_remains = os.path.exists(self._user_data_dir)
+                    profile_remains = os.path.exists(profile_dir)
                 except Exception:  # noqa: BLE001
                     profile_remains = True
                 if not profile_remains:
@@ -675,11 +681,13 @@ class BrowserSession:
                 if attempt < 2:
                     time.sleep(0.05)
         try:
-            profile_remains = os.path.exists(self._user_data_dir)
+            profile_remains = os.path.exists(profile_dir)
         except Exception:  # noqa: BLE001
             profile_remains = True
         if profile_remains:
             self._record_cleanup_diagnostic("PROFILE_REMOVE_FAILED")
+        else:
+            self._user_data_dir = None
 
     def __enter__(self) -> "BrowserSession":
         return self.start()

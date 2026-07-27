@@ -118,6 +118,40 @@ def test_high_low_insufficient_reason_uses_measured_not_valid_count():
     assert "主指标实测样本 14 < 15" in result["performance_meta"]["reason"]
 
 
+def test_date_bounded_analysis_excludes_unknown_and_out_of_range_posts():
+    rows = []
+    for index in range(15):
+        row = _high_low_post(index, index + 1)
+        row["published_at"] = f"2026-07-{index + 1:02d}T08:00:00+08:00"
+        rows.append(row)
+    for index in range(15, 30):
+        row = _high_low_post(index, 10_000 + index)
+        row["published_at"] = None
+        rows.append(row)
+    outside = _high_low_post(30, 20_000)
+    outside["published_at"] = "2026-06-30T23:59:59+08:00"
+    rows.append(outside)
+
+    result = analyze.analyze_in_memory(
+        {"platform": "douyin", "followers": 100},
+        rows,
+        {
+            "platform": "douyin",
+            "analysis_goal": "播放表现",
+            "date_from": "2026-07-01T00:00:00+08:00",
+            "date_to": "2026-07-31T23:59:59+08:00",
+        },
+    ).analysis
+
+    selected_ids = {
+        item["post_id"]
+        for item in result["high_performance"] + result["low_performance"]
+    }
+    assert result["sample_boundary"]["valid"] == 15
+    assert result["performance_meta"]["measured_count"] == 15
+    assert selected_ids <= {str(index) for index in range(15)}
+
+
 def test_high_low_counts_zero_as_measured_and_excludes_null_values():
     posts = [
         _high_low_post(index, 0 if index < 15 else None)

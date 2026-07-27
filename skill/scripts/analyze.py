@@ -33,6 +33,21 @@ from collectors.url_policy import (
 # 统一指标字段(见 data-schema.md §6)
 METRIC_FIELDS = ["views", "likes", "comments", "favorites", "shares", "coins", "danmaku"]
 VALID_STATUS = {"SUCCESS", "PARTIAL"}  # 参与默认统计的采集状态(§1)
+_PROFILE_OVERLAY_FIELD_KEYS = frozenset({
+    "account_id",
+    "account_name",
+    "bio",
+    "verified",
+    "followers",
+    "post_count",
+    "level",
+    "platform_metrics.douyin_id",
+    "platform_metrics.latest_post_at",
+    "platform_metrics.sec_uid",
+    "platform_metrics.total_likes",
+    "platform_metrics.uid",
+    "platform_metrics.unique_id",
+})
 COLLECTION_STATUS_ORDER = (
     "SUCCESS",
     "PARTIAL",
@@ -85,6 +100,8 @@ COLLECTION_COVERAGE_BOOL_FIELDS = frozenset({
     "terminal_page_observed",
     "range_filter_applied",
     "range_no_match",
+    "browser_fallback_requested",
+    "browser_fallback_launched",
 })
 COLLECTION_COVERAGE_COUNT_FIELDS = frozenset({
     "max_items",
@@ -95,6 +112,14 @@ COLLECTION_COVERAGE_COUNT_FIELDS = frozenset({
     "zero_new_page_count",
     "range_match_count",
     "unknown_date_count",
+    "scroll_rounds",
+    "max_scrolls",
+})
+COLLECTION_COVERAGE_BROWSER_SOURCES = frozenset({
+    "none",
+    "network",
+    "dom",
+    "network+dom",
 })
 COLLECTION_COVERAGE_STOP_CONDITIONS = frozenset({
     "terminal_page",
@@ -367,6 +392,35 @@ def split_samples(all_posts: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dic
     missing = [p for p in all_posts if p["collection_status"] in ("FAILED", "DELETED")]
     restricted = [p for p in all_posts if p["collection_status"] == "RESTRICTED"]
     return all_posts, valid, flagged, missing, restricted
+
+
+def filter_task_date_window(
+    posts: List[Dict[str, Any]],
+    date_from: Any,
+    date_to: Any,
+) -> List[Dict[str, Any]]:
+    """Keep only known publication dates inside an explicit task window."""
+    if date_from is None and date_to is None:
+        return posts
+    lower = parse_dt(date_from)
+    upper = parse_dt(date_to)
+    if date_from is not None and lower is None:
+        raise ValueError("date_from is invalid")
+    if date_to is not None and upper is None:
+        raise ValueError("date_to is invalid")
+    if lower is not None and upper is not None and lower > upper:
+        raise ValueError("date_from is after date_to")
+    scoped: List[Dict[str, Any]] = []
+    for post in posts:
+        published_at = post.get("published_at")
+        if not isinstance(published_at, datetime):
+            continue
+        if lower is not None and published_at < lower:
+            continue
+        if upper is not None and published_at > upper:
+            continue
+        scoped.append(post)
+    return scoped
 
 
 def collection_status_counts(all_posts: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -2640,7 +2694,7 @@ def _validated_collection_coverage(
     allowed_fields = (
         COLLECTION_COVERAGE_BOOL_FIELDS
         | COLLECTION_COVERAGE_COUNT_FIELDS
-        | {"stop_condition"}
+        | {"stop_condition", "browser_evidence_source", "max_seconds"}
     )
     if set(raw) - allowed_fields:
         raise ValueError("collection coverage contains unsupported fields")
@@ -2664,7 +2718,30 @@ def _validated_collection_coverage(
             )
         if key == "max_items" and not 1 <= value <= 50_000:
             raise ValueError("collection coverage max_items is out of range")
+        if key in {"scroll_rounds", "max_scrolls"} and value > 20_000:
+            raise ValueError(f"collection coverage {key} is out of range")
+        if key == "max_scrolls" and value < 1:
+            raise ValueError("collection coverage max_scrolls is out of range")
         clean[key] = value
+
+    if "max_seconds" in raw:
+        max_seconds = raw["max_seconds"]
+        if (
+            isinstance(max_seconds, bool)
+            or not isinstance(max_seconds, (int, float))
+            or not math.isfinite(max_seconds)
+            or not 0 < max_seconds <= 14_400
+        ):
+            raise ValueError("collection coverage max_seconds is out of range")
+        clean["max_seconds"] = float(max_seconds)
+
+    if "browser_evidence_source" in raw:
+        evidence_source = raw["browser_evidence_source"]
+        if evidence_source not in COLLECTION_COVERAGE_BROWSER_SOURCES:
+            raise ValueError(
+                "collection coverage browser_evidence_source is invalid"
+            )
+        clean["browser_evidence_source"] = evidence_source
 
     if "stop_condition" in raw:
         stop_condition = raw["stop_condition"]
@@ -2799,6 +2876,9 @@ def analyze_in_memory(
     all_posts = build_posts(normalized_rows)
     collected = len(all_posts)
     _, valid, flagged, missing, restricted = split_samples(all_posts)
+    valid = filter_task_date_window(
+        valid, params.get("date_from"), params.get("date_to")
+    )
     valid_count = len(valid)
     platform = profile.get("platform") or params.get("platform")
     comment_analysis = analyze_comments_in_memory(
@@ -2953,6 +3033,44 @@ def analyze_in_memory(
         )
     )
 
+    profile_overlay = params.get("profile_overlay")
+    if profile_overlay is not None:
+        if not isinstance(profile_overlay, dict):
+            raise ValueError("profile overlay contract is invalid")
+        field_sources = profile_overlay.get("field_sources")
+        collected_at = profile_overlay.get("collected_at")
+        source_task_id = profile_overlay.get("source_task_id")
+        try:
+            collected_datetime = datetime.fromisoformat(str(collected_at))
+        except ValueError as exc:
+            raise ValueError("profile overlay contract is invalid") from exc
+        if not (
+            set(profile_overlay) == {
+                "source_format",
+                "source_commit_sha256",
+                "source_task_id",
+                "collected_at",
+                "field_sources",
+            }
+            and profile_overlay.get("source_format")
+            == "public-social-account-analyzer/immutable-workspace-v1"
+            and isinstance(profile_overlay.get("source_commit_sha256"), str)
+            and re.fullmatch(
+                r"[0-9a-f]{64}", profile_overlay["source_commit_sha256"]
+            )
+            and isinstance(source_task_id, str)
+            and bool(source_task_id)
+            and len(source_task_id) <= 200
+            and not any(ord(char) < 32 for char in source_task_id)
+            and collected_datetime.tzinfo is not None
+            and isinstance(field_sources, dict)
+            and set(field_sources) == _PROFILE_OVERLAY_FIELD_KEYS
+            and set(field_sources.values())
+            <= {"direct_public_collection", "index_evidence"}
+        ):
+            raise ValueError("profile overlay contract is invalid")
+        profile_overlay = copy.deepcopy(profile_overlay)
+
     meta = {
         "task_id": params.get("task_id"),
         "platform": platform,
@@ -2973,6 +3091,7 @@ def analyze_in_memory(
         "snapshot_age_label": params.get("snapshot_age_label"),
         "evidence_is_exhaustive": evidence_is_exhaustive,
         "collection_coverage": collection_coverage,
+        "profile_overlay": profile_overlay,
         "main_sort_metric": main_metric,
         **copy.deepcopy(classification),
         "note": classification_note,

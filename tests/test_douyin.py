@@ -1390,6 +1390,20 @@ class _AllDouyinAdapter(_PartialDouyinAdapter):
         }
 
 
+def test_all_disabled_browser_records_requested_and_launched_false():
+    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
+
+    collector = DouyinCollector(browser_fallback=False)
+
+    with pytest.raises(DouyinError) as exc_info:
+        collector.collect_all_post_list(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    coverage = collector.get_collection_coverage()
+    assert coverage["browser_fallback_requested"] is False
+    assert coverage["browser_fallback_launched"] is False
+
+
 def test_all_rejects_non_douyin_urls_before_writing(monkeypatch, tmp_path):
     import collect
 
@@ -1782,7 +1796,7 @@ def test_all_terminal_empty_list_raises_no_public_content_with_coverage():
 
 
 def test_all_terminal_empty_list_writes_failed_no_public_content(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, capsys
 ):
     import collect
     from collectors._douyin_browser_transport import DouyinBrowserResult
@@ -1819,6 +1833,10 @@ def test_all_terminal_empty_list_writes_failed_no_public_content(
     assert task["task_status"] == "FAILED"
     assert task["stop_reason"] == STOP_NO_PUBLIC_CONTENT
     assert task["collection_coverage"]["is_exhaustive"] is True
+    captured = capsys.readouterr()
+    assert "[COMMITTED]" in captured.out
+    assert "[FAILED]" in captured.out
+    assert "[OK]" not in captured.out
 
 
 def test_all_exhaustive_date_range_with_no_matches_returns_successful_empty():
@@ -1926,6 +1944,9 @@ def test_collect_post_list_keeps_ssr_fast_path_without_browser(monkeypatch):
     assert [post["post_id"] for post in posts] == ["7001"]
     assert posts[0]["post_url"] == "https://www.douyin.com/note/7001"
     assert browser_calls == []
+    coverage = collector.get_collection_coverage()
+    assert coverage["browser_fallback_requested"] is True
+    assert coverage["browser_fallback_launched"] is False
 
 
 def test_collect_post_list_uses_browser_when_ssr_is_missing(monkeypatch):
@@ -2145,6 +2166,8 @@ def test_collect_post_list_can_disable_browser_fallback(monkeypatch):
         collector.collect_post_list(ACCOUNT_URL)
 
     assert exc_info.value.stop_reason == STOP_PARSER_FAILED
+    assert collector.get_collection_coverage()["browser_fallback_requested"] is False
+    assert collector.get_collection_coverage()["browser_fallback_launched"] is False
 
 
 def test_collect_post_list_retains_normalized_partial_posts_on_restriction(monkeypatch):
@@ -4969,6 +4992,12 @@ def test_collect_account_page_never_scrolls_more_than_twenty(monkeypatch):
 
     assert result.diagnostics["scroll_rounds"] == 20
     assert len(browser.scrolls) == 20
+    assert result.coverage["browser_fallback_requested"] is True
+    assert result.coverage["browser_fallback_launched"] is True
+    assert result.coverage["browser_evidence_source"] == "none"
+    assert result.coverage["scroll_rounds"] == 20
+    assert result.coverage["max_seconds"] == 90.0
+    assert result.coverage["max_scrolls"] == 20
 
 
 def test_collect_account_page_skips_dom_after_deadline():
@@ -5414,6 +5443,8 @@ def test_limited_ssr_filters_every_valid_item_before_limit_and_counts_unknown_da
     assert [post["post_id"] for post in posts] == ["7001", "7002"]
     assert collector.get_collection_coverage() == {
         "requested_all": False,
+        "browser_fallback_requested": False,
+        "browser_fallback_launched": False,
         "terminal_page_observed": False,
         "is_exhaustive": False,
         "observed_post_count": 4,
@@ -5669,6 +5700,78 @@ def test_workspace_coverage_allowlist_keeps_unknown_date_count():
 
     assert clean["unknown_date_count"] == 3
     assert "cookie" not in clean
+
+
+def test_none_browser_evidence_source_survives_strict_sanitizers():
+    import collect
+    from collectors.douyin import DouyinCollector
+
+    raw = {
+        "browser_fallback_requested": True,
+        "browser_fallback_launched": True,
+        "browser_evidence_source": "none",
+    }
+
+    assert collect._sanitize_collection_coverage(raw)[
+        "browser_evidence_source"
+    ] == "none"
+    assert DouyinCollector._sanitize_collection_coverage(raw)[
+        "browser_evidence_source"
+    ] == "none"
+
+
+def test_browser_runtime_coverage_reaches_workspace_without_secrets(
+    monkeypatch, tmp_path
+):
+    import collect
+    from collectors._douyin_browser_transport import DouyinBrowserResult
+    from collectors.douyin import DouyinCollector
+
+    collector = DouyinCollector(
+        browser_collect=lambda **kwargs: DouyinBrowserResult(
+            aweme_items=[ACCOUNT_AWEME],
+            source="network+dom",
+            coverage={
+                "requested_all": False,
+                "browser_fallback_requested": True,
+                "browser_fallback_launched": True,
+                "browser_evidence_source": "network+dom",
+                "scroll_rounds": 3,
+                "max_seconds": 90.0,
+                "max_scrolls": 20,
+                "observed_page_count": 1,
+                "observed_post_count": 1,
+                "stop_condition": "limit",
+                "cookie": "must-not-persist",
+                "response_paths": ["/must-not-persist"],
+            },
+        )
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+    monkeypatch.setattr(
+        collector, "check_access", lambda _url: {"accessible": True}
+    )
+    monkeypatch.setattr(
+        collector,
+        "collect_profile",
+        lambda _url: {"platform": "douyin", "field_visibility": {}},
+    )
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [collector])
+    out = tmp_path / "task"
+
+    assert collect.run(ACCOUNT_URL, limit=1, out_dir=str(out)) == 0
+
+    coverage = json.loads((out / "task.json").read_text(encoding="utf-8"))[
+        "collection_coverage"
+    ]
+    assert coverage["browser_fallback_requested"] is True
+    assert coverage["browser_fallback_launched"] is True
+    assert coverage["browser_evidence_source"] == "network+dom"
+    assert coverage["scroll_rounds"] == 3
+    assert coverage["max_seconds"] == 90.0
+    assert coverage["max_scrolls"] == 20
+    assert "cookie" not in coverage
+    assert "response_paths" not in coverage
 
 
 def test_workspace_date_intersection_excludes_unknown_rows_when_range_is_explicit():

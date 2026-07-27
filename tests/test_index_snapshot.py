@@ -123,6 +123,72 @@ def _search_evidence():
     }
 
 
+def _sealed_profile_collection(tmp_path, *, profile=None, task=None):
+    target = tmp_path / "direct-profile"
+    direct_profile = {
+        "platform": "douyin",
+        "account_id": "zgzfw-current",
+        "account_name": "中国政府网（当前）",
+        "profile_url": PROFILE_URL,
+        "bio": "当前公开简介",
+        "verified": True,
+        "followers": 12_345_678,
+        "post_count": 8_765,
+        "level": None,
+        "platform_metrics": {
+            "sec_uid": PROFILE_ID,
+            "unique_id": "zgzfw-current",
+            "total_likes": 88_000_000,
+        },
+        "collected_at": "2026-07-25T09:00:00+08:00",
+        "field_visibility": {
+            "account_id": "visible",
+            "account_name": "visible",
+            "bio": "visible",
+            "verified": "visible",
+            "followers": "visible",
+            "post_count": "visible",
+        },
+    }
+    direct_profile.update(profile or {})
+    direct_task = {
+        "task_id": "douyin-direct-profile-task",
+        "platform": "douyin",
+        "profile_url": PROFILE_URL,
+        "task_status": "FAILED",
+        "stop_reason": "LOGIN_REQUIRED",
+        "collected_count": 0,
+    }
+    direct_task.update(task or {})
+    artifacts = {
+        "source/profile.json": json.dumps(direct_profile, ensure_ascii=False),
+        "source/posts.jsonl": "",
+        "task.json": json.dumps(direct_task, ensure_ascii=False),
+        "collection-report.md": "# direct profile\n",
+    }
+    reservation = immutable.ImmutableWorkspace.reserve(
+        str(target),
+        allowed_artifacts=frozenset(
+            {
+                "source/profile.json",
+                "source/posts.jsonl",
+                "source/comments.jsonl",
+                "normalized-posts.csv",
+                "task.json",
+                "collection-report.md",
+            }
+        ),
+    )
+    try:
+        for relative, payload in artifacts.items():
+            with reservation.open_text(relative) as handle:
+                handle.write(payload)
+        digest = reservation.commit()
+    finally:
+        reservation.close()
+    return target, digest
+
+
 def test_jingxuan_evidence_keeps_real_ids_urls_and_partial_status():
     result = importer.validate_evidence(_jingxuan_evidence(), limit=1)
 
@@ -404,6 +470,369 @@ def test_index_task_persists_task_id_goal_and_committed_manifest(tmp_path):
     )
 
 
+def test_index_run_normalizes_date_window_and_keeps_only_known_in_range_posts(
+    tmp_path,
+):
+    evidence = _jingxuan_evidence()
+    evidence["posts"].reverse()
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(evidence, ensure_ascii=False), encoding="utf-8"
+    )
+    out = tmp_path / "task"
+
+    summary = importer.run(
+        str(evidence_path),
+        str(out),
+        limit=1,
+        date_from="2026-07-10",
+        date_to="2026-07-20",
+    )
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    posts = [
+        json.loads(line)
+        for line in (out / "source" / "posts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert task["date_from"] == "2026-07-10T00:00:00+08:00"
+    assert task["date_to"] == "2026-07-20T23:59:59+08:00"
+    assert task["collected_count"] == summary["collected_count"] == 1
+    assert [post["post_id"] for post in posts] == ["7646317821839805739"]
+
+
+def test_bounded_search_index_with_unknown_dates_is_empty_without_workspace(
+    tmp_path,
+):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EmptyEvidenceError, match="日期范围"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            date_from="2026-04-25",
+            date_to="2026-07-24",
+        )
+
+    assert not out.exists()
+
+
+def test_index_import_overlays_newer_verified_direct_profile(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, source_digest = _sealed_profile_collection(tmp_path)
+    out = tmp_path / "task"
+
+    importer.run(
+        str(evidence_path),
+        str(out),
+        profile_collection_dir=str(profile_collection),
+    )
+
+    profile = json.loads((out / "source" / "profile.json").read_text())
+    task = json.loads((out / "task.json").read_text())
+    index_evidence = json.loads(
+        (out / "source" / "index-evidence.json").read_text()
+    )
+    assert profile["account_id"] == "zgzfw-current"
+    assert profile["account_name"] == "中国政府网（当前）"
+    assert profile["followers"] == 12_345_678
+    assert profile["post_count"] == 8_765
+    assert profile["platform_metrics"]["total_likes"] == 88_000_000
+    assert profile["platform_metrics"]["collection_source"] == (
+        "douyin_search_index"
+    )
+    assert task["profile_overlay"] == {
+        "source_format": immutable.FORMAT,
+        "source_commit_sha256": source_digest,
+        "source_task_id": "douyin-direct-profile-task",
+        "collected_at": "2026-07-25T09:00:00+08:00",
+        "field_sources": {
+            "account_id": "direct_public_collection",
+            "account_name": "direct_public_collection",
+            "bio": "direct_public_collection",
+            "verified": "direct_public_collection",
+            "followers": "direct_public_collection",
+            "post_count": "direct_public_collection",
+            "level": "index_evidence",
+            "platform_metrics.douyin_id": "index_evidence",
+            "platform_metrics.latest_post_at": "index_evidence",
+            "platform_metrics.sec_uid": "direct_public_collection",
+            "platform_metrics.total_likes": "direct_public_collection",
+            "platform_metrics.uid": "index_evidence",
+            "platform_metrics.unique_id": "direct_public_collection",
+        },
+    }
+    assert index_evidence["account"]["account_name"] == "中国政府网"
+    assert all(
+        post["author_name"] == "中国政府网"
+        for post in index_evidence["posts"]
+    )
+
+
+def test_index_import_rejects_profile_overlay_older_than_known_index_snapshot(tmp_path):
+    evidence = _search_evidence()
+    evidence["snapshot_crawled_at"] = "2026-07-24"
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(evidence, ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(
+        tmp_path,
+        profile={"collected_at": "2026-07-23T09:00:00+08:00"},
+    )
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="较新|时间"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(profile_collection),
+        )
+
+    assert not out.exists()
+
+
+def test_index_import_rejects_profile_overlay_not_newer_than_observation(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(
+        tmp_path,
+        profile={"collected_at": "2026-07-24T17:00:00+08:00"},
+    )
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="较新|时间"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(profile_collection),
+        )
+
+    assert not out.exists()
+
+
+def test_index_import_rejects_same_day_overlay_for_date_precision_snapshot(tmp_path):
+    evidence = _search_evidence()
+    evidence["snapshot_crawled_at"] = "2026-07-24"
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(evidence, ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(
+        tmp_path,
+        profile={"collected_at": "2026-07-24T23:00:00+08:00"},
+    )
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="较新|时间"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(profile_collection),
+        )
+
+    assert not out.exists()
+
+
+def test_index_import_rejects_profile_overlay_without_source_task_id(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(
+        tmp_path,
+        task={"task_id": None},
+    )
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="task_id"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(profile_collection),
+        )
+
+    assert not out.exists()
+
+
+def test_index_profile_overlay_nulls_do_not_erase_index_profile_values(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(
+        tmp_path,
+        profile={
+            "bio": None,
+            "followers": None,
+            "platform_metrics": {
+                "sec_uid": PROFILE_ID,
+                "unique_id": "zgzfw-current",
+                "total_likes": None,
+            },
+        },
+    )
+    out = tmp_path / "task"
+
+    importer.run(
+        str(evidence_path),
+        str(out),
+        profile_collection_dir=str(profile_collection),
+    )
+
+    profile = json.loads((out / "source" / "profile.json").read_text())
+    task = json.loads((out / "task.json").read_text())
+    assert profile["platform_metrics"]["total_likes"] == 73_000_000
+    assert task["profile_overlay"]["field_sources"][
+        "platform_metrics.total_likes"
+    ] == "index_evidence"
+
+
+def test_index_profile_overlay_provenance_reaches_analysis_and_report(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(tmp_path)
+    collection = tmp_path / "collection"
+    output = tmp_path / "analysis"
+    importer.run(
+        str(evidence_path),
+        str(collection),
+        profile_collection_dir=str(profile_collection),
+    )
+
+    run_pipeline.run_pipeline(str(collection), str(output))
+
+    collection_task = json.loads((collection / "task.json").read_text())
+    analysis = json.loads((output / "analysis.json").read_text())
+    report = (output / "account-analysis-report.md").read_text()
+    assert analysis["meta"]["profile_overlay"] == collection_task[
+        "profile_overlay"
+    ]
+    assert "当前直连公开资料" in report
+    assert "较旧索引作品" in report
+
+
+def test_index_profile_overlay_rejects_cross_account_task_before_output(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(
+        tmp_path,
+        task={"profile_url": "https://www.douyin.com/user/another-account"},
+    )
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="账号.*不一致"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(profile_collection),
+        )
+
+    assert not out.exists()
+
+
+def test_index_profile_overlay_rejects_authorized_owner_collection(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(
+        tmp_path,
+        task={"collection_source": "douyin_openapi_token_owner"},
+    )
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="匿名公开采集"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(profile_collection),
+        )
+
+    assert not out.exists()
+
+
+def test_index_profile_overlay_rejects_conflicting_sec_uid_before_output(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(
+        tmp_path,
+        profile={
+            "platform_metrics": {
+                "sec_uid": "another-account",
+                "unique_id": "zgzfw-current",
+            }
+        },
+    )
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="绑定证据"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(profile_collection),
+        )
+
+    assert not out.exists()
+
+
+def test_index_profile_overlay_rejects_uncommitted_directory_before_output(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    uncommitted = tmp_path / "uncommitted"
+    (uncommitted / "source").mkdir(parents=True)
+    (uncommitted / "source" / "profile.json").write_text("{}")
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="已提交采集工作区"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(uncommitted),
+        )
+
+    assert not out.exists()
+
+
+def test_index_profile_overlay_rejects_tampered_commit_before_output(tmp_path):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(_search_evidence(), ensure_ascii=False), encoding="utf-8"
+    )
+    profile_collection, _ = _sealed_profile_collection(tmp_path)
+    profile_path = profile_collection / "source" / "profile.json"
+    profile_path.chmod(0o600)
+    profile_path.write_text("{}", encoding="utf-8")
+    out = tmp_path / "task"
+
+    with pytest.raises(importer.EvidenceError, match="已提交采集工作区"):
+        importer.run(
+            str(evidence_path),
+            str(out),
+            profile_collection_dir=str(profile_collection),
+        )
+
+    assert not out.exists()
+
+
 @pytest.mark.parametrize("goal", [123, "", " ", "x" * 501, "a\nb", "a\x00b"])
 def test_index_rejects_invalid_goal_before_evidence_read_or_output(
     tmp_path, goal
@@ -420,15 +849,27 @@ def test_index_rejects_invalid_goal_before_evidence_read_or_output(
     assert not out.exists()
 
 
-def test_index_cli_forwards_analysis_goal(monkeypatch, capsys):
+def test_index_cli_forwards_analysis_goal_and_date_window(monkeypatch, capsys):
     captured = {}
 
-    def fake_run(evidence, out, *, limit, analysis_goal):
+    def fake_run(
+        evidence,
+        out,
+        *,
+        limit,
+        analysis_goal,
+        date_from,
+        date_to,
+        profile_collection_dir,
+    ):
         captured.update(
             evidence=evidence,
             out=out,
             limit=limit,
             analysis_goal=analysis_goal,
+            date_from=date_from,
+            date_to=date_to,
+            profile_collection_dir=profile_collection_dir,
         )
         return {
             "task_status": "PARTIAL",
@@ -444,8 +885,14 @@ def test_index_cli_forwards_analysis_goal(monkeypatch, capsys):
         "--evidence", "evidence.json",
         "--out", "task",
         "--analysis-goal", "分析公开索引",
+        "--date-from", "2026-04-25",
+        "--date-to", "2026-07-24",
+        "--profile-from-collection", "profile-task",
     ]) == 0
     assert captured["analysis_goal"] == "分析公开索引"
+    assert captured["date_from"] == "2026-04-25"
+    assert captured["date_to"] == "2026-07-24"
+    assert captured["profile_collection_dir"] == "profile-task"
     assert capsys.readouterr().err == ""
 
 

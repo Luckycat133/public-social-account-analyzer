@@ -63,6 +63,33 @@ def test_build_publish_cadence_includes_hour_distribution():
     assert "<svg" in html
 
 
+def test_completed_taxonomy_report_does_not_warn_that_it_may_be_pending():
+    analysis = {
+        "classification_status": "completed",
+        "meta": {"classification_status": "completed"},
+        "posts": [{"format": "news"}, {"format": "news"}],
+        "sample_boundary": {"valid": 20},
+    }
+
+    strategy_md, strategy_html = render_report.build_strategy(analysis, {})
+    limits_md, limits_html = render_report.build_sample_limits(analysis, {})
+
+    for rendered in (strategy_md, strategy_html, limits_md, limits_html):
+        assert "可能为 pending-model" not in rendered
+        assert "分类已完成" in rendered
+
+
+def test_content_structure_labels_platform_carrier_separately_from_model_format():
+    md, html = render_report.build_content_structure(
+        {}, [{"content_type": "other", "is_pinned": False}]
+    )
+
+    for rendered in (md, html):
+        assert "平台内容载体" in rendered
+        assert "content_type" in rendered
+        assert "模型分类的内容形式（format）" in rendered
+
+
 def test_high_performance_renders_analyzer_value_field():
     analysis = {
         "meta": {"main_sort_metric": "likes"},

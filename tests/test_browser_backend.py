@@ -27,6 +27,13 @@ from collectors.browser_backend import (  # noqa: E402
 )
 
 
+def _provision_owned_profile(session, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    session._user_data_dir = str(profile)
+    return str(profile)
+
+
 # --------------------------------------------------------------------------
 # 跨平台浏览器探测（find_browser）
 # --------------------------------------------------------------------------
@@ -127,7 +134,45 @@ def test_session_rejects_user_data_dir_override(tmp_path):
         BrowserSession(port=9222, user_data_dir=str(tmp_path))
 
 
-def test_start_connect_failure_cleans_owned_resources(monkeypatch):
+def test_session_defers_profile_allocation_until_start(monkeypatch, tmp_path):
+    browser = tmp_path / "browser"
+    browser.write_text("fake", encoding="utf-8")
+    created = []
+
+    def make_profile(*, prefix):
+        profile = tmp_path / f"{prefix}profile"
+        profile.mkdir()
+        created.append(profile)
+        return str(profile)
+
+    class FakeProc:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout):
+            return 0
+
+    monkeypatch.setattr(
+        "collectors.browser_backend.tempfile.mkdtemp", make_profile
+    )
+    monkeypatch.setattr(
+        "collectors.browser_backend.subprocess.Popen",
+        lambda *args, **kwargs: FakeProc(),
+    )
+    session = BrowserSession(browser_bin=str(browser), port=9222)
+    monkeypatch.setattr(session, "_wait_for_devtools", lambda: None)
+    monkeypatch.setattr(session, "_connect", lambda: None)
+
+    assert created == []
+    session.start()
+    assert len(created) == 1
+    assert created[0].is_dir()
+
+    session.close()
+    assert not created[0].exists()
+
+
+def test_start_connect_failure_cleans_owned_resources(monkeypatch, tmp_path):
     class FakeProc:
         def __init__(self):
             self.terminated = False
@@ -140,7 +185,11 @@ def test_start_connect_failure_cleans_owned_resources(monkeypatch):
 
     proc = FakeProc()
     session = BrowserSession(browser_bin="/fake/browser", port=9222)
-    profile_dir = session._user_data_dir
+    profile_dir = tmp_path / "profile"
+    monkeypatch.setattr(
+        "collectors.browser_backend.tempfile.mkdtemp",
+        lambda **_kwargs: str(profile_dir.mkdir() or profile_dir),
+    )
     real_exists = os.path.exists
     monkeypatch.setattr("collectors.browser_backend.os.path.exists", lambda _: True)
     monkeypatch.setattr("collectors.browser_backend.subprocess.Popen", lambda *args, **kwargs: proc)
@@ -486,7 +535,7 @@ def test_page_text_returns_only_string_values():
     assert session.page_text() == ""
 
 
-def test_close_kills_waits_and_retries_profile_cleanup(monkeypatch):
+def test_close_kills_waits_and_retries_profile_cleanup(monkeypatch, tmp_path):
     """A timed-out browser is reaped before its temporary profile is removed."""
 
     class StuckProc:
@@ -510,7 +559,7 @@ def test_close_kills_waits_and_retries_profile_cleanup(monkeypatch):
     session = BrowserSession(port=9222)
     proc = StuckProc()
     session._proc = proc
-    profile_dir = session._user_data_dir
+    profile_dir = _provision_owned_profile(session, tmp_path)
     real_rmtree = shutil.rmtree
     attempts = []
 
@@ -531,10 +580,10 @@ def test_close_kills_waits_and_retries_profile_cleanup(monkeypatch):
     assert not os.path.exists(profile_dir)
 
 
-def test_close_reports_sanitized_cleanup_failure_without_raising(monkeypatch):
+def test_close_reports_sanitized_cleanup_failure_without_raising(monkeypatch, tmp_path):
     """Cleanup failure is observable without disclosing the profile path."""
     session = BrowserSession(port=9222)
-    profile_dir = session._user_data_dir
+    profile_dir = _provision_owned_profile(session, tmp_path)
     real_rmtree = shutil.rmtree
     monkeypatch.setattr(
         "collectors.browser_backend.shutil.rmtree",
@@ -552,10 +601,12 @@ def test_close_reports_sanitized_cleanup_failure_without_raising(monkeypatch):
     real_rmtree(profile_dir)
 
 
-def test_close_never_replaces_an_error_when_profile_state_is_unreadable(monkeypatch):
+def test_close_never_replaces_an_error_when_profile_state_is_unreadable(
+    monkeypatch, tmp_path
+):
     """Even filesystem inspection failure becomes only a sanitized diagnostic."""
     session = BrowserSession(port=9222)
-    profile_dir = session._user_data_dir
+    profile_dir = _provision_owned_profile(session, tmp_path)
     real_rmtree = shutil.rmtree
     monkeypatch.setattr(
         "collectors.browser_backend.os.path.isdir",
@@ -569,10 +620,12 @@ def test_close_never_replaces_an_error_when_profile_state_is_unreadable(monkeypa
     real_rmtree(profile_dir)
 
 
-def test_context_exit_raises_sanitized_cleanup_error_without_active_exception(monkeypatch):
+def test_context_exit_raises_sanitized_cleanup_error_without_active_exception(
+    monkeypatch, tmp_path
+):
     """A failed cleanup is observable to production callers on a normal exit."""
     session = BrowserSession(port=9222)
-    profile_dir = session._user_data_dir
+    profile_dir = _provision_owned_profile(session, tmp_path)
     real_rmtree = shutil.rmtree
     monkeypatch.setattr(
         "collectors.browser_backend.shutil.rmtree",
@@ -591,10 +644,12 @@ def test_context_exit_raises_sanitized_cleanup_error_without_active_exception(mo
     real_rmtree(profile_dir)
 
 
-def test_context_exit_attaches_cleanup_codes_without_replacing_active_error(monkeypatch):
+def test_context_exit_attaches_cleanup_codes_without_replacing_active_error(
+    monkeypatch, tmp_path
+):
     """Cleanup diagnostics augment, but never override, the original exception."""
     session = BrowserSession(port=9222)
-    profile_dir = session._user_data_dir
+    profile_dir = _provision_owned_profile(session, tmp_path)
     real_rmtree = shutil.rmtree
     monkeypatch.setattr(
         "collectors.browser_backend.shutil.rmtree",
@@ -611,10 +666,12 @@ def test_context_exit_attaches_cleanup_codes_without_replacing_active_error(monk
     real_rmtree(profile_dir)
 
 
-def test_context_exit_preserves_an_active_error_diagnostic_code(monkeypatch):
+def test_context_exit_preserves_an_active_error_diagnostic_code(
+    monkeypatch, tmp_path
+):
     """The cleanup code remains secondary when the active error has a diagnosis."""
     session = BrowserSession(port=9222)
-    profile_dir = session._user_data_dir
+    profile_dir = _provision_owned_profile(session, tmp_path)
     real_rmtree = shutil.rmtree
     monkeypatch.setattr(
         "collectors.browser_backend.shutil.rmtree",

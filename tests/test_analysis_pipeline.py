@@ -112,6 +112,56 @@ def _minimal_template() -> str:
     ) + "</body></html>"
 
 
+def test_failed_collection_pipeline_error_reports_sanitized_status_and_reason(
+    tmp_path,
+):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(
+        tmp_path,
+        task_status="FAILED",
+        posts=[],
+        task_overrides={"stop_reason": "LOGIN_REQUIRED"},
+    )
+    output = tmp_path / "analysis"
+
+    with pytest.raises(
+        pipeline.PipelineError,
+        match=(
+            "task_status=FAILED is not analyzable; "
+            "stop_reason=LOGIN_REQUIRED; no analysis workspace created"
+        ),
+    ):
+        pipeline.run_pipeline(
+            str(collection), str(output), template_text=_minimal_template()
+        )
+
+    assert not output.exists()
+
+
+def test_untrusted_collection_status_is_not_echoed_by_pipeline_error(tmp_path):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(
+        tmp_path,
+        task_status="SECRET_STATUS_VALUE",
+        posts=[],
+        task_overrides={"stop_reason": "SECRET_REASON_VALUE"},
+    )
+    output = tmp_path / "analysis"
+
+    with pytest.raises(pipeline.PipelineError) as exc_info:
+        pipeline.run_pipeline(
+            str(collection), str(output), template_text=_minimal_template()
+        )
+
+    message = str(exc_info.value)
+    assert message == (
+        "collection task_status=INVALID is not analyzable; "
+        "stop_reason=INVALID; no analysis workspace created"
+    )
+    assert "SECRET" not in message
+    assert not output.exists()
+
+
 def _classification(post_id: str = "1", **overrides) -> dict:
     result = {
         "post_id": post_id,
@@ -700,6 +750,41 @@ def test_pipeline_binds_public_exhaustive_coverage_to_normalized_count(tmp_path)
     assert not bad_output.exists()
 
 
+@pytest.mark.parametrize("browser_evidence_source", ["network+dom", "none"])
+def test_pipeline_preserves_safe_browser_runtime_coverage(
+    tmp_path, browser_evidence_source
+):
+    pipeline = _pipeline_module()
+    runtime_coverage = {
+        "browser_fallback_requested": True,
+        "browser_fallback_launched": True,
+        "browser_evidence_source": browser_evidence_source,
+        "scroll_rounds": 3,
+        "max_seconds": 90.0,
+        "max_scrolls": 20,
+    }
+    collection, _ = _collection(
+        tmp_path,
+        task_overrides={
+            "requested_limit": 10_000,
+            "stop_reason": None,
+            "collection_coverage": _public_terminal_coverage(
+                **runtime_coverage
+            ),
+        },
+    )
+    output = tmp_path / "analysis"
+
+    pipeline.run_pipeline(
+        str(collection), str(output), template_text=_minimal_template()
+    )
+
+    coverage = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )["meta"]["collection_coverage"]
+    assert {key: coverage[key] for key in runtime_coverage} == runtime_coverage
+
+
 def test_pipeline_accepts_public_protection_without_coverage_stop_condition(
     tmp_path,
 ):
@@ -1232,6 +1317,34 @@ def test_public_pipeline_keeps_public_page_snapshot_disclaimer(tmp_path):
     for rendered in (markdown, dashboard):
         assert "公开页面快照" in rendered
         assert "本报告基于公开来源证据" not in rendered
+
+
+def test_pipeline_preserves_collection_date_window_in_all_task_outputs(tmp_path):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(
+        tmp_path,
+        task_overrides={
+            "date_from": "2026-01-01T00:00:00+08:00",
+            "date_to": "2026-01-31T23:59:59+08:00",
+        },
+    )
+    output = tmp_path / "analysis"
+
+    pipeline.run_pipeline(
+        str(collection), str(output), template_text=_minimal_template()
+    )
+
+    task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+    analysis_payload = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )
+    markdown = (output / "account-analysis-report.md").read_text(encoding="utf-8")
+    assert task["date_from"] == "2026-01-01T00:00:00+08:00"
+    assert task["date_to"] == "2026-01-31T23:59:59+08:00"
+    assert analysis_payload["meta"]["date_from"] == task["date_from"]
+    assert analysis_payload["meta"]["date_to"] == task["date_to"]
+    assert "2026-01-01T00:00:00+08:00" in markdown
+    assert "2026-01-31T23:59:59+08:00" in markdown
 
 
 def test_limited_upstream_commits_partial_analysis(tmp_path):

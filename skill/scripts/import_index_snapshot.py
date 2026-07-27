@@ -11,6 +11,7 @@ It never logs in, launches a browser, calls Douyin, or fabricates metrics.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -30,7 +31,10 @@ from immutable_workspace import (
     WorkspaceExistsError,
     WorkspaceIdentityError,
     WorkspaceVerificationError,
+    VerifiedWorkspaceReader,
 )
+from collectors._douyin_browser_transport import sanitize_profile_raw
+from collectors.url_policy import canonical_profile_url
 from task_contract import (
     TaskContractError,
     new_task_id,
@@ -57,6 +61,31 @@ _INDEX_ARTIFACTS = frozenset({
     "task.json",
     "collection-report.md",
 })
+_PUBLIC_COLLECTION_ARTIFACTS = frozenset({
+    "source/profile.json",
+    "source/posts.jsonl",
+    "source/comments.jsonl",
+    "normalized-posts.csv",
+    "task.json",
+    "collection-report.md",
+})
+_PROFILE_FIELDS = (
+    "account_id",
+    "account_name",
+    "bio",
+    "verified",
+    "followers",
+    "post_count",
+    "level",
+)
+_PROFILE_METRIC_FIELDS = (
+    "douyin_id",
+    "latest_post_at",
+    "sec_uid",
+    "total_likes",
+    "uid",
+    "unique_id",
+)
 
 
 class EvidenceError(ValueError):
@@ -102,7 +131,8 @@ def _is_douyin_host(hostname: str | None) -> bool:
 
 def _canonical_url(value: Any, label: str) -> str:
     text = _text(value, label, maximum=2048)
-    assert text is not None
+    if text is None:
+        raise EvidenceError(f"{label} 不可为空")
     try:
         parsed = urlsplit(text)
         port = parsed.port
@@ -153,7 +183,8 @@ def _timestamp(
     if value is None and nullable:
         return None, "unknown"
     text = _text(value, label, maximum=64)
-    assert text is not None
+    if text is None:
+        raise EvidenceError(f"{label} 不可为空")
     if allow_date and re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         try:
             parsed_date = datetime.strptime(text, "%Y-%m-%d").date()
@@ -169,6 +200,58 @@ def _timestamp(
     if dt.tzinfo is None or dt.utcoffset() is None:
         raise EvidenceError(f"{label} 必须包含时区")
     return dt.isoformat(), "datetime"
+
+
+def _date_bound(value: Any, label: str, *, end_of_day: bool = False) -> str | None:
+    if value is None:
+        return None
+    text = _text(value, label, maximum=64)
+    if text is None:
+        raise EvidenceError(f"{label} 不可为空")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            day = datetime.strptime(text, "%Y-%m-%d")
+        except ValueError as exc:
+            raise EvidenceError(f"{label} 不是合法日期") from exc
+        if end_of_day:
+            day = day.replace(hour=23, minute=59, second=59)
+        return day.replace(tzinfo=BEIJING).isoformat()
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise EvidenceError(f"{label} 不是合法 ISO 8601 时间") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=BEIJING)
+    return parsed.isoformat()
+
+
+def _date_window(date_from: Any, date_to: Any) -> tuple[str | None, str | None]:
+    lower = _date_bound(date_from, "date_from")
+    upper = _date_bound(date_to, "date_to", end_of_day=True)
+    if lower is not None and upper is not None:
+        if datetime.fromisoformat(lower) > datetime.fromisoformat(upper):
+            raise EvidenceError("date_from 不得晚于 date_to")
+    return lower, upper
+
+
+def _profile_freshness_baseline(evidence: dict[str, Any]) -> datetime:
+    """Return the latest instant the index evidence could represent.
+
+    `observed_at` is always a lower bound for proving that a later direct
+    profile is current. A date-only crawl timestamp has day precision, so its
+    conservative upper bound is the end of that calendar day.
+    """
+    baseline = datetime.fromisoformat(evidence["observed_at"])
+    snapshot = evidence.get("snapshot_crawled_at")
+    if snapshot is not None:
+        snapshot_time = datetime.fromisoformat(snapshot)
+        if evidence.get("snapshot_crawled_at_precision") == "date":
+            snapshot_time = snapshot_time.replace(
+                hour=23, minute=59, second=59, microsecond=999999
+            )
+        baseline = max(baseline, snapshot_time)
+    return baseline
 
 
 def _ensure_not_after(value: str | None, observed_at: str, label: str) -> None:
@@ -198,7 +281,8 @@ def _validate_account(raw: Any, *, profile_id: str, observed_at: str, profile_ur
     if account_id != profile_id:
         raise EvidenceError("account_id 必须与 profile_url 的账号 ID 完全一致")
     account_name = _text(account.get("account_name"), "account.account_name", maximum=200)
-    assert account_name is not None
+    if account_name is None:
+        raise EvidenceError("account.account_name 不可为空")
     bio = _text(account.get("bio"), "account.bio", nullable=True, maximum=2000)
     verified = _optional_bool_or_text(account.get("verified"), "account.verified")
     followers = _nonnegative_int(account.get("followers"), "account.followers")
@@ -255,10 +339,17 @@ def _validate_account(raw: Any, *, profile_id: str, observed_at: str, profile_ur
     return profile, account_name
 
 
-def validate_evidence(payload: Any, *, limit: int = 30) -> dict[str, Any]:
+def validate_evidence(
+    payload: Any,
+    *,
+    limit: int = 30,
+    date_from: Any = None,
+    date_to: Any = None,
+) -> dict[str, Any]:
     """Validate an evidence object and return whitelisted workspace payloads."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise EvidenceError("limit 必须是 1 到 100 的整数")
+    date_from, date_to = _date_window(date_from, date_to)
     data = _object(payload, "evidence")
     if data.get("schema_version") != 1:
         raise EvidenceError("schema_version 必须为 1")
@@ -277,7 +368,8 @@ def validate_evidence(payload: Any, *, limit: int = 30) -> dict[str, Any]:
         _post_identity(source_url, "source_url")
 
     observed_at, _ = _timestamp(data.get("observed_at"), "observed_at", allow_date=False)
-    assert observed_at is not None
+    if observed_at is None:
+        raise EvidenceError("observed_at 不可为空")
     snapshot_crawled_at, snapshot_precision = _timestamp(
         data.get("snapshot_crawled_at"), "snapshot_crawled_at", nullable=True
     )
@@ -320,7 +412,8 @@ def validate_evidence(payload: Any, *, limit: int = 30) -> dict[str, Any]:
                 f"posts[{source_rank - 1}].author_name 与目标账号不一致"
             )
         title = _text(item.get("title"), f"posts[{source_rank - 1}].title", maximum=2000)
-        assert title is not None
+        if title is None:
+            raise EvidenceError(f"posts[{source_rank - 1}].title 不可为空")
         published_at, published_precision = _timestamp(
             item.get("published_at"),
             f"posts[{source_rank - 1}].published_at",
@@ -363,7 +456,8 @@ def validate_evidence(payload: Any, *, limit: int = 30) -> dict[str, Any]:
         raw_post_url = item.get("post_url")
         if source_kind == "douyin_jingxuan":
             post_id = _text(raw_post_id, f"posts[{source_rank - 1}].post_id", maximum=64)
-            assert post_id is not None
+            if post_id is None:
+                raise EvidenceError(f"posts[{source_rank - 1}].post_id 不可为空")
             if not post_id.isdigit():
                 raise EvidenceError(f"posts[{source_rank - 1}].post_id 必须是数字作品 ID")
             post_url = _canonical_url(raw_post_url, f"posts[{source_rank - 1}].post_url")
@@ -436,8 +530,32 @@ def validate_evidence(payload: Any, *, limit: int = 30) -> dict[str, Any]:
     if not posts:
         raise EmptyEvidenceError("证据中没有可导入作品")
 
-    # Validate the complete evidence batch before applying the caller's output
-    # limit. Otherwise malformed records after the limit could evade checks.
+    # Validate the complete evidence batch before applying the date window and
+    # caller's output limit. Otherwise malformed excluded records could evade
+    # checks, or early out-of-range records could consume the requested limit.
+    if date_from is not None or date_to is not None:
+        lower = datetime.fromisoformat(date_from) if date_from is not None else None
+        upper = datetime.fromisoformat(date_to) if date_to is not None else None
+        if len(posts) != len(safe_posts):
+            # _validate_post 应保证两者等长；偏离时立刻失败而不是 zip 静默截断。
+            raise EvidenceError(
+                f"posts/safe_posts 长度不一致: {len(posts)} vs {len(safe_posts)}"
+            )
+        filtered = []
+        for post, safe_post in zip(posts, safe_posts):
+            published_at = post.get("published_at")
+            if published_at is None:
+                continue
+            published = datetime.fromisoformat(published_at)
+            if lower is not None and published < lower:
+                continue
+            if upper is not None and published > upper:
+                continue
+            filtered.append((post, safe_post))
+        posts = [post for post, _ in filtered]
+        safe_posts = [safe_post for _, safe_post in filtered]
+        if not posts:
+            raise EmptyEvidenceError("日期范围内没有可导入的已知发布日期作品")
     posts = posts[:limit]
     safe_posts = safe_posts[:limit]
 
@@ -446,8 +564,8 @@ def validate_evidence(payload: Any, *, limit: int = 30) -> dict[str, Any]:
         "platform": "douyin",
         "profile_url": profile_url,
         "requested_limit": limit,
-        "date_from": None,
-        "date_to": None,
+        "date_from": date_from,
+        "date_to": date_to,
         "analysis_goal": None,
         "include_comments": False,
         "task_status": "PARTIAL",
@@ -485,6 +603,109 @@ def validate_evidence(payload: Any, *, limit: int = 30) -> dict[str, Any]:
         "posts": safe_posts,
     }
     return {"profile": profile, "posts": posts, "task": task, "evidence": safe_evidence}
+
+
+def _json_object_bytes(payload: bytes | None, label: str) -> dict[str, Any]:
+    if payload is None:
+        raise EvidenceError(f"{label} 缺失")
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError(f"{label} 不是合法 JSON object") from exc
+    return _object(value, label)
+
+
+def _profile_overlay(
+    collection_dir: str,
+    *,
+    expected_profile_url: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        context = VerifiedWorkspaceReader.open(
+            collection_dir, allowed_artifacts=_PUBLIC_COLLECTION_ARTIFACTS
+        )
+    except WorkspaceError as exc:
+        raise EvidenceError("profile 来源不是有效的已提交采集工作区") from exc
+    with context as reader:
+        manifested = {
+            item["path"] for item in reader.manifest.get("artifacts", [])
+        }
+        if not {"source/profile.json", "task.json"}.issubset(manifested):
+            raise EvidenceError("profile 来源缺少账号资料或任务证据")
+        profile_artifact = reader.read("source/profile.json")
+        task_artifact = reader.read("task.json")
+        profile = _json_object_bytes(
+            profile_artifact.payload, "profile 来源 source/profile.json"
+        )
+        task = _json_object_bytes(task_artifact.payload, "profile 来源 task.json")
+        if task.get("platform") != "douyin" or profile.get("platform") != "douyin":
+            raise EvidenceError("profile 来源平台必须为 douyin")
+        if task.get("collection_source") == "douyin_openapi_token_owner":
+            raise EvidenceError("profile 来源必须是匿名公开采集，不得混用本人授权数据")
+        source_task_id = task.get("task_id")
+        if not isinstance(source_task_id, str) or not source_task_id:
+            raise EvidenceError("profile 来源 task_id 无效")
+        if (
+            canonical_profile_url("douyin", task.get("profile_url"))
+            != expected_profile_url
+            or canonical_profile_url("douyin", profile.get("profile_url"))
+            != expected_profile_url
+        ):
+            raise EvidenceError("profile 来源账号与索引账号不一致")
+        collected_at, _ = _timestamp(
+            profile.get("collected_at"),
+            "profile 来源 collected_at",
+            allow_date=False,
+        )
+        clean = sanitize_profile_raw(profile, expected_profile_url)
+        if clean is None:
+            raise EvidenceError("profile 来源账号绑定证据无效")
+        reader.verify_unchanged()
+        return clean, {
+            "source_format": reader.source_format,
+            "source_commit_sha256": reader.source_digest,
+            "source_task_id": source_task_id,
+            "collected_at": collected_at,
+        }
+
+
+def _merge_profile_overlay(
+    profile: dict[str, Any],
+    overlay: dict[str, Any],
+    provenance: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return (merged_profile, overlay_provenance) without mutating input.
+
+    纯函数：传入的 `profile` 不会被就地修改；返回一个 deep-copied profile
+    与 overlay 元数据，调用方需显式赋值，避免下游读到半改写状态。
+    """
+    merged = copy.deepcopy(profile)
+    field_sources: dict[str, str] = {}
+    overlay_visibility = overlay.get("field_visibility") or {}
+    visibility = dict(merged.get("field_visibility") or {})
+    for field in _PROFILE_FIELDS:
+        if overlay.get(field) is not None:
+            merged[field] = overlay[field]
+            field_sources[field] = "direct_public_collection"
+            if field in overlay_visibility:
+                visibility[field] = overlay_visibility[field]
+        else:
+            field_sources[field] = "index_evidence"
+    merged["field_visibility"] = visibility
+
+    metrics = dict(merged.get("platform_metrics") or {})
+    overlay_metrics = overlay.get("platform_metrics") or {}
+    for field in _PROFILE_METRIC_FIELDS:
+        key = f"platform_metrics.{field}"
+        if overlay_metrics.get(field) is not None:
+            metrics[field] = overlay_metrics[field]
+            field_sources[key] = "direct_public_collection"
+        else:
+            field_sources[key] = "index_evidence"
+    merged["platform_metrics"] = metrics
+    merged["collected_at"] = provenance["collected_at"]
+    overlay_info = {**provenance, "field_sources": field_sources}
+    return merged, overlay_info
 
 
 def _json_text(payload: Any) -> str:
@@ -547,6 +768,9 @@ def run(
     *,
     limit: int = 30,
     analysis_goal: str | None = None,
+    date_from: Any = None,
+    date_to: Any = None,
+    profile_collection_dir: str | None = None,
 ) -> dict[str, Any]:
     """Validate an evidence JSON file and write a partial task workspace."""
     try:
@@ -554,13 +778,32 @@ def run(
     except TaskContractError as exc:
         raise EvidenceError("analysis_goal 参数无效") from exc
 
+    date_from, date_to = _date_window(date_from, date_to)
     path = Path(evidence_path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise EvidenceError(f"无法读取 evidence JSON: {exc}") from exc
 
-    result = validate_evidence(payload, limit=limit)
+    result = validate_evidence(
+        payload,
+        limit=limit,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    if profile_collection_dir is not None:
+        overlay, overlay_provenance = _profile_overlay(
+            profile_collection_dir,
+            expected_profile_url=result["task"]["profile_url"],
+        )
+        if datetime.fromisoformat(
+            overlay_provenance["collected_at"]
+        ) <= _profile_freshness_baseline(result["evidence"]):
+            raise EvidenceError("profile 来源时间必须可证明晚于索引证据时间")
+        result["profile"], overlay_info = _merge_profile_overlay(
+            result["profile"], overlay, overlay_provenance
+        )
+        result["task"]["profile_overlay"] = overlay_info
     result["task"]["task_id"] = new_task_id("douyin")
     result["task"]["analysis_goal"] = analysis_goal
     out = os.path.abspath(out_dir)
@@ -618,6 +861,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="尚不存在的任务输出目录")
     parser.add_argument("--limit", type=int, default=30, help="导入上限（1-100，默认 30）")
     parser.add_argument("--analysis-goal", default=None, help="可选分析目标")
+    parser.add_argument("--date-from", default=None, help="可选采集起始日期/时间")
+    parser.add_argument("--date-to", default=None, help="可选采集结束日期/时间")
+    parser.add_argument(
+        "--profile-from-collection",
+        default=None,
+        help="可选的已提交同账号公开采集工作区，用其较新账号资料覆盖索引快照",
+    )
     args = parser.parse_args(argv)
     try:
         summary = run(
@@ -625,6 +875,9 @@ def main(argv: list[str] | None = None) -> int:
             args.out,
             limit=args.limit,
             analysis_goal=args.analysis_goal,
+            date_from=args.date_from,
+            date_to=args.date_to,
+            profile_collection_dir=args.profile_from_collection,
         )
     except WorkspaceCommitIndeterminate:
         print("[INDETERMINATE] 索引产物提交状态无法确认", file=sys.stderr)

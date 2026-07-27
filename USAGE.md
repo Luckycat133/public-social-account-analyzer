@@ -202,7 +202,11 @@ SOCIAL_BROWSER_FALLBACK=0 python skill/scripts/collect.py "https://www.douyin.co
 python skill/scripts/import_index_snapshot.py \
   --evidence /path/to/douyin-evidence.json \
   --out workspace/douyin-index-<account>-<date> \
-  --limit 30
+  --limit 30 \
+  --date-from 2026-04-28 \
+  --date-to 2026-07-27 \
+  --analysis-goal "分析最近90天高表现内容的共同点" \
+  --profile-from-collection workspace/douyin-direct-failed
 python skill/scripts/run_pipeline.py \
   --input workspace/douyin-index-<account>-<date> \
   --output workspace/douyin-index-<account>-analysis
@@ -212,9 +216,23 @@ python skill/scripts/run_pipeline.py \
 没有单条 ID/URL 时只生成已披露的 `idx-*` 本地键并以账号主页作为证据锚点。两者始终
 `PARTIAL`、非实时、非穷尽；没有 Web 连接器的离线沙箱无法取得新数据。
 
+日期参数必须从原任务传入导入器。日期未知的搜索索引无法证明属于显式时间窗，过滤后为空时
+命令退出 `3` 且不创建工作区，不会用陈旧卡片生成时间窗排名。`--profile-from-collection`
+只读取同账号、已密封且摘要核验通过的匿名直连采集提交，用其中较新的非空公开资料覆盖索引
+账号卡；来源提交路径不会进入产物。本人授权 OpenAPI 提交会被拒绝，避免把授权数据误标为
+匿名公开证据。叠加资料必须可证明晚于索引证据的观察时间；日期精度的快照按当天结束保守
+判断；只有严格晚于该保守基线时才覆盖。
+
 分析工作区即使已存在有效 `.complete`，也可能是 `PARTIAL`：当前没有完整语义分类结果时
 `analysis=PARTIAL`；索引证据等上游受限输入也会保持 `PARTIAL`。`.complete` 表示持久提交，
 不等同于业务数据完备。
+
+当用户要求内容策略、高低表现共同点或分类分布，并且存在有效样本时，Agent Skill 不把上述
+`pending-model` draft 当作最终交付。先运行 `run_pipeline.py --with-llm-tax` 创建 draft，
+由 Agent 按 `taxonomy-prompt.md` 在提交目录外生成覆盖全部父作品的分类 JSON，再从同一个
+collection 运行 `run_pipeline.py --classification-results ...` 创建 final。只有 final 的
+`classification_status=completed` 且 manifest 封存 `source/classification-results.json`，
+才可声称共同点分析完成。
 
 ### 示例 3：抖音公开 `--all` 与详情补全
 
@@ -229,7 +247,9 @@ python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" \
 ```
 
 `task.json.collection_coverage` 会记录 `is_exhaustive`、`terminal_page_observed`、观察页数、
-作品数和遍历停止条件。达到 `max_items`、超时、空闲、重复游标或滚动预算都不能称为全量；
+作品数、遍历停止条件，以及可用时的浏览器是否请求/启动、证据 transport、滚动轮数和预算。
+这些运行字段经过严格白名单，不包含 Cookie、请求头、响应正文或临时 profile 路径。达到
+`max_items`、超时、空闲、重复游标或滚动预算都不能称为全量；
 登录、验证、频控和访问限制写入根级 `task.json.stop_reason`，同样保持非穷尽。已经取得的作品
 会作为可审计部分结果保留。
 

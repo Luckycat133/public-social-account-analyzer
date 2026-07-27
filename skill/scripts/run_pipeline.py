@@ -31,8 +31,13 @@ from immutable_workspace import (
 from normalize import NormalizationResult, normalize_in_memory
 from render_report import RenderResult, render_in_memory
 from task_contract import (
+    ANALYZABLE_TASK_STATUSES,
+    STOP_REASONS,
+    TASK_STATUSES,
     TaskContractError,
     new_task_id,
+    safe_stop_reason_label,
+    safe_task_status_label,
     validate_analysis_goal,
 )
 
@@ -55,6 +60,7 @@ COLLECTION_OPTIONAL_EVIDENCE = {
     "source/comments.jsonl": "source/comments.jsonl",
     "source/index-evidence.json": "source/index-evidence.json",
 }
+# 任务级枚举从 task_contract 单一来源导入，避免与 _constants.py / collect.py 漂移。
 
 
 class PipelineError(RuntimeError):
@@ -360,8 +366,15 @@ def run_pipeline(
         if not isinstance(source_task_id, str) or not source_task_id:
             raise PipelineError("collection task_id is missing")
         upstream_status = source_task.get("task_status")
-        if upstream_status not in {"COMPLETED", "PARTIAL"}:
-            raise PipelineError("collection task_status is not analyzable")
+        if upstream_status not in ANALYZABLE_TASK_STATUSES:
+            safe_status = safe_task_status_label(upstream_status)
+            safe_stop_reason = safe_stop_reason_label(
+                source_task.get("stop_reason")
+            )
+            raise PipelineError(
+                f"collection task_status={safe_status} is not analyzable; "
+                f"stop_reason={safe_stop_reason}; no analysis workspace created"
+            )
         platform = profile.get("platform") or source_task.get("platform")
         if not isinstance(platform, str) or not platform:
             raise PipelineError("collection platform is missing")
@@ -467,6 +480,8 @@ def run_pipeline(
             "task_id": derived_task_id,
             "platform": platform,
             "analysis_goal": analysis_goal,
+            "date_from": source_task.get("date_from"),
+            "date_to": source_task.get("date_to"),
             "task_status": task_status,
             "partial_reasons": partial_reasons,
             "source_task_id": source_task_id,

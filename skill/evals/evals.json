@@ -22,7 +22,12 @@
       "expected_output": "按日期范围采集（同时受最大100条限制），高低表现拆解各引用至少3条内容；若有效样本不足15条则标记 INSUFFICIENT_SAMPLE 并跳过完整共同点归纳。",
       "assertions": [
         "采集范围为最近90天与最大100条的交集",
+        "索引证据缺少可验证发布时间时，不把日期未知或陈旧卡片纳入最近90天排名，并明确该时间窗无法分析",
         "有效样本≥15条时：高表现和低表现内容各至少列出3条，均带 post_url",
+        "有效样本≥15条且要求共同点时：执行 Agent 完成两阶段 taxonomy，最终 classification_status=completed 且 manifest 封存 source/classification-results.json",
+        "有效样本≥15条且分类完成时：Agent 的最终答复至少归纳一条可由高低组明细复核的高表现共同点，并明确样本量、非因果和仅适用于当前证据范围的限制",
+        "classification_status=completed 时，最终报告不得再出现分类可能为 pending-model 的矛盾提示，并明确区分平台 content_type 与模型 format",
+        "最终报告中的主题/形式计数与高低组结构化特征能够从 manifest 封存的 source/classification-results.json 和标准化作品逐项重算",
         "有效样本<15条时：报告标记 INSUFFICIENT_SAMPLE，不输出完整高低表现共同点归纳，且未用置顶/转载/失效内容凑数",
         "排行依据与分析目标一致，未只按点赞排序"
       ]

@@ -42,6 +42,8 @@ from ._constants import (
     PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
     PUBLIC_ALL_DEFAULT_MAX_SECONDS,
     PUBLIC_ALL_HARD_MAX_ITEMS,
+    PUBLIC_ALL_HARD_MAX_SCROLLS,
+    PUBLIC_ALL_HARD_MAX_SECONDS,
     PUBLIC_LIMIT_DEFAULT,
     STOP_ACCESS_RESTRICTED,
     STOP_ACCOUNT_UNAVAILABLE,
@@ -687,6 +689,7 @@ class DouyinCollector(BaseCollector):
                 STOP_PARSER_FAILED,
                 "账号主页 SSR 缺失或作品列表结构无法识别，且浏览器降级已禁用",
             )
+        self._collection_coverage["browser_fallback_launched"] = True
         try:
             result = self._browser_collect(
                 url=url,
@@ -766,6 +769,17 @@ class DouyinCollector(BaseCollector):
             if exposed.get(identity) is entry[0]
         }
 
+    def _init_collection_coverage(self, **extras: Any) -> dict[str, Any]:
+        """Build a fresh coverage dict seeded with browser_fallback state.
+
+        三处入口（_record_limited_coverage / _collect_*_post_list_*_current）共用
+        同一字段组合逻辑；以后加字段（如 browser_fallback_completed_at）只改这里。
+        """
+        coverage: dict[str, Any] = dict(extras)
+        coverage.setdefault("browser_fallback_requested", self.browser_fallback)
+        coverage.setdefault("browser_fallback_launched", False)
+        return coverage
+
     @staticmethod
     def _date_summary(
         posts: list[dict[str, Any]],
@@ -785,8 +799,13 @@ class DouyinCollector(BaseCollector):
         matched_posts: list[dict[str, Any]],
         date_range: tuple[str | None, str | None] | None,
         transport_coverage: Any = None,
+        *,
+        browser_launched: bool = False,
     ) -> None:
         clean = self._sanitize_collection_coverage(transport_coverage)
+        clean = self._init_collection_coverage(**clean)
+        if browser_launched:
+            clean["browser_fallback_launched"] = True
         _, unknown_count = self._date_summary(posts_before_range, date_range)
         clean.update({
             "requested_all": False,
@@ -827,6 +846,7 @@ class DouyinCollector(BaseCollector):
             matched,
             date_range,
             getattr(result, "coverage", {}),
+            browser_launched=True,
         )
         if result.restriction:
             raise DouyinError(
@@ -887,10 +907,41 @@ class DouyinCollector(BaseCollector):
         terminal_observed = value.get("terminal_page_observed") is True
         clean["requested_all"] = requested_all
         clean["terminal_page_observed"] = terminal_observed
+        for key in (
+            "browser_fallback_requested",
+            "browser_fallback_launched",
+        ):
+            if type(value.get(key)) is bool:
+                clean[key] = value[key]
+        evidence_source = value.get("browser_evidence_source")
+        if evidence_source in {"none", "network", "dom", "network+dom"}:
+            clean["browser_evidence_source"] = evidence_source
         for key in count_fields:
             field_value = value.get(key)
             if isinstance(field_value, int) and not isinstance(field_value, bool):
                 clean[key] = max(0, field_value)
+        scroll_rounds = value.get("scroll_rounds")
+        if (
+            isinstance(scroll_rounds, int)
+            and not isinstance(scroll_rounds, bool)
+            and 0 <= scroll_rounds <= PUBLIC_ALL_HARD_MAX_SCROLLS
+        ):
+            clean["scroll_rounds"] = scroll_rounds
+        max_scrolls = value.get("max_scrolls")
+        if (
+            isinstance(max_scrolls, int)
+            and not isinstance(max_scrolls, bool)
+            and 1 <= max_scrolls <= PUBLIC_ALL_HARD_MAX_SCROLLS
+        ):
+            clean["max_scrolls"] = max_scrolls
+        max_seconds = value.get("max_seconds")
+        if (
+            isinstance(max_seconds, (int, float))
+            and not isinstance(max_seconds, bool)
+            and math.isfinite(max_seconds)
+            and 0 < max_seconds <= PUBLIC_ALL_HARD_MAX_SECONDS
+        ):
+            clean["max_seconds"] = float(max_seconds)
         max_items = value.get("max_items")
         if (
             isinstance(max_items, int)
@@ -961,16 +1012,17 @@ class DouyinCollector(BaseCollector):
         max_items, max_seconds, max_scrolls = validate_public_all_budgets(
             max_items, max_seconds, max_scrolls
         )
-        self._collection_coverage = {
-            "requested_all": True,
-            "max_items": max_items,
-        }
+        self._collection_coverage = self._init_collection_coverage(
+            requested_all=True,
+            max_items=max_items,
+        )
         if not self.browser_fallback:
             raise DouyinError(
                 STOP_PARSER_FAILED,
                 "全量作品采集需要启用公开浏览器传输层",
                 diagnostic_code="BROWSER_DISABLED",
             )
+        self._collection_coverage["browser_fallback_launched"] = True
         try:
             result = self._browser_collect(
                 url=url,
@@ -991,6 +1043,8 @@ class DouyinCollector(BaseCollector):
         self._collection_coverage = self._sanitize_collection_coverage(
             getattr(result, "coverage", {})
         )
+        self._collection_coverage.setdefault("browser_fallback_requested", True)
+        self._collection_coverage["browser_fallback_launched"] = True
         self._collection_coverage["max_items"] = max_items
         valid_items = self._validated_aweme_items(result.aweme_items)
         normalized = self._normalized_posts_from_items(
@@ -1082,7 +1136,7 @@ class DouyinCollector(BaseCollector):
         Best-effort：从 RENDER_DATA 抽取作品数组。尊重 limit 与 date_range。
         命中任务级限制抛 DouyinError；单条缺失不影响整体（保持 null，不臆造）。
         """
-        self._collection_coverage = {}
+        self._collection_coverage = self._init_collection_coverage()
         limit = validate_public_limit(limit)
         if not self.supports(url):
             raise DouyinError(STOP_UNSUPPORTED, f"不支持的账号主页 URL: {url}")
@@ -1149,6 +1203,7 @@ class DouyinCollector(BaseCollector):
             merged_matched,
             date_range,
             getattr(result, "coverage", {}),
+            browser_launched=True,
         )
         if result.restriction:
             raise DouyinError(

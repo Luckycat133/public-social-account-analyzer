@@ -1165,6 +1165,15 @@ def _sanitize_collection_coverage(value) -> dict:
     clean["requested_all"] = requested_all
     clean["terminal_page_observed"] = terminal_observed
     for key in (
+        "browser_fallback_requested",
+        "browser_fallback_launched",
+    ):
+        if type(value.get(key)) is bool:
+            clean[key] = value[key]
+    evidence_source = value.get("browser_evidence_source")
+    if evidence_source in {"none", "network", "dom", "network+dom"}:
+        clean["browser_evidence_source"] = evidence_source
+    for key in (
         "max_items",
         "observed_page_count",
         "observed_post_count",
@@ -1180,6 +1189,27 @@ def _sanitize_collection_coverage(value) -> dict:
                     clean[key] = field_value
             else:
                 clean[key] = max(0, field_value)
+    scroll_rounds = value.get("scroll_rounds")
+    if (
+        isinstance(scroll_rounds, int)
+        and not isinstance(scroll_rounds, bool)
+        and 0 <= scroll_rounds <= PUBLIC_ALL_HARD_MAX_SCROLLS
+    ):
+        clean["scroll_rounds"] = scroll_rounds
+    max_scrolls = value.get("max_scrolls")
+    if (
+        isinstance(max_scrolls, int)
+        and not isinstance(max_scrolls, bool)
+        and 1 <= max_scrolls <= PUBLIC_ALL_HARD_MAX_SCROLLS
+    ):
+        clean["max_scrolls"] = max_scrolls
+    max_seconds = value.get("max_seconds")
+    if (
+        isinstance(max_seconds, (int, float))
+        and not isinstance(max_seconds, bool)
+        and 0 < max_seconds <= PUBLIC_ALL_HARD_MAX_SECONDS
+    ):
+        clean["max_seconds"] = float(max_seconds)
     stop_condition = value.get("stop_condition")
     if isinstance(stop_condition, str) and stop_condition in {
         "terminal_page",
@@ -1358,6 +1388,16 @@ def _write_report(
     reservation: _WorkspaceReservation | None = None,
 ) -> None:
     """生成采集质量报告(含停止位置、成功/失败数量、字段覆盖率、错误日志)。"""
+    safe_errors = [_sanitize_report_error(error) for error in error_log]
+    safe_stop_reason = _safe_stop_reason(stop_reason) if stop_reason else None
+    stop_stage = next(
+        (
+            error.get("stage")
+            for error in safe_errors
+            if error.get("error_code") == safe_stop_reason
+        ),
+        None,
+    )
     lines = [
         "# 采集质量报告",
         "",
@@ -1369,6 +1409,9 @@ def _write_report(
         f"{_safe_stop_reason(stop_reason) if stop_reason else 'null'}",
         f"- 资料 field_visibility 可见字段数: {_vis_count(profile)}",
         f"- 内容条数: {len(posts)}",
+        f"- 成功采集内容数: {len(posts)}",
+        f"- 错误或受限事件数: {len(safe_errors)}",
+        f"- 停止阶段: {stop_stage if stop_stage else 'null'}",
     ]
     if incremental:
         lines.append(f"- 增量续采: 是(既有 {existing_count} 条 + 新增 {new_count} 条)")
@@ -1393,12 +1436,11 @@ def _write_report(
         for fld in ("views", "likes", "comments", "favorites", "shares", "coins", "danmaku"):
             visible = sum(1 for p in posts if p.get(fld) is not None)
             lines.append(f"- 指标 {fld}: {visible}/{len(posts)} 可见")
-    if error_log:
+    if safe_errors:
         lines.append("")
         lines.append("## 错误日志")
         lines.append("")
-        for raw_error in error_log:
-            e = _sanitize_report_error(raw_error)
+        for e in safe_errors:
             diagnostic_code = e.get("diagnostic_code")
             diagnostic = (
                 f" diagnostic_code={diagnostic_code}"
@@ -2026,12 +2068,20 @@ def run(
         print("[FAILED] 输出产物提交失败", file=sys.stderr)
         return 3
 
-    print(
-        f"[OK] 平台={platform} 资料可见字段={_vis_count(profile)} "
-        f"内容条数={len(posts)} task_status={task_status} "
-        f"stop_reason={stop_reason if stop_reason else 'null'}"
-    )
-    print(f"[OK] 输出目录: {ws}")
+    if task_status == "FAILED":
+        print(f"[COMMITTED] 输出目录: {ws}")
+        print(
+            f"[FAILED] 平台={platform} 资料可见字段={_vis_count(profile)} "
+            f"内容条数={len(posts)} task_status={task_status} "
+            f"stop_reason={stop_reason if stop_reason else 'null'}"
+        )
+    else:
+        print(
+            f"[OK] 平台={platform} 资料可见字段={_vis_count(profile)} "
+            f"内容条数={len(posts)} task_status={task_status} "
+            f"stop_reason={stop_reason if stop_reason else 'null'}"
+        )
+        print(f"[OK] 输出目录: {ws}")
     reservation.close()
     return 0 if task_status != "FAILED" else 3
 

@@ -78,7 +78,7 @@ public-social-account-analyzer/             # 项目根目录
 
 抖音浏览器降级默认自动尝试：当 SSR 缺失或作品列表结构无法识别时，依次使用公开的 CDP 网络响应和可见 DOM 卡片；已识别的空列表不会启动浏览器，而是返回 `NO_PUBLIC_CONTENT`。公开 `--all` 只在安全预算内尽量滚动；见到可信末页后停止滚动，并排空到一个无尾随 CDP 调用的静默边界。每个候选须具有精确 HTTP 200，顶层 `status_code` / `error_code` 若存在须为整数 0；owner、原始条目和分页事实逐项验证后原子合并成一个逻辑页，作品 ID 别名及可解析的官方直接作品 URL 也须一致。只有全部候选一致且观察到账号绑定的明确末页，才可标记 `is_exhaustive=true`。登录、验证、频控、HTTP/API 错误、歧义绑定、候选加载/JSON/结构/原始条目/分页冲突、超时或预算停止都保留为非穷尽结果。`--enrich-details` 只补列表中已有真实作品的缺失字段，不能发现新作品。
 
-如果直连被登录墙/验证/空响应阻断，Agent 环境有 Web 连接器时还可导入官方精选页或精确主页搜索索引；该数据始终标记 `PARTIAL`，不把本地 ID、账号主页或陈旧索引冒充真实单条作品。账号本人另可使用 `collect_douyin_authorized.py` 和官方 `video.list` 权限遍历自己的公开视频；入口同时要求 OAuth 返回的 access token 与 open_id，并用官方 userinfo 精确回证账号。它不是任意第三方账号的匿名接口。`--no-browser-fallback` 仅控制抖音是否启动系统浏览器；B站收到平台保护响应会立即停止当前任务，不重试、不轮换身份，也不转浏览器，详见 [USAGE.md](USAGE.md)。
+如果直连被登录墙/验证/空响应阻断，Agent 环境有 Web 连接器时还可导入官方精选页或精确主页搜索索引；该数据始终标记 `PARTIAL`，不把本地 ID、账号主页或陈旧索引冒充真实单条作品。索引导入必须继承原任务日期范围；日期未知的搜索索引不能用于“最近 N 天”排名。导入器还可从同账号、已密封的直连提交合并较新的非空公开资料，并保留来源摘要与新旧证据边界。账号本人另可使用 `collect_douyin_authorized.py` 和官方 `video.list` 权限遍历自己的公开视频；入口同时要求 OAuth 返回的 access token 与 open_id，并用官方 userinfo 精确回证账号。它不是任意第三方账号的匿名接口。`--no-browser-fallback` 仅控制抖音是否启动系统浏览器；B站收到平台保护响应会立即停止当前任务，不重试、不轮换身份，也不转浏览器，详见 [USAGE.md](USAGE.md)。
 
 ## 需求实现状态
 
@@ -165,6 +165,11 @@ python skill/scripts/run_pipeline.py \
 ```
 
 完整分类通过后，分析会确定性生成主题×形式全矩阵、主题/形式主指标覆盖与中位数，以及高低组的结构化特征对比。它只使用已校验分类字段、栏目、公开标志、话题和固定时长桶，不从标题或正文猜测开头结构、因果关系或策略优劣。
+
+Agent Skill 收到“内容策略、选题分布、高低表现共同点”等目标时，会把分类作为最终交付前置：
+先从同一 collection 创建带 `taxonomy-prompt.md` 的 draft，由 Agent 在已提交目录外生成完整
+分类 JSON，再创建封存 `source/classification-results.json` 的 final。无法完成全部分类时保持
+`pending-model/PARTIAL`，不会把 draft 冒充完整共同点分析。
 
 抖音公开账号的有界尽力全量与详情补全：
 

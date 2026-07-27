@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added script-layer and historical-observation indexes that document entry-point contracts, module boundaries, and evidence freshness.
 
 ### Changed
+- Strategy/commonality requests in the Agent Skill now use a two-stage taxonomy workflow and only treat the classified, manifest-sealed analysis as final.
+- Collection CLI output now separates immutable commit success from business status; quality reports include explicit collected/error counts and the sanitized stop stage.
+- Douyin browser coverage now records safe requested/launched, evidence-source, scroll, and budget fields across collection and analysis, while temporary profiles are allocated lazily at browser start.
 - Extended `split_dataset.py --verify` to validate JSONL structure, required fields, partition integrity, record counts, and SHA-256 checksums.
 - Upgraded the evaluation dataset manifest to schema version 2 with dataset version, path, split-policy, and quality-check metadata.
 - Consolidated the repository structure documentation with the current 128-test suite, collector dependency direction, networking boundaries, and relocated historical records.
@@ -56,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cadence analysis no longer fabricates a weekly average when all publication dates are unknown, and date-only evidence is excluded from hour-of-day and exact-hour interval claims.
 
 ### Fixed
+
+- Web-index imports now preserve and enforce explicit date windows before limiting results; unknown-date search cards cannot enter bounded rankings, and derived task metadata retains the requested window.
+- Web-index imports can overlay newer public profile fields only from a sealed, same-account anonymous collection commit, with digest-bound provenance and null-preserving field merges. Authorized-owner data is rejected, and freshness must be provably later than the observation/date-precision baseline.
+- Browser fallback coverage now records `browser_fallback_launched=false` when SSR satisfies the request without starting a browser, instead of omitting the launch state.
+- Failed collection analysis errors now report only sanitized task status and stop reason and explicitly state that no analysis workspace was created.
+- Completed taxonomy reports no longer warn that classification may still be pending, and platform `content_type` is labeled separately from model-classified `format`.
 
 - Public Douyin SSR/browser list evidence is now bound to the requested account before it can contribute posts, an empty-page observation, or terminal-page completeness. SSR accepts only frozen account post-list containers; browser transport accepts only frozen public list-response paths and visible user-post cards. Foreign, missing-author, mixed-author, recommendation, and global-page observations are ignored.
 - Authorized Douyin collection now follows the official dual-credential identity contract: userinfo receives form-encoded `access_token` and `open_id`, its response must echo the exact `open_id`, and `video.list` receives JSON Content-Type plus the token only in the `access-token` header. Direct and numeric share item URLs must bind to `video_id`; nonnumeric opaque iesdouyin share URLs are source-only, while numeric mismatches fail closed. User-controlled analysis goals that echo the token are rejected before transport or output. The public orchestration entry no longer accepts a preconstructed client that could bypass environment-bound identity verification.

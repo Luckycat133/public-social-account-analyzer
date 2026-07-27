@@ -13,6 +13,77 @@ from urllib.parse import urlsplit
 MAX_ANALYSIS_GOAL_LENGTH = 500
 
 
+# Task status 枚举的单一来源。run_pipeline / collect / analyze 等模块必须从这里导入，
+# 不要在本模块外独立定义以免 drift。
+TASK_STATUSES: frozenset[str] = frozenset({
+    "CREATED",
+    "COLLECTING",
+    "NORMALIZING",
+    "ANALYZING",
+    "COMPLETED",
+    "PARTIAL",
+    "FAILED",
+})
+
+# Stop reason 枚举的单一来源。collect.py / run_pipeline.py 都从 collectors._constants
+# 引入 STOP_* 单常量；但下游 pipeline / 分析层需要做白名单校验时使用本枚举，
+# 避免对未知 stop_reason 拼接到错误消息或下游 panic。
+STOP_REASONS: frozenset[str] = frozenset({
+    "LOGIN_REQUIRED",
+    "VERIFICATION_REQUIRED",
+    "RATE_LIMITED",
+    "ACCOUNT_UNAVAILABLE",
+    "ACCESS_RESTRICTED",
+    "PARSER_FAILED",
+    "NO_PUBLIC_CONTENT",
+    "OPENAPI_ERROR",
+    "UNSUPPORTED_PLATFORM",
+    "ADAPTER_UNAVAILABLE",
+    "INTERNAL_ERROR",
+})
+
+# 分析层能继续往下走的 task_status（与 STOP_REASONS 配合用于安全错误消息）。
+ANALYZABLE_TASK_STATUSES: frozenset[str] = frozenset({"COMPLETED", "PARTIAL"})
+
+# 清洗后消息中的三种固定取值：MISSING（输入为 None）/ UNKNOWN（不在白名单）/ 原值。
+LABEL_MISSING: str = "null"
+LABEL_UNKNOWN: str = "INVALID"
+
+# 类型契约：safe_*_label 只返回这三类字面量，调用方无需再校验。
+LabelLiteral = str  # 实际取值为 LABEL_MISSING | LABEL_UNKNOWN | STOP_REASONS/TASK_STATUSES 成员
+
+
+def safe_stop_reason_label(value: object) -> LabelLiteral:
+    """Render a stop_reason for diagnostic messages without leaking unknowns.
+
+    返回固定清洗后的字面量：
+    - None → LABEL_MISSING ("null")
+    - 在 STOP_REASONS 白名单内 → 原值
+    - 其他 → LABEL_UNKNOWN ("INVALID")
+
+    注意：LABEL_MISSING 仅作为消息渲染标记，**不**代表 STOP_REASONS 中存在名为 "null"
+    的合法停止原因。调用方若要把返回值当作合法枚举继续流转，必须显式忽略
+    LABEL_MISSING / LABEL_UNKNOWN。
+    """
+    if value is None:
+        return LABEL_MISSING
+    if isinstance(value, str) and value in STOP_REASONS:
+        return value
+    return LABEL_UNKNOWN
+
+
+def safe_task_status_label(value: object) -> LabelLiteral:
+    """Render a task_status for diagnostic messages.
+
+    同 safe_stop_reason_label 的三态契约。
+    """
+    if value is None:
+        return LABEL_MISSING
+    if isinstance(value, str) and value in TASK_STATUSES:
+        return value
+    return LABEL_UNKNOWN
+
+
 class TaskContractError(ValueError):
     """A task field is malformed and must be rejected before side effects."""
 

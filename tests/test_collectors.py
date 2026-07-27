@@ -1212,6 +1212,32 @@ def test_report_writer_sanitizes_untrusted_error_metadata(tmp_path):
     assert "SECRET diagnostic value" not in report
 
 
+def test_failure_report_summarizes_success_errors_and_stop_stage(tmp_path):
+    import collect
+
+    collect._write_report(
+        _SafeCommentAdapter(),
+        "https://www.douyin.com/user/example",
+        {},
+        [],
+        str(tmp_path),
+        task_status="FAILED",
+        stop_reason="LOGIN_REQUIRED",
+        error_log=[{
+            "stage": "collect_post_list",
+            "error_code": "LOGIN_REQUIRED",
+            "url": "https://www.douyin.com/user/example",
+            "message": "must be sanitized",
+            "occurred_at": "2026-07-27T13:29:32+08:00",
+        }],
+    )
+
+    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    assert "- 成功采集内容数: 0" in report
+    assert "- 错误或受限事件数: 1" in report
+    assert "- 停止阶段: collect_post_list" in report
+
+
 @pytest.mark.parametrize("link_kind", ["workspace", "source"])
 def test_comments_reject_workspace_or_source_symlink_before_writes(
     monkeypatch, tmp_path, link_kind

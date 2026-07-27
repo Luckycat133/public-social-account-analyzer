@@ -673,6 +673,13 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         )],
         ["主排序指标", meta.get("main_sort_metric") or "—"],
     ]
+    if isinstance(meta.get("profile_overlay"), dict):
+        rows.extend(
+            [
+                ["账号资料口径", "当前直连公开资料（已核验同账号密封提交）"],
+                ["作品资料口径", "较旧索引作品证据（非实时、非穷尽）"],
+            ]
+        )
     rows.extend(_classification_lifecycle_rows(analysis))
     md = md_table(["字段", "值"], rows)
 
@@ -812,11 +819,12 @@ def build_content_structure(analysis, posts_csv) -> tuple[str, str]:
         ["投放 (is_promoted)", fmt_int(sum(1 for r in posts_csv if _b(r.get("is_promoted"))))],
     ]
 
-    md = "**内容形态分布**\n\n" + md_table(["内容形态", "数量"], ct_rows) + \
+    carrier_note = "平台内容载体（采集字段 content_type；不同于模型分类的内容形式（format））"
+    md = f"**{carrier_note}**\n\n" + md_table(["平台内容载体", "数量"], ct_rows) + \
          "\n\n**特殊标记内容**\n\n" + md_table(["标记类型", "数量"], flag_rows)
 
-    html = '<p class="note">内容形态分布</p>' + \
-        html_table(["内容形态", "数量"], [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in ct_rows]) + \
+    html = f'<p class="note">{h_esc(carrier_note)}</p>' + \
+        html_table(["平台内容载体", "数量"], [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in ct_rows]) + \
         '<p class="note">特殊标记内容</p>' + \
         html_table(["标记类型", "数量"], [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in flag_rows])
     return md, html
@@ -827,6 +835,17 @@ def _cadence_inference_allowed(analysis, cadence) -> bool:
     return not (
         meta.get("evidence_is_exhaustive") is False
         or cadence.get("cadence_inference_allowed") is False
+    )
+
+
+def _classification_is_completed(analysis) -> bool:
+    if not isinstance(analysis, dict):
+        return False
+    meta = analysis.get("meta")
+    return (
+        analysis.get("classification_status") == "completed"
+        or isinstance(meta, dict)
+        and meta.get("classification_status") == "completed"
     )
 
 
@@ -1885,8 +1904,15 @@ def build_strategy(analysis, profile) -> tuple[str, str]:
             fmt_counter[f] += 1
     if fmt_counter:
         top_fmt = fmt_counter.most_common(1)[0][0]
-        tips.append(f"已分类内容中最常见的内容形式为「{top_fmt}」，可作为账号内容结构基线；"
-                    f"因样本分类状态可能为 pending-model，结论仅供参考。")
+        classification_note = (
+            "分类已完成严格覆盖校验；该结论仍仅描述当前样本，不代表因果关系。"
+            if _classification_is_completed(analysis)
+            else "分类状态可能为 pending-model，结论仅供参考。"
+        )
+        tips.append(
+            f"已分类内容中最常见的内容形式为「{top_fmt}」，可作为账号内容结构基线；"
+            f"{classification_note}"
+        )
 
     sb = _safe_get(analysis, "sample_boundary", default={}) or {}
     valid = sb.get("valid")
@@ -1952,8 +1978,13 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
             )
     if hidden:
         md += f"\n\n> 受限/不可见字段：{', '.join(hidden)}（相关指标覆盖率相应下调）。"
+    classification_note = (
+        "分类已完成严格覆盖校验。"
+        if _classification_is_completed(analysis)
+        else "分类字段由模型填充（可能为 pending-model）。"
+    )
     md += ("\n\n> 默认排除置顶/转载/投放内容；统计仅基于有效样本，"
-           "确定性数字由脚本计算，分类字段由模型填充（可能为 pending-model）。")
+           f"确定性数字由脚本计算，{classification_note}")
 
     html = html_table(["样本边界", "数值"],
                       [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
@@ -1978,8 +2009,10 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
             )
     if hidden:
         notes.append("受限/不可见字段：" + ", ".join(hidden) + "（相关指标覆盖率相应下调）。")
-    notes.append("默认排除置顶/转载/投放内容；统计仅基于有效样本，确定性数字由脚本计算，"
-                 "分类字段由模型填充（可能为 pending-model）。")
+    notes.append(
+        "默认排除置顶/转载/投放内容；统计仅基于有效样本，确定性数字由脚本计算，"
+        + classification_note
+    )
     html += "".join(f'<p class="note">{h_esc(n)}</p>' for n in notes)
     return md, html
 

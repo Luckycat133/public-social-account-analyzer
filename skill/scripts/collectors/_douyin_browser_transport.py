@@ -1886,6 +1886,8 @@ def collect_account_page(
         else "dom"
         if dom_count
         else "network"
+        if network_count
+        else "none"
     )
     item_budget_truncated = len(items) > requested
     unresolved_account_post_count = sum(
@@ -1946,6 +1948,12 @@ def collect_account_page(
         },
         coverage={
             "requested_all": bool(all_posts),
+            "browser_fallback_requested": True,
+            "browser_fallback_launched": True,
+            "browser_evidence_source": source,
+            "scroll_rounds": scrolls,
+            "max_seconds": float(seconds_budget),
+            "max_scrolls": scroll_budget,
             **({"max_items": requested} if all_posts else {}),
             "is_exhaustive": is_exhaustive,
             "terminal_page_observed": terminal_page_observed,
