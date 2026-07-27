@@ -74,6 +74,48 @@ COMMENT_COVERAGE_FIELDS = (
     "published_at",
     "collected_at",
 )
+INDEX_COLLECTION_SOURCES = frozenset({
+    "douyin_jingxuan",
+    "douyin_search_index",
+})
+AUTHORIZED_DOUYIN_SOURCE = "douyin_openapi_token_owner"
+COLLECTION_COVERAGE_BOOL_FIELDS = frozenset({
+    "requested_all",
+    "is_exhaustive",
+    "terminal_page_observed",
+    "range_filter_applied",
+    "range_no_match",
+})
+COLLECTION_COVERAGE_COUNT_FIELDS = frozenset({
+    "max_items",
+    "observed_page_count",
+    "observed_post_count",
+    "cursor_fingerprint_count",
+    "repeated_cursor_count",
+    "zero_new_page_count",
+    "range_match_count",
+    "unknown_date_count",
+})
+COLLECTION_COVERAGE_STOP_CONDITIONS = frozenset({
+    "terminal_page",
+    "idle",
+    "timeout",
+    "repeated_cursor",
+    "repeated_zero_new_page",
+    "max_items",
+    "max_scrolls",
+    "date_lower_bound",
+    "limit",
+    "api_error",
+})
+COLLECTION_COVERAGE_CORE_FIELDS = frozenset({
+    "requested_all",
+    "is_exhaustive",
+    "terminal_page_observed",
+    "observed_page_count",
+    "observed_post_count",
+    "stop_condition",
+})
 COMMENT_LEDGER_FIELDS = (
     "attempted_posts",
     "comments_collected",
@@ -2376,9 +2418,19 @@ def generate_report(
     coverage_classified = classification_coverage.get("classified_count")
     coverage_rate = classification_coverage.get("rate")
     coverage_rate_label = "null" if coverage_rate is None else str(coverage_rate)
-    L.append("# 账号内容分析报告(公开页面快照)")
+    collection_source = meta.get("collection_source")
+    authorized_source = collection_source == AUTHORIZED_DOUYIN_SOURCE
+    L.append(
+        "# 账号内容分析报告(账号本人授权 OpenAPI 公开证据)"
+        if authorized_source
+        else "# 账号内容分析报告(公开页面快照)"
+    )
     L.append("")
-    L.append("> 本报告基于无需登录即可查看的公开页面数据生成,代表公开页面快照,")
+    L.append(
+        "> 本报告基于账号本人授权 OpenAPI 返回的公开来源证据生成,"
+        if authorized_source
+        else "> 本报告基于无需登录即可查看的公开页面数据生成,代表公开页面快照,"
+    )
     L.append("> **不代表账号后台真实曝光、触达、完播或转化**。")
     L.append("> 分类字段(topic/format/funnel_stage/hook_type 等)由模型在运行时填充,")
     L.append(
@@ -2386,15 +2438,27 @@ def generate_report(
         f"classification_version = {classification_version_label};"
         f"覆盖 {coverage_classified}/{coverage_total}(比例 {coverage_rate_label})。"
     )
-    if meta.get("collection_source"):
+    if collection_source:
         L.append(
             f"> 采集状态:{meta.get('task_status') or '未知'};停止原因:"
-            f"{meta.get('stop_reason') or 'null'};来源:{meta.get('collection_source')}。"
+            f"{meta.get('stop_reason') or 'null'};来源:{collection_source}。"
         )
+    if collection_source in INDEX_COLLECTION_SOURCES:
         L.append(
             "> 本批数据是非穷尽的公开索引快照，不是实时完整作品列表；"
             "搜索索引的 idx-* 为本地记录键。"
         )
+    elif collection_source == AUTHORIZED_DOUYIN_SOURCE:
+        if meta.get("evidence_is_exhaustive") is True:
+            L.append(
+                "> 本批数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "覆盖账本已观察到官方末页，对该授权接口返回集合为穷尽遍历。"
+            )
+        else:
+            L.append(
+                "> 本批数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "尚未观察到官方末页，当前结果非穷尽。"
+            )
     L.append("")
     L.append("## 样本边界(报告必填,见 §2)")
     L.append("")
@@ -2543,6 +2607,170 @@ class AnalysisResult:
     taxonomy_prompt: Optional[str] = None
 
 
+def _validated_collection_coverage(
+    params: Dict[str, Any],
+    *,
+    normalized_count: int,
+) -> Tuple[Dict[str, Any], Optional[bool]]:
+    """Whitelist and bind untrusted task coverage before deriving claims."""
+
+    raw_root_evidence = params.get("evidence_is_exhaustive")
+    if raw_root_evidence is not None and type(raw_root_evidence) is not bool:
+        raise ValueError("collection coverage evidence flag is invalid")
+
+    if "collection_coverage" not in params:
+        if raw_root_evidence is True:
+            raise ValueError("collection coverage cannot prove exhaustive evidence")
+        if params.get("collection_source") in INDEX_COLLECTION_SOURCES:
+            return {}, False
+        return {}, raw_root_evidence
+
+    raw = params.get("collection_coverage")
+    if not isinstance(raw, dict):
+        raise ValueError("collection coverage must be an object")
+    if not raw:
+        if raw_root_evidence is True:
+            raise ValueError("collection coverage cannot prove exhaustive evidence")
+        if params.get("collection_source") == AUTHORIZED_DOUYIN_SOURCE:
+            raise ValueError("collection coverage is required for authorized source")
+        if params.get("collection_source") in INDEX_COLLECTION_SOURCES:
+            return {}, False
+        return {}, raw_root_evidence
+
+    allowed_fields = (
+        COLLECTION_COVERAGE_BOOL_FIELDS
+        | COLLECTION_COVERAGE_COUNT_FIELDS
+        | {"stop_condition"}
+    )
+    if set(raw) - allowed_fields:
+        raise ValueError("collection coverage contains unsupported fields")
+
+    clean: Dict[str, Any] = {}
+    for key in COLLECTION_COVERAGE_BOOL_FIELDS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if type(value) is not bool:
+            raise ValueError(f"collection coverage field {key} must be boolean")
+        clean[key] = value
+
+    for key in COLLECTION_COVERAGE_COUNT_FIELDS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"collection coverage field {key} must be a non-negative integer"
+            )
+        if key == "max_items" and not 1 <= value <= 50_000:
+            raise ValueError("collection coverage max_items is out of range")
+        clean[key] = value
+
+    if "stop_condition" in raw:
+        stop_condition = raw["stop_condition"]
+        if (
+            type(stop_condition) is not str
+            or stop_condition not in COLLECTION_COVERAGE_STOP_CONDITIONS
+        ):
+            raise ValueError("collection coverage stop_condition is invalid")
+        clean["stop_condition"] = stop_condition
+
+    source = params.get("collection_source")
+    requires_core = (
+        source == AUTHORIZED_DOUYIN_SOURCE
+        or clean.get("is_exhaustive") is True
+    )
+    if requires_core:
+        missing = COLLECTION_COVERAGE_CORE_FIELDS - clean.keys()
+        if missing:
+            raise ValueError(
+                "collection coverage is missing core fields: "
+                + ", ".join(sorted(missing))
+            )
+
+    is_exhaustive = clean.get("is_exhaustive")
+    if is_exhaustive is True:
+        valid_source = source == AUTHORIZED_DOUYIN_SOURCE or source is None
+        coherent_claim = (
+            params.get("platform") == "douyin"
+            and valid_source
+            and clean.get("terminal_page_observed") is True
+            and clean.get("stop_condition") == "terminal_page"
+            and params.get("task_status") == "COMPLETED"
+            and params.get("stop_reason") is None
+            and clean.get("observed_page_count", 0) > 0
+        )
+        if source == AUTHORIZED_DOUYIN_SOURCE:
+            requested_limit = params.get("requested_limit")
+            valid_request_range = (
+                requested_limit is None
+                if clean.get("requested_all") is True
+                else (
+                    type(requested_limit) is int
+                    and 1 <= requested_limit <= 100
+                )
+            )
+            collected_count = params.get("collected_count")
+            coherent_claim = (
+                coherent_claim
+                and valid_request_range
+                and type(collected_count) is int
+                and collected_count == normalized_count
+                and clean.get("observed_post_count") == normalized_count
+            )
+        else:
+            collected_count = params.get("collected_count")
+            observed_post_count = clean.get("observed_post_count")
+            range_filter_applied = clean.get("range_filter_applied") is True
+            if params.get("incremental") is True:
+                existing_count = params.get("existing_count")
+                new_count = params.get("new_count")
+                count_evidence_matches = (
+                    type(existing_count) is int
+                    and existing_count >= 0
+                    and type(new_count) is int
+                    and new_count >= 0
+                    and collected_count == existing_count + new_count
+                    and observed_post_count >= new_count
+                )
+            elif range_filter_applied:
+                range_match_count = clean.get("range_match_count")
+                count_evidence_matches = (
+                    type(range_match_count) is int
+                    and range_match_count == normalized_count
+                    and observed_post_count >= range_match_count
+                )
+            else:
+                count_evidence_matches = observed_post_count == normalized_count
+            coherent_claim = (
+                coherent_claim
+                and clean.get("requested_all") is True
+                and type(clean.get("max_items")) is int
+                and params.get("requested_limit") == clean.get("max_items")
+                and type(collected_count) is int
+                and collected_count == normalized_count
+                and count_evidence_matches
+            )
+        if not coherent_claim:
+            raise ValueError("collection coverage has a false exhaustive claim")
+        if raw_root_evidence is False:
+            raise ValueError("collection coverage evidence flags conflict")
+        evidence_is_exhaustive: Optional[bool] = True
+    else:
+        if raw_root_evidence is True:
+            raise ValueError("collection coverage cannot prove exhaustive evidence")
+        evidence_is_exhaustive = (
+            False if is_exhaustive is False else raw_root_evidence
+        )
+
+    if source in INDEX_COLLECTION_SOURCES:
+        if evidence_is_exhaustive is True:
+            raise ValueError("index collection coverage cannot be exhaustive")
+        evidence_is_exhaustive = False
+
+    return clean, evidence_is_exhaustive
+
+
 def analyze_in_memory(
     profile: Dict[str, Any],
     normalized_rows: List[Dict[str, Any]],
@@ -2563,6 +2791,11 @@ def analyze_in_memory(
         raise ValueError("task parameters must be an object")
 
     params = dict(task_params)
+    collection_coverage, evidence_is_exhaustive = (
+        _validated_collection_coverage(
+            params, normalized_count=len(normalized_rows)
+        )
+    )
     all_posts = build_posts(normalized_rows)
     collected = len(all_posts)
     _, valid, flagged, missing, restricted = split_samples(all_posts)
@@ -2738,7 +2971,8 @@ def analyze_in_memory(
         "source_url": params.get("source_url"),
         "snapshot_crawled_at": params.get("snapshot_crawled_at"),
         "snapshot_age_label": params.get("snapshot_age_label"),
-        "evidence_is_exhaustive": params.get("evidence_is_exhaustive"),
+        "evidence_is_exhaustive": evidence_is_exhaustive,
+        "collection_coverage": collection_coverage,
         "main_sort_metric": main_metric,
         **copy.deepcopy(classification),
         "note": classification_note,

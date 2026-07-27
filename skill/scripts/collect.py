@@ -2088,8 +2088,9 @@ def main() -> None:
     ap.add_argument("--date-to", default=None, help="结束日期 YYYY-MM-DD 或 ISO 8601(北京时间)")
     ap.add_argument(
         "--resume", action="store_true",
-        help="增量续采:读取 --out 目录既有 source/posts.jsonl,以其最新 published_at 为起点续采,"
-             "按 post_id/bvid 去重合并(新覆盖旧),并写入新的不可变任务目录。必须配合 --out。",
+        help="增量续采:核验 --out 指向的同平台、同账号不可变采集提交,以其最新 published_at "
+             "为起点续采,按 post_id/bvid 去重合并(新覆盖旧),并写入新的不可变任务目录。"
+             "必须配合 --out。",
     )
     ap.add_argument(
         "--resume-out",

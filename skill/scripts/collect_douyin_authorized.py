@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect the authorized token owner's profile and Douyin video history."""
+"""Collect the Douyin account bound to one OAuth token + open_id pair."""
 
 from __future__ import annotations
 
@@ -359,8 +359,12 @@ def run(
         print("[FAILED] analysis_goal 参数无效", file=sys.stderr)
         return 2
 
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-        print("[FAILED] --limit 必须为正整数", file=sys.stderr)
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= 100
+    ):
+        print("[FAILED] --limit 必须在 1–100 之间", file=sys.stderr)
         return 2
     if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
         print("[FAILED] page_size 必须为正整数", file=sys.stderr)
@@ -374,6 +378,9 @@ def run(
     open_id = env.get(_OPEN_ID_ENV)
     if not _valid_credential(open_id):
         print(f"[FAILED] 缺少环境变量 {_OPEN_ID_ENV}", file=sys.stderr)
+        return 2
+    if analysis_goal is not None and access_token in analysis_goal:
+        print("[FAILED] analysis_goal 不得包含访问令牌", file=sys.stderr)
         return 2
 
     task_id = new_task_id("douyin")
@@ -398,11 +405,14 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="采集 Douyin OpenAPI access token 所有者的授权账号"
+        description="采集 Douyin OpenAPI 同次 OAuth 凭据对应的授权账号"
     )
     range_group = parser.add_mutually_exclusive_group()
     range_group.add_argument("--all", dest="collect_all", action="store_true")
-    range_group.add_argument("--limit", type=int, default=30)
+    range_group.add_argument(
+        "--limit", type=int, default=30,
+        help="采集条数（默认 30，范围 1–100）",
+    )
     parser.add_argument("--out", default=None)
     parser.add_argument("--analysis-goal", default=None)
     args = parser.parse_args()

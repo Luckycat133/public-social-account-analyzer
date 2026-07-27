@@ -56,6 +56,11 @@ METRIC_LABELS = {
     "danmaku": "弹幕",
 }
 COLLECTION_STATUSES = ("SUCCESS", "PARTIAL", "FAILED", "DELETED", "RESTRICTED")
+INDEX_COLLECTION_SOURCES = frozenset({
+    "douyin_jingxuan",
+    "douyin_search_index",
+})
+AUTHORIZED_DOUYIN_SOURCE = "douyin_openapi_token_owner"
 
 # 12 个占位符 -> 报告节标题（顺序固定，对应模板 SECTION 标记）
 SECTION_DEFS = [
@@ -78,7 +83,18 @@ _PLACEHOLDER_PATTERN = re.compile(
 )
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-DISCLAIMER = "本报告基于公开页面快照，不代表账号后台真实曝光、触达、完播或转化数据。"
+PUBLIC_PAGE_DISCLAIMER = "本报告基于公开页面快照，不代表账号后台真实曝光、触达、完播或转化数据。"
+AUTHORIZED_DISCLAIMER = (
+    "本报告基于账号本人授权 OpenAPI 返回的公开来源证据，"
+    "不代表账号后台真实曝光、触达、完播或转化数据。"
+)
+PUBLIC_PAGE_FOOTER = "本报告由公开页面快照自动生成 · 数据仅供参考，不构成后台真实指标"
+AUTHORIZED_FOOTER = (
+    "本报告由账号本人授权 OpenAPI 公开证据自动生成 · "
+    "数据仅供参考，不构成后台真实指标"
+)
+# 保留公开页面默认常量名，兼容调用方与既有合同。
+DISCLAIMER = PUBLIC_PAGE_DISCLAIMER
 EMPTY_MD = "暂无数据"
 EMPTY_HTML = '<p class="empty">暂无数据</p>'
 
@@ -626,6 +642,11 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
     account_name = meta.get("account_name") or (profile or {}).get("account_name") or "未知账号"
     platform = meta.get("platform") or (profile or {}).get("platform") or "—"
     profile_url = meta.get("profile_url") or (profile or {}).get("profile_url") or "—"
+    profile_label = (
+        "资料来源（OpenAPI userinfo）"
+        if meta.get("collection_source") == AUTHORIZED_DOUYIN_SOURCE
+        else "账号主页"
+    )
     title = f"{account_name}（{platform}）公开账号分析报告"
 
     rows = [
@@ -633,7 +654,7 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         ["任务 ID", meta.get("task_id") or "—"],
         ["平台", platform],
         ["账号名称", account_name],
-        ["账号主页", link_md(profile_url, profile_url) if profile_url != "—" else "—"],
+        [profile_label, link_md(profile_url, profile_url) if profile_url != "—" else "—"],
         ["请求采集数量", fmt_int(meta.get("requested_limit"))],
         ["采集时间范围", f"{meta.get('date_from') or '—'} ~ {meta.get('date_to') or '—'}"],
         ["分析目的", meta.get("analysis_goal") or "—"],
@@ -655,10 +676,10 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
     rows.extend(_classification_lifecycle_rows(analysis))
     md = md_table(["字段", "值"], rows)
 
-    # 账号主页行需要渲染为链接
+    # 账号主页或授权资料来源行需要渲染为链接
     html_rows = []
     for k, v in rows:
-        if k == "账号主页" and profile_url != "—":
+        if k == profile_label and profile_url != "—":
             html_rows.append([Raw(h_esc(k)), link_html(profile_url, profile_url)])
         else:
             html_rows.append([Raw(h_esc(k)), Raw(h_esc(v))])
@@ -721,6 +742,12 @@ def build_account_card(profile) -> tuple[str, str]:
     platform_metrics = profile.get("platform_metrics")
     if not isinstance(platform_metrics, dict):
         platform_metrics = {}
+    profile_label = (
+        "资料来源（OpenAPI userinfo）"
+        if platform_metrics.get("authorization_source")
+        == AUTHORIZED_DOUYIN_SOURCE
+        else "主页"
+    )
     rows = [
         ["平台", platform],
         ["账号 ID", profile.get("account_id") or "—"],
@@ -749,7 +776,7 @@ def build_account_card(profile) -> tuple[str, str]:
         [
             ["简介", profile.get("bio") or "—"],
             [
-                "主页",
+                profile_label,
                 link_md(profile.get("profile_url") or "", profile.get("profile_url") or "—")
                 if profile.get("profile_url")
                 else "—",
@@ -760,7 +787,7 @@ def build_account_card(profile) -> tuple[str, str]:
 
     html_rows = []
     for k, v in rows:
-        if k == "主页" and profile.get("profile_url"):
+        if k == profile_label and profile.get("profile_url"):
             html_rows.append([Raw(h_esc(k)), link_html(profile["profile_url"], profile["profile_url"])])
         else:
             html_rows.append([Raw(h_esc(k)), Raw(h_esc(v))])
@@ -1893,11 +1920,16 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
     fv = (profile or {}).get("field_visibility", {}) or {}
     hidden = [k for k, v in fv.items() if v in ("hidden", "partial")]
 
-    md = md_table(["样本边界", "数值"], rows)
-    md += "\n\n> " + DISCLAIMER
     meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
     collection_source = meta.get("collection_source")
-    if collection_source:
+    disclaimer = (
+        AUTHORIZED_DISCLAIMER
+        if collection_source == AUTHORIZED_DOUYIN_SOURCE
+        else PUBLIC_PAGE_DISCLAIMER
+    )
+    md = md_table(["样本边界", "数值"], rows)
+    md += "\n\n> " + disclaimer
+    if collection_source in INDEX_COLLECTION_SOURCES:
         md += (
             f"\n\n> 当前数据来自 `{collection_source}` 公开索引快照，属于非实时、非穷尽样本；"
             "不能据此推断账号完整发布量或后台表现。"
@@ -1907,6 +1939,17 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
                 "\n\n> `idx-*` 是本地记录键；账号主页仅为证据锚点，"
                 "不是单条作品详情链接。"
             )
+    elif collection_source == AUTHORIZED_DOUYIN_SOURCE:
+        if meta.get("evidence_is_exhaustive") is True:
+            md += (
+                "\n\n> 当前数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "覆盖账本已观察到官方末页，对该授权接口返回集合为穷尽遍历。"
+            )
+        else:
+            md += (
+                "\n\n> 当前数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "尚未观察到官方末页，当前结果非穷尽。"
+            )
     if hidden:
         md += f"\n\n> 受限/不可见字段：{', '.join(hidden)}（相关指标覆盖率相应下调）。"
     md += ("\n\n> 默认排除置顶/转载/投放内容；统计仅基于有效样本，"
@@ -1914,14 +1957,25 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
 
     html = html_table(["样本边界", "数值"],
                       [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
-    notes = [DISCLAIMER]
-    if collection_source:
+    notes = [disclaimer]
+    if collection_source in INDEX_COLLECTION_SOURCES:
         notes.append(
             f"当前数据来自 {collection_source} 公开索引快照，属于非实时、非穷尽样本；"
             "不能据此推断账号完整发布量或后台表现。"
         )
         if collection_source == "douyin_search_index":
             notes.append("idx-* 是本地记录键；账号主页仅为证据锚点，不是单条作品详情链接。")
+    elif collection_source == AUTHORIZED_DOUYIN_SOURCE:
+        if meta.get("evidence_is_exhaustive") is True:
+            notes.append(
+                "当前数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "覆盖账本已观察到官方末页，对该授权接口返回集合为穷尽遍历。"
+            )
+        else:
+            notes.append(
+                "当前数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "尚未观察到官方末页，当前结果非穷尽。"
+            )
     if hidden:
         notes.append("受限/不可见字段：" + ", ".join(hidden) + "（相关指标覆盖率相应下调）。")
     notes.append("默认排除置顶/转载/投放内容；统计仅基于有效样本，确定性数字由脚本计算，"
@@ -2079,7 +2133,16 @@ def render_in_memory(
             if platform
             else f"公开社媒账号分析报告：{safe_account_name}"
         )
-        md_parts = [f"# {title}", "", DISCLAIMER, ""]
+        collection_source = (
+            (analysis.get("meta", {}) or {}).get("collection_source")
+        )
+        authorized_source = collection_source == AUTHORIZED_DOUYIN_SOURCE
+        disclaimer = (
+            AUTHORIZED_DISCLAIMER
+            if authorized_source
+            else PUBLIC_PAGE_DISCLAIMER
+        )
+        md_parts = [f"# {title}", "", disclaimer, ""]
         for index, (name, section_title) in enumerate(SECTION_DEFS, 1):
             md_parts.extend(
                 [
@@ -2090,7 +2153,12 @@ def render_in_memory(
                 ]
             )
         markdown_text = "\n".join(md_parts).rstrip() + "\n"
-        html_text = render_dashboard(template, sections_html)
+        dashboard_template = template
+        if authorized_source:
+            dashboard_template = dashboard_template.replace(
+                PUBLIC_PAGE_DISCLAIMER, AUTHORIZED_DISCLAIMER
+            ).replace(PUBLIC_PAGE_FOOTER, AUTHORIZED_FOOTER)
+        html_text = render_dashboard(dashboard_template, sections_html)
         post_render_checks(html_text)
         if state.diagnostics:
             raise RenderError(

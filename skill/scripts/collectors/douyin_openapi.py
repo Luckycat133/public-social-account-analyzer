@@ -1,4 +1,4 @@
-"""Official Douyin OpenAPI client for the access-token owner only.
+"""Official Douyin OpenAPI client for one exact OAuth token + open_id pair.
 
 This module deliberately implements neither OAuth login nor token lifecycle
 operations.  ``oauth/userinfo`` receives the documented form credentials;
@@ -13,6 +13,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+
+from .url_policy import canonical_item_url, sanitize_routing_url
 
 
 _PROFILE_URL = "https://open.douyin.com/oauth/userinfo/"
@@ -97,41 +99,50 @@ def _safe_int(value: Any) -> int | None:
     return None
 
 
-def _sanitize_share_url(value: Any) -> str:
-    if not isinstance(value, str) or not value:
+def _sanitize_share_url(
+    value: Any, expected_video_id: str
+) -> tuple[str | None, str]:
+    """Separate ID-bound item evidence from an official opaque share source."""
+
+    safe_url = sanitize_routing_url(value)
+    if safe_url is None:
         raise DouyinOpenAPIError(
             "INVALID_RESPONSE", "Douyin OpenAPI returned an invalid share URL"
         )
-    parse_failed = False
-    parsed = None
-    hostname = ""
-    port = None
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        hostname = (parsed.hostname or "").lower()
-        port = parsed.port
-    except ValueError:
-        parse_failed = True
-    if parse_failed:
+    canonical = canonical_item_url("douyin", safe_url, expected_video_id)
+    if canonical is not None:
+        return canonical, canonical
+
+    parsed = urllib.parse.urlsplit(safe_url)
+    if parsed.hostname not in {"iesdouyin.com", "www.iesdouyin.com"}:
         raise DouyinOpenAPIError(
             "INVALID_RESPONSE", "Douyin OpenAPI returned an invalid share URL"
         )
-    assert parsed is not None
-    is_douyin_owned = any(
-        hostname == suffix or hostname.endswith(f".{suffix}")
-        for suffix in ("douyin.com", "iesdouyin.com")
+    numeric_share = re.fullmatch(
+        r"/share/(video|note)/(\d+)/?", parsed.path
     )
+    if numeric_share is not None:
+        if numeric_share.group(2) != expected_video_id:
+            raise DouyinOpenAPIError(
+                "INVALID_RESPONSE", "Douyin OpenAPI returned an invalid share URL"
+            )
+        canonical = (
+            f"https://www.douyin.com/{numeric_share.group(1)}/"
+            f"{expected_video_id}"
+        )
+        return canonical, canonical
+
+    match = re.fullmatch(r"/share/(?:video|note)/(.+)/?", parsed.path)
+    opaque = match.group(1).rstrip("/") if match is not None else ""
     if (
-        parsed.scheme != "https"
-        or not is_douyin_owned
-        or parsed.username is not None
-        or parsed.password is not None
-        or port is not None
+        not opaque
+        or re.fullmatch(r"[A-Za-z0-9_+=/-]+", opaque) is None
+        or not any(character.isalnum() for character in opaque)
     ):
         raise DouyinOpenAPIError(
             "INVALID_RESPONSE", "Douyin OpenAPI returned an invalid share URL"
         )
-    return urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, "", ""))
+    return None, safe_url
 
 
 def _parse_cursor(value: Any) -> int:
@@ -235,7 +246,7 @@ def _map_video(item: Any) -> dict[str, Any]:
         raise DouyinOpenAPIError(
             "INVALID_RESPONSE", "Douyin OpenAPI returned an invalid video_id"
         )
-    post_url = _sanitize_share_url(item.get("share_url"))
+    post_url, source_url = _sanitize_share_url(item.get("share_url"), video_id)
     title = item.get("title") if isinstance(item.get("title"), str) else None
     create_time = item.get("create_time")
     if isinstance(create_time, int) and not isinstance(create_time, bool):
@@ -278,7 +289,7 @@ def _map_video(item: Any) -> dict[str, Any]:
         "collection_status": "SUCCESS",
         "collection_status_source": "declared",
         "collected_at": now,
-        "source_url": post_url,
+        "source_url": source_url,
         "views": _safe_int(statistics.get("play_count")),
         "likes": _safe_int(statistics.get("digg_count")),
         "comments": _safe_int(statistics.get("comment_count")),
@@ -366,6 +377,7 @@ class DouyinOpenAPIClient:
         else:
             headers = {
                 "Accept": "application/json",
+                "Content-Type": "application/json",
                 "access-token": self._access_token,
             }
             data = None
@@ -491,6 +503,11 @@ class DouyinOpenAPIClient:
                 if not isinstance(raw_items, list):
                     raise DouyinOpenAPIError(
                         "INVALID_RESPONSE", "Douyin OpenAPI returned a non-list video list"
+                    )
+                if len(raw_items) > count:
+                    raise DouyinOpenAPIError(
+                        "INVALID_RESPONSE",
+                        "Douyin OpenAPI returned more videos than requested",
                     )
                 next_cursor = _parse_cursor(data.get("cursor"))
                 has_more = _parse_has_more(data.get("has_more"))

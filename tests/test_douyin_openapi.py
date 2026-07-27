@@ -14,6 +14,7 @@ import pytest
 import collect_douyin_authorized as authorized
 import analyze
 import immutable_workspace as immutable
+import run_pipeline as pipeline
 import collectors.douyin_openapi as openapi
 from collect_douyin_authorized import run
 from collectors.douyin_openapi import DouyinOpenAPIClient, DouyinOpenAPIError
@@ -242,6 +243,7 @@ def test_two_video_pages_map_deduplicate_and_prove_exhaustive():
     ]
     assert all(request["headers"] == {
         "Accept": "application/json",
+        "Content-Type": "application/json",
         "access-token": TOKEN,
     } for request in transport.requests)
     assert all(request["data"] is None for request in transport.requests)
@@ -272,6 +274,89 @@ def test_rejects_non_douyin_https_share_urls_without_leaking_token(share_url):
         ).collect_video_pages()
 
     assert TOKEN not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "share_url",
+    [
+        "https://www.douyin.com/",
+        "https://www.douyin.com/user/foreign-account",
+        "https://www.douyin.com/video/7002",
+        "https://www.douyin.com/note/7002",
+        "https://www.iesdouyin.com/share/user/foreign-account",
+        "https://www.iesdouyin.com/share/video/7002",
+        "https://iesdouyin.com/share/note/7002/",
+    ],
+)
+def test_rejects_same_site_non_item_or_mismatched_share_urls(share_url):
+    item = _video(7001, title="作品", create_time=1700000000, is_top=0, play_count=1)
+    item["share_url"] = share_url
+    transport = FakeTransport([{
+        "data": {"error_code": 0, "list": [item], "cursor": 20, "has_more": 0},
+        "extra": {"error_code": 0},
+    }])
+
+    with pytest.raises(DouyinOpenAPIError) as exc_info:
+        DouyinOpenAPIClient(
+            TOKEN, OPEN_ID, transport=transport
+        ).collect_video_pages()
+
+    assert exc_info.value.error_code == "INVALID_RESPONSE"
+    assert TOKEN not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("share_url", "expected_url"),
+    [
+        (
+            "https://www.iesdouyin.com/share/video/7001?region=CN#fragment",
+            "https://www.douyin.com/video/7001",
+        ),
+        (
+            "https://iesdouyin.com/share/note/7001/",
+            "https://www.douyin.com/note/7001",
+        ),
+    ],
+)
+def test_numeric_official_share_url_is_id_bound_item_evidence(
+    share_url, expected_url
+):
+    item = _video(7001, title="作品", create_time=1700000000, is_top=0, play_count=1)
+    item["share_url"] = share_url
+    transport = FakeTransport([{
+        "data": {"error_code": 0, "list": [item], "cursor": 20, "has_more": 0},
+        "extra": {"error_code": 0},
+    }])
+
+    posts, _coverage = DouyinOpenAPIClient(
+        TOKEN, OPEN_ID, transport=transport
+    ).collect_video_pages()
+
+    assert posts[0]["post_url"] == expected_url
+    assert posts[0]["source_url"] == expected_url
+
+
+def test_official_opaque_share_url_is_source_only_not_item_evidence():
+    item = _video(7001, title="作品", create_time=1700000000, is_top=0, play_count=1)
+    item["share_url"] = (
+        "https://www.iesdouyin.com/share/video/opaque+token==/part/"
+        "?region=CN&credential=discard#fragment"
+    )
+    transport = FakeTransport([{
+        "data": {"error_code": 0, "list": [item], "cursor": 20, "has_more": 0},
+        "extra": {"error_code": 0},
+    }])
+
+    posts, coverage = DouyinOpenAPIClient(
+        TOKEN, OPEN_ID, transport=transport
+    ).collect_video_pages()
+
+    assert posts[0]["post_id"] == "7001"
+    assert posts[0]["post_url"] is None
+    assert posts[0]["source_url"] == (
+        "https://www.iesdouyin.com/share/video/opaque+token==/part/"
+    )
+    assert coverage["is_exhaustive"] is True
 
 
 @pytest.mark.parametrize(
@@ -571,6 +656,24 @@ def test_requested_limit_stops_without_claiming_exhaustive():
     assert coverage["is_exhaustive"] is False
 
 
+def test_page_exceeding_requested_count_cannot_prove_terminal_coverage():
+    transport = FakeTransport([_page([
+        _video(7001, title="第一条", create_time=1700000000, is_top=0, play_count=1),
+        _video(7002, title="第二条", create_time=1700000001, is_top=0, play_count=1),
+    ], cursor=0, has_more=0)])
+
+    with pytest.raises(DouyinOpenAPIError) as exc_info:
+        DouyinOpenAPIClient(
+            TOKEN, OPEN_ID, transport=transport
+        ).collect_video_pages(limit=1, page_size=20)
+
+    assert exc_info.value.error_code == "INVALID_RESPONSE"
+    assert exc_info.value.partial_posts == []
+    assert exc_info.value.coverage["is_exhaustive"] is False
+    assert exc_info.value.coverage["terminal_page_observed"] is False
+    assert exc_info.value.coverage["stop_condition"] == "api_error"
+
+
 @pytest.mark.parametrize(
     ("media_type", "expected_type"),
     [
@@ -634,6 +737,27 @@ def test_missing_token_fails_before_creating_workspace(tmp_path, capsys):
     assert rc == 2
     assert not out_dir.exists()
     assert "DOUYIN_OPENAPI_ACCESS_TOKEN" in captured.err
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 101])
+def test_invalid_authorized_limit_fails_before_transport_or_output(
+    tmp_path, capsys, limit
+):
+    out_dir = tmp_path / "authorized"
+    transport = FakeTransport([RuntimeError("API must not be called")])
+
+    rc = run(
+        out_dir=str(out_dir),
+        limit=limit,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert not out_dir.exists()
+    assert transport.requests == []
+    assert "1–100" in captured.err
 
 
 @pytest.mark.parametrize(
@@ -1063,6 +1187,93 @@ def test_all_writes_standard_completed_artifacts_without_token(tmp_path, capsys)
     assert TOKEN not in captured.out + captured.err
 
 
+def test_official_opaque_share_is_committed_as_non_item_source(tmp_path):
+    out_dir = tmp_path / "authorized-opaque-share"
+    video = _video(7001, title="授权作品", create_time=1700000000, is_top=0, play_count=10)
+    video["share_url"] = (
+        "https://www.iesdouyin.com/share/video/opaque+token==/part/"
+        "?region=CN#fragment"
+    )
+    transport = FakeTransport([
+        _profile_response(),
+        _page([video], cursor=20, has_more=0),
+    ])
+
+    assert run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
+    ) == 0
+
+    raw_post = json.loads(
+        (out_dir / "source" / "posts.jsonl").read_text(encoding="utf-8")
+    )
+    assert raw_post["post_id"] == "7001"
+    assert raw_post["post_url"] is None
+    assert raw_post["source_url"] == (
+        "https://www.iesdouyin.com/share/video/opaque+token==/part/"
+    )
+    with (out_dir / "normalized-posts.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        normalized = analyze.build_posts([next(csv.DictReader(handle))])[0]
+    assert normalized["post_url"] == ""
+    assert normalized["source_url"] == raw_post["source_url"]
+    assert normalized["platform_post_id_known"] is True
+    assert normalized["item_url_known"] is False
+
+
+def test_authorized_terminal_collection_renders_as_exhaustive_openapi_source(
+    tmp_path
+):
+    collection = tmp_path / "authorized-collection"
+    analysis_dir = tmp_path / "authorized-analysis"
+    transport = FakeTransport([
+        _profile_response(),
+        _page([
+            _video(
+                7001,
+                title="授权作品",
+                create_time=1700000000,
+                is_top=0,
+                play_count=10,
+            )
+        ], cursor=20, has_more=0),
+    ])
+
+    assert run(
+        out_dir=str(collection),
+        collect_all=True,
+        environ=AUTHORIZED_ENV,
+        transport=transport,
+    ) == 0
+    pipeline.run_pipeline(str(collection), str(analysis_dir))
+
+    analysis = json.loads(
+        (analysis_dir / "analysis.json").read_text(encoding="utf-8")
+    )
+    assert analysis["meta"]["collection_source"] == (
+        "douyin_openapi_token_owner"
+    )
+    assert analysis["meta"]["evidence_is_exhaustive"] is True
+    assert analysis["meta"]["collection_coverage"]["is_exhaustive"] is True
+
+    report = (analysis_dir / "account-analysis-report.md").read_text(
+        encoding="utf-8"
+    )
+    dashboard = (analysis_dir / "dashboard.html").read_text(encoding="utf-8")
+    for rendered in (report, dashboard):
+        assert "账号本人授权 OpenAPI 公热视频列表" in rendered
+        assert "公开索引快照" not in rendered
+        assert "非实时、非穷尽样本" not in rendered
+        assert "资料来源（OpenAPI userinfo）" in rendered
+        assert "公开页面快照" not in rendered
+        assert "无需登录" not in rendered
+    assert "| 账号主页 |" not in report
+    assert "| 主页 |" not in report
+
+
 def test_authorized_task_persists_task_id_and_analysis_goal(tmp_path):
     out_dir = tmp_path / "authorized-goal"
     transport = FakeTransport([
@@ -1097,6 +1308,29 @@ def test_authorized_rejects_invalid_analysis_goal_before_output_or_transport(
         transport=must_not_run,
     ) == 2
     assert not out_dir.exists()
+
+
+def test_authorized_rejects_analysis_goal_containing_access_token(
+    tmp_path, capsys
+):
+    out_dir = tmp_path / "authorized-secret-goal"
+    transport = FakeTransport([
+        _profile_response(),
+        _page([], cursor=0, has_more=0),
+    ])
+
+    rc = run(
+        out_dir=str(out_dir),
+        analysis_goal=f"分析授权内容 {TOKEN}",
+        environ=AUTHORIZED_ENV,
+        transport=transport,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert not out_dir.exists()
+    assert transport.requests == []
+    assert TOKEN not in captured.out + captured.err
 
 
 def test_authorized_cli_forwards_analysis_goal(monkeypatch):

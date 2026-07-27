@@ -43,7 +43,8 @@ _BINDING_ABSENT = "absent"
 _BINDING_MATCH = "match"
 _BINDING_CONFLICT = "conflict"
 _BINDING_INVALID = "invalid"
-_POST_PATH = re.compile(r"/(?P<kind>video|note)/(?P<post_id>\d+)")
+_ACCOUNT_ID = re.compile(r"[A-Za-z0-9_-]+")
+_POST_PATH = re.compile(r"/(?P<kind>video|note)/(?P<post_id>\d+)/?")
 _POST_ID = re.compile(r"\d+")
 _HEX_PAIR = re.compile(r"[0-9A-Fa-f]{2}")
 _VISIBLE_METRIC_NUMBER = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?\s*[万亿]?")
@@ -234,6 +235,15 @@ class PostPageObservation:
     cursor: Any = None
 
 
+@dataclass
+class _AccountPostCandidateAudit:
+    """Atomic account-list evidence extracted from one response candidate."""
+
+    items: list[dict[str, Any]] = field(default_factory=list)
+    observation: Optional[PostPageObservation] = None
+    invalid: bool = False
+
+
 _DETAIL_RESPONSE_PATHS = (
     ("aweme_detail",),
     ("awemeDetail",),
@@ -285,6 +295,28 @@ def _item_id(item: dict[str, Any]) -> Optional[str]:
     value = item.get("aweme_id") or item.get("aweme_id_str")
     text = str(value) if value is not None else ""
     return text if _POST_ID.fullmatch(text) else None
+
+
+def _account_post_item_id(item: dict[str, Any]) -> Optional[str]:
+    """Bind every supplied public identity alias to one numeric post ID."""
+    identifiers: list[str] = []
+    for key in ("aweme_id", "aweme_id_str"):
+        value = item.get(key)
+        if value is None or value == "":
+            continue
+        text = str(value)
+        if _POST_ID.fullmatch(text) is None:
+            return None
+        identifiers.append(text)
+    if not identifiers or len(set(identifiers)) != 1:
+        return None
+    item_id = identifiers[0]
+    reference = _post_reference_from_public_url(
+        str(item.get("share_url") or "")
+    )
+    if reference is not None and reference[1] != item_id:
+        return None
+    return item_id
 
 
 def _is_trustworthy_aweme(item: dict[str, Any]) -> bool:
@@ -767,7 +799,7 @@ def _response_account_binding(
         if not separator:
             return _BINDING_INVALID
         value = _strict_query_component(encoded_value)
-        if value is None:
+        if value is None or _ACCOUNT_ID.fullmatch(value) is None:
             return _BINDING_INVALID
         bindings.append(value)
     if not bindings:
@@ -814,31 +846,6 @@ def _container_account_binding(
     return _BINDING_MATCH
 
 
-def _account_post_page_conflicts(
-    data: Any,
-    expected_sec_uid: str,
-    response_binding: str,
-) -> bool:
-    """Reject a whole account-post response on explicit page-level conflict."""
-    if response_binding in {_BINDING_CONFLICT, _BINDING_INVALID}:
-        return True
-    for owner_path in _ACCOUNT_POST_LIST_OWNER_PATHS:
-        owner = data
-        for key in owner_path:
-            if not isinstance(owner, dict):
-                owner = None
-                break
-            owner = owner.get(key)
-        if not isinstance(owner, dict) or not any(
-            isinstance(owner.get(key), list) for key in _ITEM_LIST_KEYS
-        ):
-            continue
-        binding = _container_account_binding(owner, expected_sec_uid)
-        if binding == _BINDING_CONFLICT:
-            return True
-    return False
-
-
 def _item_belongs_to_account(
     item: dict[str, Any], expected_sec_uid: str
 ) -> bool:
@@ -851,6 +858,180 @@ def _item_belongs_to_account(
     )
 
 
+def _is_valid_pagination_cursor(value: Any) -> bool:
+    """Accept only bounded scalar cursor forms used by public list responses."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    return bool(
+        isinstance(value, str)
+        and value.strip()
+        and len(value) <= 2_048
+    )
+
+
+def _audit_account_post_candidate(
+    data: Any,
+    expected_sec_uid: str,
+    response_binding: str,
+) -> _AccountPostCandidateAudit:
+    """Validate and merge every frozen list owner into one logical page."""
+    if response_binding == _BINDING_CONFLICT:
+        return _AccountPostCandidateAudit()
+    if response_binding == _BINDING_INVALID:
+        return _AccountPostCandidateAudit(invalid=True)
+    if isinstance(data, dict):
+        for status_key in ("status_code", "error_code"):
+            if status_key not in data:
+                continue
+            status_value = data[status_key]
+            if (
+                isinstance(status_value, bool)
+                or not isinstance(status_value, int)
+                or status_value != 0
+            ):
+                return _AccountPostCandidateAudit(invalid=True)
+
+    merged: dict[str, dict[str, Any]] = {}
+    observations: list[PostPageObservation] = []
+    invalid = False
+
+    def retain(raw_item: dict[str, Any], item_id: str) -> None:
+        if item_id not in merged:
+            merged[item_id] = copy.deepcopy(raw_item)
+        else:
+            _merge_missing(merged[item_id], raw_item)
+
+    for owner_path in _ACCOUNT_POST_LIST_OWNER_PATHS:
+        owner = data
+        for key in owner_path:
+            if not isinstance(owner, dict):
+                owner = None
+                break
+            owner = owner.get(key)
+        if not isinstance(owner, dict):
+            continue
+
+        list_keys = [key for key in _ITEM_LIST_KEYS if key in owner]
+        if not list_keys:
+            continue
+        container_binding = _container_account_binding(
+            owner, expected_sec_uid
+        )
+        if container_binding == _BINDING_CONFLICT:
+            invalid = True
+            continue
+
+        has_more = owner.get("has_more")
+        metadata_valid = True
+        if "has_more" in owner and not isinstance(has_more, bool):
+            has_more = None
+            metadata_valid = False
+            invalid = True
+
+        cursor_values: list[Any] = []
+        for cursor_key in ("max_cursor", "cursor", "min_cursor"):
+            if cursor_key not in owner or owner[cursor_key] is None:
+                continue
+            cursor_value = owner[cursor_key]
+            if not _is_valid_pagination_cursor(cursor_value):
+                metadata_valid = False
+                invalid = True
+                continue
+            cursor_values.append(cursor_value)
+        cursor_fingerprints = {
+            _cursor_fingerprint(cursor_value)
+            for cursor_value in cursor_values
+        }
+        if len(cursor_fingerprints) > 1:
+            metadata_valid = False
+            invalid = True
+        cursor = cursor_values[0] if cursor_values else None
+
+        for list_key in list_keys:
+            raw_items = owner[list_key]
+            if not isinstance(raw_items, list):
+                invalid = True
+                continue
+            list_valid = metadata_valid
+            unique: dict[str, dict[str, Any]] = {}
+            if not raw_items and _BINDING_MATCH not in {
+                container_binding,
+                response_binding,
+            }:
+                list_valid = False
+                invalid = True
+            for raw_item in raw_items:
+                item_id = (
+                    _account_post_item_id(raw_item)
+                    if isinstance(raw_item, dict)
+                    else None
+                )
+                if (
+                    not isinstance(raw_item, dict)
+                    or item_id is None
+                    or not _is_trustworthy_aweme(raw_item)
+                    or not _item_belongs_to_account(
+                        raw_item, expected_sec_uid
+                    )
+                ):
+                    list_valid = False
+                    invalid = True
+                    continue
+                retain(raw_item, item_id)
+                if item_id not in unique:
+                    unique[item_id] = copy.deepcopy(raw_item)
+                else:
+                    _merge_missing(unique[item_id], raw_item)
+            if list_valid:
+                observations.append(
+                    PostPageObservation(
+                        items=list(unique.values()),
+                        has_more=has_more,
+                        cursor=cursor,
+                    )
+                )
+
+    items = list(merged.values())
+    if invalid or not observations:
+        return _AccountPostCandidateAudit(
+            items=items,
+            invalid=invalid or bool(items),
+        )
+
+    has_more_states = {
+        observation.has_more for observation in observations
+    }
+    candidate_cursor_fingerprints = {
+        fingerprint
+        for observation in observations
+        if (fingerprint := _cursor_fingerprint(observation.cursor))
+        is not None
+    }
+    if (
+        len(has_more_states) > 1
+        or len(candidate_cursor_fingerprints) > 1
+    ):
+        return _AccountPostCandidateAudit(items=items, invalid=True)
+    cursor = next(
+        (
+            observation.cursor
+            for observation in observations
+            if observation.cursor is not None
+        ),
+        None,
+    )
+    return _AccountPostCandidateAudit(
+        items=items,
+        observation=PostPageObservation(
+            items=items,
+            has_more=observations[0].has_more,
+            cursor=cursor,
+        ),
+    )
+
+
 def extract_post_page_observations(
     data: Any,
     *,
@@ -858,6 +1039,14 @@ def extract_post_page_observations(
     response_binding: str = _BINDING_ABSENT,
 ) -> list[PostPageObservation]:
     """Extract list-scoped pagination facts, optionally bound to one account."""
+    if expected_sec_uid is not None:
+        audit = _audit_account_post_candidate(
+            data,
+            expected_sec_uid,
+            response_binding,
+        )
+        return [audit.observation] if audit.observation is not None else []
+
     observations: list[PostPageObservation] = []
 
     def inspect_owner(value: dict[str, Any]) -> None:
@@ -873,33 +1062,6 @@ def extract_post_page_observations(
                 if isinstance(raw_item, dict)
                 and _is_trustworthy_aweme(raw_item)
             ]
-            if expected_sec_uid is not None:
-                container_binding = _container_account_binding(
-                    value, expected_sec_uid
-                )
-                if (
-                    container_binding == _BINDING_CONFLICT
-                    or response_binding
-                    in {_BINDING_CONFLICT, _BINDING_INVALID}
-                ):
-                    continue
-                if trustworthy_items:
-                    if any(
-                        not _item_belongs_to_account(
-                            raw_item, expected_sec_uid
-                        )
-                        for raw_item in trustworthy_items
-                    ):
-                        continue
-                else:
-                    # A non-empty but unrecognized list is not an empty page.
-                    if raw_items:
-                        continue
-                    if (
-                        _BINDING_MATCH
-                        not in {container_binding, response_binding}
-                    ):
-                        continue
             unique: dict[str, dict[str, Any]] = {}
             for raw_item in trustworthy_items:
                 item_id = _item_id(raw_item)
@@ -941,18 +1103,7 @@ def extract_post_page_observations(
             for child in value:
                 walk(child, depth + 1)
 
-    if expected_sec_uid is None:
-        walk(data)
-    else:
-        for owner_path in _ACCOUNT_POST_LIST_OWNER_PATHS:
-            owner = data
-            for key in owner_path:
-                if not isinstance(owner, dict):
-                    owner = None
-                    break
-                owner = owner.get(key)
-            if isinstance(owner, dict):
-                inspect_owner(owner)
+    walk(data)
     return observations
 
 
@@ -1084,6 +1235,23 @@ def _allowed_response(event: dict[str, Any]) -> Optional[tuple[str, str]]:
     if resource_type not in {"xhr", "fetch"} and "json" not in mime_type:
         return None
     return request_id, sanitize_response_url(url)
+
+
+def _response_http_status(event: dict[str, Any]) -> Optional[int]:
+    """Return an exact integral CDP HTTP status, rejecting coercible values."""
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return None
+    response = params.get("response")
+    if not isinstance(response, dict):
+        return None
+    status = response.get("status")
+    if isinstance(status, bool) or not isinstance(status, (int, float)):
+        return None
+    numeric_status = float(status)
+    if not math.isfinite(numeric_status) or not numeric_status.is_integer():
+        return None
+    return int(numeric_status)
 
 
 def _call_with_timeout(method, *args, timeout: float):
@@ -1271,6 +1439,7 @@ def collect_account_page(
     pending: dict[str, dict[str, Any]] = {}
     safe_paths: list[str] = []
     candidate_response_count = 0
+    failed_account_post_count = 0
     cleanup_state: dict[str, Any] = {}
     restriction: Optional[str] = None
     scrolls = 0
@@ -1329,6 +1498,7 @@ def collect_account_page(
         """Try once; temporary body errors leave the candidate retryable."""
         nonlocal observed_page_count, terminal_page_observed
         nonlocal repeated_cursor_count, stop_condition, profile_raw
+        nonlocal failed_account_post_count
         candidate = pending.get(request_id)
         if candidate is None:
             return False
@@ -1348,33 +1518,56 @@ def collect_account_page(
             decoded = json.loads(body)
         except (json.JSONDecodeError, TypeError, UnicodeError):
             pending.pop(request_id, None)
+            if candidate["blocks_exhaustive"]:
+                failed_account_post_count += 1
             return False
         pending.pop(request_id, None)
         safe_url = candidate["safe_url"]
         if safe_url not in safe_paths:
             safe_paths.append(safe_url)
-        if candidate["is_account_post_response"] and _account_post_page_conflicts(
-            decoded,
-            expected_sec_uid,
-            candidate["account_binding"],
-        ):
-            return False
-        discovered_profile = extract_profile_raw(decoded, url)
-        if discovered_profile is not None:
-            if profile_raw is None:
-                profile_raw = discovered_profile
-            else:
-                _merge_profile_evidence(profile_raw, discovered_profile)
         before = len(items)
-        observations = (
-            extract_post_page_observations(
+        audit = (
+            _audit_account_post_candidate(
                 decoded,
-                expected_sec_uid=expected_sec_uid,
-                response_binding=candidate["account_binding"],
+                expected_sec_uid,
+                candidate["account_binding"],
             )
             if candidate["is_account_post_response"]
+            else None
+        )
+        if audit is not None and audit.invalid:
+            if candidate["blocks_exhaustive"]:
+                failed_account_post_count += 1
+            for item in audit.items:
+                store_network_item(item)
+            return len(items) > before
+        observations = (
+            [audit.observation]
+            if audit is not None and audit.observation is not None
             else []
         )
+        if (
+            audit is None
+            or (
+                candidate["account_binding"] != _BINDING_CONFLICT
+                and not audit.invalid
+            )
+        ):
+            discovered_profile = extract_profile_raw(decoded, url)
+            if discovered_profile is not None:
+                if profile_raw is None:
+                    profile_raw = discovered_profile
+                else:
+                    _merge_profile_evidence(profile_raw, discovered_profile)
+        if (
+            candidate["blocks_exhaustive"]
+            and not observations
+        ):
+            # A syntactically valid body is not evidence that a list page was
+            # consumed. Unknown schemas, unrecognized non-empty lists, and
+            # author-binding failures could otherwise hide a page before a
+            # later terminal response.
+            failed_account_post_count += 1
         if observations:
             for observation in observations:
                 observed_page_count += 1
@@ -1388,20 +1581,131 @@ def collect_account_page(
                         cursor_fingerprints.add(fingerprint)
                 if observation.has_more is False:
                     terminal_page_observed = True
-                    if all_posts:
+                    if all_posts and stop_condition != "repeated_cursor":
                         stop_condition = "terminal_page"
                 for item in observation.items:
                     store_network_item(item)
         return len(items) > before
 
-    def flush_pending(session: BrowserSession) -> None:
+    def flush_pending(session: BrowserSession, *, drain: bool = False) -> None:
         # Header-only fakes do not emit loadingFinished.  A quiet boundary is a
         # bounded compatibility retry; production candidates remain pending
         # after temporary body errors and can succeed on a later finish/idle.
         for request_id in list(pending):
             read_pending(request_id, session)
-            if target_count() >= requested or remaining() <= 0:
+            if (not drain and target_count() >= requested) or remaining() <= 0:
                 break
+
+    def process_event(event: Optional[dict[str, Any]], session: BrowserSession) -> None:
+        """Register or finish one CDP response lifecycle event."""
+        nonlocal candidate_response_count, failed_account_post_count
+        method = event.get("method") if isinstance(event, dict) else None
+        params = event.get("params") if isinstance(event, dict) else None
+        params = params if isinstance(params, dict) else {}
+        candidate = _allowed_response(event or {})
+        if candidate:
+            candidate_response_count += 1
+            request_id, safe_url = candidate
+            if safe_url not in safe_paths:
+                safe_paths.append(safe_url)
+            is_account_post_response = _is_account_post_response(event or {})
+            account_binding = _response_account_binding(
+                event or {}, expected_sec_uid
+            )
+            blocks_exhaustive = bool(
+                is_account_post_response
+                and account_binding != _BINDING_CONFLICT
+            )
+            if (
+                blocks_exhaustive
+                and _response_http_status(event or {}) != 200
+            ):
+                failed_account_post_count += 1
+                return
+            pending[request_id] = {
+                "safe_url": safe_url,
+                "is_account_post_response": is_account_post_response,
+                "account_binding": account_binding,
+                # An unreadable response from an eligible account-list path
+                # could contain a missing page. Only an explicitly foreign
+                # binding is known not to belong to the target; duplicate or
+                # malformed bindings remain ambiguous.
+                "blocks_exhaustive": blocks_exhaustive,
+                "ready": False,
+                "attempts": 0,
+                "quiet_retried": False,
+            }
+            return
+        if method == "Network.loadingFinished":
+            request_id = params.get("requestId")
+            if isinstance(request_id, str) and request_id in pending:
+                pending[request_id]["ready"] = True
+                read_pending(request_id, session)
+            return
+        if method == "Network.loadingFailed":
+            request_id = params.get("requestId")
+            if isinstance(request_id, str):
+                failed_candidate = pending.pop(request_id, None)
+                if (
+                    failed_candidate is not None
+                    and failed_candidate["blocks_exhaustive"]
+                ):
+                    failed_account_post_count += 1
+
+    def retry_pending_at_quiet_boundary(session: BrowserSession) -> bool:
+        """Retry each unresolved body once, requiring a fresh poll afterward."""
+        attempted = False
+        for request_id in list(pending):
+            candidate = pending.get(request_id)
+            if candidate is None or candidate["quiet_retried"]:
+                continue
+            candidate["quiet_retried"] = True
+            attempted = True
+            read_pending(request_id, session)
+            if remaining() <= 0:
+                break
+        return attempted
+
+    def drain_terminal_until_quiet(session: BrowserSession) -> None:
+        """Finish terminal collection only after a command-free quiet poll."""
+        nonlocal deadline_expired, restriction, stop_condition
+        needs_page_check = True
+        while True:
+            budget = remaining()
+            if budget <= 0:
+                deadline_expired = True
+                stop_condition = "timeout"
+                return
+            event = session.poll_event(timeout=min(1.0, budget))
+            if event is not None:
+                process_event(event, session)
+                needs_page_check = True
+                continue
+            if retry_pending_at_quiet_boundary(session):
+                needs_page_check = True
+                continue
+            if needs_page_check:
+                budget = remaining()
+                if budget <= 0:
+                    deadline_expired = True
+                    stop_condition = "timeout"
+                    return
+                visible_text = _call_with_timeout(
+                    session.page_text,
+                    timeout=budget,
+                )
+                if remaining() <= 0:
+                    deadline_expired = True
+                    stop_condition = "timeout"
+                    return
+                restriction = detect_restriction(visible_text)
+                if restriction:
+                    stop_condition = restriction
+                    return
+                needs_page_check = False
+                continue
+            # No CDP command is sent after this fresh quiet poll.
+            return
 
     with _collection_session(session_factory, cleanup_state) as session:
         budget = remaining()
@@ -1418,7 +1722,10 @@ def collect_account_page(
         while (
             not deadline_expired
             and target_count() < requested
-            and not (all_posts and stop_condition in {"terminal_page", "repeated_cursor"})
+            and not (
+                all_posts
+                and stop_condition in {"terminal_page", "repeated_cursor"}
+            )
         ):
             budget = remaining()
             if budget <= 0:
@@ -1427,39 +1734,10 @@ def collect_account_page(
                 break
 
             event = session.poll_event(timeout=min(1.0, budget))
-            method = event.get("method") if isinstance(event, dict) else None
-            params = event.get("params") if isinstance(event, dict) else None
-            params = params if isinstance(params, dict) else {}
-
-            candidate = _allowed_response(event or {})
-            if candidate:
-                candidate_response_count += 1
-                request_id, safe_url = candidate
-                if safe_url not in safe_paths:
-                    safe_paths.append(safe_url)
-                pending[request_id] = {
-                    "safe_url": safe_url,
-                    "is_account_post_response": _is_account_post_response(
-                        event or {}
-                    ),
-                    "account_binding": _response_account_binding(
-                        event or {}, expected_sec_uid
-                    ),
-                    "ready": False,
-                    "attempts": 0,
-                }
-            elif method == "Network.loadingFinished":
-                request_id = params.get("requestId")
-                if isinstance(request_id, str) and request_id in pending:
-                    pending[request_id]["ready"] = True
-                    read_pending(request_id, session)
-            elif method == "Network.loadingFailed":
-                request_id = params.get("requestId")
-                if isinstance(request_id, str):
-                    pending.pop(request_id, None)
+            process_event(event, session)
 
             if event is None:
-                flush_pending(session)
+                flush_pending(session, drain=all_posts)
 
             budget = remaining()
             if budget <= 0:
@@ -1478,7 +1756,10 @@ def collect_account_page(
             if restriction:
                 stop_condition = restriction
                 break
-            if all_posts and stop_condition in {"terminal_page", "repeated_cursor"}:
+            if all_posts and stop_condition in {
+                "terminal_page",
+                "repeated_cursor",
+            }:
                 break
             if target_count() >= requested:
                 stop_condition = "limit"
@@ -1522,9 +1803,8 @@ def collect_account_page(
                 break
             sleep(min(1.0, budget))
 
-        network_count = sum(
-            item.get("_collection_source") == "network" for item in items.values()
-        )
+        cards: list[dict[str, Any]] = []
+        visible_profile: Optional[dict[str, Any]] = None
         if not deadline_expired:
             budget = remaining()
             if budget > 0:
@@ -1545,22 +1825,38 @@ def collect_account_page(
                 if remaining() <= 0:
                     deadline_expired = True
                     stop_condition = "timeout"
-                else:
-                    if visible_profile is not None:
-                        if profile_raw is None:
-                            profile_raw = visible_profile
-                        else:
-                            _merge_profile_evidence(profile_raw, visible_profile)
-                    if not restriction:
-                        for item in extract_dom_items(cards):
-                            item_id = str(item["aweme_id"])
-                            if item_id not in items:
-                                items[item_id] = item
-                            else:
-                                _merge_missing(items[item_id], item)
             else:
                 deadline_expired = True
                 stop_condition = "timeout"
+
+        if (
+            all_posts
+            and terminal_page_observed
+            and not deadline_expired
+            and not restriction
+        ):
+            # DOM evaluation and every response-body/page-text CDP command can
+            # enqueue lifecycle events. Exhaustive evidence is committed only
+            # after a later poll is quiet and no further CDP command follows.
+            drain_terminal_until_quiet(session)
+
+        # Pure in-memory merges are intentionally delayed until after the
+        # command-free quiet boundary so they cannot invalidate it.
+        if visible_profile is not None:
+            if profile_raw is None:
+                profile_raw = visible_profile
+            else:
+                _merge_profile_evidence(profile_raw, visible_profile)
+        if not restriction:
+            for item in extract_dom_items(cards):
+                item_id = str(item["aweme_id"])
+                if item_id not in items:
+                    items[item_id] = item
+                else:
+                    _merge_missing(items[item_id], item)
+        network_count = sum(
+            item.get("_collection_source") == "network" for item in items.values()
+        )
 
     observed_items = list(items.values())
     range_items = (
@@ -1592,10 +1888,20 @@ def collect_account_page(
         else "network"
     )
     item_budget_truncated = len(items) > requested
+    unresolved_account_post_count = sum(
+        bool(candidate["blocks_exhaustive"])
+        for candidate in pending.values()
+    )
+    account_post_candidates_complete = bool(
+        failed_account_post_count == 0
+        and unresolved_account_post_count == 0
+    )
     if restriction:
         stop_condition = restriction
     elif deadline_expired or stop_condition == "timeout":
         stop_condition = "timeout"
+    elif all_posts and repeated_cursor_count:
+        stop_condition = "repeated_cursor"
     elif all_posts and terminal_page_observed and not item_budget_truncated:
         stop_condition = "terminal_page"
     elif (len(range_items) if bounds is not None and not all_posts else len(final)) >= requested:
@@ -1608,6 +1914,8 @@ def collect_account_page(
         and not item_budget_truncated
         and not deadline_expired
         and not restriction
+        and repeated_cursor_count == 0
+        and account_post_candidates_complete
         and stop_condition == "terminal_page"
     )
     if profile_raw is not None:
@@ -1627,6 +1935,8 @@ def collect_account_page(
             "candidate_response_count": candidate_response_count,
             "response_paths": safe_paths,
             "pending_response_count": len(pending),
+            "unresolved_account_post_count": unresolved_account_post_count,
+            "failed_account_post_count": failed_account_post_count,
             "stop_condition": stop_condition,
             **(
                 {"cleanup_codes": cleanup_state["cleanup_codes"]}

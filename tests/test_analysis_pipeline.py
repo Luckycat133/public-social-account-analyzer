@@ -516,6 +516,221 @@ def test_analyze_in_memory_has_no_filesystem_side_effects(tmp_path):
     assert list(tmp_path.iterdir()) == before
 
 
+def _authorized_terminal_coverage(**overrides) -> dict:
+    coverage = {
+        "requested_all": True,
+        "is_exhaustive": True,
+        "terminal_page_observed": True,
+        "observed_page_count": 1,
+        "observed_post_count": 1,
+        "repeated_cursor_count": 0,
+        "zero_new_page_count": 0,
+        "stop_condition": "terminal_page",
+    }
+    coverage.update(overrides)
+    return coverage
+
+
+def _public_terminal_coverage(**overrides) -> dict:
+    coverage = {
+        "requested_all": True,
+        "max_items": 10_000,
+        "is_exhaustive": True,
+        "terminal_page_observed": True,
+        "observed_page_count": 1,
+        "observed_post_count": 1,
+        "repeated_cursor_count": 0,
+        "stop_condition": "terminal_page",
+    }
+    coverage.update(overrides)
+    return coverage
+
+
+def test_pipeline_whitelists_authorized_collection_coverage(tmp_path):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(
+        tmp_path,
+        task_overrides={
+            "collection_source": "douyin_openapi_token_owner",
+            "requested_limit": None,
+            "stop_reason": None,
+            "collection_coverage": _authorized_terminal_coverage(),
+        },
+    )
+    output = tmp_path / "analysis"
+
+    pipeline.run_pipeline(
+        str(collection), str(output), template_text=_minimal_template()
+    )
+
+    meta = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )["meta"]
+    assert meta["evidence_is_exhaustive"] is True
+    assert meta["collection_coverage"] == _authorized_terminal_coverage()
+
+
+def test_pipeline_rejects_unwhitelisted_coverage_before_copying_source_task(
+    tmp_path,
+):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(
+        tmp_path,
+        task_overrides={
+            "collection_source": "douyin_openapi_token_owner",
+            "requested_limit": None,
+            "stop_reason": None,
+            "collection_coverage": _authorized_terminal_coverage(
+                raw_cursor="must-not-propagate",
+                headers={"access-token": "must-not-propagate"},
+            ),
+        },
+    )
+    output = tmp_path / "analysis"
+
+    with pytest.raises(pipeline.PipelineError, match="collection coverage"):
+        pipeline.run_pipeline(
+            str(collection), str(output), template_text=_minimal_template()
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("coverage_overrides", "task_overrides"),
+    [
+        ({"terminal_page_observed": False}, {}),
+        ({"stop_condition": "api_error"}, {}),
+        ({"observed_post_count": 2}, {}),
+        ({"observed_post_count": True}, {}),
+        ({}, {"task_status": "PARTIAL", "stop_reason": "OPENAPI_ERROR"}),
+    ],
+)
+def test_pipeline_rejects_false_authorized_exhaustive_claim_before_output(
+    tmp_path, coverage_overrides, task_overrides
+):
+    pipeline = _pipeline_module()
+    task = {
+        "collection_source": "douyin_openapi_token_owner",
+        "requested_limit": None,
+        "stop_reason": None,
+        "collection_coverage": _authorized_terminal_coverage(
+            **coverage_overrides
+        ),
+        **task_overrides,
+    }
+    collection, _ = _collection(tmp_path, task_overrides=task)
+    output = tmp_path / "analysis"
+
+    with pytest.raises(pipeline.PipelineError, match="collection coverage"):
+        pipeline.run_pipeline(
+            str(collection), str(output), template_text=_minimal_template()
+        )
+
+    assert not output.exists()
+
+
+def test_pipeline_accepts_authorized_limited_terminal_as_exhaustive(tmp_path):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(
+        tmp_path,
+        task_overrides={
+            "collection_source": "douyin_openapi_token_owner",
+            "requested_limit": 30,
+            "stop_reason": None,
+            "collection_coverage": _authorized_terminal_coverage(
+                requested_all=False
+            ),
+        },
+    )
+    output = tmp_path / "analysis"
+
+    pipeline.run_pipeline(
+        str(collection), str(output), template_text=_minimal_template()
+    )
+
+    meta = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )["meta"]
+    assert meta["evidence_is_exhaustive"] is True
+    assert meta["collection_coverage"]["requested_all"] is False
+
+
+def test_pipeline_binds_public_exhaustive_coverage_to_normalized_count(tmp_path):
+    pipeline = _pipeline_module()
+    valid_collection, _ = _collection(
+        tmp_path,
+        name="valid-public-all",
+        task_overrides={
+            "requested_limit": 10_000,
+            "stop_reason": None,
+            "collection_coverage": _public_terminal_coverage(),
+        },
+    )
+    valid_output = tmp_path / "valid-analysis"
+
+    pipeline.run_pipeline(
+        str(valid_collection),
+        str(valid_output),
+        template_text=_minimal_template(),
+    )
+    valid_meta = json.loads(
+        (valid_output / "analysis.json").read_text(encoding="utf-8")
+    )["meta"]
+    assert valid_meta["evidence_is_exhaustive"] is True
+
+    bad_collection, _ = _collection(
+        tmp_path,
+        name="bad-public-all",
+        task_overrides={
+            "requested_limit": 10_000,
+            "stop_reason": None,
+            "collection_coverage": _public_terminal_coverage(
+                observed_post_count=2
+            ),
+        },
+    )
+    bad_output = tmp_path / "bad-analysis"
+    with pytest.raises(pipeline.PipelineError, match="collection coverage"):
+        pipeline.run_pipeline(
+            str(bad_collection),
+            str(bad_output),
+            template_text=_minimal_template(),
+        )
+    assert not bad_output.exists()
+
+
+def test_pipeline_accepts_public_protection_without_coverage_stop_condition(
+    tmp_path,
+):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(
+        tmp_path,
+        task_status="PARTIAL",
+        task_overrides={
+            "requested_limit": 10_000,
+            "stop_reason": "LOGIN_REQUIRED",
+            "collection_coverage": {
+                "requested_all": True,
+                "max_items": 10_000,
+                "is_exhaustive": False,
+                "terminal_page_observed": False,
+            },
+        },
+    )
+    output = tmp_path / "analysis"
+
+    pipeline.run_pipeline(
+        str(collection), str(output), template_text=_minimal_template()
+    )
+
+    meta = json.loads(
+        (output / "analysis.json").read_text(encoding="utf-8")
+    )["meta"]
+    assert meta["evidence_is_exhaustive"] is False
+    assert meta["collection_coverage"]["is_exhaustive"] is False
+
+
 def test_pending_classification_slots_are_null_not_model_unknown():
     result = analyze.analyze_in_memory(
         _sample_profile(),
@@ -1001,6 +1216,22 @@ def test_pipeline_commits_exact_inventory_once_and_never_mutates_collection(
     assert provenance["collection_commit_sha256"] == source_digest
     assert provenance["source_task_id"] == "douyin-source-task"
     assert str(collection) not in provenance_text
+
+
+def test_public_pipeline_keeps_public_page_snapshot_disclaimer(tmp_path):
+    pipeline = _pipeline_module()
+    collection, _ = _collection(tmp_path)
+    output = tmp_path / "analysis"
+
+    pipeline.run_pipeline(str(collection), str(output))
+
+    markdown = (output / "account-analysis-report.md").read_text(
+        encoding="utf-8"
+    )
+    dashboard = (output / "dashboard.html").read_text(encoding="utf-8")
+    for rendered in (markdown, dashboard):
+        assert "公开页面快照" in rendered
+        assert "本报告基于公开来源证据" not in rendered
 
 
 def test_limited_upstream_commits_partial_analysis(tmp_path):
