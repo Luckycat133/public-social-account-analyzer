@@ -2053,7 +2053,32 @@ def run(
     adapter = _pick(adapters, routing_url)
     if adapter is None:
         # URL 不属于任何已加载平台 → UNSUPPORTED_PLATFORM(见 exceptions.md §1)
-        print(f"[FAILED] 无支持的适配器 (stop_reason={SR_UNSUPPORTED})", file=sys.stderr)
+        # 内联列出本次实际加载的适配器平台与示例 URL 形态,避免用户看到
+        # 干瘪的 stop_reason 后还要翻 SKILL.md。微博是 P1 条件支持,仅当
+        # 适配器被本次加载时才会出现在列表里。
+        loaded = sorted(
+            (a.platform for a in adapters),
+            key=lambda p: {"bilibili": 0, "douyin": 1, "weibo": 2}.get(p, 9),
+        )
+        url_examples = {
+            "bilibili": "https://space.bilibili.com/<uid>",
+            "douyin": "https://www.douyin.com/user/<sec_uid>",
+            "weibo": "https://weibo.com/u/<uid>",
+        }
+        if loaded:
+            examples = " ; ".join(
+                f"{p}={url_examples.get(p, '?')}" for p in loaded
+            )
+            print(
+                f"[FAILED] 无支持的适配器 (stop_reason={SR_UNSUPPORTED}); "
+                f"已加载平台: {examples}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[FAILED] 无支持的适配器 (stop_reason={SR_UNSUPPORTED})",
+                file=sys.stderr,
+            )
         return 2
 
     platform = adapter.platform
