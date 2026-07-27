@@ -10,3 +10,6 @@
 {"id": "trg-pos-010", "label": "should_trigger", "platform": "douyin", "query": "分析这个抖音账号最近50条作品的选题分布：https://www.douyin.com/user/MS4wLjABAAAAexamplehandle000000000000000000004"}
 {"id": "trg-pos-011", "label": "should_trigger", "platform": "bilibili", "query": "帮我评估这个B站账号最近30天的公开表现，顺便看看评论区在问什么：https://space.bilibili.com/946974"}
 {"id": "trg-pos-012", "label": "should_trigger", "platform": "douyin", "query": "这个抖音品牌号的内容运营方向帮我总结一下：https://www.douyin.com/user/MS4wLjABAAAAexamplehandle000000000000000000005"}
+{"id": "trg-pos-013", "label": "should_trigger", "platform": "weibo", "query": "检查当前微博适配器是否启用；如果可用就分析这个公开账号，否则明确说明条件支持：https://weibo.com/u/9876543210"}
+{"id": "trg-pos-014", "label": "should_trigger", "platform": "weibo", "query": "按公开数据能力边界分析这个微博主页最近内容，并在适配器不可用时安全停止：https://weibo.com/u/1122334455"}
+{"id": "trg-pos-015", "label": "should_trigger", "platform": "douyin", "query": "分析这个抖音机构账号最近30天的公开内容结构和发布节奏：https://www.douyin.com/user/MS4wLjABAAAAexamplehandle000000000000000000006"}

@@ -120,6 +120,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 8. 核对 final 的分类与业务洞察状态均为 `completed`，5 项定位、6 项对比、10/5/4 清单完整，原 collection digest 一致，并确认 manifest 同时封存两份原始结果后，才交付完整策略结论。
 9. 若请求评论洞察且有有效评论，先以 `--with-comment-insights` 创建 draft，再从同一 collection 传入 `--comment-insight-results` 创建 final；核对五类评论洞察、三重摘要和逐评论证据均完成。
 
+- **最终答复先摘要后结论**：给用户的最终答复必须在任何分析结论之前，先完整展示数据质量摘要——成功/失败/受限数量与关键字段覆盖率；`task_status=PARTIAL` 时同时说明 `stop_reason` 与影响范围。仅在报告文件内包含摘要、答复里只提状态码，不满足本条。
 - `valid_count == 0` 时不得生成分类结果或空洞策略结论；交付采集失败/部分证据说明。
 - 有效样本少于 15 条时，即使分类完成也标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现共同点归纳。
 - 采集与分析 `task.json` 必须记录带时区的 `started_at` / `ended_at`、非负整数 `duration_ms` 和固定阶段 `phase_durations_ms`。这些字段用于工程可观测性，不等于“真实 30 条全流程 ≤10 分钟”已经通过。
@@ -127,6 +128,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 ## 输出验证清单
 
+- [ ] 最终答复在分析结论前先展示数据质量摘要（成功/失败/受限数量与字段覆盖率）
 - [ ] Markdown / HTML / CSV / JSON 四份产物均已生成且有效
 - [ ] 页面未展示字段统一为 `null`
 - [ ] 置顶与转载内容已隔离

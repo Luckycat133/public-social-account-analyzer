@@ -1,7 +1,7 @@
 {
-  "schema": "public-social-account-analyzer/eval-dataset-manifest@2",
-  "dataset_version": "1.0.0",
-  "generated_at": "2026-07-24T09:06:34+00:00",
+  "schema": "public-social-account-analyzer/eval-dataset-manifest@3",
+  "dataset_version": "1.1.0",
+  "generated_at": "2026-07-27T09:37:39+00:00",
   "generated_by": "skill/scripts/split_dataset.py",
   "paths": {
     "source": "source",
@@ -15,8 +15,9 @@
     "validation_ratio": 0.7,
     "stratify_fields": {
       "behavior_cases": "category",
+      "p0_cases": "scenario_type",
       "trigger_should": "platform",
-      "trigger_should_not": "reason"
+      "trigger_should_not": "category"
     }
   },
   "quality_checks": [
@@ -25,27 +26,29 @@
     "unique_id",
     "partition_disjointness",
     "source_coverage",
+    "scenario_group_disjointness",
+    "p0_requirement_coverage",
     "record_counts",
     "sha256"
   ],
   "consistency_tolerance": 0.2,
-  "max_distribution_deviation": 0.7,
+  "max_distribution_deviation": 0.2,
   "datasets": [
     {
       "dataset": "behavior_cases",
       "stratify_field": "category",
-      "total": 14,
-      "validation_count": 10,
-      "test_count": 4,
-      "max_distribution_deviation": 0.3,
+      "total": 20,
+      "validation_count": 14,
+      "test_count": 6,
+      "max_distribution_deviation": 0.05,
       "strata": [
         {
           "stratum": "boundary",
-          "total": 3,
+          "total": 4,
           "test": 1,
-          "validation": 2,
-          "test_ratio_actual": 0.3333,
-          "deviation": 0.0333
+          "validation": 3,
+          "test_ratio_actual": 0.25,
+          "deviation": 0.05
         },
         {
           "stratum": "compliance",
@@ -57,14 +60,6 @@
         },
         {
           "stratum": "data_quality",
-          "total": 2,
-          "test": 1,
-          "validation": 1,
-          "test_ratio_actual": 0.5,
-          "deviation": 0.2
-        },
-        {
-          "stratum": "happy_path",
           "total": 3,
           "test": 1,
           "validation": 2,
@@ -72,33 +67,94 @@
           "deviation": 0.0333
         },
         {
+          "stratum": "happy_path",
+          "total": 4,
+          "test": 1,
+          "validation": 3,
+          "test_ratio_actual": 0.25,
+          "deviation": 0.05
+        },
+        {
           "stratum": "output_contract",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
+          "total": 3,
+          "test": 1,
+          "validation": 2,
+          "test_ratio_actual": 0.3333,
+          "deviation": 0.0333
         },
         {
           "stratum": "refusal",
-          "total": 2,
-          "test": 0,
+          "total": 3,
+          "test": 1,
           "validation": 2,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
+          "test_ratio_actual": 0.3333,
+          "deviation": 0.0333
         }
       ],
-      "validation_sha256": "a2118e14584a28731f48d95675c235099a4a72ab64213a66fc3be090dd3d3794",
-      "test_sha256": "0b512d866666dc422163d3f802c070116c0b9e730781bc6cdcaa8c1681233f76",
-      "source_sha256": "dda72b35ea13b5d509fd6a397575b5e2f576ff3f74d0361d2b069cb7e484a205"
+      "validation_sha256": "cfcf37bb21b51f7183b9ce9b6afaa1da2495bbb947c5bf402fc5de208f8a1500",
+      "test_sha256": "bd1777463b3349ab3f23aec82d0f2c8845a60f56e4c983743e076342f6df26e6",
+      "source_sha256": "2ce0f7de87fc3fc3db440e900afebd562e649aa86cfda32ecab8ea37dc5e0857"
+    },
+    {
+      "dataset": "p0_cases",
+      "stratify_field": "scenario_type",
+      "total": 30,
+      "validation_count": 21,
+      "test_count": 9,
+      "max_distribution_deviation": 0.2,
+      "strata": [
+        {
+          "stratum": "boundary",
+          "total": 7,
+          "test": 2,
+          "validation": 5,
+          "test_ratio_actual": 0.2857,
+          "deviation": 0.0143
+        },
+        {
+          "stratum": "contract",
+          "total": 2,
+          "test": 1,
+          "validation": 1,
+          "test_ratio_actual": 0.5,
+          "deviation": 0.2
+        },
+        {
+          "stratum": "external_acceptance",
+          "total": 7,
+          "test": 2,
+          "validation": 5,
+          "test_ratio_actual": 0.2857,
+          "deviation": 0.0143
+        },
+        {
+          "stratum": "failure",
+          "total": 6,
+          "test": 2,
+          "validation": 4,
+          "test_ratio_actual": 0.3333,
+          "deviation": 0.0333
+        },
+        {
+          "stratum": "positive",
+          "total": 8,
+          "test": 2,
+          "validation": 6,
+          "test_ratio_actual": 0.25,
+          "deviation": 0.05
+        }
+      ],
+      "validation_sha256": "b24a60c856b8551c3a378e8babe64f3a5a49bced9b4d9fd735fa9ccebc4e034f",
+      "test_sha256": "f2c4e03144aa3ac8731072f13b46d4142d4538815352739eac2e93ea292460ee",
+      "source_sha256": "817ff2e6480139415c67f75a1629fca449e9e286b1a0bb280930438fff9aeadc"
     },
     {
       "dataset": "trigger_should",
       "stratify_field": "platform",
-      "total": 12,
-      "validation_count": 8,
+      "total": 15,
+      "validation_count": 11,
       "test_count": 4,
-      "max_distribution_deviation": 0.3,
+      "max_distribution_deviation": 0.1333,
       "strata": [
         {
           "stratum": "bilibili",
@@ -110,125 +166,67 @@
         },
         {
           "stratum": "douyin",
-          "total": 5,
-          "test": 2,
-          "validation": 3,
-          "test_ratio_actual": 0.4,
-          "deviation": 0.1
+          "total": 6,
+          "test": 1,
+          "validation": 5,
+          "test_ratio_actual": 0.1667,
+          "deviation": 0.1333
         },
         {
           "stratum": "weibo",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
+          "total": 3,
+          "test": 1,
+          "validation": 2,
+          "test_ratio_actual": 0.3333,
+          "deviation": 0.0333
         }
       ],
-      "validation_sha256": "ea7a292eb0accc28ef0db9efc52939ab5ad6e2b90eaff0667b4bbd6c08a75c3d",
-      "test_sha256": "9d2ad37a3663553ef6caa76af518c45471f5a2b4edcf0dd3586a3140375a87fb",
-      "source_sha256": "ff27f41428748fd6b9e6893afad43401b101693ca3074446b775819e83258dd0"
+      "validation_sha256": "58814aed1b155a2d77e5da0ac981a01d67bbf001ab2581d40088adcd06097434",
+      "test_sha256": "c8057f4b682c5568c0806868125c40802a635a86b12663226280486e62649a01",
+      "source_sha256": "fdb7c1f3bb0d4e3882bd6072ad6181fc78452bd963e578a4f06fbbd5a2060ffb"
     },
     {
       "dataset": "trigger_should_not",
-      "stratify_field": "reason",
+      "stratify_field": "category",
       "total": 12,
       "validation_count": 8,
       "test_count": 4,
-      "max_distribution_deviation": 0.7,
+      "max_distribution_deviation": 0.2,
       "strata": [
         {
-          "stratum": "account_takeover",
-          "total": 1,
-          "test": 1,
-          "validation": 0,
-          "test_ratio_actual": 1.0,
-          "deviation": 0.7
-        },
-        {
-          "stratum": "bypass_risk_control",
-          "total": 1,
-          "test": 1,
-          "validation": 0,
-          "test_ratio_actual": 1.0,
-          "deviation": 0.7
-        },
-        {
-          "stratum": "fake_completion",
-          "total": 1,
-          "test": 1,
-          "validation": 0,
-          "test_ratio_actual": 1.0,
-          "deviation": 0.7
-        },
-        {
-          "stratum": "general_chitchat",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
-        },
-        {
-          "stratum": "media_download",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
-        },
-        {
-          "stratum": "no_url_content_writing",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
-        },
-        {
-          "stratum": "platform_generic_question",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
-        },
-        {
-          "stratum": "private_backend",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
-        },
-        {
-          "stratum": "private_dm",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
-        },
-        {
-          "stratum": "unrelated_platform",
-          "total": 1,
-          "test": 0,
-          "validation": 1,
-          "test_ratio_actual": 0.0,
-          "deviation": 0.3
-        },
-        {
-          "stratum": "unsupported_platform",
-          "total": 2,
-          "test": 1,
-          "validation": 1,
+          "stratum": "non_analysis_request",
+          "total": 4,
+          "test": 2,
+          "validation": 2,
           "test_ratio_actual": 0.5,
           "deviation": 0.2
+        },
+        {
+          "stratum": "private_or_control",
+          "total": 4,
+          "test": 1,
+          "validation": 3,
+          "test_ratio_actual": 0.25,
+          "deviation": 0.05
+        },
+        {
+          "stratum": "unsupported_scope",
+          "total": 4,
+          "test": 1,
+          "validation": 3,
+          "test_ratio_actual": 0.25,
+          "deviation": 0.05
         }
       ],
-      "validation_sha256": "3c2b9592a7a233f37021cf0c5c562f95233fcf7bec3f85b69e66d8e466e89a6e",
-      "test_sha256": "c8ddc7399beddc4edc359543760cfcf31316bd6526c71c56e5fa6a15289e5ff1",
-      "source_sha256": "25d69b188bf9b7aac7aa5c53e76e96f4471d925c2821df31eedceae69b6e5828"
+      "validation_sha256": "a900b92acef4f20c53c43527cfb7dd87efc51b30b983236ae51117efdaa0823c",
+      "test_sha256": "2aaad59790914f40445e87b3fbf37dba37666944f78323335684bc29b93328a6",
+      "source_sha256": "f69abe34a18dd6f7ebb95907c728ffd17a9496c3fc0d6d31c7e1b134c07bc59c"
     }
-  ]
+  ],
+  "p0_governance": {
+    "requirements_path": "p0_requirements.json",
+    "requirements_sha256": "44a1a8f2469b02ebec5be1bea02457415fa17209f0881643ec512dcc291b73bf",
+    "coverage_path": "p0_coverage.json",
+    "coverage_sha256": "43d58a0b7194cde06f6e2e0eca9f3b2641cd6579ad48058e5c550dff3dd7d5ec"
+  }
 }
