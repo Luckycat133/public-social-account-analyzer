@@ -55,6 +55,25 @@ STOP_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
 STOP_INTERNAL = "INTERNAL_ERROR"
 STOP_COMMENTS_UNAVAILABLE = "COMMENTS_UNAVAILABLE"
 
+# 安全诊断码只描述内部阶段，不包含端点参数、账号 ID、响应正文或异常文本。
+DIAG_MEDIALIST_DISCOVERY = "BILIBILI_MEDIALIST_DISCOVERY"
+DIAG_ARC_DISCOVERY = "BILIBILI_ARC_DISCOVERY"
+DIAG_SEARCH_DISCOVERY = "BILIBILI_SEARCH_DISCOVERY"
+DIAG_DYNAMIC_DISCOVERY = "BILIBILI_DYNAMIC_DISCOVERY"
+DIAG_VIEW_DETAIL = "BILIBILI_VIEW_DETAIL"
+DIAG_TAG_ENRICHMENT = "BILIBILI_TAG_ENRICHMENT"
+
+BILIBILI_DYNAMIC_STATUSES = frozenset({
+    "NOT_ATTEMPTED",
+    "UNAVAILABLE",
+    "OBSERVED",
+    STOP_LOGIN,
+    STOP_VERIFICATION,
+    STOP_ACCESS_RESTRICTED,
+    STOP_PARSER_FAILED,
+    STOP_INTERNAL,
+})
+
 # WBI 置换表（bilibili-api-collect 项目权威值，长度 64，元素 0-63）
 MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43,
@@ -91,11 +110,22 @@ TYPENAME_MAP = {
 class BilibiliError(Exception):
     """采集错误，携带 stop_reason 供上层决策（不绕过、如实上抛）。"""
 
-    def __init__(self, stop_reason: str, message: str, raw: Any = None):
+    def __init__(
+        self,
+        stop_reason: str,
+        message: str,
+        raw: Any = None,
+        partial_posts: list[dict] | None = None,
+        partial_entries: list[dict] | None = None,
+        diagnostic_code: str | None = None,
+    ):
         super().__init__(message)
         self.stop_reason = stop_reason
         self.message = message
         self.raw = raw
+        self.partial_posts = list(partial_posts or [])
+        self.partial_entries = list(partial_entries or [])
+        self.diagnostic_code = diagnostic_code
 
 
 class _TransportError(BilibiliError):
@@ -148,6 +178,13 @@ def _backoff(attempt: int) -> float:
 
 def _is_platform_protection(error: BilibiliError) -> bool:
     return error.stop_reason in PLATFORM_PROTECTION_REASONS
+
+
+def _set_diagnostic(error: BilibiliError, code: str) -> BilibiliError:
+    """Attach a fixed safe substage without replacing an earlier diagnosis."""
+    if not getattr(error, "diagnostic_code", None):
+        error.diagnostic_code = code
+    return error
 
 
 # --------------------------------------------------------------------------
@@ -225,9 +262,15 @@ class Session:
         stop_reason: str,
         message: str,
         raw: Any = None,
+        diagnostic_code: str | None = None,
     ) -> None:
         """Raise a task error and trip the circuit for protection reasons."""
-        error = BilibiliError(stop_reason, message, raw)
+        error = BilibiliError(
+            stop_reason,
+            message,
+            raw,
+            diagnostic_code=diagnostic_code,
+        )
         self._trip_circuit(error)
         raise error
 
@@ -390,7 +433,12 @@ class Session:
             return
 
     # -- 投稿发现 --
-    def discover_medialist(self, mid: str, limit: int) -> list:
+    def discover_medialist(
+        self,
+        mid: str,
+        limit: int,
+        date_range: tuple[str | None, str | None] | None = None,
+    ) -> list:
         """首选：medialist/resource/list 游标分页（免 wbi、免频控、返回完整 cnt_info）。
 
         相比 arc/search 的优势（T6 实测，2026-07-23）：
@@ -405,33 +453,58 @@ class Session:
           copy_right: 1=原创, 2=转载
         """
         out: list = []
+        seen_bvids: set[str] = set()
         oid = "0"
         size = 20
         for _ in range(20):  # 上限保护
-            data = self.get_json(
-                "/x/v2/medialist/resource/list",
-                {
-                    "mobi_app": "web",
-                    "type": "1",
-                    "biz_id": mid,
-                    "oid": oid,
-                    "size": size,
-                },
-                wbi=False,
-                retry=3,
-            )
+            try:
+                data = self.get_json(
+                    "/x/v2/medialist/resource/list",
+                    {
+                        "mobi_app": "web",
+                        "type": "1",
+                        "biz_id": mid,
+                        "oid": oid,
+                        "size": size,
+                    },
+                    wbi=False,
+                    retry=3,
+                )
+            except BilibiliError as error:
+                error.partial_entries = list(out)
+                _set_diagnostic(error, DIAG_MEDIALIST_DISCOVERY)
+                raise
             if data.get("code") != 0:
                 self.raise_for_task(
                     _stop_reason_for_code(data.get("code")),
                     f"medialist 失败: {data.get('message')}",
+                    diagnostic_code=DIAG_MEDIALIST_DISCOVERY,
                 )
             d = data.get("data") or {}
             media_list = d.get("media_list") or []
             if not media_list:
                 break
-            out.extend(media_list)
-            if len(out) >= limit:
-                return out[:limit]
+            reached_lower_bound = False
+            for item in media_list:
+                bvid = item.get("bv_id") or item.get("bvid")
+                if isinstance(bvid, str) and bvid:
+                    if bvid in seen_bvids:
+                        continue
+                    seen_bvids.add(bvid)
+                published_at = _to_iso(item.get("pubtime"))
+                if _date_matches(published_at, date_range):
+                    out.append(item)
+                    if len(out) >= limit:
+                        return out[:limit]
+                if (
+                    date_range
+                    and date_range[0]
+                    and published_at
+                    and published_at < date_range[0]
+                ):
+                    reached_lower_bound = True
+            if reached_lower_bound:
+                break
             if not d.get("has_more"):
                 break
             # 游标更新为当前页最后一条的 id
@@ -492,36 +565,69 @@ class Session:
                 raise
         return []
 
-    def discover_arc(self, mid: str, limit: int) -> list:
+    def discover_arc(
+        self,
+        mid: str,
+        limit: int,
+        date_range: tuple[str | None, str | None] | None = None,
+    ) -> list:
         """降级 A：wbi 签名的 space 投稿列表(自动翻页至 limit 或末页)。失败抛 BilibiliError 由上层降级。"""
         out: list = []
+        seen_bvids: set[str] = set()
         ps = 50
         pn = 1
         while len(out) < limit:
             if pn > 1:
                 # 翻页时仅节流，始终复用任务创建时的公开身份。
                 time.sleep(6)
-            data = self.get_json(
-                "/x/space/wbi/arc/search",
-                {
-                    "mid": mid,
-                    "ps": ps,
-                    "pn": pn,
-                    "order": "pubdate",
-                    "web_location": WEB_LOCATION_ARC,
-                },
-                wbi=True,
-                retry=3,
-            )
+            try:
+                data = self.get_json(
+                    "/x/space/wbi/arc/search",
+                    {
+                        "mid": mid,
+                        "ps": ps,
+                        "pn": pn,
+                        "order": "pubdate",
+                        "web_location": WEB_LOCATION_ARC,
+                    },
+                    wbi=True,
+                    retry=3,
+                )
+            except BilibiliError as error:
+                error.partial_entries = list(out)
+                _set_diagnostic(error, DIAG_ARC_DISCOVERY)
+                raise
             if data.get("code") != 0:
                 self.raise_for_task(
-                    _stop_reason_for_code(data.get("code")), "arc/search 失败"
+                    _stop_reason_for_code(data.get("code")),
+                    "arc/search 失败",
+                    diagnostic_code=DIAG_ARC_DISCOVERY,
                 )
             vlist = (data.get("data") or {}).get("list", {}).get("vlist", [])
             if not vlist:
                 break
-            out.extend(vlist)
-            if len(vlist) < ps:
+            reached_lower_bound = False
+            for item in vlist:
+                bvid = item.get("bvid")
+                if isinstance(bvid, str) and bvid:
+                    if bvid in seen_bvids:
+                        continue
+                    seen_bvids.add(bvid)
+                published_at = _to_iso(
+                    item.get("created") or item.get("pubdate")
+                )
+                if _date_matches(published_at, date_range):
+                    out.append(item)
+                    if len(out) >= limit:
+                        return out[:limit]
+                if (
+                    date_range
+                    and date_range[0]
+                    and published_at
+                    and published_at < date_range[0]
+                ):
+                    reached_lower_bound = True
+            if reached_lower_bound or len(vlist) < ps:
                 break  # 已到末页
             pn += 1
         return out[:limit]
@@ -532,7 +638,9 @@ class Session:
         name = (card.get("data") or {}).get("card", {}).get("name", "")
         if not name:
             self.raise_for_task(
-                STOP_PARSER_FAILED, f"无法解析昵称进行 search 降级 (mid={mid})"
+                STOP_PARSER_FAILED,
+                f"无法解析昵称进行 search 降级 (mid={mid})",
+                diagnostic_code=DIAG_SEARCH_DISCOVERY,
             )
         data = self.get_json(
             "/x/web-interface/search/type",
@@ -542,6 +650,7 @@ class Session:
             self.raise_for_task(
                 _stop_reason_for_code(data.get("code")),
                 "search/type 降级失败",
+                diagnostic_code=DIAG_SEARCH_DISCOVERY,
             )
         res_data = data.get("data") or {}
         target = next(
@@ -550,10 +659,19 @@ class Session:
             None,
         )
         if not target:
-            self.raise_for_task(STOP_PARSER_FAILED, "search/type 未匹配到该账号")
+            self.raise_for_task(
+                STOP_PARSER_FAILED,
+                "search/type 未匹配到该账号",
+                diagnostic_code=DIAG_SEARCH_DISCOVERY,
+            )
         return [it["bvid"] for it in target.get("res", []) if it.get("bvid")][:limit]
 
-    def discover_dynamics(self, mid: str, limit: int) -> list:
+    def discover_dynamics(
+        self,
+        mid: str,
+        limit: int,
+        date_range: tuple[str | None, str | None] | None = None,
+    ) -> list:
         """空间动态 feed（视频类动态）。WBI 签名 + web_location=333.1007。
 
         分页用 offset + has_more；B站动态 feed 偶发返回空页（has_more 仍为 true），
@@ -566,30 +684,38 @@ class Session:
         for _ in range(20):
             if out and offset:
                 time.sleep(1.0)  # 分页间隔，降低被风控概率
-            data = self.get_json(
-                "/x/polymer/web-dynamic/v1/feed/space",
-                {
-                    "host_mid": mid,
-                    "offset": offset,
-                    "timeline_ad": "true",
-                    "web_location": WEB_LOCATION_SPACE,
-                },
-                wbi=True,
-                retry=3,
-            )
+            try:
+                data = self.get_json(
+                    "/x/polymer/web-dynamic/v1/feed/space",
+                    {
+                        "host_mid": mid,
+                        "offset": offset,
+                        "timeline_ad": "true",
+                        "web_location": WEB_LOCATION_SPACE,
+                    },
+                    wbi=True,
+                    retry=3,
+                )
+            except BilibiliError as error:
+                error.partial_entries = list(out)
+                _set_diagnostic(error, DIAG_DYNAMIC_DISCOVERY)
+                raise
             if data.get("code") != 0:
                 self.raise_for_task(
                     _stop_reason_for_code(data.get("code")),
                     "动态 feed 请求失败",
+                    diagnostic_code=DIAG_DYNAMIC_DISCOVERY,
                 )
             d = data.get("data") or {}
             items = d.get("items") or []
             for it in items:
                 card = _extract_dynamic_card(it)
                 if card:
-                    out.append(card)
-                    if len(out) >= limit:
-                        return out[:limit]
+                    published_at = _to_iso(card.get("pub_ts"))
+                    if _date_matches(published_at, date_range):
+                        out.append(card)
+                        if len(out) >= limit:
+                            return out[:limit]
             if not items:
                 empty_streak += 1
                 if empty_streak >= 2:
@@ -646,6 +772,22 @@ def _to_iso(ts: Any) -> str | None:
         return None
 
 
+def _date_matches(
+    published_at: str | None,
+    date_range: tuple[str | None, str | None] | None,
+) -> bool:
+    if date_range is None:
+        return True
+    if published_at is None:
+        return False
+    date_from, date_to = date_range
+    if date_from and published_at < date_from:
+        return False
+    if date_to and published_at > date_to:
+        return False
+    return True
+
+
 def _extract_hashtags(*texts: Any) -> list[str]:
     """从文本中按 #标签# 形式提取话题标签。"""
     tags: list[str] = []
@@ -680,6 +822,79 @@ def _mid_from_url(url: str) -> str:
     return m.group(1)
 
 
+def _mark_detail_unavailable(post: dict) -> None:
+    """Keep list evidence while declaring that detail enrichment failed."""
+    post["collection_status"] = "PARTIAL"
+    metrics = post.get("platform_metrics")
+    metrics = dict(metrics) if isinstance(metrics, dict) else {}
+    metrics["detail_status"] = "UNAVAILABLE"
+    post["platform_metrics"] = metrics
+
+
+def _mark_post_deleted(post: dict) -> None:
+    """Keep stale list evidence while recording an explicit deleted detail."""
+    post["collection_status"] = "DELETED"
+    metrics = post.get("platform_metrics")
+    metrics = dict(metrics) if isinstance(metrics, dict) else {}
+    metrics["detail_status"] = "DELETED"
+    post["platform_metrics"] = metrics
+
+
+def _mark_tags_unavailable(post: dict) -> None:
+    """Declare optional tag enrichment incomplete without losing list data."""
+    post["collection_status"] = "PARTIAL"
+    metrics = post.get("platform_metrics")
+    metrics = dict(metrics) if isinstance(metrics, dict) else {}
+    metrics["tags_status"] = "UNAVAILABLE"
+    post["platform_metrics"] = metrics
+
+
+def _raise_with_partial_posts(
+    error: BilibiliError,
+    posts: list[dict],
+    current: dict | None = None,
+) -> None:
+    partial_posts = list(posts)
+    if current is not None:
+        partial_posts.append(current)
+    error.partial_posts = partial_posts
+    raise error
+
+
+def _deduplicate_discovery_entries(entries: list[dict]) -> list[dict]:
+    """Keep the first public observation for each post before enrichment."""
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        post_id = (
+            entry.get("bvid")
+            or entry.get("bv_id")
+            or str(entry.get("aid") or "")
+        )
+        if not post_id or post_id == "None" or post_id in seen:
+            continue
+        seen.add(post_id)
+        unique.append(entry)
+    return unique
+
+
+def _deduplicate_dynamic_cards(cards: list[dict]) -> list[dict]:
+    """Keep the first dynamic observation for each BV before merging."""
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        post_id = card.get("bvid")
+        if not isinstance(post_id, str) or not post_id or post_id in seen:
+            continue
+        seen.add(post_id)
+        unique.append(card)
+    return unique
+
+
 # --------------------------------------------------------------------------
 # 适配器
 # --------------------------------------------------------------------------
@@ -689,12 +904,18 @@ class BilibiliCollector(BaseCollector):
     def __init__(self, browser_fallback: bool | None = None):
         self.browser_fallback = browser_fallback
         self._task_session: Session | None = None
+        self._cached_profile_card: dict | None = None
+        self._collection_coverage: dict[str, Any] = {}
 
     def _new_session(self) -> Session:
         """Return the collector task's single shared session."""
         if self._task_session is None:
             self._task_session = Session(browser_fallback=self.browser_fallback)
         return self._task_session
+
+    def get_collection_coverage(self) -> dict[str, Any]:
+        """Return a copy of the safe regular/dynamic observation ledger."""
+        return dict(self._collection_coverage)
 
     # -- 路由 --
     def supports(self, url: str) -> bool:
@@ -713,6 +934,11 @@ class BilibiliCollector(BaseCollector):
         mid = _mid_from_url(url)
         s = self._new_session()
         s.ensure_buvid()
+        self._collection_coverage = {
+            "regular_observed_count": 0,
+            "dynamic_status": "NOT_ATTEMPTED",
+            "dynamic_observed_count": 0,
+        }
         # 免 wbi 端点优先：card 稳定，relation/stat 偶发被风控(-400/-412)。
         # 任一成功即视为可访问；仅两端点都失败才报受限。
         last: BilibiliError | None = None
@@ -729,6 +955,8 @@ class BilibiliCollector(BaseCollector):
                 continue
             code = data.get("code")
             if code == 0:
+                if path == "/x/web-interface/card":
+                    self._cached_profile_card = data
                 return {"accessible": True, "status": "normal", "stop_reason": None}
             if code == -404:
                 return {"accessible": False, "status": "account_not_exist", "stop_reason": STOP_ACCOUNT_UNAVAILABLE}
@@ -745,34 +973,117 @@ class BilibiliCollector(BaseCollector):
         s = self._new_session()
         s.ensure_buvid()
 
-        # card(免wbi) 稳定保底；关注数优先 relation/stat，失败用 card.fans 兜底
-        card = s.get_json("/x/web-interface/card", {"mid": mid})
-        stat = None
-        try:
-            stat = s.get_json("/x/relation/stat", {"mid": mid}, retry=2)
-            if stat.get("code") != 0:
-                stat = None
-        except BilibiliError as error:
-            if _is_platform_protection(error):
-                raise
-            stat = None
+        # ``check_access`` 已通过同一公开 card 响应确认账号可访问。复用该证据既避免
+        # 重复请求，也保证列表阶段稍后触发断路时资料不会被清空。card 已覆盖 P0
+        # 资料字段；高风险 acc/info 不再作为完成 P0 资料的前置条件。
+        card = self._cached_profile_card
+        if card is None:
+            card = s.get_json("/x/web-interface/card", {"mid": mid})
+            self._cached_profile_card = card
+        return self.normalize_profile(_build_profile_raw(mid, card, None, None))
 
-        # acc/info(wbi + web_location) 作富字段增强，失败不影响主路径
-        acc = None
-        try:
-            acc_raw = s.get_json(
-                "/x/space/wbi/acc/info",
-                {"mid": mid, "web_location": WEB_LOCATION_SPACE},
-                wbi=True,
+    def _normalize_discovery_entries(
+        self,
+        entries: list[dict],
+        source: str,
+        account_url: str,
+        pinned_observed: bool,
+        pinned_bvid: str | None,
+    ) -> list[dict]:
+        """Normalize already-observed list pages without making more requests."""
+        posts: list[dict] = []
+        for entry in _deduplicate_discovery_entries(entries):
+            if not isinstance(entry, dict):
+                continue
+            bvid = (
+                entry.get("bvid")
+                or entry.get("bv_id")
+                or str(entry.get("aid") or "")
             )
-            if acc_raw.get("code") == 0:
-                acc = acc_raw.get("data")
-        except BilibiliError as error:
-            if _is_platform_protection(error):
-                raise
-            acc = None
+            if not bvid or bvid == "None":
+                continue
+            if source == "medialist":
+                base = _build_post_raw_from_medialist(entry, account_url)
+            elif source == "arc":
+                base = _build_post_raw_from_vlist(entry, account_url)
+                _mark_detail_unavailable(base)
+            else:
+                base = _empty_post(str(bvid))
+                _mark_detail_unavailable(base)
+            if pinned_observed:
+                base["is_pinned"] = bool(
+                    pinned_bvid is not None and bvid == pinned_bvid
+                )
+            base["field_visibility"] = _post_field_visibility(base)
+            posts.append(self.normalize_post(base))
+        return posts
 
-        return self.normalize_profile(_build_profile_raw(mid, card, stat, acc))
+    def _merge_dynamic_cards(
+        self,
+        posts: list[dict],
+        cards: list[dict],
+        *,
+        pinned_observed: bool,
+        pinned_bvid: str | None,
+    ) -> list[dict]:
+        """Merge dynamic evidence by BV without duplicating regular posts."""
+        by_id = {
+            str(post.get("post_id")): post
+            for post in posts
+            if post.get("post_id") is not None
+        }
+        for card in _deduplicate_dynamic_cards(cards):
+            dynamic_post = self.normalize_post(_build_dynamic_raw(card))
+            post_id = str(dynamic_post.get("post_id") or "")
+            if not post_id:
+                continue
+            existing = by_id.get(post_id)
+            if existing is not None:
+                existing_metrics = existing.get("platform_metrics")
+                existing_metrics = (
+                    dict(existing_metrics)
+                    if isinstance(existing_metrics, dict)
+                    else {}
+                )
+                dynamic_metrics = dynamic_post.get("platform_metrics") or {}
+                existing_metrics["appeared_in_dynamic_feed"] = True
+                existing_metrics["dynamic"] = dynamic_metrics.get("dynamic")
+                if dynamic_metrics.get("collection_evidence_status") == "OBSERVED":
+                    existing_metrics["collection_evidence_status"] = "OBSERVED"
+                elif (
+                    existing_metrics.get("collection_evidence_status")
+                    in {None, "UNAVAILABLE"}
+                ):
+                    existing_metrics["collection_evidence_status"] = (
+                        dynamic_metrics.get("collection_evidence_status")
+                    )
+                for key in (
+                    "is_in_collection",
+                    "series_name",
+                    "season_id",
+                ):
+                    if existing_metrics.get(key) is None:
+                        existing_metrics[key] = dynamic_metrics.get(key)
+                existing["platform_metrics"] = existing_metrics
+                continue
+            if pinned_observed:
+                dynamic_post["is_pinned"] = bool(
+                    pinned_bvid is not None and post_id == pinned_bvid
+                )
+                dynamic_post["field_visibility"]["is_pinned"] = "visible"
+            posts.append(dynamic_post)
+            by_id[post_id] = dynamic_post
+        return posts
+
+    @staticmethod
+    def _sort_posts(posts: list[dict]) -> None:
+        posts.sort(
+            key=lambda post: (
+                post.get("published_at") is not None,
+                post.get("published_at") or "",
+            ),
+            reverse=True,
+        )
 
     # -- 视频列表 --
     def collect_post_list(
@@ -785,6 +1096,11 @@ class BilibiliCollector(BaseCollector):
         mid = _mid_from_url(url)
         s = self._new_session()
         s.ensure_buvid()
+        self._collection_coverage = {
+            "regular_observed_count": 0,
+            "dynamic_status": "NOT_ATTEMPTED",
+            "dynamic_observed_count": 0,
+        }
 
         # 置顶视频检测（top/arc，免 wbi、稳定）——用于标记 is_pinned
         pinned_result = s.collect_pinned(mid)
@@ -807,20 +1123,58 @@ class BilibiliCollector(BaseCollector):
 
         # 首选：medialist/resource/list（免 wbi、返回完整 cnt_info、无 412 风控）
         try:
-            entries = s.discover_medialist(mid, limit)
+            entries = (
+                s.discover_medialist(mid, limit, date_range=date_range)
+                if date_range
+                else s.discover_medialist(mid, limit)
+            )
             source = "medialist"
         except BilibiliError as error:
+            _set_diagnostic(error, DIAG_MEDIALIST_DISCOVERY)
             if _is_platform_protection(error):
+                partial_entries = _deduplicate_discovery_entries(
+                    error.partial_entries
+                )
+                self._collection_coverage.update({
+                    "regular_source": "medialist",
+                    "regular_observed_count": len(partial_entries),
+                })
+                error.partial_posts = self._normalize_discovery_entries(
+                    partial_entries,
+                    "medialist",
+                    url,
+                    pinned_observed,
+                    pinned_bvid,
+                )
                 raise
             entries = None
 
         # 降级 A：arc/search（wbi + web_location=333.1387）
         if not entries:
             try:
-                entries = s.discover_arc(mid, limit)
+                entries = (
+                    s.discover_arc(mid, limit, date_range=date_range)
+                    if date_range
+                    else s.discover_arc(mid, limit)
+                )
                 source = "arc"
             except BilibiliError as error:
+                _set_diagnostic(error, DIAG_ARC_DISCOVERY)
                 if _is_platform_protection(error):
+                    partial_entries = _deduplicate_discovery_entries(
+                        error.partial_entries
+                    )
+                    self._collection_coverage.update({
+                        "regular_source": "arc",
+                        "regular_observed_count": len(partial_entries),
+                    })
+                    error.partial_posts = self._normalize_discovery_entries(
+                        partial_entries,
+                        "arc",
+                        url,
+                        pinned_observed,
+                        pinned_bvid,
+                    )
                     raise
                 entries = None
 
@@ -831,7 +1185,81 @@ class BilibiliCollector(BaseCollector):
                 entries = [{"bvid": b} for b in bvids]
                 source = "search"
             except BilibiliError as e:
+                _set_diagnostic(e, DIAG_SEARCH_DISCOVERY)
                 raise e
+
+        entries = _deduplicate_discovery_entries(entries)
+        self._collection_coverage.update({
+            "regular_source": source,
+            "regular_observed_count": len(entries),
+        })
+
+        # 动态发现优先于逐条 view/tag 补充。它只发起一次列表阶段，并在任何平台
+        # 保护响应后立刻停止；这样不会把 fragile WBI 观察放到几十次可选标签请求之后。
+        dynamic_cards: list[dict] = []
+        discover_dynamics = getattr(s, "discover_dynamics", None)
+        if callable(discover_dynamics):
+            try:
+                dynamic_cards = (
+                    discover_dynamics(mid, limit, date_range=date_range)
+                    if date_range
+                    else discover_dynamics(mid, limit)
+                )
+                dynamic_cards = _deduplicate_dynamic_cards(dynamic_cards)
+                self._collection_coverage.update({
+                    "dynamic_status": "OBSERVED",
+                    "dynamic_observed_count": len(dynamic_cards),
+                })
+            except BilibiliError as error:
+                _set_diagnostic(error, DIAG_DYNAMIC_DISCOVERY)
+                dynamic_cards = _deduplicate_dynamic_cards(
+                    error.partial_entries
+                )
+                dynamic_status = (
+                    error.stop_reason
+                    if error.stop_reason in BILIBILI_DYNAMIC_STATUSES
+                    else STOP_PARSER_FAILED
+                )
+                self._collection_coverage.update({
+                    "dynamic_status": dynamic_status,
+                    "dynamic_observed_count": len(dynamic_cards),
+                })
+                partial_posts = self._normalize_discovery_entries(
+                    entries,
+                    source,
+                    url,
+                    pinned_observed,
+                    pinned_bvid,
+                )
+                self._merge_dynamic_cards(
+                    partial_posts,
+                    dynamic_cards,
+                    pinned_observed=pinned_observed,
+                    pinned_bvid=pinned_bvid,
+                )
+                self._sort_posts(partial_posts)
+                error.partial_posts = partial_posts[:limit]
+                raise
+            except Exception:
+                self._collection_coverage.update({
+                    "dynamic_status": STOP_PARSER_FAILED,
+                    "dynamic_observed_count": 0,
+                })
+                partial_posts = self._normalize_discovery_entries(
+                    entries,
+                    source,
+                    url,
+                    pinned_observed,
+                    pinned_bvid,
+                )
+                raise BilibiliError(
+                    STOP_PARSER_FAILED,
+                    "动态 feed 解析失败",
+                    partial_posts=partial_posts[:limit],
+                    diagnostic_code=DIAG_DYNAMIC_DISCOVERY,
+                ) from None
+        else:
+            self._collection_coverage["dynamic_status"] = "UNAVAILABLE"
 
         posts = []
         any_view_ok = False
@@ -850,44 +1278,53 @@ class BilibiliCollector(BaseCollector):
                 # arc/search vlist 缺 like/coin/favorite/share，用 view 补全
                 try:
                     v = s.get_json("/x/web-interface/view", {"bvid": bvid})
-                    if v.get("code") == 0:
-                        base = _build_post_raw_from_view(v["data"], url)
+                    view_data = v.get("data") if isinstance(v, dict) else None
+                    if v.get("code") == 0 and isinstance(view_data, dict):
+                        base = _build_post_raw_from_view(view_data, url)
                         any_view_ok = True
+                    elif v.get("code") == -404:
+                        _mark_post_deleted(base)
+                    else:
+                        _mark_detail_unavailable(base)
                 except BilibiliError as error:
+                    _set_diagnostic(error, DIAG_VIEW_DETAIL)
                     if _is_platform_protection(error):
-                        raise
-                    pass  # 保留 vlist 级数据（honest null）
+                        _mark_detail_unavailable(base)
+                        _raise_with_partial_posts(
+                            error, posts, self.normalize_post(base)
+                        )
+                    if error.stop_reason == STOP_ACCOUNT_UNAVAILABLE:
+                        _mark_post_deleted(base)
+                    else:
+                        _mark_detail_unavailable(base)
+                except Exception:
+                    _mark_detail_unavailable(base)
             else:
                 base = _empty_post(bvid)
                 # search 降级仅有 BV，必须 view 补全
                 try:
                     v = s.get_json("/x/web-interface/view", {"bvid": bvid})
-                    if v.get("code") == 0:
-                        base = _build_post_raw_from_view(v["data"], url)
+                    view_data = v.get("data") if isinstance(v, dict) else None
+                    if v.get("code") == 0 and isinstance(view_data, dict):
+                        base = _build_post_raw_from_view(view_data, url)
                         any_view_ok = True
+                    elif v.get("code") == -404:
+                        _mark_post_deleted(base)
+                    else:
+                        _mark_detail_unavailable(base)
                 except BilibiliError as error:
+                    _set_diagnostic(error, DIAG_VIEW_DETAIL)
                     if _is_platform_protection(error):
-                        raise
-                    pass
-
-            # 权威标签补全：普通不可用不影响主流程；平台保护响应必须立即停止。
-            try:
-                api_tags = s.collect_tags(bvid)
-            except BilibiliError as error:
-                if _is_platform_protection(error):
-                    raise
-                api_tags = []
-            except Exception:
-                api_tags = []
-            if api_tags:
-                base_tags = base.get("hashtags") or []
-                if isinstance(base_tags, str):
-                    base_tags = [t for t in base_tags.replace("|", ",").split(",") if t.strip()]
-                merged = list(base_tags)
-                for t in api_tags:
-                    if t and t not in merged:
-                        merged.append(t)
-                base["hashtags"] = merged
+                        _mark_detail_unavailable(base)
+                        _raise_with_partial_posts(
+                            error, posts, self.normalize_post(base)
+                        )
+                    if error.stop_reason == STOP_ACCOUNT_UNAVAILABLE:
+                        _mark_post_deleted(base)
+                    else:
+                        _mark_detail_unavailable(base)
+                except Exception:
+                    _mark_detail_unavailable(base)
 
             # 置顶标记
             if pinned_observed:
@@ -895,7 +1332,17 @@ class BilibiliCollector(BaseCollector):
                     pinned_bvid is not None and bvid == pinned_bvid
                 )
 
+            base["field_visibility"] = _post_field_visibility(base)
+
             posts.append(self.normalize_post(base))
+
+        self._merge_dynamic_cards(
+            posts,
+            dynamic_cards,
+            pinned_observed=pinned_observed,
+            pinned_bvid=pinned_bvid,
+        )
+        self._sort_posts(posts)
 
         if not posts:
             raise BilibiliError(
@@ -921,7 +1368,44 @@ class BilibiliCollector(BaseCollector):
             raise BilibiliError(
                 STOP_PARSER_FAILED,
                 f"search 降级且全部 view 补全失败 (mid={mid})",
+                partial_posts=posts,
+                diagnostic_code=DIAG_VIEW_DETAIL,
             )
+
+        # 仅对最终去重且会落盘的作品补标签，每个 BV 最多一次。动态或其他列表阶段
+        # 一旦触发保护，函数已在上方停止，不会继续发起这些可选请求。
+        posts = posts[:limit]
+        for post in posts:
+            if str(post.get("collection_status") or "").upper() == "DELETED":
+                continue
+            post_id = str(post.get("post_id") or "")
+            if not post_id:
+                continue
+            try:
+                api_tags = s.collect_tags(post_id)
+            except BilibiliError as error:
+                _set_diagnostic(error, DIAG_TAG_ENRICHMENT)
+                if _is_platform_protection(error):
+                    _mark_tags_unavailable(post)
+                    error.partial_posts = list(posts)
+                    raise
+                api_tags = []
+            except Exception:
+                api_tags = []
+            if not api_tags:
+                continue
+            base_tags = post.get("hashtags") or []
+            if isinstance(base_tags, str):
+                base_tags = [
+                    tag
+                    for tag in base_tags.replace("|", ",").split(",")
+                    if tag.strip()
+                ]
+            merged = list(base_tags)
+            for tag in api_tags:
+                if tag and tag not in merged:
+                    merged.append(tag)
+            post["hashtags"] = merged
         return posts
 
     # -- 单条详情 --
@@ -1045,24 +1529,34 @@ def _build_profile_raw(mid, card, stat, acc) -> dict:
     stat_d = (stat or {}).get("data") or {}
     acc_d = acc or {}
     official = card_d.get("official") or card_d.get("official_verify") or {}
-    verified = official.get("type") not in (None, -1, 0, 127)
+    official_type = official.get("type") if isinstance(official, dict) else None
+    if isinstance(official_type, bool) or not isinstance(official_type, int):
+        verified = None
+    elif official_type in (-1, 127):
+        verified = False
+    else:
+        verified = official_type >= 0
     name = card_d.get("name") or acc_d.get("name")
     bio = card_d.get("sign") or acc_d.get("sign")
     # 等级：优先 acc/info 顶层 level（card.level_info 在 acc 响应中不存在，仅作兜底）
-    level = (acc_d.get("level") if acc else None) or (card_d.get("level_info") or {}).get("current_level")
+    level = acc_d.get("level")
+    if level is None:
+        level = (card_d.get("level_info") or {}).get("current_level")
     # 关注数：relation/stat 权威；缺失时用 card.fans 兜底（二者均为公开值）
     followers = stat_d.get("follower")
     if followers is None:
         followers = card_d.get("fans")
     # 投稿数：优先 acc/info，其次 card
-    post_count = (acc_d.get("archive_count") if acc else None) or card_d.get("archive_count")
+    post_count = acc_d.get("archive_count")
+    if post_count is None:
+        post_count = card_d.get("archive_count")
     return {
         "platform": "bilibili",
         "account_id": str(mid),
         "account_name": name,
         "profile_url": f"https://space.bilibili.com/{mid}",
         "bio": bio or None,
-        "verified": bool(verified),
+        "verified": verified,
         "followers": followers,
         "post_count": post_count,
         "level": level,
@@ -1070,8 +1564,12 @@ def _build_profile_raw(mid, card, stat, acc) -> dict:
         "platform_metrics": {},
         "collected_at": _now_iso(),
         "field_visibility": {
+            "account_name": "visible" if name is not None else "hidden",
+            "bio": "visible" if bio else "hidden",
+            "verified": "visible" if verified is not None else "hidden",
             "followers": "visible" if followers is not None else "hidden",
             "post_count": "visible" if post_count is not None else "hidden",
+            "level": "visible" if level is not None else "hidden",
         },
     }
 
@@ -1096,6 +1594,68 @@ def _copyright_repost(value: Any) -> bool | None:
     return None
 
 
+def _normalize_typeid(value: Any) -> int | None:
+    """Canonicalize public numeric partition IDs without coercing booleans."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _partition_evidence(
+    typeid: Any,
+    api_name: Any = None,
+) -> tuple[int | None, str | None, str | None, bool | None]:
+    """Resolve partition from the audited map, then an explicit API name."""
+    canonical_typeid = _normalize_typeid(typeid)
+    if canonical_typeid in TYPENAME_MAP:
+        return (
+            canonical_typeid,
+            TYPENAME_MAP[canonical_typeid],
+            "reference",
+            True,
+        )
+    canonical_name = (
+        api_name.strip()
+        if isinstance(api_name, str) and api_name.strip()
+        else None
+    )
+    if canonical_name is not None:
+        return canonical_typeid, canonical_name, "api", None
+    return canonical_typeid, None, None, None
+
+
+_POST_VISIBILITY_FIELDS = (
+    "published_at",
+    "content_type",
+    "title",
+    "text",
+    "duration_seconds",
+    "hashtags",
+    "is_pinned",
+    "is_repost",
+    "is_promoted",
+    "views",
+    "likes",
+    "comments",
+    "favorites",
+    "shares",
+    "coins",
+    "danmaku",
+)
+
+
+def _post_field_visibility(post: dict) -> dict[str, str]:
+    """Describe visibility from the raw public response, preserving zeroes."""
+    return {
+        field: "visible" if post.get(field) is not None else "hidden"
+        for field in _POST_VISIBILITY_FIELDS
+    }
+
+
 def _build_post_raw_from_medialist(p: dict, url: str) -> dict:
     """medialist/resource/list 条目 → 统一原始字典。
 
@@ -1111,12 +1671,17 @@ def _build_post_raw_from_medialist(p: dict, url: str) -> dict:
         return _empty_post("")
     cnt = p.get("cnt_info") or {}
     copyright = p.get("copy_right")
-    tid = p.get("tid")
+    tid, partition, partition_source, partition_needs_verification = (
+        _partition_evidence(
+            p.get("tid"),
+            p.get("tname") or p.get("typename"),
+        )
+    )
     upper = p.get("upper") or {}
     intro = p.get("intro") or ""
     # 合并 tag API 与文本提取的 hashtags（tag API 更权威，在 collect_post_list 中补充）
     hashtags = _extract_hashtags(p.get("title"), intro)
-    return {
+    raw = {
         "platform": "bilibili",
         "post_id": bvid,
         "post_url": f"{VIDEO}{bvid}",
@@ -1141,13 +1706,19 @@ def _build_post_raw_from_medialist(p: dict, url: str) -> dict:
         "source_url": f"{VIDEO}{bvid}",
         "platform_metrics": {
             "typeid": tid,
-            "partition": TYPENAME_MAP.get(tid),
-            "partition_source": "reference" if tid in TYPENAME_MAP else None,
-            "partition_needs_verification": True if tid in TYPENAME_MAP else None,
+            "partition": partition,
+            "partition_source": partition_source,
+            "partition_needs_verification": partition_needs_verification,
             "owner_mid": upper.get("mid"),
             "owner_name": upper.get("name"),
+            "collection_evidence_status": "UNAVAILABLE",
+            "is_in_collection": None,
+            "series_name": None,
+            "season_id": None,
         },
     }
+    raw["field_visibility"] = _post_field_visibility(raw)
+    return raw
 
 
 def _build_post_raw_from_vlist(p: dict, url: str) -> dict:
@@ -1158,7 +1729,16 @@ def _build_post_raw_from_vlist(p: dict, url: str) -> dict:
     """
     bvid = p.get("bvid") or str(p.get("aid"))
     copyright = p.get("copyright")
-    return {
+    tid, partition, partition_source, partition_needs_verification = (
+        _partition_evidence(
+            p.get("typeid"),
+            p.get("typename") or p.get("tname"),
+        )
+    )
+    comment_count = p.get("comment")
+    if comment_count is None:
+        comment_count = p.get("reply")
+    raw = {
         "platform": "bilibili",
         "post_id": bvid,
         "post_url": f"{VIDEO}{bvid}",
@@ -1173,7 +1753,7 @@ def _build_post_raw_from_vlist(p: dict, url: str) -> dict:
         "is_promoted": None,
         "views": _int(p.get("play")),
         "likes": None,
-        "comments": _int(p.get("comment") or p.get("reply")),
+        "comments": _int(comment_count),
         "favorites": None,
         "shares": None,
         "coins": None,
@@ -1182,13 +1762,19 @@ def _build_post_raw_from_vlist(p: dict, url: str) -> dict:
         "collected_at": _now_iso(),
         "source_url": f"{VIDEO}{bvid}",
         "platform_metrics": {
-            "typeid": p.get("typeid"),
+            "typeid": tid,
             "typename": p.get("typename"),
-            "partition": TYPENAME_MAP.get(p.get("typeid")),
-            "partition_source": "reference" if p.get("typeid") in TYPENAME_MAP else None,
-            "partition_needs_verification": True if p.get("typeid") in TYPENAME_MAP else None,
+            "partition": partition,
+            "partition_source": partition_source,
+            "partition_needs_verification": partition_needs_verification,
+            "collection_evidence_status": "UNAVAILABLE",
+            "is_in_collection": None,
+            "series_name": None,
+            "season_id": None,
         },
     }
+    raw["field_visibility"] = _post_field_visibility(raw)
+    return raw
 
 
 def _build_post_raw_from_view(d: dict, url: str) -> dict:
@@ -1197,9 +1783,27 @@ def _build_post_raw_from_view(d: dict, url: str) -> dict:
     stat = d.get("stat") or {}
     owner = d.get("owner") or {}
     copyright = d.get("copyright")
-    tid = d.get("tid")
-    partition = TYPENAME_MAP.get(tid, d.get("tname"))
-    return {
+    tid, partition, partition_source, partition_needs_verification = (
+        _partition_evidence(d.get("tid"), d.get("tname") or d.get("tname_v2"))
+    )
+    season = d.get("ugc_season") or {}
+    series_name = season.get("title") if isinstance(season, dict) else None
+    season_id = season.get("id") if isinstance(season, dict) else None
+    expected_metrics = {
+        "view": "views",
+        "like": "likes",
+        "reply": "comments",
+        "favorite": "favorites",
+        "share": "shares",
+        "coin": "coins",
+        "danmaku": "danmaku",
+    }
+    missing_detail_metrics = [
+        field
+        for api_key, field in expected_metrics.items()
+        if stat.get(api_key) is None
+    ]
+    raw = {
         "platform": "bilibili",
         "post_id": bvid,
         "post_url": f"{VIDEO}{bvid}",
@@ -1219,22 +1823,43 @@ def _build_post_raw_from_view(d: dict, url: str) -> dict:
         "shares": _int(stat.get("share")),
         "coins": _int(stat.get("coin")),
         "danmaku": _int(stat.get("danmaku")),
-        "collection_status": "ok",
+        "collection_status": (
+            "PARTIAL" if missing_detail_metrics else "ok"
+        ),
         "collected_at": _now_iso(),
-        "source_url": url,
+        "source_url": f"{VIDEO}{bvid}",
         "platform_metrics": {
+            "typeid": tid,
             "partition": partition,
             # 来源标注：静态映射=reference（待官方表核对）；否则回退 API tname=api
-            "partition_source": "reference" if (tid in TYPENAME_MAP) else ("api" if d.get("tname") else None),
-            "partition_needs_verification": True if (tid in TYPENAME_MAP) else None,
+            "partition_source": partition_source,
+            "partition_needs_verification": partition_needs_verification,
             "owner_mid": owner.get("mid"),
             "owner_name": owner.get("name"),
+            "collection_evidence_status": (
+                "OBSERVED"
+                if series_name is not None or season_id is not None
+                else "NOT_OBSERVED"
+            ),
+            "is_in_collection": (
+                True
+                if series_name is not None or season_id is not None
+                else None
+            ),
+            "series_name": series_name,
+            "season_id": season_id,
+            "detail_status": (
+                "INCOMPLETE" if missing_detail_metrics else "COMPLETE"
+            ),
+            "missing_detail_metrics": missing_detail_metrics,
         },
     }
+    raw["field_visibility"] = _post_field_visibility(raw)
+    return raw
 
 
 def _empty_post(bvid: str) -> dict:
-    return {
+    raw = {
         "platform": "bilibili",
         "post_id": bvid,
         "post_url": f"{VIDEO}{bvid}",
@@ -1246,8 +1871,15 @@ def _empty_post(bvid: str) -> dict:
         "collection_status": "ok",
         "collected_at": _now_iso(),
         "source_url": f"{VIDEO}{bvid}",
-        "platform_metrics": {},
+        "platform_metrics": {
+            "collection_evidence_status": "UNAVAILABLE",
+            "is_in_collection": None,
+            "series_name": None,
+            "season_id": None,
+        },
     }
+    raw["field_visibility"] = _post_field_visibility(raw)
+    return raw
 
 
 def _extract_dynamic_card(it: dict) -> dict | None:
@@ -1264,7 +1896,10 @@ def _extract_dynamic_card(it: dict) -> dict | None:
     author = mods.get("module_author") or {}
     md = mods.get("module_dynamic") or {}
     major = md.get("major") or {}
-    arch = major.get("archive") or major.get("ugc_season") or {}
+    season = major.get("ugc_season") or {}
+    arch = major.get("archive") or (
+        season.get("archive") if isinstance(season, dict) else None
+    ) or {}
     bv = arch.get("bvid")
     if not bv:
         return None
@@ -1280,6 +1915,13 @@ def _extract_dynamic_card(it: dict) -> dict | None:
         "bvid": bv,
         "title": arch.get("title"),
         "desc": desc,
+        "duration": arch.get("duration"),
+        "series_name": (
+            season.get("title") if isinstance(season, dict) else None
+        ),
+        "season_id": (
+            season.get("id") if isinstance(season, dict) else None
+        ),
         "pub_ts": pts,
         "pub_time": author.get("pub_time"),
         "is_forward": bool(it.get("orig")) if "orig" in it else None,
@@ -1297,7 +1939,23 @@ def _build_dynamic_raw(card: dict) -> dict:
     """动态卡片 → 统一原始字典（content_type=dynamic）。"""
     bv = card.get("bvid")
     st = card.get("stat") or {}
-    return {
+    metric_values = {
+        "views": _int(st.get("play")),
+        "likes": _int(st.get("like")),
+        "comments": _int(st.get("comment")),
+        "favorites": None,
+        "shares": _int(st.get("forward")),
+        "coins": None,
+        "danmaku": _int(st.get("danmaku")),
+    }
+    missing_detail_metrics = [
+        field for field, value in metric_values.items() if value is None
+    ]
+    has_collection_evidence = bool(
+        card.get("series_name") is not None
+        or card.get("season_id") is not None
+    )
+    raw = {
         "platform": "bilibili",
         "post_id": bv,
         "post_url": f"{VIDEO}{bv}",
@@ -1305,13 +1963,31 @@ def _build_dynamic_raw(card: dict) -> dict:
         "content_type": "dynamic",
         "title": card.get("title"),
         "text": card.get("desc"),
+        "duration_seconds": _parse_duration(card.get("duration")),
+        "hashtags": _extract_hashtags(card.get("title"), card.get("desc")),
         "is_pinned": None,
         "is_repost": card.get("is_forward"),
         "is_promoted": None,
-        "collection_status": "ok",
+        **metric_values,
+        "collection_status": (
+            "PARTIAL" if missing_detail_metrics else "ok"
+        ),
         "collected_at": _now_iso(),
         "source_url": f"{VIDEO}{bv}",
         "platform_metrics": {
+            "appeared_in_dynamic_feed": True,
+            "collection_evidence_status": (
+                "OBSERVED" if has_collection_evidence else "NOT_OBSERVED"
+            ),
+            "is_in_collection": (
+                True if has_collection_evidence else None
+            ),
+            "series_name": card.get("series_name"),
+            "season_id": card.get("season_id"),
+            "detail_status": (
+                "INCOMPLETE" if missing_detail_metrics else "COMPLETE"
+            ),
+            "missing_detail_metrics": missing_detail_metrics,
             "dynamic": {
                 "is_dynamic": True,
                 "pub_ts": card.get("pub_ts"),
@@ -1323,3 +1999,5 @@ def _build_dynamic_raw(card: dict) -> dict:
             },
         },
     }
+    raw["field_visibility"] = _post_field_visibility(raw)
+    return raw

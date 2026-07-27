@@ -42,6 +42,7 @@ workspace/<platform>-<account>-analysis/
   source/collection-task.json       # 原采集 task.json 的逐字节副本
   source/collection-provenance.json # 来源格式、task_id、commit 与 artifact digests
   source/classification-results.json # 可选；严格核验后按原字节封存
+  source/business-insight-results.json # 可选；绑定 collection/taxonomy 摘要后按原字节封存
   normalized-posts.csv             # 从 source/posts.jsonl 重新生成
   normalized-coverage.json         # 归一化覆盖与损失说明
   analysis.json                    # 结构化分析结果
@@ -50,6 +51,7 @@ workspace/<platform>-<account>-analysis/
   task.json                  # 派生任务状态与 phase_results
   pipeline-report.md         # 流水线阶段摘要
   taxonomy-prompt.md         # 可选；请求分类提示时生成
+  business-insights-prompt.md # 可选；分类完成后请求业务洞察时生成
   manifest.json              # 分析产物的确定性清单
   .complete                  # 分析工作区的独立提交点
 ```
@@ -72,14 +74,16 @@ workspace/<platform>-<account>-analysis/
 即使存在旧 `normalized-posts.csv` 也必须忽略，以 `source/posts.jsonl` 重建。
 
 分析工作区的 `.complete` 只代表文件集合已持久提交。`task.json.task_status=COMPLETED` 还要求
-上游采集完整、归一化无损、语义分类完整且渲染校验全部通过；有效但受限的采集输入或
-`pending-model` / `partial-model` 分类写 `PARTIAL`。分析阶段只在语义分类为
-`completed` 且高低表现证据覆盖明确为 `COMPLETE` 时才能为 `COMPLETED`。
+上游采集完整、归一化无损、语义分类完整、已请求的业务洞察完整且渲染校验全部通过；有效但受限的采集输入、
+`pending-model` / `partial-model` 分类，或已请求但未完成的业务洞察都写 `PARTIAL`。分析阶段只在语义分类为
+`completed`、高低表现证据覆盖明确为 `COMPLETE`，且 `business_insight_required=true` 时业务洞察也为
+`completed`，才能为 `COMPLETED`。
 `task.json.phase_results` 必须包含
 `collection_input=VERIFIED`、`normalization/analysis=COMPLETED|PARTIAL`、
 `render=COMPLETED`、`validation=COMPLETED`。`task.json.partial_reasons` 按实际情况列出
 `UPSTREAM_COLLECTION_PARTIAL`、`NORMALIZATION_PARTIAL`、`PENDING_CLASSIFICATION`、
-`PARTIAL_CLASSIFICATION`、`EVIDENCE_INCOMPLETE` 或无法更具体归因时的
+`PARTIAL_CLASSIFICATION`、`PENDING_BUSINESS_INSIGHTS`、`PARTIAL_BUSINESS_INSIGHTS`、
+`EVIDENCE_INCOMPLETE` 或无法更具体归因时的
 `ANALYSIS_PARTIAL`；多个独立原因按稳定顺序并存且不得重复。无部分原因时为空数组。
 相同状态与原因必须同步进入 `analysis.json.meta`
 和最终报告，不能让派生任务与报告继续显示上游任务状态。
@@ -98,6 +102,30 @@ workspace/<platform>-<account>-analysis/
 `classification_status=completed` 且 `classification_version=llm-1`；分析阶段是否为
 `COMPLETED` 还取决于证据覆盖完整性。原输入字节作为
 `source/classification-results.json` 纳入分析清单，不记录其本地路径。
+
+分类 Prompt 中的公开标题、正文和标签属于不可信数据，必须以单行 JSON 记录隔离并明确禁止执行其内指令；
+JSON 对象重复键、NaN 与 Infinity 均拒绝。`topic` 除 `unknown` 外必须为 2–10 字符且至少含一个汉字。
+B站只有 `platform_metrics.opening_text` 提供公开开头证据时才允许具体 `hook_type`，否则强制 `unknown`；
+`is_original` 必须等于公开 `is_repost` 的逻辑反值，转载证据未知时为 `null`。
+
+### 2.2 完整业务洞察输入
+
+`--business-insight-results` 只接受 UTF-8 严格 JSON 对象，并同时绑定
+`collection_commit_sha256` 与 `classification_results_sha256`。根对象固定包含：
+
+- `schema_version=1`、`model_version=llm-insight-1` 与上述两个 SHA-256；
+- `account_positioning`：恰好 5 项——`target_audience`、`content_domain`、
+  `value_proposition`、`persona_expression`、`follow_reason`；
+- `performance_patterns`：按固定顺序恰好 6 项——高/低表现各自的标题、公开文案开头、公开文案结构；
+- `topic_ideas` 恰好 10 项、`content_modes` 恰好 5 项、`experiments` 恰好 4 项；
+- `limitations`：最多 20 条单行文本。
+
+每个普通洞察必须包含至少一条 `{post_id, source_field, excerpt}` 证据；脚本要求摘录与冻结父作品字段逐字绑定，
+再由父作品补全平台、规范作品 URL、URL 类型和 `collected_at`。模型不得提交或修改 URL、指标、排名和采集时间。
+高/低表现组三类模式的证据并集各至少覆盖 3 个对应组作品。公开视频文案无法支持“开头”或“结构”时，
+该模式必须显式写 `observability=not_observable` 与 limitation；此时业务洞察状态为 `partial-model`，不得伪造。
+只有全部合同与作品证据完整时 `business_insight_status=completed`。原输入字节封存为
+`source/business-insight-results.json`。
 
 最终标记的 `fsync` 最多尝试三次；提交后的用户路径核验遇 I/O 错误时也最多尝试三次。
 最终标记 `fsync` 持续失败，或标记已经成功同步但用户路径核验持续发生 I/O 错误时，提交状态为
@@ -155,6 +183,10 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 | evidence_is_exhaustive | boolean | 否 | 是 | false | 索引降级固定为 `false` |
 | collection_coverage | object | 否 | 否 | 见 §3.1 / §3.2 | 公开页面或授权 OpenAPI 列表采集的覆盖与完备性账本；普通限量采集可为 `{}` |
 | comment_collection | object | 否 | 否 | 见 §3.3 | 评论采样结果计数；未请求时为 `{}` |
+| started_at | datetime | 是 | 否 | 2026-07-27T15:28:54+08:00 | 本次进程开始时间；必须带时区 |
+| ended_at | datetime | 是 | 否 | 2026-07-27T15:29:09+08:00 | 最终任务产物准备完成前的结束快照；必须带时区且不早于开始时间 |
+| duration_ms | integer | 是 | 否 | 15734 | 由 monotonic clock 计算的非负总毫秒数 |
+| phase_durations_ms | object | 是 | 否 | `{collect_post_list: 15016}` | 固定阶段名到非负整数毫秒的映射；重复阶段累加 |
 
 约束：
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
@@ -171,8 +203,12 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 - 执行前向用户回显 `platform`、`requested_limit`、`date_from`/`date_to`、`include_comments`。
 - Web 索引降级必须设置 `task_status=PARTIAL`、保留真实上游 `stop_reason`，并填写来源与
   快照字段；未知快照时间保持 `null`，可单独保存来源显示的 `snapshot_age_label`。
+- `diagnostic_code` 只能是内部固定的 `[A-Z][A-Z0-9_]{0,63}` 安全枚举；不能保存适配器
+  异常文本、响应或查询。错误日志的 `occurred_at` 必须在捕获该事件时生成，不得复用任务
+  初始化时的 `collected_at`。
 - `source/index-evidence.json` 不是搜索引擎 HTML 或连接器原始转储。Agent 先核验公开来源，
   导入脚本再只持久化白名单字段；Cookie、请求头、内部引用、签名参数和原始页面正文不得落盘。
+- 公开采集阶段名为 `check_access`、`collect_post_list`、`collect_profile`、可选 `collect_post_detail` 与 `persist`；分析阶段名为 `collection_input`、`normalization`、`analysis`、`render`、`validation`。耗时字段提供可观测性，不能单独证明 PRD 的真实 30 条性能门槛。
 
 ### 3.1 collection_coverage 覆盖与完备性账本
 
@@ -193,6 +229,8 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 | `range_match_count` | integer | 日期范围过滤后保留的作品数量 |
 | `range_no_match` | boolean | 已观察到有效作品但日期范围内匹配数为零 |
 | `stop_condition` | enum | `terminal_page` / `idle` / `timeout` / `repeated_cursor` / `max_items` / `max_scrolls` / `date_lower_bound` |
+| `restriction_source` | enum | 抖音临时浏览器明确看到限制页时固定为 `browser_visible_text`；其他来源不得伪造该值 |
+| `restriction_marker` | enum | 与根级停止原因绑定的安全枚举：`LOGIN_WALL_VISIBLE` / `VERIFICATION_CHALLENGE_VISIBLE` / `ACCESS_RESTRICTION_VISIBLE` / `ACCOUNT_UNAVAILABLE_VISIBLE` / `NO_PUBLIC_CONTENT_VISIBLE` |
 
 只有精确 HTTP 200、可选顶层 `status_code` / `error_code` 为整数 0 的已验证作品列表载荷上的显式 `has_more=false`，并且会话内每个可能属于目标账号的列表
 候选都合并成一个经过账号绑定、作品身份和列表结构校验、且候选内分页事实一致的逻辑页，才可以令
@@ -207,6 +245,7 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 `unresolved_account_post_count` 与 `failed_account_post_count`，不得记录响应内容或查询值。
 空闲、超时、重复游标、数量/滚动预算或日期边界停止也都属于非穷尽结果；若已保留作品，
 任务状态为 `PARTIAL`。原始游标、请求头、查询字符串、响应正文和请求体不得写入账本或其他任务产物。
+可见限制页的原始文字同样不得落盘；`restriction_source` 与 `restriction_marker` 必须成对出现并通过固定映射校验，不能保存页面正文、选择器或命中文案。
 当公开列表已验证到末页、存在有效数字作品 ID，但日期范围过滤后为零条时，任务可以
 `COMPLETED`；此时 `observed_post_count>0`、`range_filter_applied=true`、
 `range_match_count=0`、`range_no_match=true`，不得与账号原始公开作品列表为空混淆。
@@ -214,6 +253,21 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 公开 `--all` 的默认预算固定为 `max_items=10,000`、`max_seconds=1,800`、
 `max_scrolls=2,000`；允许显式上调，但硬上限分别为 `50,000`、`14,400` 秒和
 `20,000` 轮。零值、负值、非有限秒数、类型不符和超过硬上限都必须拒绝，不得静默钳制。
+
+B站限量采集复用 `collection_coverage` 保存一个独立的列表子阶段账本；它不证明历史全量，
+`requested_all/terminal_page_observed/is_exhaustive` 仍为 `false`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `regular_source` | enum | `medialist` / `arc` / `search`，本次实际使用的常规投稿发现路径 |
+| `regular_observed_count` | integer | 常规列表在 limit 前按 BV first-wins 去重后的非负数量 |
+| `dynamic_status` | enum | `NOT_ATTEMPTED` / `UNAVAILABLE` / `OBSERVED` 或固定任务停止枚举 `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `ACCESS_RESTRICTED` / `PARSER_FAILED` / `INTERNAL_ERROR` |
+| `dynamic_observed_count` | integer | 动态入口已解析并按 BV 去重的非负数量；可在受限前保留部分值 |
+
+`dynamic_status=OBSERVED` 只表示本次有界动态入口观察没有报错，不表示账号历史动态穷尽。
+非 `OBSERVED` 状态必须在最终报告披露“可能遗漏仅出现在动态入口的公开视频”。覆盖账本只
+允许上述枚举和计数，不能保存 endpoint、offset、查询、响应正文或异常消息。动态发现使用
+固定安全诊断码 `BILIBILI_DYNAMIC_DISCOVERY`；诊断码不是新的 `stop_reason`。
 
 ### 3.2 授权账号 OpenAPI 覆盖账本
 
@@ -349,10 +403,19 @@ boolean、非负 exact integer 与停止枚举进入派生 `analysis.meta.collec
 | source_url | string | 是 | 否 | 来源 URL（证据锚点） |
 
 约束：
+- 所有普通平台记录以 `(platform, post_id)` 唯一。B站 medialist 的下一页可能再次包含上一页
+  `oid` 锚点，必须在累计数量和 limit 判断前 first-wins 去重；持久化边界再次去重后，
+  `task.collected_count`、JSONL 行数、CSV 记录数和报告内容数必须一致。
 - `is_pinned` / `is_repost` / `is_promoted` 仅保留明确公开的 `true` / `false`；未知时为 `null`，不得把缺失证据断言为 `false` 或 `true`。
 - `collection_status` 缺失或非法时必须归一为 `PARTIAL`，并分别标记 `inferred_missing` / `inferred_invalid`；禁止默认为 `SUCCESS`。归一化覆盖率须记录 `COLLECTION_STATUS_INFERRED` warning，流水线因此降为 `PARTIAL`。
 - `normalized-posts.csv` 使用紧凑、排序键的 JSON 序列化 `hashtags`、`platform_metrics` 与 `field_visibility`；布尔值统一写小写 `true` / `false`，`null` 写为空单元格。读取端仍兼容旧 CSV 中用 `|` / `,` / `;` 分隔的话题串，以及旧采集器写出的 Python `list` / `tuple` / `dict` 字面量；后者只在严格单元格大小、AST 复杂度、目标类型及 JSON 兼容性校验后读取，绝不执行表达式，也不再以旧格式写出。
 - 默认分析排除置顶、转载、投放内容（见 `analysis-rules.md`），但须在数据中保留标记。
+- B站所有构建路径的 `platform_metrics` 固定包含
+  `collection_evidence_status/is_in_collection/series_name/season_id`：只有公开
+  `ugc_season` 正证据可写 `OBSERVED/true`；完整响应未见该节点写
+  `NOT_OBSERVED/null`，列表路径不具备该证据写 `UNAVAILABLE/null`。不得用字段缺失推断
+  `is_in_collection=false`。动态-only 卡若缺少收藏、投币或其他统一指标，单条
+  `collection_status=PARTIAL`，并在 `missing_detail_metrics` 中列明。
 - 授权 OpenAPI 作品必须使用响应提供的 HTTPS `share_url`，持久化前移除查询参数与片段。
   与 `video_id` 精确一致的直接 `/video/<id>` / `/note/<id>` 规范化为 `post_url`；官方
   `iesdouyin.com/share/video|note/<id>` 若末段为同一数字 ID，也规范化为直接作品 URL，数字
@@ -474,7 +537,7 @@ ID 绑定作品证据。任何来源 URL 均不得保留原始 query、fragment 
 
 | 字段 | 类型 | 必填 | 可空 | 说明 |
 |---|---|---:|---:|---|
-| topic | string | 否 | 是 | 主题标签（2–10 汉字，未知为 `unknown`） |
+| topic | string | 否 | 是 | 主题标签（2–10 字符且至少一个汉字，未知为 `unknown`） |
 | format | enum | 否 | 是 | 内容形式（§9.5） |
 | funnel_stage | enum | 否 | 是 | 内容目的 / 漏斗阶段（§9.6） |
 | hook_type | enum | 否 | 是 | 开头钩子类型（§9.7） |
@@ -500,6 +563,9 @@ ID 绑定作品证据。任何来源 URL 均不得保留原始 query、fragment 
 - 纯函数或兼容读取可表达部分覆盖；但 `--classification-results` 与历史
   `--llm-tax-results` 文件输入均为全量原子合同，缺失、重复、额外父作品、未知字段、
   错误类型或非法枚举必须在任何输出写入前失败，不得回退为待分类。
+- B站分类中的 `series_name` 只能逐字沿用父作品
+  `platform_metrics.series_name` 的公开正证据；父字段为 `null` 时分类结果也必须为
+  `null`，不得从标题、标签或相似内容猜测栏目 / 合集。
 
 ### 7.1 高低表现确定性输出
 

@@ -153,6 +153,13 @@
 | 解析失败 | 页面可访问（HTTP 200）但缺少 SSR 数据（抖音升级为 JS 虚拟机 `_$jsvmprt` 动态渲染，未嵌入静态 `RENDER_DATA` / `_SSR_DATA`） | `PARSER_FAILED` |
 | 无公开内容 | 账号存在但作品列表为空且非受限 | `NO_PUBLIC_CONTENT` |
 
+临时浏览器明确看到限制页时，覆盖账本只保存安全审计对：`restriction_source` 固定为
+`browser_visible_text`，`restriction_marker` 按停止原因固定映射为
+`LOGIN_WALL_VISIBLE`、`VERIFICATION_CHALLENGE_VISIBLE`、
+`ACCESS_RESTRICTION_VISIBLE`、`ACCOUNT_UNAVAILABLE_VISIBLE` 或
+`NO_PUBLIC_CONTENT_VISIBLE`。页面原文、选择器、Cookie、请求头与带查询参数 URL 不得进入
+`task.json`、报告或其他产物；两个审计字段必须成对出现且与根级 `stop_reason` 一致。
+
 行为约束与解决决策树：
 - 命中上述任一**任务级**限制时，**立即停止**对应请求；`check_access` 返回
   `{"accessible": False, "reason": <说明>, "stop_reason": <上表值>}`；

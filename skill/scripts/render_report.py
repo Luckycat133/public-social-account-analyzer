@@ -627,6 +627,52 @@ def _classification_lifecycle_rows(analysis) -> list[list[str]]:
     ]
 
 
+def _business_insight_lifecycle_rows(analysis) -> list[list[str]]:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+
+    def lifecycle_value(key):
+        if isinstance(analysis, dict) and key in analysis:
+            return analysis.get(key)
+        return meta.get(key) if isinstance(meta, dict) else None
+
+    status = lifecycle_value("business_insight_status")
+    status_labels = {
+        "not-requested": "not-requested（未请求）",
+        "pending-model": "pending-model（待生成）",
+        "partial-model": "partial-model（部分可核验）",
+        "completed": "completed（已完成）",
+    }
+    required = lifecycle_value("business_insight_required")
+    required_label = "是" if required is True else ("否" if required is False else "—")
+    rows = [
+        ["业务洞察是否必需 (business_insight_required)", required_label],
+        [
+            "业务洞察状态 (business_insight_status)",
+            status_labels.get(status, status or "—"),
+        ],
+        [
+            "业务洞察版本 (business_insight_version)",
+            lifecycle_value("business_insight_version") or "—",
+        ],
+    ]
+    contract = analysis.get("business_insights") if isinstance(analysis, dict) else None
+    provenance = contract.get("provenance") if isinstance(contract, dict) else None
+    if isinstance(provenance, dict):
+        rows.extend(
+            [
+                [
+                    "采集提交绑定 (collection_commit_sha256)",
+                    provenance.get("collection_commit_sha256") or "—",
+                ],
+                [
+                    "分类结果绑定 (classification_results_sha256)",
+                    provenance.get("classification_results_sha256") or "—",
+                ],
+            ]
+        )
+    return rows
+
+
 def _status_count_rows(sample_boundary) -> list[list[str]]:
     counts = sample_boundary.get("status_counts", {})
     if not isinstance(counts, dict):
@@ -664,6 +710,7 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         ],
         ["任务状态", meta.get("task_status") or "—"],
         ["停止原因", meta.get("stop_reason") or "—"],
+        ["安全诊断码", meta.get("diagnostic_code") or "—"],
         ["采集来源", meta.get("collection_source") or "—"],
         ["索引快照时间", meta.get("snapshot_crawled_at") or "—"],
         ["索引年龄标注", meta.get("snapshot_age_label") or "—"],
@@ -673,6 +720,30 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         )],
         ["主排序指标", meta.get("main_sort_metric") or "—"],
     ]
+    coverage = meta.get("collection_coverage")
+    if platform == "bilibili":
+        coverage = coverage if isinstance(coverage, dict) else {}
+        unrecorded = "未记录（旧产物/未知）"
+        rows.extend([
+            ["B站常规列表来源", coverage.get("regular_source") or unrecorded],
+            [
+                "B站常规列表观测数",
+                (
+                    fmt_int(coverage.get("regular_observed_count"))
+                    if "regular_observed_count" in coverage
+                    else unrecorded
+                ),
+            ],
+            ["B站动态入口状态", coverage.get("dynamic_status") or unrecorded],
+            [
+                "B站动态入口观测数",
+                (
+                    fmt_int(coverage.get("dynamic_observed_count"))
+                    if "dynamic_observed_count" in coverage
+                    else unrecorded
+                ),
+            ],
+        ])
     if isinstance(meta.get("profile_overlay"), dict):
         rows.extend(
             [
@@ -681,6 +752,7 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
             ]
         )
     rows.extend(_classification_lifecycle_rows(analysis))
+    rows.extend(_business_insight_lifecycle_rows(analysis))
     md = md_table(["字段", "值"], rows)
 
     # 账号主页或授权资料来源行需要渲染为链接
@@ -732,9 +804,12 @@ def build_quality_summary(analysis) -> tuple[str, str]:
     return md, html
 
 
-def build_account_card(profile) -> tuple[str, str]:
+def build_account_card(profile, analysis=None) -> tuple[str, str]:
     if not profile:
-        return EMPTY_MD, EMPTY_HTML
+        positioning_md, positioning_html = _business_positioning_block(analysis)
+        return _append_report_block(
+            EMPTY_MD, EMPTY_HTML, positioning_md, positioning_html
+        )
     verified = profile.get("verified")
     if verified is True:
         verified_label = "是"
@@ -799,7 +874,8 @@ def build_account_card(profile) -> tuple[str, str]:
         else:
             html_rows.append([Raw(h_esc(k)), Raw(h_esc(v))])
     html = html_table(["字段", "值"], html_rows)
-    return md, html
+    positioning_md, positioning_html = _business_positioning_block(analysis)
+    return _append_report_block(md, html, positioning_md, positioning_html)
 
 
 def build_content_structure(analysis, posts_csv) -> tuple[str, str]:
@@ -832,21 +908,51 @@ def build_content_structure(analysis, posts_csv) -> tuple[str, str]:
 
 def _cadence_inference_allowed(analysis, cadence) -> bool:
     meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    if cadence.get("cadence_inference_allowed") is False:
+        return False
     return not (
-        meta.get("evidence_is_exhaustive") is False
-        or cadence.get("cadence_inference_allowed") is False
+        meta.get("collection_source") in INDEX_COLLECTION_SOURCES
+        and meta.get("evidence_is_exhaustive") is False
     )
+
+
+def _validate_lifecycle_consistency(analysis) -> None:
+    if not isinstance(analysis, dict):
+        return
+    meta = analysis.get("meta")
+    if not isinstance(meta, dict):
+        return
+    for key in (
+        "classification_status",
+        "classification_version",
+        "classification_coverage",
+        "business_insight_required",
+        "business_insight_status",
+        "business_insight_version",
+    ):
+        if key in analysis and key in meta and analysis.get(key) != meta.get(key):
+            raise RenderError(f"analysis lifecycle conflict for {key}")
 
 
 def _classification_is_completed(analysis) -> bool:
     if not isinstance(analysis, dict):
         return False
     meta = analysis.get("meta")
-    return (
-        analysis.get("classification_status") == "completed"
-        or isinstance(meta, dict)
-        and meta.get("classification_status") == "completed"
+    root_has_status = "classification_status" in analysis
+    meta_has_status = isinstance(meta, dict) and "classification_status" in meta
+    if (
+        root_has_status
+        and meta_has_status
+        and analysis.get("classification_status")
+        != meta.get("classification_status")
+    ):
+        raise RenderError("analysis lifecycle conflict for classification_status")
+    status = (
+        analysis.get("classification_status")
+        if root_has_status
+        else (meta.get("classification_status") if meta_has_status else None)
     )
+    return status == "completed"
 
 
 def build_publish_cadence(analysis) -> tuple[str, str]:
@@ -1273,6 +1379,289 @@ def _append_report_block(
     return combined_md, combined_html
 
 
+_BUSINESS_POSITIONING_LABELS = (
+    ("target_audience", "目标受众"),
+    ("content_domain", "内容领域"),
+    ("value_proposition", "价值主张"),
+    ("persona_expression", "人设 / 品牌表达"),
+    ("follow_reason", "关注理由"),
+)
+_BUSINESS_PATTERN_LABELS = {
+    "high-title": "高表现公开文案特征（标题）",
+    "high-opening": "高表现公开文案特征（公开文案开头）",
+    "high-structure": "高表现公开文案特征（公开文案结构）",
+    "low-title": "低表现公开文案特征（标题）",
+    "low-opening": "低表现公开文案特征（公开文案开头）",
+    "low-structure": "低表现公开文案特征（公开文案结构）",
+}
+
+
+def _business_contract(analysis):
+    if not isinstance(analysis, dict):
+        return None
+    contract = analysis.get("business_insights")
+    if not isinstance(contract, dict):
+        return None
+    if contract.get("status") not in {"completed", "partial-model"}:
+        return None
+    return contract
+
+
+def _business_evidence_table(analysis, evidence_items) -> tuple[str, str]:
+    if not isinstance(evidence_items, list) or not evidence_items:
+        return "", ""
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    default_platform = meta.get("platform") if isinstance(meta, dict) else None
+    default_source = (
+        meta.get("collection_source") if isinstance(meta, dict) else None
+    )
+    headers = ["post_id", "证据字段", "原文摘录", "URL 类型 / 证据", "collected_at"]
+    rows_md = []
+    rows_html = []
+    for evidence in evidence_items:
+        if not isinstance(evidence, dict):
+            continue
+        md_reference, html_reference = _report_reference(
+            evidence,
+            url_field="url",
+            require_item_known=True,
+            default_platform=default_platform,
+            default_collection_source=default_source,
+        )
+        values = [
+            evidence.get("post_id") or "—",
+            evidence.get("source_field") or "—",
+            evidence.get("excerpt") or "—",
+        ]
+        rows_md.append(
+            values + [md_reference, evidence.get("collected_at") or "—"]
+        )
+        rows_html.append(
+            values + [html_reference, evidence.get("collected_at") or "—"]
+        )
+    if not rows_md:
+        return "", ""
+    return md_table(headers, rows_md), html_table(headers, rows_html)
+
+
+def _business_positioning_block(analysis) -> tuple[str, str]:
+    contract = _business_contract(analysis)
+    positioning = contract.get("account_positioning") if contract else None
+    if not isinstance(positioning, dict):
+        return "", ""
+    md_blocks = ["**模型业务洞察：账号定位**"]
+    html_blocks = ['<p class="note">模型业务洞察：账号定位</p>']
+    rendered = 0
+    for field, label in _BUSINESS_POSITIONING_LABELS:
+        claim = positioning.get(field)
+        if not isinstance(claim, dict):
+            continue
+        evidence_md, evidence_html = _business_evidence_table(
+            analysis, claim.get("evidence")
+        )
+        md_block = (
+            f"**{md_escape_text(label)}**\n\n"
+            f"{md_escape_text(claim.get('statement') or '—')}"
+        )
+        html_block = (
+            '<div class="business-insight">'
+            f"<p><strong>{h_esc(label)}</strong></p>"
+            f"<p>{h_esc(claim.get('statement') or '—')}</p>"
+        )
+        if evidence_md:
+            md_block += "\n\n" + evidence_md
+            html_block += evidence_html
+        html_block += "</div>"
+        md_blocks.append(md_block)
+        html_blocks.append(html_block)
+        rendered += 1
+    if not rendered:
+        return "", ""
+    return "\n\n".join(md_blocks), "".join(html_blocks)
+
+
+def _business_patterns_block(analysis, group: str) -> tuple[str, str]:
+    contract = _business_contract(analysis)
+    patterns = contract.get("performance_patterns") if contract else None
+    if not isinstance(patterns, list):
+        return "", ""
+    group_label = "高表现" if group == "high" else "低表现"
+    md_blocks = [f"**模型业务洞察：{group_label}公开文案特征**"]
+    html_blocks = [
+        f'<p class="note">模型业务洞察：{h_esc(group_label)}公开文案特征</p>'
+    ]
+    rendered = 0
+    for pattern in patterns:
+        if not isinstance(pattern, dict):
+            continue
+        pattern_id = pattern.get("id")
+        if not isinstance(pattern_id, str) or not pattern_id.startswith(f"{group}-"):
+            continue
+        label = _BUSINESS_PATTERN_LABELS.get(pattern_id, pattern_id)
+        if pattern.get("observability") == "not_observable":
+            limitation = pattern.get("limitation") or "该公开文案特征不可核验。"
+            md_block = (
+                f"**{md_escape_text(label)}**\n\n"
+                f"> 可观测性限制：{md_escape_text(limitation)}"
+            )
+            html_block = (
+                '<div class="business-insight">'
+                f"<p><strong>{h_esc(label)}</strong></p>"
+                f'<p class="note">可观测性限制：{h_esc(limitation)}</p>'
+                "</div>"
+            )
+        else:
+            evidence_md, evidence_html = _business_evidence_table(
+                analysis, pattern.get("evidence")
+            )
+            md_block = (
+                f"**{md_escape_text(label)}**\n\n"
+                f"{md_escape_text(pattern.get('statement') or '—')}"
+            )
+            html_block = (
+                '<div class="business-insight">'
+                f"<p><strong>{h_esc(label)}</strong></p>"
+                f"<p>{h_esc(pattern.get('statement') or '—')}</p>"
+            )
+            if evidence_md:
+                md_block += "\n\n" + evidence_md
+                html_block += evidence_html
+            html_block += "</div>"
+        md_blocks.append(md_block)
+        html_blocks.append(html_block)
+        rendered += 1
+    if not rendered:
+        return "", ""
+    return "\n\n".join(md_blocks), "".join(html_blocks)
+
+
+def _business_modes_block(analysis) -> tuple[str, str]:
+    contract = _business_contract(analysis)
+    modes = contract.get("content_modes") if contract else None
+    if not isinstance(modes, list) or not modes:
+        return "", ""
+    md_blocks = ["**模型业务洞察：内容模式（5 项）**"]
+    html_blocks = ['<p class="note">模型业务洞察：内容模式（5 项）</p>']
+    for mode in modes:
+        if not isinstance(mode, dict):
+            continue
+        title = f"{mode.get('id') or '—'} · {mode.get('name') or '—'}"
+        evidence_md, evidence_html = _business_evidence_table(
+            analysis, mode.get("evidence")
+        )
+        md_block = (
+            f"**{md_escape_text(title)}**\n\n"
+            f"- 模式配方：{md_escape_text(mode.get('recipe') or '—')}"
+        )
+        html_block = (
+            '<div class="business-insight">'
+            f"<p><strong>{h_esc(title)}</strong></p>"
+            f"<p>模式配方：{h_esc(mode.get('recipe') or '—')}</p>"
+        )
+        if evidence_md:
+            md_block += "\n\n" + evidence_md
+            html_block += evidence_html
+        md_blocks.append(md_block)
+        html_blocks.append(html_block + "</div>")
+    return "\n\n".join(md_blocks), "".join(html_blocks)
+
+
+def _business_strategy_block(analysis) -> tuple[str, str]:
+    contract = _business_contract(analysis)
+    if contract is None:
+        return "", ""
+    md_blocks = []
+    html_blocks = []
+    topics = contract.get("topic_ideas")
+    if isinstance(topics, list) and topics:
+        topic_md = ["**模型业务洞察：选题方向（10 项）**"]
+        topic_html = ['<p class="note">模型业务洞察：选题方向（10 项）</p>']
+        for topic in topics:
+            if not isinstance(topic, dict):
+                continue
+            title = f"{topic.get('id') or '—'} · {topic.get('title') or '—'}"
+            evidence_md, evidence_html = _business_evidence_table(
+                analysis, topic.get("evidence")
+            )
+            item_md = (
+                f"**{md_escape_text(title)}**\n\n"
+                f"- 依据：{md_escape_text(topic.get('rationale') or '—')}"
+            )
+            item_html = (
+                '<div class="business-insight">'
+                f"<p><strong>{h_esc(title)}</strong></p>"
+                f"<p>依据：{h_esc(topic.get('rationale') or '—')}</p>"
+            )
+            if evidence_md:
+                item_md += "\n\n" + evidence_md
+                item_html += evidence_html
+            topic_md.append(item_md)
+            topic_html.append(item_html + "</div>")
+        md_blocks.append("\n\n".join(topic_md))
+        html_blocks.append("".join(topic_html))
+
+    experiments = contract.get("experiments")
+    if isinstance(experiments, list) and experiments:
+        experiment_md = ["**模型业务洞察：可验证实验（4 项）**"]
+        experiment_html = ['<p class="note">模型业务洞察：可验证实验（4 项）</p>']
+        for experiment in experiments:
+            if not isinstance(experiment, dict):
+                continue
+            title = (
+                f"{experiment.get('id') or '—'} · "
+                f"{experiment.get('hypothesis') or '—'}"
+            )
+            fields = [
+                ("实验变量", experiment.get("variable")),
+                ("控制条件", experiment.get("control")),
+                ("成功指标", experiment.get("success_metric")),
+                ("决策规则", experiment.get("decision_rule")),
+                ("观察窗口", experiment.get("window")),
+            ]
+            evidence_md, evidence_html = _business_evidence_table(
+                analysis, experiment.get("evidence")
+            )
+            item_md = f"**{md_escape_text(title)}**\n\n" + "\n".join(
+                f"- {md_escape_text(label)}：{md_escape_text(value or '—')}"
+                for label, value in fields
+            )
+            item_html = (
+                '<div class="business-insight">'
+                f"<p><strong>{h_esc(title)}</strong></p>"
+                "<ul class='tight'>"
+                + "".join(
+                    f"<li>{h_esc(label)}：{h_esc(value or '—')}</li>"
+                    for label, value in fields
+                )
+                + "</ul>"
+            )
+            if evidence_md:
+                item_md += "\n\n" + evidence_md
+                item_html += evidence_html
+            experiment_md.append(item_md)
+            experiment_html.append(item_html + "</div>")
+        md_blocks.append("\n\n".join(experiment_md))
+        html_blocks.append("".join(experiment_html))
+
+    limitations = contract.get("limitations")
+    safe_limitations = (
+        [item for item in limitations if isinstance(item, str) and item]
+        if isinstance(limitations, list)
+        else []
+    )
+    if safe_limitations:
+        md_blocks.append(
+            "**业务洞察限制**\n\n"
+            + "\n".join(f"- {md_escape_text(item)}" for item in safe_limitations)
+        )
+        html_blocks.append(
+            '<p class="note">业务洞察限制</p><ul class="tight">'
+            + "".join(f"<li>{h_esc(item)}</li>" for item in safe_limitations)
+            + "</ul>"
+        )
+    return "\n\n".join(md_blocks), "".join(html_blocks)
+
+
 def _performance_metric_context(analysis) -> tuple[str | None, str | None, str | None]:
     meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
     performance_meta = (
@@ -1321,6 +1710,8 @@ def build_high_performance(analysis) -> tuple[str, str]:
         collection_source,
     )
     md, html = _append_report_block(md, html, insight_md, insight_html)
+    pattern_md, pattern_html = _business_patterns_block(analysis, "high")
+    md, html = _append_report_block(md, html, pattern_md, pattern_html)
     # 高低表现雷达图：对比两组在各指标上的均值形态（仅作形态对比，不构成因果）
     radar = svg_high_low_radar(high, low, METRIC_FIELDS)
     if radar:
@@ -1348,6 +1739,8 @@ def build_low_performance(analysis) -> tuple[str, str]:
         collection_source,
     )
     md, html = _append_report_block(md, html, insight_md, insight_html)
+    pattern_md, pattern_html = _business_patterns_block(analysis, "low")
+    md, html = _append_report_block(md, html, pattern_md, pattern_html)
     return _append_performance_note(md, html, metric_note)
 
 
@@ -1853,6 +2246,10 @@ def build_content_patterns(analysis) -> tuple[str, str]:
     if comment_md:
         blocks.append((comment_md, comment_html))
 
+    modes_md, modes_html = _business_modes_block(analysis)
+    if modes_md:
+        blocks.append((modes_md, modes_html))
+
     if not blocks:
         return EMPTY_MD, EMPTY_HTML
     md = "\n\n".join(b[0] for b in blocks)
@@ -1920,12 +2317,19 @@ def build_strategy(analysis, profile) -> tuple[str, str]:
         tips.append(f"当前有效样本仅 {valid} 条（<15），高低表现对比与模式结论置信度有限，"
                     f"建议扩大采集周期或数量后再下结论。")
 
-    if not tips:
-        return EMPTY_MD, EMPTY_HTML
-
-    md = "\n".join(f"{i}. {md_escape_text(t)}" for i, t in enumerate(tips, 1))
-    html = "<ul class='tight'>" + "".join(f"<li>{h_esc(t)}</li>" for t in tips) + "</ul>"
-    return md, html
+    if tips:
+        md = "**确定性数据提示**\n\n" + "\n".join(
+            f"{i}. {md_escape_text(t)}" for i, t in enumerate(tips, 1)
+        )
+        html = (
+            '<p class="note">确定性数据提示</p><ul class="tight">'
+            + "".join(f"<li>{h_esc(t)}</li>" for t in tips)
+            + "</ul>"
+        )
+    else:
+        md, html = EMPTY_MD, EMPTY_HTML
+    business_md, business_html = _business_strategy_block(analysis)
+    return _append_report_block(md, html, business_md, business_html)
 
 
 def build_sample_limits(analysis, profile) -> tuple[str, str]:
@@ -1976,6 +2380,25 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
                 "\n\n> 当前数据来自账号本人授权 OpenAPI 公热视频列表；"
                 "尚未观察到官方末页，当前结果非穷尽。"
             )
+    coverage = meta.get("collection_coverage")
+    dynamic_status = (
+        coverage.get("dynamic_status")
+        if isinstance(coverage, dict)
+        else None
+    )
+    bilibili_dynamic_note = None
+    if meta.get("platform") == "bilibili" and dynamic_status != "OBSERVED":
+        if dynamic_status:
+            bilibili_dynamic_note = (
+                f"B站动态入口状态为 {dynamic_status}；"
+                "当前样本可能遗漏仅出现在动态入口的公开视频。"
+            )
+        else:
+            bilibili_dynamic_note = (
+                "B站动态入口覆盖状态未记录（旧产物或未知）；无法确认动态入口是否完成，"
+                "当前样本可能遗漏仅出现在动态入口的公开视频。"
+            )
+        md += "\n\n> " + bilibili_dynamic_note
     if hidden:
         md += f"\n\n> 受限/不可见字段：{', '.join(hidden)}（相关指标覆盖率相应下调）。"
     classification_note = (
@@ -2007,6 +2430,8 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
                 "当前数据来自账号本人授权 OpenAPI 公热视频列表；"
                 "尚未观察到官方末页，当前结果非穷尽。"
             )
+    if bilibili_dynamic_note is not None:
+        notes.append(bilibili_dynamic_note)
     if hidden:
         notes.append("受限/不可见字段：" + ", ".join(hidden) + "（相关指标覆盖率相应下调）。")
     notes.append(
@@ -2102,6 +2527,7 @@ def render_in_memory(
         raise RenderError("missing or invalid normalized posts input")
     if not isinstance(analysis, dict):
         raise RenderError("missing or invalid analysis input")
+    _validate_lifecycle_consistency(analysis)
     if not isinstance(template, str) or not template:
         raise RenderError("missing or invalid report template")
     template_without_comments = re.sub(
@@ -2125,7 +2551,7 @@ def render_in_memory(
         builders = {
             "task_info": lambda: build_task_info(analysis, profile, posts_csv),
             "quality_summary": lambda: build_quality_summary(analysis),
-            "account_card": lambda: build_account_card(profile),
+            "account_card": lambda: build_account_card(profile, analysis),
             "content_structure": lambda: build_content_structure(
                 analysis, posts_csv
             ),

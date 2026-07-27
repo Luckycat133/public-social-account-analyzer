@@ -369,6 +369,53 @@ def test_single_post_failure_continues():
     assert len(valid) + len(missing) == len(collected)
 
 
+def test_collection_task_is_partial_when_a_post_is_partial(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class PartialBilibiliAdapter:
+        platform = "bilibili"
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            return [{
+                "platform": "bilibili",
+                "post_id": "BVpartial",
+                "post_url": "https://www.bilibili.com/video/BVpartial",
+                "source_url": "https://www.bilibili.com/video/BVpartial",
+                "collection_status": "PARTIAL",
+                "platform_metrics": {"detail_status": "UNAVAILABLE"},
+            }]
+
+        def collect_profile(self, url):
+            return {
+                "platform": "bilibili",
+                "account_id": "123",
+                "account_name": "tester",
+                "field_visibility": {"account_name": "visible"},
+            }
+
+        def get_collection_coverage(self):
+            return {}
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [PartialBilibiliAdapter()])
+    out = tmp_path / "bilibili-partial"
+
+    assert collect.run(
+        "https://space.bilibili.com/123", out_dir=str(out), limit=1
+    ) == 0
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] is None
+
+
 def test_vis_count_field_visibility():
     from collect import _vis_count
 
@@ -1107,6 +1154,14 @@ def test_adapter_failure_text_is_sanitized_at_every_output_boundary(
 ):
     import collect
 
+    event_timestamp = "2026-07-27T16:45:00+08:00"
+    monkeypatch.setattr(
+        collect,
+        "_event_timestamp",
+        lambda: event_timestamp,
+        raising=False,
+    )
+
     secret = f"SECRET_{failure_stage.upper()}_VALUE"
     profile_url = (
         "https://www.douyin.com/user/example?token=PROFILE_QUERY_SECRET"
@@ -1165,6 +1220,9 @@ def test_adapter_failure_text_is_sanitized_at_every_output_boundary(
     report = (out / "collection-report.md").read_text(encoding="utf-8")
     if failure_stage == "post_list":
         assert "diagnostic_code=SAFE_DIAGNOSTIC" in report
+        assert f"occurred_at={event_timestamp}" in report
+        task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+        assert task["diagnostic_code"] == "SAFE_DIAGNOSTIC"
 
 
 def test_adapter_load_exception_text_is_not_printed(monkeypatch, capsys):
@@ -1236,6 +1294,31 @@ def test_failure_report_summarizes_success_errors_and_stop_stage(tmp_path):
     assert "- 成功采集内容数: 0" in report
     assert "- 错误或受限事件数: 1" in report
     assert "- 停止阶段: collect_post_list" in report
+
+
+def test_report_counts_success_and_partial_rows_separately(tmp_path):
+    import collect
+
+    collect._write_report(
+        _SafeCommentAdapter(),
+        "https://www.douyin.com/user/example",
+        {},
+        [
+            {"collection_status": "SUCCESS"},
+            {"collection_status": "PARTIAL"},
+            {"collection_status": "DELETED"},
+        ],
+        str(tmp_path),
+        task_status="PARTIAL",
+        stop_reason="PARSER_FAILED",
+        error_log=[],
+    )
+
+    report = (tmp_path / "collection-report.md").read_text(encoding="utf-8")
+    assert "- 内容条数: 3" in report
+    assert "- 成功采集内容数: 1" in report
+    assert "- 部分采集内容数: 1" in report
+    assert "- 删除/失败/受限内容数: 1" in report
 
 
 @pytest.mark.parametrize("link_kind", ["workspace", "source"])

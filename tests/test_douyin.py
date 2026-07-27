@@ -3706,6 +3706,35 @@ def test_collect_account_page_returns_restriction_with_retained_items():
     assert result.diagnostics["stop_condition"] == STOP_VERIFICATION
 
 
+@pytest.mark.parametrize(
+    ("visible_text", "expected_reason", "expected_marker"),
+    [
+        ("扫码登录", STOP_LOGIN, "LOGIN_WALL_VISIBLE"),
+        ("请完成滑动验证", STOP_VERIFICATION, "VERIFICATION_CHALLENGE_VISIBLE"),
+        ("访问过于频繁", STOP_ACCESS_RESTRICTED, "ACCESS_RESTRICTION_VISIBLE"),
+        ("该账号已注销", STOP_ACCOUNT_UNAVAILABLE, "ACCOUNT_UNAVAILABLE_VISIBLE"),
+        ("暂无公开作品", STOP_NO_PUBLIC_CONTENT, "NO_PUBLIC_CONTENT_VISIBLE"),
+    ],
+)
+def test_collect_account_page_records_safe_visible_restriction_audit(
+    visible_text, expected_reason, expected_marker
+):
+    """A visible platform state is persisted as fixed enums, never page text."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: FakeBrowser(page_texts=[visible_text]),
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.restriction == expected_reason
+    assert result.coverage["restriction_source"] == "browser_visible_text"
+    assert result.coverage["restriction_marker"] == expected_marker
+    assert visible_text not in json.dumps(result.coverage, ensure_ascii=False)
+
+
 def test_restriction_retains_visible_profile_header_but_ignores_dom_cards():
     """Reading the already-visible account header must not bypass a login stop."""
     from collectors._douyin_browser_transport import collect_account_page
@@ -5772,6 +5801,57 @@ def test_browser_runtime_coverage_reaches_workspace_without_secrets(
     assert coverage["max_scrolls"] == 20
     assert "cookie" not in coverage
     assert "response_paths" not in coverage
+
+
+def test_visible_login_audit_reaches_collection_task_and_report_without_page_text(
+    monkeypatch, tmp_path
+):
+    import collect
+    from collectors._douyin_browser_transport import collect_account_page
+    from collectors.douyin import DouyinCollector
+
+    visible_text = "登录后查看 PAGE_TEXT_MUST_NOT_PERSIST"
+    browser_result = collect_account_page(
+        ACCOUNT_URL,
+        limit=1,
+        session_factory=lambda: FakeBrowser(page_texts=[visible_text]),
+        sleep=lambda _seconds: None,
+    )
+    collector = DouyinCollector(
+        browser_collect=lambda **_request: browser_result,
+    )
+    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
+    monkeypatch.setattr(
+        collector, "check_access", lambda _url: {"accessible": True}
+    )
+    monkeypatch.setattr(
+        collector,
+        "collect_profile",
+        lambda _url: {"platform": "douyin", "field_visibility": {}},
+    )
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [collector])
+    out = tmp_path / "task"
+
+    assert collect.run(ACCOUNT_URL, limit=1, out_dir=str(out)) == 3
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "FAILED"
+    assert task["stop_reason"] == STOP_LOGIN
+    assert task["collection_coverage"]["restriction_source"] == (
+        "browser_visible_text"
+    )
+    assert task["collection_coverage"]["restriction_marker"] == (
+        "LOGIN_WALL_VISIBLE"
+    )
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
+    assert '- restriction_source: "browser_visible_text"' in report
+    assert '- restriction_marker: "LOGIN_WALL_VISIBLE"' in report
+    persisted = "".join(
+        artifact.read_text(encoding="utf-8")
+        for artifact in out.rglob("*")
+        if artifact.is_file()
+    )
+    assert "PAGE_TEXT_MUST_NOT_PERSIST" not in persisted
 
 
 def test_workspace_date_intersection_excludes_unknown_rows_when_range_is_explicit():

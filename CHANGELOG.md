@@ -8,23 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a Bilibili regular/dynamic coverage ledger, safe discovery diagnostics, and stable per-post collection-evidence fields so partial dynamic coverage is auditable without persisting response data.
 - Added standardized `source`, `validation_data`, and held-out `test_data` documentation, a path configuration example, and an operational data usage guide.
 - Added evaluation dataset tests covering schema contracts, duplicate IDs, partition leakage, source coverage, manifest counts, and local file modes.
 - Added script-layer and historical-observation indexes that document entry-point contracts, module boundaries, and evidence freshness.
 - Added PRD AC-03 / AC-06 外部人工真值工具 `tests/manual_accuracy_check.py`：绑定采集与分析提交、确定性抽样，分别输出逐字段准确率、流水线自洽性和具体作品证据覆盖；自动 source→CSV 对照不再冒充人工真值。
-- Added PRD AC-10 运营人员试用反馈模板 `docs/operations-trial-template.md`，记录两份不可变提交、两阶段模型产物、外部真值、证据逐项核验、结构化耗时，以及反馈驱动修改的合并闭环。
-- Added dev → 部署打包与 drift 检测清单 `docs/deployment-package-checklist.md`，覆盖运行脚本、人工验收工具、两阶段 CLI 标志和不写死用例数的完整回归。
+- Added PRD AC-10 运营人员试用反馈模板 `docs/guides/operations-trial-template.md`，记录两份不可变提交、两阶段模型产物、外部真值、证据逐项核验、结构化耗时，以及反馈驱动修改的合并闭环。
+- Added dev → 部署打包与 drift 检测清单 `docs/guides/deployment-package-checklist.md`，覆盖运行脚本、人工验收工具、两阶段 CLI 标志和不写死用例数的完整回归。
 - Added a strict taxonomy → business-insight workflow with digest-bound model inputs, five account-positioning claims, six public-copy performance patterns, ten topic ideas, five reusable content modes, and four falsifiable experiments.
 - Added timezone-aware start/end timestamps, monotonic total duration, and fixed phase timings to collection and analysis task artifacts.
 
 ### Changed
+- Bilibili medialist pagination now deduplicates inclusive cursor anchors before applying limits; dynamic discovery runs before optional tag enrichment, final persisted counts use unique `(platform, post_id)` rows, and quality reports count `SUCCESS`, `PARTIAL`, and unavailable rows separately.
 - Strategy/commonality requests in the Agent Skill now use a two-stage taxonomy workflow and only treat the classified, manifest-sealed analysis as final.
 - Collection CLI output now separates immutable commit success from business status; quality reports include explicit collected/error counts and the sanitized stop stage.
 - Douyin browser coverage now records safe requested/launched, evidence-source, scroll, and budget fields across collection and analysis, while temporary profiles are allocated lazily at browser start.
 - Extended `split_dataset.py --verify` to validate JSONL structure, required fields, partition integrity, record counts, and SHA-256 checksums.
 - Upgraded the evaluation dataset manifest to schema version 2 with dataset version, path, split-policy, and quality-check metadata.
-- Consolidated the repository structure documentation with the current 128-test suite, collector dependency direction, networking boundaries, and relocated historical records.
-- Kept comment sampling explicitly best-effort only; comment persistence and comment-insight conclusions remain unimplemented rather than being claimed by evaluation data.
+- Consolidated the repository structure documentation around the current regression suite without embedding an expiring test count, collector dependency direction, networking boundaries, and relocated historical records.
+- Kept comment sampling explicitly best-effort; deterministic evidence persistence is implemented, while semantic comment conclusions remain pending model input rather than being fabricated.
 - Clarified LLM taxonomy behavior: the Agent Skill flow assigns classification to the executing agent when valid samples exist, while `analyze.py` only exposes optional prompt-generation and result-backfill interfaces and never calls an LLM itself.
 
 - Established a local permission baseline of `0750` for dataset directories and `0640` for dataset files, with deployment guidance because Git does not preserve full Unix modes.

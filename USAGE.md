@@ -391,6 +391,9 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 ### Q3: B站 采集遭遇 IP 拦截 (-799 / -412) 怎么办？
 **解决**：当前任务立即停止并记录 `ACCESS_RESTRICTED`。不要在同一任务中重试、轮换
 `buvid` 或切换端点；请稍后创建新任务重新采集，并以已提交的部分数据和覆盖说明为准。
+若发生在动态发现阶段，`diagnostic_code=BILIBILI_DYNAMIC_DISCOVERY`，报告会显示
+`dynamic_status=ACCESS_RESTRICTED`；已采常规投稿可以保留，但当前样本可能遗漏仅出现在动态
+入口的公开视频。程序不会在该保护响应后继续逐条标签补充。
 
 ### Q4: macOS 下把 `--out` 指向 `/tmp` 或 `/var` 为什么被拒绝？
 

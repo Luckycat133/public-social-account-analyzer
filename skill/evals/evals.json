@@ -189,6 +189,22 @@
         "access token 只允许位于固定 HTTPS userinfo 的 form 请求体和 video.list 的 access-token 请求头，不得进入 URL、命令行、shell 历史、日志、异常、诊断或产物；回证后的 open_id 可作为授权账号身份持久化",
         "说明 userinfo 编码与 video.list cursor/count 的真实兼容性仍需同次真实 OAuth 凭据在线验收，未把离线合同当作在线可用证明"
       ]
+    },
+    {
+      "id": 15,
+      "name": "bilibili-sealed-partial-artifact-audit",
+      "prompt": "不要联网、不要启动浏览器、不要修改封存产物。审查目录 workspace/acceptance-bilibili-946974-20260727-152828-run1：说明实际唯一作品数、任务与作品状态是否冲突、动态与合集证据边界、post_count 和未知分区应如何表达、错误诊断与时间戳问题，以及该样本能否直接支持完整内容策略结论。给出应修复的不变量和最终对用户的诚实结论。",
+      "expected_output": "只读离线审查识别 30 行中仅 29 个唯一 BV；保留 PARTIAL / ACCESS_RESTRICTED，区分普通投稿可用与动态覆盖未知；合集、投稿数和未知分区均保持 null 而不猜测；指出错误时间复用任务开始时间和诊断粒度不足；要求先去重再 limit、各产物计数一致、动态覆盖单列，并把策略结论限定在 29 条普通投稿样本内。",
+      "assertions": [
+        "没有联网、启动浏览器、重试平台请求或修改封存工作区",
+        "明确指出 source/posts.jsonl 有 30 行但只有 29 个唯一 BV，重复项为 BV1GB5Q6uEDk",
+        "没有把作品级 SUCCESS 与任务级 PARTIAL 误判为必然矛盾，并明确普通投稿证据可用但动态覆盖失败",
+        "没有用 29/30 条样本回填 profile.post_count，也没有猜测 typeid 242、76、228 或合集名称",
+        "指出合集证据字段应稳定存在且未知为 null，动态覆盖状态与安全 diagnostic_code 应在任务级单列",
+        "指出错误 occurred_at 复用了任务初始化时间，应在捕获异常时生成当前时间",
+        "要求去重发生在 limit 截断前，并约束 task、JSONL、CSV、报告的唯一作品计数一致",
+        "最终策略结论明确限定为 29 条普通投稿公开样本，披露动态缺口、非穷尽和非因果限制"
+      ]
     }
   ]
 }

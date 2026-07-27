@@ -37,6 +37,8 @@ from typing import Any
 
 
 from ._constants import (
+    DOUYIN_BROWSER_VISIBLE_RESTRICTION_MARKER_VALUES,
+    DOUYIN_BROWSER_VISIBLE_RESTRICTION_SOURCE,
     DOUYIN_PAGE_STATE_PATTERNS,
     PUBLIC_ALL_DEFAULT_MAX_ITEMS,
     PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
@@ -916,6 +918,15 @@ class DouyinCollector(BaseCollector):
         evidence_source = value.get("browser_evidence_source")
         if evidence_source in {"none", "network", "dom", "network+dom"}:
             clean["browser_evidence_source"] = evidence_source
+        restriction_source = value.get("restriction_source")
+        restriction_marker = value.get("restriction_marker")
+        if (
+            restriction_source == DOUYIN_BROWSER_VISIBLE_RESTRICTION_SOURCE
+            and restriction_marker
+            in DOUYIN_BROWSER_VISIBLE_RESTRICTION_MARKER_VALUES
+        ):
+            clean["restriction_source"] = restriction_source
+            clean["restriction_marker"] = restriction_marker
         for key in count_fields:
             field_value = value.get(key)
             if isinstance(field_value, int) and not isinstance(field_value, bool):

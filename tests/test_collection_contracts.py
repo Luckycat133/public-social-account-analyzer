@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import csv
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -741,6 +743,114 @@ def test_public_task_persists_unique_task_id_and_analysis_goal(
     assert first_task["task_id"] != second_task["task_id"]
 
 
+def test_public_persistence_deduplicates_before_limit_and_keeps_counts_aligned(
+    monkeypatch, tmp_path
+):
+    class BoundaryDuplicateAdapter(RecordingBilibiliAdapter):
+        def collect_post_list(self, url, limit=30, date_range=None):
+            posts = []
+            for index in range(30):
+                post_id = f"BVboundary{index:02d}"
+                posts.append({
+                    "platform": "bilibili",
+                    "post_id": post_id,
+                    "post_url": f"https://www.bilibili.com/video/{post_id}",
+                    "source_url": f"https://www.bilibili.com/video/{post_id}",
+                    "collection_status": "SUCCESS",
+                })
+            posts.insert(20, dict(posts[19]))
+            return posts
+
+    adapter = BoundaryDuplicateAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "deduplicated-task"
+
+    assert collect.run(BILIBILI_URL, limit=30, out_dir=str(out)) == 0
+
+    jsonl_rows = [
+        json.loads(line)
+        for line in (out / "source" / "posts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    with (out / "normalized-posts.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as handle:
+        csv_rows = list(csv.DictReader(handle))
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
+
+    assert len(jsonl_rows) == 30
+    assert len({(row["platform"], row["post_id"]) for row in jsonl_rows}) == 30
+    assert len(csv_rows) == 30
+    assert task["collected_count"] == 30
+    assert "- 内容条数: 30" in report
+    assert "- 成功采集内容数: 30" in report
+
+
+def test_collection_coverage_preserves_bilibili_substage_ledger_only():
+    clean = collect._sanitize_collection_coverage({
+        "regular_source": "medialist",
+        "regular_observed_count": 29,
+        "dynamic_status": "ACCESS_RESTRICTED",
+        "dynamic_observed_count": 0,
+        "raw_response": "must-not-persist",
+        "offset": "must-not-persist",
+    })
+
+    assert clean["regular_source"] == "medialist"
+    assert clean["regular_observed_count"] == 29
+    assert clean["dynamic_status"] == "ACCESS_RESTRICTED"
+    assert clean["dynamic_observed_count"] == 0
+    assert "raw_response" not in clean
+    assert "offset" not in clean
+
+
+def test_public_task_persists_structured_execution_timing(monkeypatch, tmp_path):
+    adapter = RecordingBilibiliAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "timed-task"
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 0
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    started_at = datetime.fromisoformat(task["started_at"])
+    ended_at = datetime.fromisoformat(task["ended_at"])
+    assert started_at.tzinfo is not None
+    assert ended_at.tzinfo is not None
+    assert ended_at >= started_at
+    assert isinstance(task["duration_ms"], int)
+    assert task["duration_ms"] >= 0
+    assert {
+        "check_access",
+        "collect_post_list",
+        "collect_profile",
+        "persist",
+    }.issubset(task["phase_durations_ms"])
+    assert all(
+        isinstance(duration_ms, int) and duration_ms >= 0
+        for duration_ms in task["phase_durations_ms"].values()
+    )
+
+
+def test_access_failure_still_persists_structured_execution_timing(
+    monkeypatch, tmp_path
+):
+    class RestrictedAdapter(RecordingDouyinAdapter):
+        def check_access(self, url):
+            return {"accessible": False, "stop_reason": "ACCESS_RESTRICTED"}
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [RestrictedAdapter()])
+    out = tmp_path / "timed-access-failure"
+
+    assert collect.run(DOUYIN_URL, out_dir=str(out)) == 3
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "FAILED"
+    assert task["phase_durations_ms"].keys() >= {"check_access", "persist"}
+    assert task["duration_ms"] >= 0
+
+
 @pytest.mark.parametrize(
     "goal",
     [123, "", "   ", "x" * 501, "分析\n注入", "分析\x00注入"],
@@ -986,16 +1096,12 @@ def test_authorized_default_output_uses_repository_workspace(
     assert not (repo / "skill" / "workspace").exists()
 
 
-def test_schema_and_design_state_exact_budget_and_output_contracts():
+def test_schema_states_exact_budget_and_output_contracts():
     root = Path(__file__).resolve().parents[1]
     schema = (root / "skill/references/data-schema.md").read_text(encoding="utf-8")
-    design = (
-        root / "docs/superpowers/specs/2026-07-24-douyin-complete-collection-design.md"
-    ).read_text(encoding="utf-8")
-    contract = schema + "\n" + design
 
     for value in ("50,000", "14,400", "20,000"):
-        assert value in contract
+        assert value in schema
     assert "仓库根目录" in schema
     assert "非空" in schema
     assert "原子" in schema

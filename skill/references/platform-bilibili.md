@@ -124,7 +124,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 - **`arc/search` 翻页复用同一身份**：页间保留节流，但不轮换 buvid；任一页返回 `-412` 等平台保护响应即停止当前任务。
 - **IP 风控具累积性（重要）**：不要在正式采集前反复探测同一端点。当前任务一旦收到平台保护响应就停止；是否在稍后由用户创建新任务重试，应由用户根据环境状态决定，程序不会在同一任务中自动冷却、换身份或转浏览器。
 - **账号等级 `level` 是代码缺陷，非数据缺失**：`acc/info` 返回的等级在**顶层 `level` 字段**（`acc['level']=5`），而旧报告脚本/适配器误读 `level_info.current_level`（该键在 acc/info 响应中不存在）→ 显示 null。本适配器 `_build_profile_raw` 虽算了 `level` 却**未写回输出字典**，故统一模型里完全没有该字段。修复方向：读 `acc.get("level")`（兜底 `card.level_info.current_level`），并纳入 Profile。
-- **分区中文名：B站已不再经 API 暴露**：视频 `view` API 的 `tname` / `tname_v2` 实测均为空；分区列表接口（`region` 系列）被 WAF 拦截（返回风控 HTML）；视频页 DOM 也无分区面包屑。`arc/search` 仅给数值 `typeid`。→ 分区中文名只能靠**静态参考映射**（见下），且需核对。
+- **分区中文名并非稳定可见**：部分实测响应的 `tname` / `tname_v2` 为空，`arc/search` 也可能只给数值 `typeid`。适配器先接受同一响应明确给出的非空 `tname` / `typename`，否则才查内置静态参考映射；两者都没有时保留整数 `typeid`，中文名写 `null`，不得按标题猜测。
   - 参考映射（⚠️ 属**第 2 层**：独立工作流产出、高置信、待本管线用官方分区表核对；尤其 249/250。完整口径见下方「分区中文名缺口结论」）：
     | typeid | 子分区（主分区） | typeid | 子分区（主分区） |
     |---|---|---|---|
@@ -135,7 +135,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
     | 31 | 翻唱（音乐） | 218 | 喵星人（动物圈） |
     | 65 | 网络游戏（游戏） | 249 | 足球（运动） |
     | 95 | 数码（科技） | 250 | 出行（生活） |
-- **动态视频：本管线 `collect_dynamics` 已实测从 sandbox 直采 19/19 成功**（端点 `x/polymer/web-dynamic/v1/feed/space`，`web_location=333.1007`，与 `card`/`relation/stat` 同级、未被封禁）。结构：`module_author.pub_ts`、`major.archive.bvid/title/stat`、`module_stat.like/comment/forward`。T4 已实现 `discover_dynamics` + `collect_dynamics`，离线+在线双验证。
+- **动态视频可用性随环境变化**：历史 sandbox 样本曾直采 19/19；2026-07-27 对 UID 946974 的一次真实验收在常规列表成功后于动态入口收到 `ACCESS_RESTRICTED`。因此不能把历史成功当成当前保证。主流程现在先做动态发现，再做逐条标签补充；受限后立即停止，并在 `diagnostic_code=BILIBILI_DYNAMIC_DISCOVERY` 与任务级覆盖账本中披露。
 - **`post_count` 回填陷阱**：`collect.py` 在 `archive_count` 缺失时用「实际枚举到的条数」回填 `post_count`。当采集因限流只拿到 3 条时，会错误写成 `post_count=3`（真实为 98）。**修复方向：`post_count` 只应来自 `archive_count`（真实投稿总数），部分采集时宁可留 `null`/标记 `partial`，不可把子集大小当总数。**
 
 ### 合规边界（重申）
@@ -146,12 +146,13 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 
 ### 补充实证（T6 medialist/resource/list 主路径验证，2026-07-23）
 
-经独立 agent 工作流启发，发现 `medialist/resource/list` 端点可绕开 `arc/search` 的全部风控痛点：
+经独立 agent 工作流启发，确认 `medialist/resource/list` 可作为低请求量主路径，减少进入高风险 `arc/search` 的机会：
 
 - **端点**：`GET /x/v2/medialist/resource/list?mobi_app=web&type=1&biz_id={mid}&oid={last_id}&size=20`
 - **免 wbi 签名**：数据中心 IP 直连即可 `code:0`，无 `-412/-799/-352` 风控
 - **完整 `cnt_info`**：单次调用即返回 `play/thumb_up/coin/collect/reply/danmaku/share` 全部 7 项指标，**无需逐条 `view` 补全**
 - **游标分页**：`oid=0` 起始，每页最后一条的 `id` 作为下一页 `oid`，`has_more` 控制翻页
+- **游标锚点可能重复**：下一页可能再次包含上一页的 `oid` 锚点。必须在累计数量和 `limit` 判断之前按 BV first-wins 去重；持久化边界还要再次保证 JSONL、CSV、`task.collected_count` 与报告均使用唯一作品数。
 - **字段差异**：BV号字段名为 `bv_id`（非 `bvid`），发布时间为 `pubtime`（非 `pubdate`），分区为 `tid`（非 `typeid`）
 - **置顶检测**：`/x/space/top/arc?vmid={mid}` 同样免 wbi、稳定，返回置顶视频完整 JSON
 - **标签采集**：`/x/tag/archive/tags?bvid={BV}` 同样免 wbi、稳定，返回 `tag_name` 列表
@@ -159,7 +160,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 **端到端验证结果**（uid=518388027，幸运的一只猫，粉丝 258）：
 - 采集 10 条视频，7 项指标（views/likes/coins/favorites/comments/shares/danmaku）**100% 覆盖率**
 - 对比 T5 的 `arc/search` 路径（需逐条 `view` 补全，常因风控导致 likes/coins/favorites/shares 为 0%），medialist 路径指标完整度从 ~14% 提升至 **100%**
-- 请求数从 `1 + N`（arc/search 1 次 + 每条 view 1 次）降至 `1 + ceil(N/20)`（仅 medialist 翻页），IP 信誉消耗降低 80%+
+- 核心列表与 7 项指标请求从 `1 + N`（arc/search 1 次 + 每条 view 1 次）降至约 `ceil(N/20)` 个 medialist 页面；动态观察和可选标签补充另行计数。动态发现排在逐条标签之前，避免在大量可选请求后才观察动态入口。
 
 ## 实证分层总览（T1–T6 全部结论的三层归类）
 
@@ -180,7 +181,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 
 > **措辞更正**：此前缺口分析文档将这些结论判为「外部未验证 / 外部断言」。经复核，独立浏览器工作流的产物文件虽不在本工作区（事实），但其得出的数据与本项目探针结论已被交叉验证（事实），置信度应定为**高置信、待本管线复现**，而非「未验证」。
 
-- **账号等级 `level=5` 来自 `acc['level']`（顶层）**：旧代码误读 `level_info.current_level`（该键在 `acc/info` 响应中不存在）→ 显示 null。本管线已定位该代码缺陷，修复方向为读 `acc.get("level")`（兜底 `card.level_info.current_level`），属 §适配规则 账号字段层待补。
+- **账号等级 `level=5` 来自 `acc['level']`（顶层）**：旧代码误读 `level_info.current_level` 会显示 null；当前适配器已修复为显式读取顶层 `level`，并以 `card.level_info.current_level` 兜底，真实 `0` 不会被当作缺失。
 - **该账号（UID 518388027，幸运的一只猫）投稿总数 98**：已由 T5 本管线 `arc/search` 两页计数（50+48）独立交叉验证，与独立工作流结论一致。
 - **14 个 `typeid` 分区映射**（数值分区 ID → 子分区/主分区）：独立工作流产出，见下方「分区中文名缺口结论」静态映射表。需以官方分区表静态映射并标注「待核对」，置信度为高（非「未知」）。
 - **空间动态 feed 共 19 条视频类动态**：端点 `x/polymer/web-dynamic/v1/feed/space`（WBI + `web_location=333.1007`），结构 `module_author.pub_ts`、`major.archive.bvid/title/stat`、`module_stat.like/comment/forward`。本管线 `collect_dynamics` 已实测从 sandbox 直采 19/19（该端点未受 arc/search 同款封禁），T4 实现配方见「实现配方速查」。
@@ -194,9 +195,9 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 
 ### 分区中文名缺口结论（补充）
 
-- **B站视频 API 的 `tname` / `tname_v2` 实测为空**；分区列表接口（`region` 系列）被 WAF 拦截（返回风控 HTML）；视频页 DOM 无分区面包屑 → **分区中文名已无法从 API 实时获取**。
-- **解决**：用 B站官方分区表**静态映射** `typeid → 子分区/主分区`，在数据中标注 `field_visibility` / 来源为 `reference`（非 API 实时值），并注明需核对。
-- 现网可用的 14 个 `typeid` 映射（⚠️ 属第 2 层：独立工作流产出、高置信、已对照 `bili_extra.json` 核实；权威表见 `bili_extra.json` 的 `typeid_map`，来源 `bilibili-API-collect/video_zone.md`；尤其 249/250 建议再核对）：
+- **B站视频 API 的 `tname` / `tname_v2` 可能为空**；分区列表接口和页面面包屑也不构成稳定依赖。因此中文名只能使用同一响应明确给出的 API 名称，或有来源说明的静态参考映射。
+- **解决**：API 条目若明确给出非空 `tname` / `typename`，优先作为 `partition_source=api`；否则规范化整数或数字字符串 `typeid`，再用已审计静态映射并标 `partition_source=reference`、`partition_needs_verification=true`。完全未知时保持 `null`。
+- 当前代码内置的 14 个 `typeid` 参考映射（⚠️ 属第 2 层历史参考，不是随包提供的官方表；尤其 249/250 仍需核对）。仓库没有可复核的 `bili_extra.json`，因此文档不得再把它称为权威本地证据。2026-07-27 实采出现的 242、76、228 暂无同响应名称或已随包版本化映射，必须保持 `partition=null`：
 
   | typeid | 子分区（主分区） | typeid | 子分区（主分区） |
   |---|---|---|---|
@@ -213,10 +214,10 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 > 历史实验目录只用于交叉核验字段来源，不是当前 B站采集的运行路径。当前适配器不会复用其中的登录状态、浏览器传输或反爬参数；平台保护响应始终按上一节立即停止。
 
 - **账号等级（T2）**：读 `acc/info` 的**顶层 `level`**（`account.level`）；**绝不读 `level_info.current_level`**（该键不存在 → null）。`bili_report.py` 的 account 构建即如此。
-- **typeid + 分区映射（T2）**：`arc/search` vlist 含 `typeid`；分区中文名用静态映射，权威表在 **`bili_extra.json` 的 `typeid_map`**（14 项，来源 `bilibili-API-collect/video_zone.md`，标 `reference`）。⚠️ 同目录 `bili_partmap.json` 是**坏样本**（DOM 选择器误抓全局导航「赛事库」污染，切勿使用）。
+- **typeid + 分区映射（T2）**：`arc/search` vlist 含 `typeid`；内置 14 项仅是标为 `reference` 且 `partition_needs_verification=true` 的历史参考，不是官方实时表。仓库未随包提供此前文档所称的 `bili_extra.json`，未知 ID 必须保留原始整数并令名称/来源为 `null`；DOM 全局导航不得作为分区证据。
 - **arc/search 的 WBI 参数**：当前实现使用公开业务参数与 `web_location=333.1387` 参与签名，不从浏览器复制动态反爬参数。
 - **空间动态 feed（T4）**：端点 `x/polymer/web-dynamic/v1/feed/space`，参数 `host_mid` / `offset` / `timeline_ad="true"`、`web_location=333.1007`；分页用 `has_more`+`offset`（**偶发空页，需 empty-streak 守卫防死循环**）；卡片取 `modules.module_author.pub_ts`、`modules.module_dynamic.major.archive.{bvid,title,stat}`、`modules.module_stat.{like,comment,forward}.count`；`is_forward = bool(it["orig"])`；`pub_ts` 有时是字符串需 `int()`。
-- **内容分析启发式（T5）**：`bili_report.py` 的 `analyze(title,desc,tags,duration,partition_name,partition_parent,ugc_season,is_original)` 返回 `(topic,format,funnel_stage,hook_type,analysis_labels)`，全规则可整段移植；分析层字段统一标 `generated(启发式)`。
+- **历史启发式不可直接迁移**：标题/简介可以支持主题与形式候选，但不能证明视频开头。当前 taxonomy 合同在没有公开 `opening_text` 时强制 B站 `hook_type=unknown`，原创性只绑定公开转载枚举。
 
 # B站适配规则
 
@@ -240,7 +241,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 | `account_id` | UID | 主页数字 ID，`web-interface/card` 的 `card.mid` |
 | `account_name` | 名称 | `card.name` |
 | `bio` | 简介 | `card.sign` |
-| `verified` | 认证 | `card.official_verify`：`type>=0` 视为已认证，写入认证文案 `desc`，否则 `null` |
+| `verified` | 认证 | `card.official` / `official_verify`：`type>=0` 为 `true`，`-1/127` 为 `false`，字段缺失/非法为 `null` |
 | `followers` | 粉丝 | `card.fans` 或 `data.follower`（免 wbi 的权威源） |
 | `post_count` | 视频数 | `data.archive_count` |
 
@@ -258,7 +259,7 @@ B站账号层 `platform_metrics` 约定为空对象 `{}`（获赞总量非账号
 | `text` | 简介 | 视频简介 `desc` |
 | `published_at` | 发布时间 | `pubdate`（Unix 秒）→ ISO 8601 `+08:00` |
 | `content_type` | video / dynamic | 投稿=`video`；动态视频=`dynamic` |
-| `hashtags` | 标签 | `tag[].tag_name` 列表 |
+| `hashtags` | 标签 | 优先 `tag[].tag_name`，并合并标题/简介中可见 `#标签#` |
 | `duration_seconds` | 时长 | `duration`（秒） |
 
 ## 公开指标
@@ -280,10 +281,12 @@ B站账号层 `platform_metrics` 约定为空对象 `{}`（获赞总量非账号
 ## 特殊处理
 
 - **置顶视频**：`top/arc` 成功返回 BV 号时，命中项写 `true`、其余项写 `false`；端点明确成功但无置顶时全部写 `false`；端点失败或结果不可验证时写 `null`。
-- **合集**：统一模型无 `is_in_collection` 字段；合集归属作为分析层 `series_name` 标记（见 data-schema §7），不新增 Post 布尔字段；合集本身不计入近期投稿排序。
-- **动态视频**：标记 `content_type=dynamic`（区别于正式投稿 `video`）。
+- **合集**：Post 顶层不新增合集布尔字段；所有 B站构建路径固定输出 `platform_metrics.collection_evidence_status/is_in_collection/series_name/season_id`。只有 `ugc_season` 正证据才写 `OBSERVED/true`；完整响应未见该节点写 `NOT_OBSERVED/null`，不具备该证据的列表路径写 `UNAVAILABLE/null`。分类阶段只可沿用非空 `series_name`。合集容器本身不作为投稿重复计数。
+- **动态视频**：动态发现先于逐条标签补充。独立 BV 标记 `content_type=dynamic` 并进入统一主列表；与正式投稿出现同一 BV 时按 `post_id` first-wins 去重，以投稿详情为主并保留 `appeared_in_dynamic_feed` 和动态指标证据。动态卡缺失收藏/投币等统一指标时单条为 `PARTIAL` 并列出 `missing_detail_metrics`。合并后统一按时间排序、日期过滤和 limit 截断，最终唯一 BV 才各补一次标签。
+- **动态覆盖账本**：`task.collection_coverage` 保存 `regular_source`、`regular_observed_count`、`dynamic_status` 与 `dynamic_observed_count`。`dynamic_status=OBSERVED` 只表示本次入口观察成功，不声称全历史穷尽；保护响应使用固定停止枚举。报告必须披露非 `OBSERVED` 状态可能遗漏动态-only公开视频。
 - **转载**：`copyright=2` → `is_repost=true`；原创（`copyright=1`）→ `is_repost=false`；`copyright` 缺失/非法时写 `null`。未取得公开投放证据时 `is_promoted=null`。
-- **充电专属 / 不可访问内容**：无法公开访问的投稿记 `collection_status=RESTRICTED`（或 `DELETED`），指标写 `null`，不臆测数值。
+- **充电专属 / 不可访问内容**：单条详情明确 `-404` 时保留列表证据并标 `DELETED`，继续处理其余作品；其他普通详情解析失败仅将该条降为 `PARTIAL/detail_status=UNAVAILABLE`。平台保护响应才停止整批并携带此前 `partial_posts`。
+- **翻页与日期窗口**：medialist、arc 与动态在发现阶段按日期窗口继续翻页；观察到早于下界、末页或取得 limit 条命中后才停止。后续页触发平台保护时，把此前页面条目转为 `partial_posts`，不得丢弃。
 - **获赞总量**：B站主页「获赞」为全站累计，非账号层统一字段，且 `web-interface/card` 不含该值，故**不进入 Profile**（`platform_metrics` 保持 `{}`）。
 
 ## 访问限制识别
@@ -295,8 +298,9 @@ B站账号层 `platform_metrics` 约定为空对象 `{}`（获赞总量非账号
 | 页面 / 接口要求登录（登录墙标记） | `LOGIN_REQUIRED` | 停止采集，保留已得数据 |
 | 验证码 / 滑块（`verify_captcha` / 滑块文案） | `VERIFICATION_REQUIRED` | 立即停止，不破解 |
 | 频控（`-412 request was banned` / `-799 请求过于频繁`） | `ACCESS_RESTRICTED` | 停止，保留已得数据 |
-| 账号不存在 / 被封（`-404` / `ACCOUNT_UNAVAILABLE`） | `ACCOUNT_UNAVAILABLE` | 停止 |
-| 页面可访问但解析失败（JSON 异常 / 字段缺失且无法补救） | `PARSER_FAILED` | 记录字段错误，停止 |
+| 账号主页不存在 / 被封（资料阶段 `-404`） | `ACCOUNT_UNAVAILABLE` | 停止账号任务 |
+| 单条作品详情 `-404` | 条目 `DELETED` | 保留列表证据并继续其余作品 |
+| 单条详情普通解析异常 | 条目 `PARTIAL` | 记录 `detail_status` 并继续；不伪装为平台保护 |
 
 ## 平台特有测试样例
 

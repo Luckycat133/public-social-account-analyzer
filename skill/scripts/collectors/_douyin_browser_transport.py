@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from ._constants import (
+    DOUYIN_BROWSER_VISIBLE_RESTRICTION_MARKERS,
+    DOUYIN_BROWSER_VISIBLE_RESTRICTION_SOURCE,
     DOUYIN_PAGE_STATE_PATTERNS,
     PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
     PUBLIC_ALL_DEFAULT_MAX_SECONDS,
@@ -1951,6 +1953,18 @@ def collect_account_page(
             "browser_fallback_requested": True,
             "browser_fallback_launched": True,
             "browser_evidence_source": source,
+            **(
+                {
+                    "restriction_source": (
+                        DOUYIN_BROWSER_VISIBLE_RESTRICTION_SOURCE
+                    ),
+                    "restriction_marker": (
+                        DOUYIN_BROWSER_VISIBLE_RESTRICTION_MARKERS[restriction]
+                    ),
+                }
+                if restriction in DOUYIN_BROWSER_VISIBLE_RESTRICTION_MARKERS
+                else {}
+            ),
             "scroll_rounds": scrolls,
             "max_seconds": float(seconds_budget),
             "max_scrolls": scroll_budget,

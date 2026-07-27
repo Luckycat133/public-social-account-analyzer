@@ -47,6 +47,8 @@ from collectors._douyin_detail_contract import (  # noqa: E402
     set_detail_contract,
 )
 from collectors._constants import (  # noqa: E402
+    DOUYIN_BROWSER_VISIBLE_RESTRICTION_MARKER_VALUES,
+    DOUYIN_BROWSER_VISIBLE_RESTRICTION_SOURCE,
     PUBLIC_ALL_DEFAULT_MAX_ITEMS,
     PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
     PUBLIC_ALL_DEFAULT_MAX_SECONDS,
@@ -86,6 +88,7 @@ from task_contract import (  # noqa: E402
     validate_analysis_goal,
 )
 from csv_contract import deserialize_csv_row, serialize_csv_row  # noqa: E402
+from execution_timing import ExecutionTimer  # noqa: E402
 from normalize import dedup_posts, to_bool_flag  # noqa: E402
 
 # 北京时间为中国平台默认时区(见 references/data-schema.md §1)
@@ -139,11 +142,27 @@ _REPORT_ERROR_CODES = _KNOWN_STOP_REASONS | {
     "POST_UNAVAILABLE",
     "COMMENTS_UNAVAILABLE",
 }
+_BILIBILI_REGULAR_SOURCES = frozenset({"medialist", "arc", "search"})
+_BILIBILI_DYNAMIC_STATUSES = frozenset({
+    "NOT_ATTEMPTED",
+    "UNAVAILABLE",
+    "OBSERVED",
+    SR_LOGIN,
+    SR_VERIFICATION,
+    SR_ACCESS_RESTRICTED,
+    SR_PARSER_FAILED,
+    SR_INTERNAL,
+})
 _MAX_COMMENT_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_RESUME_ARTIFACT_BYTES = 64 * 1024 * 1024
 _ACTIVE_RESERVATIONS: contextvars.ContextVar[list | None] = contextvars.ContextVar(
     "active_workspace_reservations", default=None
 )
+
+
+def _event_timestamp() -> str:
+    """Timestamp an event when it is observed, not when the task started."""
+    return datetime.now(_BEIJING).isoformat()
 
 
 def _stop_reason_from_exc(e: Exception) -> str:
@@ -1173,6 +1192,15 @@ def _sanitize_collection_coverage(value) -> dict:
     evidence_source = value.get("browser_evidence_source")
     if evidence_source in {"none", "network", "dom", "network+dom"}:
         clean["browser_evidence_source"] = evidence_source
+    restriction_source = value.get("restriction_source")
+    restriction_marker = value.get("restriction_marker")
+    if (
+        restriction_source == DOUYIN_BROWSER_VISIBLE_RESTRICTION_SOURCE
+        and restriction_marker
+        in DOUYIN_BROWSER_VISIBLE_RESTRICTION_MARKER_VALUES
+    ):
+        clean["restriction_source"] = restriction_source
+        clean["restriction_marker"] = restriction_marker
     for key in (
         "max_items",
         "observed_page_count",
@@ -1189,6 +1217,20 @@ def _sanitize_collection_coverage(value) -> dict:
                     clean[key] = field_value
             else:
                 clean[key] = max(0, field_value)
+    regular_source = value.get("regular_source")
+    if regular_source in _BILIBILI_REGULAR_SOURCES:
+        clean["regular_source"] = regular_source
+    dynamic_status = value.get("dynamic_status")
+    if dynamic_status in _BILIBILI_DYNAMIC_STATUSES:
+        clean["dynamic_status"] = dynamic_status
+    for key in ("regular_observed_count", "dynamic_observed_count"):
+        field_value = value.get(key)
+        if (
+            isinstance(field_value, int)
+            and not isinstance(field_value, bool)
+            and field_value >= 0
+        ):
+            clean[key] = field_value
     scroll_rounds = value.get("scroll_rounds")
     if (
         isinstance(scroll_rounds, int)
@@ -1278,6 +1320,15 @@ def _safe_timestamp(value) -> str | None:
     return value if parsed.tzinfo is not None else None
 
 
+def _safe_diagnostic_code(value) -> str | None:
+    if (
+        isinstance(value, str)
+        and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", value)
+    ):
+        return value
+    return None
+
+
 def _sanitize_report_error(value) -> dict:
     """Map an internal/adaptor error to the report's fixed public vocabulary."""
     source = value if isinstance(value, dict) else {}
@@ -1294,11 +1345,8 @@ def _sanitize_report_error(value) -> dict:
         "message": _ERROR_STAGE_MESSAGES[stage],
         "occurred_at": _safe_timestamp(source.get("occurred_at")),
     }
-    diagnostic_code = source.get("diagnostic_code")
-    if (
-        isinstance(diagnostic_code, str)
-        and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", diagnostic_code)
-    ):
+    diagnostic_code = _safe_diagnostic_code(source.get("diagnostic_code"))
+    if diagnostic_code is not None:
         clean["diagnostic_code"] = diagnostic_code
     return clean
 
@@ -1326,6 +1374,8 @@ def _write_task_json(
     resume_source_digest: str | None = None,
     collection_coverage: dict | None = None,
     comment_collection: dict | None = None,
+    diagnostic_code: str | None = None,
+    execution_timing: dict,
     reservation: _WorkspaceReservation | None = None,
 ) -> None:
     """落盘 task.json(任务状态与停止原因,见 SKILL.md「任务状态与停止原因」)。"""
@@ -1343,6 +1393,7 @@ def _write_task_json(
         "stop_reason": (
             _safe_stop_reason(stop_reason) if stop_reason is not None else None
         ),
+        "diagnostic_code": _safe_diagnostic_code(diagnostic_code),
         "collected_count": collected_count,
         "collected_at": _safe_timestamp(collected_at),
         "incremental": incremental,
@@ -1360,6 +1411,10 @@ def _write_task_json(
         ),
         "collection_coverage": _sanitize_collection_coverage(collection_coverage),
         "comment_collection": comment_collection or {},
+        "started_at": execution_timing["started_at"],
+        "ended_at": execution_timing["ended_at"],
+        "duration_ms": execution_timing["duration_ms"],
+        "phase_durations_ms": execution_timing["phase_durations_ms"],
     }
     handle = (
         reservation.open_text("task.json")
@@ -1398,6 +1453,17 @@ def _write_report(
         ),
         None,
     )
+    success_count = sum(
+        1 for post in posts if post.get("collection_status") == "SUCCESS"
+    )
+    partial_count = sum(
+        1 for post in posts if post.get("collection_status") == "PARTIAL"
+    )
+    unavailable_count = sum(
+        1
+        for post in posts
+        if post.get("collection_status") in {"FAILED", "DELETED", "RESTRICTED"}
+    )
     lines = [
         "# 采集质量报告",
         "",
@@ -1409,7 +1475,9 @@ def _write_report(
         f"{_safe_stop_reason(stop_reason) if stop_reason else 'null'}",
         f"- 资料 field_visibility 可见字段数: {_vis_count(profile)}",
         f"- 内容条数: {len(posts)}",
-        f"- 成功采集内容数: {len(posts)}",
+        f"- 成功采集内容数: {success_count}",
+        f"- 部分采集内容数: {partial_count}",
+        f"- 删除/失败/受限内容数: {unavailable_count}",
         f"- 错误或受限事件数: {len(safe_errors)}",
         f"- 停止阶段: {stop_stage if stop_stage else 'null'}",
     ]
@@ -1516,6 +1584,7 @@ def run(
     enrich_details: bool = False,
     analysis_goal: str | None = None,
 ) -> int:
+    execution_timer = ExecutionTimer(wall_timezone=_BEIJING)
     try:
         analysis_goal = validate_analysis_goal(analysis_goal)
     except TaskContractError:
@@ -1746,10 +1815,23 @@ def run(
             "stage": "check_access",
             "error_code": reason,
             "message": _ERROR_STAGE_MESSAGES["check_access"],
-            "occurred_at": collected_at,
+            "occurred_at": _event_timestamp(),
             "retryable": False,
         }
         try:
+            with execution_timer.phase("persist"):
+                _write_report(
+                    adapter,
+                    url,
+                    profile,
+                    posts,
+                    ws,
+                    task_status="FAILED",
+                    stop_reason=reason,
+                    collection_coverage=collection_coverage,
+                    error_log=[error],
+                    reservation=reservation,
+                )
             _write_task_json(
                 ws,
                 platform=platform,
@@ -1768,18 +1850,7 @@ def run(
                 resume_source_format=resume_source_format,
                 resume_source_digest=resume_source_digest,
                 collection_coverage=collection_coverage,
-                reservation=reservation,
-            )
-            _write_report(
-                adapter,
-                url,
-                profile,
-                posts,
-                ws,
-                task_status="FAILED",
-                stop_reason=reason,
-                collection_coverage=collection_coverage,
-                error_log=[error],
+                execution_timing=execution_timer.snapshot(),
                 reservation=reservation,
             )
             reservation.commit()
@@ -1799,7 +1870,8 @@ def run(
     # 1) check_access:不绕过任何保护(见 base.py / exceptions.md §2)
     access_failed = False
     try:
-        access = adapter.check_access(url)
+        with execution_timer.phase("check_access"):
+            access = adapter.check_access(url)
     except Exception as e:
         # 适配器未启用(WeiboCollector._require_enabled 抛 RuntimeError 携 ADAPTER_UNAVAILABLE)
         stop_reason = _stop_reason_from_exc(e)
@@ -1823,16 +1895,19 @@ def run(
 
     # 2) 内容列表(先于资料,便于回填;失败不阻断资料写入)
     try:
-        if collect_all:
-            posts = adapter.collect_all_post_list(
-                url,
-                date_range=date_range,
-                max_items=max_items,
-                max_seconds=max_seconds,
-                max_scrolls=max_scrolls,
-            )
-        else:
-            posts = adapter.collect_post_list(url, limit=limit, date_range=date_range)
+        with execution_timer.phase("collect_post_list"):
+            if collect_all:
+                posts = adapter.collect_all_post_list(
+                    url,
+                    date_range=date_range,
+                    max_items=max_items,
+                    max_seconds=max_seconds,
+                    max_scrolls=max_scrolls,
+                )
+            else:
+                posts = adapter.collect_post_list(
+                    url, limit=limit, date_range=date_range
+                )
     except Exception as e:
         partial_posts = getattr(e, "partial_posts", None)
         if isinstance(partial_posts, list):
@@ -1856,7 +1931,7 @@ def run(
             "url": safe_url, "stage": "collect_post_list",
             "error_code": stop_reason,
             "message": _ERROR_STAGE_MESSAGES["collect_post_list"],
-            "occurred_at": collected_at, "retryable": False,
+            "occurred_at": _event_timestamp(), "retryable": False,
         }
         if isinstance(diagnostic_code, str) and diagnostic_code:
             entry["diagnostic_code"] = diagnostic_code
@@ -1883,7 +1958,7 @@ def run(
             "stage": "collection_coverage",
             "error_code": SR_PARSER_FAILED,
             "message": "全量采集覆盖账本缺少一致的末页完备性证据",
-            "occurred_at": collected_at,
+            "occurred_at": _event_timestamp(),
             "retryable": False,
             "diagnostic_code": "ALL_POSTS_INCOMPLETE",
         })
@@ -1892,6 +1967,26 @@ def run(
     # (见 SKILL.md §1「采集数量和日期范围同时存在时,取两者共同限定的结果」)
     if posts and (date_from_iso or date_to_iso):
         posts = _filter_by_date(posts, date_from_iso, date_to_iso)
+    duplicate_count = 0
+    if posts:
+        posts, duplicate_count = dedup_posts(posts)
+    if (
+        duplicate_count > 0
+        and not resume_mode
+        and len(posts) < requested_count
+        and stop_reason is None
+    ):
+        stop_reason = SR_PARSER_FAILED
+        task_status = "PARTIAL"
+        error_log.append({
+            "url": safe_url,
+            "stage": "collect_post_list",
+            "error_code": SR_PARSER_FAILED,
+            "message": _ERROR_STAGE_MESSAGES["collect_post_list"],
+            "occurred_at": _event_timestamp(),
+            "retryable": False,
+            "diagnostic_code": "DUPLICATE_POSTS_DROPPED",
+        })
     if posts and not resume_mode:
         posts = posts[:requested_count]
 
@@ -1901,13 +1996,20 @@ def run(
         posts, new_count = _merge_incremental(existing_posts, posts)
     _canonicalize_post_urls(platform, posts)
     _ensure_post_collection_status_contract(posts)
+    content_issue_count = sum(
+        1
+        for post in posts
+        if post.get("collection_status")
+        in {"PARTIAL", "FAILED", "DELETED", "RESTRICTED"}
+    )
 
     # 3) 资料(失败不阻塞已采内容)
     try:
-        profile = adapter.collect_profile(url)
-        if not isinstance(profile, dict):
-            raise ValueError("invalid profile result")
-        profile["profile_url"] = url
+        with execution_timer.phase("collect_profile"):
+            profile = adapter.collect_profile(url)
+            if not isinstance(profile, dict):
+                raise ValueError("invalid profile result")
+            profile["profile_url"] = url
     except Exception as e:
         profile_reason = _stop_reason_from_exc(e)
         stop_reason = _dominant_stop_reason(stop_reason, profile_reason)
@@ -1916,19 +2018,20 @@ def run(
             "url": safe_url, "stage": "collect_profile",
             "error_code": profile_reason,
             "message": _ERROR_STAGE_MESSAGES["collect_profile"],
-            "occurred_at": collected_at, "retryable": False,
+            "occurred_at": _event_timestamp(), "retryable": False,
         })
         print("[warn] 资料采集异常", file=sys.stderr)
         profile = {}
 
     if enrich_details and platform == "douyin" and posts:
-        detail_unavailable_count = _enrich_douyin_details(
-            adapter,
-            posts,
-            error_log,
-            collected_at,
-            blocked_reason=stop_reason,
-        )
+        with execution_timer.phase("collect_post_detail"):
+            detail_unavailable_count = _enrich_douyin_details(
+                adapter,
+                posts,
+                error_log,
+                collected_at,
+                blocked_reason=stop_reason,
+            )
         detail_protection = next(
             (
                 error.get("error_code")
@@ -1949,43 +2052,44 @@ def run(
 
     # 4) 落盘原始数据与归一化 CSV(已采集数据必须保留,见 exceptions.md §2 规则 3)
     try:
-        with reservation.open_text("source/profile.json") as f:
-            json.dump(profile, f, ensure_ascii=False, indent=2)
+        with execution_timer.phase("persist"):
+            with reservation.open_text("source/profile.json") as f:
+                json.dump(profile, f, ensure_ascii=False, indent=2)
 
-        with reservation.open_text("source/posts.jsonl") as f:
-            for p in posts:
-                f.write(json.dumps(p, ensure_ascii=False) + "\n")
+            with reservation.open_text("source/posts.jsonl") as f:
+                for p in posts:
+                    f.write(json.dumps(p, ensure_ascii=False) + "\n")
 
-        _write_csv(
-            posts,
-            os.path.join(ws, "normalized-posts.csv"),
-            reservation=reservation,
-        )
-
-        # 5) 评论(可选;失败不阻塞主任务,见 exceptions.md §1.1)
-        if include_comments:
-            comment_collection = _collect_and_persist_comments(
-                adapter,
+            _write_csv(
                 posts,
-                os.path.join(src, "comments.jsonl"),
-                error_log,
-                collected_at,
+                os.path.join(ws, "normalized-posts.csv"),
                 reservation=reservation,
-                blocked_reason=stop_reason,
             )
-            comment_stop_reason = comment_collection.get("stop_reason")
-            if comment_stop_reason in _TASK_PROTECTION_REASONS:
-                stop_reason = _dominant_stop_reason(
-                    stop_reason,
-                    comment_stop_reason,
+
+            # 5) 评论(可选;失败不阻塞主任务,见 exceptions.md §1.1)
+            if include_comments:
+                comment_collection = _collect_and_persist_comments(
+                    adapter,
+                    posts,
+                    os.path.join(src, "comments.jsonl"),
+                    error_log,
+                    collected_at,
+                    reservation=reservation,
+                    blocked_reason=stop_reason,
                 )
-            print(
-                "[OK] 评论采样: "
-                f"attempted_posts={comment_collection['attempted_posts']} "
-                f"comments_collected={comment_collection['comments_collected']} "
-                f"empty_results={comment_collection['empty_results']} "
-                f"failures={comment_collection['failures']}"
-            )
+                comment_stop_reason = comment_collection.get("stop_reason")
+                if comment_stop_reason in _TASK_PROTECTION_REASONS:
+                    stop_reason = _dominant_stop_reason(
+                        stop_reason,
+                        comment_stop_reason,
+                    )
+                print(
+                    "[OK] 评论采样: "
+                    f"attempted_posts={comment_collection['attempted_posts']} "
+                    f"comments_collected={comment_collection['comments_collected']} "
+                    f"empty_results={comment_collection['empty_results']} "
+                    f"failures={comment_collection['failures']}"
+                )
     except WorkspaceCommitIndeterminate:
         raise
     except (
@@ -2015,7 +2119,9 @@ def run(
     )
     if stop_reason is None:
         task_status = "COMPLETED" if posts or exhaustive_range_no_match else "FAILED"
-        if task_status == "COMPLETED" and detail_unavailable_count:
+        if task_status == "COMPLETED" and (
+            detail_unavailable_count or content_issue_count
+        ):
             task_status = "PARTIAL"
         if not posts and not profile:
             stop_reason = SR_NO_PUBLIC_CONTENT
@@ -2023,7 +2129,32 @@ def run(
     else:
         task_status = "PARTIAL" if posts else "FAILED"
 
+    task_diagnostic_code = next(
+        (
+            code
+            for error in reversed(error_log)
+            if (
+                stop_reason is None
+                or error.get("error_code") == stop_reason
+            )
+            and (
+                code := _safe_diagnostic_code(error.get("diagnostic_code"))
+            ) is not None
+        ),
+        None,
+    )
+
     try:
+        _write_report(
+            adapter, url, profile, posts, ws,
+            task_status=task_status, stop_reason=stop_reason,
+            error_log=error_log,
+            incremental=resume_mode, existing_count=len(existing_posts),
+            new_count=new_count,
+            collection_coverage=collection_coverage,
+            comment_collection=comment_collection,
+            reservation=reservation,
+        )
         _write_task_json(
             ws, platform=platform, profile_url=url,
             task_id=task_id, analysis_goal=analysis_goal,
@@ -2039,16 +2170,8 @@ def run(
             resume_source_digest=resume_source_digest,
             collection_coverage=collection_coverage,
             comment_collection=comment_collection,
-            reservation=reservation,
-        )
-        _write_report(
-            adapter, url, profile, posts, ws,
-            task_status=task_status, stop_reason=stop_reason,
-            error_log=error_log,
-            incremental=resume_mode, existing_count=len(existing_posts),
-            new_count=new_count,
-            collection_coverage=collection_coverage,
-            comment_collection=comment_collection,
+            diagnostic_code=task_diagnostic_code,
+            execution_timing=execution_timer.snapshot(),
             reservation=reservation,
         )
         reservation.commit()

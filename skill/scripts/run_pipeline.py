@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import os
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from analyze import AnalysisResult, analyze_in_memory
+from execution_timing import ExecutionTimer
 from immutable_workspace import (
     ANALYSIS_ARTIFACTS,
     ANALYSIS_OPTIONAL_ARTIFACTS,
@@ -89,9 +91,19 @@ def _classification_json(payload: bytes) -> list[dict[str, Any]]:
     def reject_constant(value: str):
         raise ValueError(f"non-standard numeric constant {value}")
 
+    def reject_duplicate_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key {key}")
+            result[key] = value
+        return result
+
     try:
         value = json.loads(
-            payload.decode("utf-8"), parse_constant=reject_constant
+            payload.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_pairs,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise PipelineError(
@@ -111,6 +123,44 @@ def _read_classification_results(path: str) -> tuple[bytes, list[dict[str, Any]]
     if len(payload) > DEFAULT_MAX_ARTIFACT_BYTES:
         raise PipelineError("classification results are too large")
     return payload, _classification_json(payload)
+
+
+def _business_insight_json(payload: bytes) -> dict[str, Any]:
+    def reject_constant(value: str):
+        raise ValueError(f"non-standard numeric constant {value}")
+
+    def reject_duplicate_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_pairs,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise PipelineError(
+            "business insight results are not strict UTF-8 JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise PipelineError("business insight results must be a JSON object")
+    return value
+
+
+def _read_business_insight_results(path: str) -> tuple[bytes, dict[str, Any]]:
+    try:
+        with open(path, "rb") as handle:
+            payload = handle.read(DEFAULT_MAX_ARTIFACT_BYTES + 1)
+    except (OSError, TypeError, ValueError) as exc:
+        raise PipelineError("business insight results cannot be read") from exc
+    if len(payload) > DEFAULT_MAX_ARTIFACT_BYTES:
+        raise PipelineError("business insight results are too large")
+    return payload, _business_insight_json(payload)
 
 
 def _validate_jsonl(payload: bytes, label: str) -> None:
@@ -176,9 +226,15 @@ def _analysis_status(result: AnalysisResult) -> str:
     evidence_status = (result.analysis.get("evidence_coverage") or {}).get(
         "status"
     )
+    business_required = result.analysis.get("business_insight_required") is True
+    business_complete = (
+        not business_required
+        or result.analysis.get("business_insight_status") == "completed"
+    )
     complete = (
         classification_status == "completed"
         and evidence_status == "COMPLETE"
+        and business_complete
     )
     return "COMPLETED" if complete else "PARTIAL"
 
@@ -195,6 +251,15 @@ def _analysis_partial_reasons(analysis: dict[str, Any]) -> list[str]:
         reasons.append("PARTIAL_CLASSIFICATION")
     elif classification_status != "completed":
         needs_generic_reason = True
+
+    if analysis.get("business_insight_required") is True:
+        business_status = analysis.get("business_insight_status")
+        if business_status == "pending-model":
+            reasons.append("PENDING_BUSINESS_INSIGHTS")
+        elif business_status == "partial-model":
+            reasons.append("PARTIAL_BUSINESS_INSIGHTS")
+        elif business_status != "completed":
+            needs_generic_reason = True
 
     evidence_status = (analysis.get("evidence_coverage") or {}).get("status")
     if evidence_status == "PARTIAL_EVIDENCE":
@@ -239,6 +304,8 @@ def _validate_output_payloads(
         )
     if "source/classification-results.json" in artifacts:
         _classification_json(artifacts["source/classification-results.json"])
+    if "source/business-insight-results.json" in artifacts:
+        _business_insight_json(artifacts["source/business-insight-results.json"])
 
     try:
         csv_rows = list(
@@ -272,6 +339,7 @@ def _pipeline_report(
     phase_results: dict[str, str],
     source_digest: str,
     normalization: NormalizationResult,
+    duration_ms: int,
 ) -> str:
     lines = [
         "# Derived analysis pipeline report",
@@ -282,6 +350,7 @@ def _pipeline_report(
         f"- collection_commit_sha256: {source_digest}",
         f"- normalized_rows: {normalization.coverage['post_count']}",
         f"- analyzable_rows: {normalization.coverage['valid_count']}",
+        f"- duration_ms: {duration_ms}",
         "",
         "## Phase results",
         "",
@@ -308,27 +377,44 @@ def run_pipeline(
     template_text: str | None = None,
     with_taxonomy_prompt: bool = False,
     classification_results_path: str | None = None,
+    with_business_insights: bool = False,
+    business_insight_results_path: str | None = None,
 ) -> PipelineResult:
     """Verify a sealed collection and commit a separate derived workspace."""
-    output = preflight_workspace_target(output_dir)
-    reject_workspace_overlap(collection_dir, output)
-    if template_text is None:
-        template_text = _load_default_template()
-    if not isinstance(template_text, str) or not template_text:
-        raise PipelineError("report template is missing or empty")
-    classification_payload: bytes | None = None
-    classification_results: list[dict[str, Any]] | None = None
-    if classification_results_path is not None:
-        classification_payload, classification_results = (
-            _read_classification_results(classification_results_path)
+    execution_timer = ExecutionTimer()
+    with execution_timer.phase("collection_input"):
+        output = preflight_workspace_target(output_dir)
+        reject_workspace_overlap(collection_dir, output)
+        if template_text is None:
+            template_text = _load_default_template()
+        if not isinstance(template_text, str) or not template_text:
+            raise PipelineError("report template is missing or empty")
+        classification_payload: bytes | None = None
+        classification_results: list[dict[str, Any]] | None = None
+        if classification_results_path is not None:
+            classification_payload, classification_results = (
+                _read_classification_results(classification_results_path)
+            )
+        classification_results_sha256 = (
+            hashlib.sha256(classification_payload).hexdigest()
+            if classification_payload is not None
+            else None
         )
+        business_insight_payload: bytes | None = None
+        business_insight_results: dict[str, Any] | None = None
+        if business_insight_results_path is not None:
+            business_insight_payload, business_insight_results = (
+                _read_business_insight_results(business_insight_results_path)
+            )
 
-    try:
-        reader_context = VerifiedWorkspaceReader.open(
-            collection_dir, allowed_artifacts=COLLECTION_ARTIFACTS
-        )
-    except WorkspaceError as exc:
-        raise PipelineError(f"collection verification failed: {exc}") from exc
+        try:
+            reader_context = VerifiedWorkspaceReader.open(
+                collection_dir, allowed_artifacts=COLLECTION_ARTIFACTS
+            )
+        except WorkspaceError as exc:
+            raise PipelineError(
+                f"collection verification failed: {exc}"
+            ) from exc
 
     with reader_context as reader:
         manifested = {
@@ -395,9 +481,10 @@ def run_pipeline(
             else:
                 _json_object(artifact.payload, relative)
 
-        normalization = _phase(
-            "NORMALIZE", normalize_in_memory, profile, posts_payload
-        )
+        with execution_timer.phase("normalization"):
+            normalization = _phase(
+                "NORMALIZE", normalize_in_memory, profile, posts_payload
+            )
         if normalization.coverage.get("valid_count", 0) < 1:
             raise PipelineError("NORMALIZE failed: no analyzable rows")
         normalization_status = _normalization_status(normalization)
@@ -405,20 +492,25 @@ def run_pipeline(
         analysis_params = dict(source_task)
         analysis_params["task_id"] = derived_task_id
         analysis_params["analysis_goal"] = analysis_goal
-        analysis = _phase(
-            "ANALYZE",
-            analyze_in_memory,
-            profile,
-            normalization.rows,
-            analysis_params,
-            classification_results=classification_results,
-            with_taxonomy_prompt=with_taxonomy_prompt,
-            comments_payload=(
-                reads["source/comments.jsonl"].payload
-                if "source/comments.jsonl" in reads
-                else None
-            ),
-        )
+        with execution_timer.phase("analysis"):
+            analysis = _phase(
+                "ANALYZE",
+                analyze_in_memory,
+                profile,
+                normalization.rows,
+                analysis_params,
+                classification_results=classification_results,
+                with_taxonomy_prompt=with_taxonomy_prompt,
+                business_insight_results=business_insight_results,
+                with_business_insights=with_business_insights,
+                collection_commit_sha256=reader.source_digest,
+                classification_results_sha256=classification_results_sha256,
+                comments_payload=(
+                    reads["source/comments.jsonl"].payload
+                    if "source/comments.jsonl" in reads
+                    else None
+                ),
+            )
         if (analysis.analysis.get("sample_boundary") or {}).get("valid", 0) < 1:
             raise PipelineError("ANALYZE failed: no analyzable rows")
         analysis_status = _analysis_status(analysis)
@@ -444,16 +536,18 @@ def run_pipeline(
         analysis = AnalysisResult(
             analysis=analysis_payload,
             taxonomy_prompt=analysis.taxonomy_prompt,
+            business_insights_prompt=analysis.business_insights_prompt,
         )
 
-        rendered = _phase(
-            "RENDER",
-            render_in_memory,
-            profile=profile,
-            posts_csv=normalization.rows,
-            analysis=analysis.analysis,
-            template=template_text,
-        )
+        with execution_timer.phase("render"):
+            rendered = _phase(
+                "RENDER",
+                render_in_memory,
+                profile=profile,
+                posts_csv=normalization.rows,
+                analysis=analysis.analysis,
+                template=template_text,
+            )
         assert isinstance(rendered, RenderResult)
 
         phase_results = {
@@ -488,6 +582,8 @@ def run_pipeline(
             "collection_commit_sha256": reader.source_digest,
             "phase_results": phase_results,
         }
+        provisional_timing = execution_timer.snapshot()
+        task.update(provisional_timing)
 
         artifacts: dict[str, bytes] = {
             "source/profile.json": profile_payload,
@@ -506,6 +602,7 @@ def run_pipeline(
                 phase_results=phase_results,
                 source_digest=reader.source_digest,
                 normalization=normalization,
+                duration_ms=provisional_timing["duration_ms"],
             ).encode("utf-8"),
         }
         for source_relative, output_relative in COLLECTION_OPTIONAL_EVIDENCE.items():
@@ -520,14 +617,40 @@ def run_pipeline(
             artifacts["source/classification-results.json"] = (
                 classification_payload
             )
+        if analysis.business_insights_prompt is not None:
+            artifacts["business-insights-prompt.md"] = (
+                analysis.business_insights_prompt.encode("utf-8")
+            )
+        if business_insight_payload is not None:
+            artifacts["source/business-insight-results.json"] = (
+                business_insight_payload
+            )
 
         expected_artifacts = ANALYSIS_REQUIRED_ARTIFACTS | frozenset(
             relative
             for relative in ANALYSIS_OPTIONAL_ARTIFACTS
             if relative in artifacts
         )
+        with execution_timer.phase("validation"):
+            _phase(
+                "VALIDATE",
+                _validate_output_payloads,
+                artifacts,
+                expected_artifacts=expected_artifacts,
+            )
+        final_timing = execution_timer.snapshot()
+        task.update(final_timing)
+        artifacts["task.json"] = _json_bytes(task)
+        artifacts["pipeline-report.md"] = _pipeline_report(
+            task_status=task_status,
+            partial_reasons=partial_reasons,
+            phase_results=phase_results,
+            source_digest=reader.source_digest,
+            normalization=normalization,
+            duration_ms=final_timing["duration_ms"],
+        ).encode("utf-8")
         _phase(
-            "VALIDATE",
+            "VALIDATE_FINAL",
             _validate_output_payloads,
             artifacts,
             expected_artifacts=expected_artifacts,
@@ -571,6 +694,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="可选的完整语义分类 JSON；验证后原字节纳入分析工作区",
     )
+    parser.add_argument(
+        "--with-business-insights",
+        action="store_true",
+        help="要求第二阶段业务洞察；无结果时生成 business-insights-prompt.md",
+    )
+    parser.add_argument(
+        "--business-insight-results",
+        default=None,
+        help="严格业务洞察 JSON；验证后原字节纳入分析工作区",
+    )
     args = parser.parse_args(argv)
     try:
         template = (
@@ -584,6 +717,8 @@ def main(argv: list[str] | None = None) -> int:
             template_text=template,
             with_taxonomy_prompt=args.with_llm_tax,
             classification_results_path=args.classification_results,
+            with_business_insights=args.with_business_insights,
+            business_insight_results_path=args.business_insight_results,
         )
     except WorkspaceCommitIndeterminate:
         print("[INDETERMINATE] analysis commit could not be confirmed", file=sys.stderr)

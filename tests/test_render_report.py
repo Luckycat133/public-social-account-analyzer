@@ -225,6 +225,62 @@ def test_non_exhaustive_index_skips_cadence_based_scheduling_advice():
     assert "稳定更新锚点" not in md
 
 
+def test_non_exhaustive_bilibili_sample_is_not_mislabeled_as_index_evidence():
+    analysis = _sample_analysis()
+    analysis["meta"] = {
+        "platform": "bilibili",
+        "collection_source": None,
+        "evidence_is_exhaustive": False,
+    }
+
+    md, html = render_report.build_publish_cadence(analysis)
+
+    for rendered in (md, html):
+        assert "索引证据" not in rendered
+        assert "周均发布量" in rendered
+        assert "5.00" in rendered
+
+
+def test_render_rejects_conflicting_root_and_meta_classification_lifecycle():
+    analysis = _sample_analysis()
+    analysis.update(
+        {
+            "classification_status": "pending-model",
+            "classification_version": None,
+            "classification_coverage": {
+                "total_count": 0,
+                "classified_count": 0,
+                "pending_count": 0,
+                "rate": None,
+            },
+            "meta": {
+                "classification_status": "completed",
+                "classification_version": "llm-1",
+                "classification_coverage": {
+                    "total_count": 1,
+                    "classified_count": 1,
+                    "pending_count": 0,
+                    "rate": 1.0,
+                },
+            },
+        }
+    )
+    template = "<!doctype html><html><body>" + "".join(
+        "{{" + name + "}}" for name in render_report.PLACEHOLDERS
+    ) + "</body></html>"
+
+    with pytest.raises(render_report.RenderError, match="lifecycle"):
+        render_report.render_in_memory(
+            profile={
+                "platform": "bilibili",
+                "account_name": "冲突账号",
+            },
+            posts_csv=[],
+            analysis=analysis,
+            template=template,
+        )
+
+
 @pytest.mark.parametrize(
     ("profile", "expected", "unexpected"),
     [
@@ -414,6 +470,77 @@ def test_task_info_renders_complete_classification_lifecycle_in_both_formats(
     if status == "pending-model":
         assert "classification_version = pending-model" not in md
         assert "classification_version = pending-model" not in html
+
+
+def test_bilibili_task_info_and_limits_disclose_dynamic_coverage_gap():
+    analysis = {
+        "meta": {
+            "platform": "bilibili",
+            "diagnostic_code": "BILIBILI_DYNAMIC_DISCOVERY",
+            "collection_coverage": {
+                "regular_source": "medialist",
+                "regular_observed_count": 29,
+                "dynamic_status": "ACCESS_RESTRICTED",
+                "dynamic_observed_count": 0,
+            },
+        },
+        "sample_boundary": {
+            "requested": 30,
+            "collected": 29,
+            "valid": 29,
+            "missing": 1,
+            "restricted": 0,
+            "excluded_flagged": 0,
+            "status_counts": {"SUCCESS": 29},
+            "time_range": {},
+        },
+    }
+
+    task_md, task_html = render_report.build_task_info(analysis, {}, [])
+    limits_md, limits_html = render_report.build_sample_limits(analysis, {})
+
+    for rendered in (task_md, task_html):
+        assert "BILIBILI_DYNAMIC_DISCOVERY" in rendered
+        assert "medialist" in rendered
+        assert "ACCESS_RESTRICTED" in rendered
+        assert "29" in rendered
+    for rendered in (limits_md, limits_html):
+        assert "动态入口" in rendered
+        assert "ACCESS_RESTRICTED" in rendered
+        assert "可能遗漏仅出现在动态入口的公开视频" in rendered
+
+
+def test_bilibili_legacy_artifact_discloses_unrecorded_dynamic_coverage():
+    analysis = {
+        "meta": {
+            "platform": "bilibili",
+            "collection_coverage": {
+                "requested_all": False,
+                "is_exhaustive": False,
+            },
+        },
+        "sample_boundary": {
+            "requested": 30,
+            "collected": 29,
+            "valid": 29,
+            "missing": 0,
+            "restricted": 0,
+            "excluded_flagged": 0,
+            "status_counts": {"SUCCESS": 29},
+            "time_range": {},
+        },
+    }
+
+    task_md, task_html = render_report.build_task_info(analysis, {}, [])
+    limits_md, limits_html = render_report.build_sample_limits(analysis, {})
+
+    for rendered in (task_md, task_html):
+        assert "B站动态入口状态" in rendered
+        assert "未记录（旧产物/未知）" in rendered
+    for rendered in (limits_md, limits_html):
+        assert "动态入口覆盖状态未记录" in rendered
+        assert "无法确认动态入口是否完成" in rendered
+        assert "可能遗漏仅出现在动态入口的公开视频" in rendered
 
 
 def test_content_patterns_separate_pending_from_model_unknown_and_other():

@@ -121,6 +121,55 @@ def test_profile():
     check("fallback level=card.level_info(6)", prof2["level"] == 6)
 
 
+def test_profile_certification_preserves_personal_and_unknown_states():
+    """个人认证、明确未认证与缺失证据必须保持三个不同状态。"""
+    from collectors.bilibili import _build_profile_raw
+
+    personal = {
+        "data": {
+            "card": {
+                "name": "personal",
+                "official": {"type": 0, "desc": "个人认证"},
+            }
+        }
+    }
+    unverified = {
+        "data": {"card": {"name": "plain", "official": {"type": -1}}}
+    }
+    unknown = {"data": {"card": {"name": "unknown"}}}
+
+    personal_profile = _build_profile_raw("1", personal, None, None)
+    unverified_profile = _build_profile_raw("2", unverified, None, None)
+    unknown_profile = _build_profile_raw("3", unknown, None, None)
+
+    assert personal_profile["verified"] is True
+    assert personal_profile["field_visibility"]["verified"] == "visible"
+    assert unverified_profile["verified"] is False
+    assert unverified_profile["field_visibility"]["verified"] == "visible"
+    assert unknown_profile["verified"] is None
+    assert unknown_profile["field_visibility"]["verified"] == "hidden"
+    for field in ("account_name", "bio", "followers", "post_count", "level"):
+        assert field in unknown_profile["field_visibility"]
+
+
+def test_profile_preserves_explicit_zero_level_and_post_count():
+    from collectors.bilibili import _build_profile_raw
+
+    raw = _build_profile_raw(
+        "9",
+        {"data": {"card": {"name": "new account", "fans": 0}}},
+        None,
+        {"level": 0, "archive_count": 0},
+    )
+
+    assert raw["followers"] == 0
+    assert raw["level"] == 0
+    assert raw["post_count"] == 0
+    assert raw["field_visibility"]["followers"] == "visible"
+    assert raw["field_visibility"]["level"] == "visible"
+    assert raw["field_visibility"]["post_count"] == "visible"
+
+
 def test_vlist():
     raw = _build_post_raw_from_vlist(VLIST_ITEM, "https://www.bilibili.com/video/BV1JMKx6sE6Q")
     post = BilibiliCollector().normalize_post(raw)
@@ -136,6 +185,62 @@ def test_vlist():
     check("published_at ISO", post["published_at"].startswith("20"))
     # I4: vlist 的 typeid=17 应静态映射为子分区「单机游戏」
     check("partition=单机游戏(typeid静态映射)", post["platform_metrics"]["partition"] == "单机游戏")
+
+
+def test_vlist_preserves_explicit_zero_comment_count():
+    item = {
+        "bvid": "BVzero",
+        "comment": 0,
+        "reply": 9,
+        "play": 1,
+    }
+
+    post = BilibiliCollector().normalize_post(
+        _build_post_raw_from_vlist(item, "https://space.bilibili.com/1")
+    )
+
+    assert post["comments"] == 0
+
+
+def test_medialist_builder_records_field_visibility_without_losing_zeroes():
+    raw = _build_post_raw_from_medialist(
+        {
+            "bv_id": "BVvisibility",
+            "title": "visible title",
+            "copy_right": 1,
+            "cnt_info": {
+                "play": 0,
+                "thumb_up": 3,
+                "reply": None,
+            },
+        },
+        "https://space.bilibili.com/1",
+    )
+
+    visibility = raw["field_visibility"]
+    assert visibility["title"] == "visible"
+    assert visibility["text"] == "hidden"
+    assert visibility["views"] == "visible"
+    assert visibility["likes"] == "visible"
+    assert visibility["comments"] == "hidden"
+    assert visibility["is_repost"] == "visible"
+    assert visibility["is_pinned"] == "hidden"
+
+
+def test_arc_and_view_builders_record_field_visibility():
+    vlist_raw = _build_post_raw_from_vlist(
+        VLIST_ITEM,
+        "https://space.bilibili.com/411581408",
+    )
+    view_raw = _build_post_raw_from_view(
+        VIEW_DATA,
+        "https://space.bilibili.com/411581408",
+    )
+
+    assert vlist_raw["field_visibility"]["views"] == "visible"
+    assert vlist_raw["field_visibility"]["likes"] == "hidden"
+    assert view_raw["field_visibility"]["views"] == "visible"
+    assert view_raw["field_visibility"]["likes"] == "visible"
 
 
 def test_vlist_missing_boolean_evidence_stays_null():
@@ -186,6 +291,101 @@ def test_view():
     # normalize_post 必须保留 platform_metrics 与指标
     check("normalize_post 保留 platform_metrics", "partition" in post["platform_metrics"])
     check("normalize_post 透传 views", post["views"] == 43435)
+
+
+def test_view_builder_binds_source_url_to_the_post_id():
+    raw = _build_post_raw_from_view(
+        VIEW_DATA,
+        "https://space.bilibili.com/411581408",
+    )
+
+    assert raw["source_url"] == (
+        "https://www.bilibili.com/video/BV1JMKx6sE6Q"
+    )
+
+
+def test_view_builder_marks_missing_expected_metrics_partial():
+    sparse = {
+        "bvid": "BVsparse",
+        "title": "sparse detail",
+        "stat": {"view": 1, "reply": 0},
+    }
+
+    raw = _build_post_raw_from_view(
+        sparse,
+        "https://space.bilibili.com/1",
+    )
+
+    assert raw["collection_status"] == "PARTIAL"
+    assert raw["platform_metrics"]["detail_status"] == "INCOMPLETE"
+    assert set(raw["platform_metrics"]["missing_detail_metrics"]) == {
+        "likes",
+        "favorites",
+        "shares",
+        "coins",
+        "danmaku",
+    }
+    assert raw["comments"] == 0
+
+
+def test_empty_post_exposes_hidden_field_visibility():
+    from collectors.bilibili import _empty_post
+
+    raw = _empty_post("BVempty")
+
+    assert raw["field_visibility"]["views"] == "hidden"
+    assert raw["field_visibility"]["title"] == "hidden"
+    assert raw["field_visibility"]["is_pinned"] == "hidden"
+    assert raw["platform_metrics"]["collection_evidence_status"] == "UNAVAILABLE"
+    assert raw["platform_metrics"]["is_in_collection"] is None
+    assert raw["platform_metrics"]["series_name"] is None
+    assert raw["platform_metrics"]["season_id"] is None
+
+
+def test_list_builders_expose_stable_unknown_collection_evidence_shape():
+    medialist = _build_post_raw_from_medialist(
+        {"bv_id": "BVmedia", "cnt_info": {}},
+        "https://space.bilibili.com/1",
+    )
+    vlist = _build_post_raw_from_vlist(
+        {"bvid": "BVvlist"},
+        "https://space.bilibili.com/1",
+    )
+
+    for raw in (medialist, vlist):
+        metrics = raw["platform_metrics"]
+        assert metrics["collection_evidence_status"] == "UNAVAILABLE"
+        assert metrics["is_in_collection"] is None
+        assert metrics["series_name"] is None
+        assert metrics["season_id"] is None
+
+
+def test_view_builder_preserves_public_collection_evidence():
+    view = dict(VIEW_DATA)
+    view["ugc_season"] = {"id": 88, "title": "长期栏目"}
+
+    raw = _build_post_raw_from_view(
+        view,
+        "https://www.bilibili.com/video/BV1JMKx6sE6Q",
+    )
+
+    assert raw["platform_metrics"]["is_in_collection"] is True
+    assert raw["platform_metrics"]["series_name"] == "长期栏目"
+    assert raw["platform_metrics"]["season_id"] == 88
+    assert raw["platform_metrics"]["collection_evidence_status"] == "OBSERVED"
+
+
+def test_view_builder_does_not_infer_no_collection_from_missing_season():
+    raw = _build_post_raw_from_view(
+        VIEW_DATA,
+        "https://www.bilibili.com/video/BV1JMKx6sE6Q",
+    )
+
+    metrics = raw["platform_metrics"]
+    assert metrics["collection_evidence_status"] == "NOT_OBSERVED"
+    assert metrics["is_in_collection"] is None
+    assert metrics["series_name"] is None
+    assert metrics["season_id"] is None
 
 
 def test_wbi():
@@ -304,6 +504,26 @@ def test_dynamics_parse():
     check("动态 platform_metrics.dynamic 存在", post["platform_metrics"]["dynamic"]["is_dynamic"] is True)
     check("动态 dynamic.like=8", post["platform_metrics"]["dynamic"]["like"] == 8)
     check("动态 dynamic.play=str→int(117)", post["platform_metrics"]["dynamic"]["play"] == 117)
+    check("动态 views=117", post["views"] == 117)
+    check("动态 likes=8", post["likes"] == 8)
+    check("动态 comments=2", post["comments"] == 2)
+    check("动态 shares=0", post["shares"] == 0)
+    check("动态 danmaku=1", post["danmaku"] == 1)
+    check("动态 favorites=None", post["favorites"] is None)
+    check("动态 coins=None", post["coins"] is None)
+    check("动态缺部分指标 → PARTIAL", post["collection_status"] == "PARTIAL")
+    check(
+        "动态缺失指标被声明",
+        set(post["platform_metrics"]["missing_detail_metrics"])
+        == {"favorites", "coins"},
+    )
+    check(
+        "动态未见合集不推断 false",
+        post["platform_metrics"]["collection_evidence_status"]
+        == "NOT_OBSERVED",
+    )
+    check("动态 views visibility=visible", post["field_visibility"]["views"] == "visible")
+    check("动态 favorites visibility=hidden", post["field_visibility"]["favorites"] == "hidden")
     check("动态 published_at 来自 pub_ts", post["published_at"].startswith("20"))
     # 转发卡
     fwd = _extract_dynamic_card(_mk_dyn_item("BVdyn02", is_forward=True))
@@ -317,6 +537,35 @@ def test_dynamics_parse():
     # 非视频类（无 bvid）应被丢弃
     none_card = _extract_dynamic_card(_mk_dyn_item("", with_bvid=False))
     check("非视频动态(无bvid)→None", none_card is None)
+
+
+def test_dynamic_ugc_season_extracts_nested_archive_and_series_evidence():
+    from collectors.bilibili import _extract_dynamic_card, _build_dynamic_raw
+
+    item = _mk_dyn_item("BVignored")
+    item["modules"]["module_dynamic"]["major"] = {
+        "ugc_season": {
+            "id": 42,
+            "title": "公开合集",
+            "archive": {
+                "bvid": "BVseason",
+                "title": "合集单集",
+                "duration": 120,
+                "stat": {"play": 99, "danmaku": 0},
+            },
+        }
+    }
+
+    card = _extract_dynamic_card(item)
+    assert card["bvid"] == "BVseason"
+    assert card["series_name"] == "公开合集"
+    assert card["season_id"] == 42
+    post = _build_dynamic_raw(card)
+    assert post["platform_metrics"]["is_in_collection"] is True
+    assert post["platform_metrics"]["series_name"] == "公开合集"
+    assert post["platform_metrics"]["season_id"] == 42
+    assert post["platform_metrics"]["collection_evidence_status"] == "OBSERVED"
+    assert post["duration_seconds"] == 120
 
 
 def test_discover_dynamics_pagination():
@@ -367,6 +616,49 @@ def test_partition_reference_flag():
     check("view(tid=17) partition=单机游戏", vw2["platform_metrics"]["partition"] == "单机游戏")
     check("view(tid=17) partition_source=reference", vw2["platform_metrics"]["partition_source"] == "reference")
     check("view(tid=17) partition_needs_verification=True", vw2["platform_metrics"]["partition_needs_verification"] is True)
+
+
+def test_partition_uses_canonical_string_ids_and_api_name_fallback():
+    medialist = _build_post_raw_from_medialist(
+        {"bv_id": "BVstring", "tid": "17", "cnt_info": {}},
+        "url",
+    )
+    assert medialist["platform_metrics"]["typeid"] == 17
+    assert medialist["platform_metrics"]["partition"] == "单机游戏"
+    assert medialist["platform_metrics"]["partition_source"] == "reference"
+
+    vlist = _build_post_raw_from_vlist(
+        {
+            "bvid": "BVunknown",
+            "typeid": "999",
+            "typename": "知识",
+        },
+        "url",
+    )
+    assert vlist["platform_metrics"]["typeid"] == 999
+    assert vlist["platform_metrics"]["partition"] == "知识"
+    assert vlist["platform_metrics"]["partition_source"] == "api"
+    assert vlist["platform_metrics"]["partition_needs_verification"] is None
+
+    view = _build_post_raw_from_view(
+        {
+            "bvid": "BVunknownview",
+            "tid": "999",
+            "tname": "知识",
+            "stat": {
+                "view": 0,
+                "like": 0,
+                "reply": 0,
+                "favorite": 0,
+                "share": 0,
+                "coin": 0,
+                "danmaku": 0,
+            },
+        },
+        "url",
+    )
+    assert view["platform_metrics"]["partition"] == "知识"
+    assert view["platform_metrics"]["partition_source"] == "api"
 
 
 if __name__ == "__main__":
