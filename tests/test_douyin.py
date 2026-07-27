@@ -117,12 +117,11 @@ def test_docs_describe_zero_python_dependency_browser_fallback():
         encoding="utf-8"
     )
     skill = (root / "skill/SKILL.md").read_text(encoding="utf-8")
-    roadmap = (root / "TODO.md").read_text(encoding="utf-8")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     module_text = (
         root / "skill/scripts/collectors/douyin.py"
     ).read_text(encoding="utf-8")
-    docs = "\n".join((readme, usage, platform, skill, roadmap, changelog))
+    docs = "\n".join((readme, usage, platform, skill, changelog))
 
     assert "实验性支持" in readme
     assert "--no-browser-fallback" in usage

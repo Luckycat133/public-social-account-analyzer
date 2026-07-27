@@ -508,8 +508,6 @@ ID 绑定作品证据。任何来源 URL 均不得保留原始 query、fragment 
 `low_performance` 均为 `INSUFFICIENT_SAMPLE`；否则两者是互不重叠的条目数组，
 分组规则见 `analysis-rules.md` §6。
 
-`analysis.json` 根对象另含 `high_metrics_median` 与 `low_metrics_median` 两个可选字段：分别为高表现组与低表现组在七项公开指标（`views` / `likes` / `comments` / `favorites` / `shares` / `coins` / `danmaku`）上的中位数 `dict`，用于驱动"高低表现雷达图"（见 `analysis-rules.md` §6 可视化约束）。两组中任一组有效样本不足 3 条、或主指标实测样本 < 15（`INSUFFICIENT_SAMPLE`）时，这两个字段为 `null`；各指标中位数仅基于该组内非 `null` 样本计算，缺失指标不参与该指标中位数。
-
 每个高/低表现条目**严格仅**包含下列字段（不包含 `text`）：
 
 ```text
