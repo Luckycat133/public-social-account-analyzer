@@ -673,6 +673,35 @@ def _business_insight_lifecycle_rows(analysis) -> list[list[str]]:
     return rows
 
 
+def _comment_insight_lifecycle_rows(analysis) -> list[list[str]]:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+
+    def lifecycle_value(key):
+        if isinstance(analysis, dict) and key in analysis:
+            return analysis.get(key)
+        return meta.get(key) if isinstance(meta, dict) else None
+
+    status = lifecycle_value("comment_insight_status")
+    status_labels = {
+        "pending-model": "pending-model（待生成）",
+        "partial-model": "partial-model（部分可核验）",
+        "completed": "completed（已完成）",
+    }
+    required = lifecycle_value("comment_insight_required")
+    required_label = "是" if required is True else ("否" if required is False else "—")
+    return [
+        ["评论语义是否必需 (comment_insight_required)", required_label],
+        [
+            "评论语义状态 (comment_insight_status)",
+            status_labels.get(status, status or "—"),
+        ],
+        [
+            "评论语义版本 (comment_insight_version)",
+            lifecycle_value("comment_insight_version") or "—",
+        ],
+    ]
+
+
 def _status_count_rows(sample_boundary) -> list[list[str]]:
     counts = sample_boundary.get("status_counts", {})
     if not isinstance(counts, dict):
@@ -753,6 +782,7 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         )
     rows.extend(_classification_lifecycle_rows(analysis))
     rows.extend(_business_insight_lifecycle_rows(analysis))
+    rows.extend(_comment_insight_lifecycle_rows(analysis))
     md = md_table(["字段", "值"], rows)
 
     # 账号主页或授权资料来源行需要渲染为链接
@@ -964,7 +994,7 @@ def build_publish_cadence(analysis) -> tuple[str, str]:
     unit = cad.get("interval_unit", "hours")
     rows = [
         ["总发布数量" if inference_allowed else "可见样本数量", fmt_int(cad.get("total_posts"))],
-        ["覆盖天数", fmt_int(cad.get("coverage_days"))],
+        ["活跃发布日数", fmt_int(cad.get("coverage_days"))],
         ["覆盖周数", fmt_int(cad.get("coverage_weeks"))],
         ["周均发布量", fmt_float(cad.get("weekly_avg"))],
         ["发布间隔中位数", f"{fmt_float(cad.get('median_interval_hours'))} {unit}"],
@@ -1418,9 +1448,24 @@ def _business_evidence_table(analysis, evidence_items) -> tuple[str, str]:
     headers = ["post_id", "证据字段", "原文摘录", "URL 类型 / 证据", "collected_at"]
     rows_md = []
     rows_html = []
+    seen_evidence: set[str] = set()
     for evidence in evidence_items:
         if not isinstance(evidence, dict):
             continue
+        try:
+            evidence_key = json.dumps(
+                evidence,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            evidence_key = None
+        if evidence_key is not None:
+            if evidence_key in seen_evidence:
+                continue
+            seen_evidence.add(evidence_key)
         md_reference, html_reference = _report_reference(
             evidence,
             url_field="url",
@@ -1998,6 +2043,185 @@ def _comment_parent_reference(
     return MdRaw(md_escape_text(label)), Raw(h_esc(label))
 
 
+_COMMENT_SEMANTIC_LABELS = (
+    ("frequent_questions", "高频问题"),
+    ("controversies", "争议"),
+    ("needs", "需求"),
+    ("concerns", "顾虑"),
+    ("follow_up_topics", "后续选题线索"),
+)
+
+
+def _comment_semantic_insights_block(
+    semantic: dict,
+    *,
+    default_platform,
+    default_collection_source,
+) -> tuple[str, str]:
+    if semantic.get("status") not in {"completed", "partial-model"}:
+        return "", ""
+    md_parts = ["### 评论语义洞察（模型）"]
+    html_parts = ['<h3 class="subsection">评论语义洞察（模型）</h3>']
+    input_summary = semantic.get("input_summary")
+    output_summary = semantic.get("output_summary")
+    provenance = semantic.get("provenance")
+    summary_rows = [
+        ["status", _comment_scalar(semantic.get("status"))],
+        ["model_version", _comment_scalar(semantic.get("model_version"))],
+    ]
+    if isinstance(input_summary, dict):
+        summary_rows.extend(
+            [
+                [
+                    "sampled_comment_count",
+                    _comment_scalar(input_summary.get("sampled_comment_count")),
+                ],
+                [
+                    "usable_comment_count",
+                    _comment_scalar(input_summary.get("usable_comment_count")),
+                ],
+                [
+                    "parent_post_count",
+                    _comment_scalar(input_summary.get("parent_post_count")),
+                ],
+            ]
+        )
+    if isinstance(output_summary, dict):
+        summary_rows.extend(
+            [
+                [
+                    "total_insights",
+                    _comment_scalar(output_summary.get("total_insights")),
+                ],
+                [
+                    "evidence_reference_count",
+                    _comment_scalar(
+                        output_summary.get("evidence_reference_count")
+                    ),
+                ],
+            ]
+        )
+    if isinstance(provenance, dict):
+        for field in (
+            "comments_source_sha256",
+            "semantic_input_sha256",
+            "result_sha256",
+        ):
+            summary_rows.append([field, _comment_scalar(provenance.get(field))])
+    md_parts.extend(["", md_table(["字段", "值"], summary_rows)])
+    html_parts.append(
+        html_table(
+            ["字段", "值"],
+            [
+                [Raw(h_esc(field)), Raw(h_esc(value))]
+                for field, value in summary_rows
+            ],
+        )
+    )
+
+    insights = semantic.get("insights")
+    if isinstance(insights, dict):
+        for category, label in _COMMENT_SEMANTIC_LABELS:
+            values = insights.get(category)
+            md_parts.extend(["", f"**{md_escape_text(label)}**"])
+            html_parts.append(f'<p class="note">{h_esc(label)}</p>')
+            if not isinstance(values, list) or not values:
+                md_parts.extend(["", "> 当前公开评论样本无足够证据支持该类结论。"])
+                html_parts.append(
+                    '<p class="note">当前公开评论样本无足够证据支持该类结论。</p>'
+                )
+                continue
+            for insight in values:
+                if not isinstance(insight, dict):
+                    continue
+                insight_id = insight.get("id") or "—"
+                statement = insight.get("statement") or "—"
+                md_rows = []
+                html_rows = []
+                evidence_items = insight.get("evidence")
+                if not isinstance(evidence_items, list):
+                    evidence_items = []
+                for evidence in evidence_items:
+                    if not isinstance(evidence, dict):
+                        continue
+                    parent_md, parent_html = _comment_parent_reference(
+                        evidence,
+                        default_platform=default_platform,
+                        default_collection_source=default_collection_source,
+                    )
+                    source = (
+                        f"{_comment_scalar(evidence.get('source_artifact'))}:"
+                        f"{_comment_scalar(evidence.get('source_line'))}"
+                    )
+                    md_rows.append(
+                        [
+                            _comment_scalar(evidence.get("parent_post_id")),
+                            parent_md,
+                            _comment_scalar(evidence.get("comment_id")),
+                            _comment_scalar(evidence.get("source_line")),
+                            _comment_scalar(evidence.get("excerpt")),
+                            source,
+                        ]
+                    )
+                    html_rows.append(
+                        [
+                            Raw(h_esc(_comment_scalar(evidence.get("parent_post_id")))),
+                            parent_html,
+                            Raw(h_esc(_comment_scalar(evidence.get("comment_id")))),
+                            Raw(h_esc(_comment_scalar(evidence.get("source_line")))),
+                            Raw(h_esc(_comment_scalar(evidence.get("excerpt")))),
+                            Raw(h_esc(source)),
+                        ]
+                    )
+                headers = [
+                    "parent_post_id",
+                    "parent_post_url",
+                    "comment_id",
+                    "source_line",
+                    "原文摘录",
+                    "source",
+                ]
+                md_block = (
+                    f"**{md_escape_text(insight_id)}**："
+                    f"{md_escape_text(statement)}"
+                )
+                html_block = (
+                    '<div class="business-insight">'
+                    f"<p><strong>{h_esc(insight_id)}</strong>："
+                    f"{h_esc(statement)}</p>"
+                )
+                if md_rows:
+                    md_block += "\n\n" + md_table(headers, md_rows)
+                    html_block += html_table(headers, html_rows)
+                md_parts.extend(["", md_block])
+                html_parts.append(html_block + "</div>")
+
+    limitations = semantic.get("limitations")
+    safe_limitations = (
+        [value for value in limitations if isinstance(value, str) and value]
+        if isinstance(limitations, list)
+        else []
+    )
+    if safe_limitations:
+        md_parts.extend(
+            [
+                "",
+                "**评论语义限制**",
+                "",
+                "\n".join(f"- {md_escape_text(item)}" for item in safe_limitations),
+            ]
+        )
+        html_parts.extend(
+            [
+                '<p class="note">评论语义限制</p>',
+                '<ul class="tight">'
+                + "".join(f"<li>{h_esc(item)}</li>" for item in safe_limitations)
+                + "</ul>",
+            ]
+        )
+    return "\n".join(md_parts), "".join(html_parts)
+
+
 def _comment_evidence_block(analysis: dict) -> tuple[str, str]:
     comments = analysis.get("comment_analysis")
     if not isinstance(comments, dict):
@@ -2178,14 +2402,27 @@ def _comment_evidence_block(analysis: dict) -> tuple[str, str]:
     semantic_version = (
         semantic.get("model_version") if isinstance(semantic, dict) else None
     )
-    semantic_note = (
-        "语义洞察待模型处理"
-        f"（status={_comment_scalar(semantic_status)}, "
-        f"model_version={_comment_scalar(semantic_version)}）；"
-        "确定性阶段不生成评论语义结论。"
-    )
-    md_parts.extend(["", f"> {md_escape_text(semantic_note)}"])
-    html_parts.append(f'<p class="note">{h_esc(semantic_note)}</p>')
+    if isinstance(semantic, dict) and semantic_status in {
+        "completed",
+        "partial-model",
+    }:
+        semantic_md, semantic_html = _comment_semantic_insights_block(
+            semantic,
+            default_platform=default_platform,
+            default_collection_source=default_collection_source,
+        )
+        if semantic_md:
+            md_parts.extend(["", semantic_md])
+            html_parts.append(semantic_html)
+    else:
+        semantic_note = (
+            "语义洞察待模型处理"
+            f"（status={_comment_scalar(semantic_status)}, "
+            f"model_version={_comment_scalar(semantic_version)}）；"
+            "确定性阶段不生成评论语义结论。"
+        )
+        md_parts.extend(["", f"> {md_escape_text(semantic_note)}"])
+        html_parts.append(f'<p class="note">{h_esc(semantic_note)}</p>')
 
     limitations = comments.get("limitations")
     if isinstance(limitations, list) and limitations:

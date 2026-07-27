@@ -177,6 +177,22 @@ def test_merge_incremental():
     assert new_count == 2                           # BV_NEW1 + NOKEY1
 
 
+def test_fresh_collection_counts_all_unique_persisted_posts_as_new(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [FakeAdapter()])
+    monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
+    out = tmp_path / "fresh"
+
+    assert collect.run(BILIBILI_URL, out_dir=str(out)) == 0
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["incremental"] is False
+    assert task["existing_count"] == 0
+    assert task["new_count"] == 2
+    assert task["collected_count"] == 2
+
+
 def test_latest_published_at():
     posts = [
         {"published_at": "2026-07-01T00:00:00+08:00"},

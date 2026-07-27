@@ -10,7 +10,7 @@
 | `guides/` | 使用、部署、运营指南 | `operations-trial-template.md`（PRD AC-10 运营试用模板）、`deployment-package-checklist.md`（部署打包与 drift 检测清单） |
 | `prd/` | 产品需求与验收 | `需求实现状态与抖音能力边界.md`（PRD AC 映射与抖音能力边界）、`公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx`（PRD 正本） |
 | `observations/` | Agent 行动路径观测与验收记录 | `agent-action-path-observations.md`（观测日志主文件，含时效性标注）、`douyin-*-acceptance.md`（在线验收记录） |
-| `plans/` | 进行中 / 待实施计划 | `2026-07-24-p1-comment-insights.md`（评论洞察，待实施） |
+| `plans/` | 设计与实施记录 | `2026-07-24-p1-comment-insights.md`（评论链路历史设计记录；当前实现见 Skill 合同） |
 
 ## 文档命名与组织规范
 

@@ -92,36 +92,41 @@ PROFILE_FIELDS = (
     "post_count",
 )
 DOUYIN_PROFILE_FIELDS = PROFILE_FIELDS + ("platform_metrics.total_likes",)
-POST_COMMON_FIELDS = (
+POST_CORE_FIELDS = (
     "post_id",
     "post_url",
     "title",
     "text",
     "published_at",
     "content_type",
-    "duration_seconds",
-    "hashtags",
+)
+POST_SHARED_METRIC_FIELDS = (
     "views",
     "likes",
     "comments",
 )
 PLATFORM_POST_FIELDS = {
-    "bilibili": POST_COMMON_FIELDS
+    "bilibili": POST_CORE_FIELDS
+    + (
+        "duration_seconds",
+        "hashtags",
+    )
+    + POST_SHARED_METRIC_FIELDS
     + (
         "favorites",
         "shares",
         "coins",
         "danmaku",
     ),
-    "douyin": POST_COMMON_FIELDS + ("favorites", "shares"),
-    "weibo": POST_COMMON_FIELDS + ("shares",),
+    "douyin": POST_CORE_FIELDS
+    + ("duration_seconds", "hashtags")
+    + POST_SHARED_METRIC_FIELDS
+    + ("favorites", "shares"),
+    "weibo": POST_CORE_FIELDS
+    + ("hashtags",)
+    + POST_SHARED_METRIC_FIELDS
+    + ("shares",),
 }
-POST_FIELDS = POST_COMMON_FIELDS + (
-    "favorites",
-    "shares",
-    "coins",
-    "danmaku",
-)
 OBSERVATION_FIELDS = frozenset({"state", "page_text", "value"})
 OBSERVATION_STATES = frozenset({"visible", "not_visible"})
 _MARKDOWN_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -292,25 +297,82 @@ def _bound_snapshot(
             raise AcceptanceError("workspace platform is invalid")
         if derived_task.get("platform") != platform:
             raise AcceptanceError("analysis platform does not bind collection")
+        source_status = source_task.get("task_status")
+        source_is_partial = source_status == "PARTIAL"
+        source_stop_reason = source_task.get("stop_reason")
         if not (
             isinstance(source_task.get("task_id"), str)
             and bool(source_task["task_id"])
-            and source_task.get("task_status") == "COMPLETED"
+            and source_status in {"COMPLETED", "PARTIAL"}
+            and (
+                not source_is_partial
+                or (
+                    isinstance(source_stop_reason, str)
+                    and bool(source_stop_reason)
+                )
+            )
             and source_task.get("platform") == platform
             and source_task.get("profile_url") == profile.get("profile_url")
         ):
-            raise AcceptanceError("collection task is not completed or coherent")
+            raise AcceptanceError("collection task is not assessable or coherent")
         phase_results = derived_task.get("phase_results")
+        derived_status = derived_task.get("task_status")
+        partial_reasons = derived_task.get("partial_reasons")
+        phases_are_assessable = (
+            isinstance(phase_results, dict)
+            and set(phase_results)
+            == {
+                "collection_input",
+                "normalization",
+                "analysis",
+                "render",
+                "validation",
+            }
+            and phase_results.get("collection_input") == "VERIFIED"
+            and phase_results.get("normalization")
+            in {"COMPLETED", "PARTIAL"}
+            and phase_results.get("analysis") in {"COMPLETED", "PARTIAL"}
+            and phase_results.get("render") == "COMPLETED"
+            and phase_results.get("validation") == "COMPLETED"
+        )
+        derived_is_partial = derived_status == "PARTIAL"
+        partial_reasons_are_valid = (
+            isinstance(partial_reasons, list)
+            and all(
+                isinstance(reason, str) and bool(reason)
+                for reason in partial_reasons
+            )
+            and len(partial_reasons) == len(set(partial_reasons))
+            and (
+                (derived_is_partial and bool(partial_reasons))
+                or (derived_status == "COMPLETED" and not partial_reasons)
+            )
+        )
+        upstream_status_is_bound = (
+            not source_is_partial
+            or (
+                derived_is_partial
+                and isinstance(partial_reasons, list)
+                and "UPSTREAM_COLLECTION_PARTIAL" in partial_reasons
+            )
+        )
+        completed_status_is_coherent = (
+            derived_status != "COMPLETED"
+            or (
+                isinstance(phase_results, dict)
+                and source_status == "COMPLETED"
+                and phase_results.get("normalization") == "COMPLETED"
+                and phase_results.get("analysis") == "COMPLETED"
+            )
+        )
         if not (
             isinstance(derived_task.get("task_id"), str)
             and bool(derived_task["task_id"])
-            and derived_task.get("task_status") == "COMPLETED"
-            and isinstance(phase_results, dict)
-            and phase_results.get("collection_input") == "VERIFIED"
-            and phase_results.get("normalization") == "COMPLETED"
-            and phase_results.get("analysis") == "COMPLETED"
-            and phase_results.get("render") == "COMPLETED"
-            and phase_results.get("validation") == "COMPLETED"
+            and derived_status in {"COMPLETED", "PARTIAL"}
+            and phases_are_assessable
+            and partial_reasons_are_valid
+            and upstream_status_is_bound
+            and completed_status_is_coherent
         ):
             raise AcceptanceError("analysis task is not completed or coherent")
 
@@ -1159,6 +1221,43 @@ def _score_ac06(snapshot: BoundSnapshot, truth: dict[str, Any]) -> dict[str, Any
     }
 
 
+def _acceptance_scope(snapshot: BoundSnapshot) -> dict[str, Any]:
+    """Disclose whether scores cover a complete or explicitly partial run."""
+    collection_status = snapshot.collection_task.get("task_status")
+    analysis_status = snapshot.analysis_task.get("task_status")
+    coverage = snapshot.collection_task.get("collection_coverage")
+    is_exhaustive = (
+        coverage.get("is_exhaustive")
+        if isinstance(coverage, dict)
+        and type(coverage.get("is_exhaustive")) is bool
+        else None
+    )
+    end_to_end_complete = bool(
+        collection_status == "COMPLETED"
+        and analysis_status == "COMPLETED"
+    )
+    if not end_to_end_complete:
+        status = "PARTIAL_SOURCE_SAMPLE"
+    elif is_exhaustive is False:
+        status = "NON_EXHAUSTIVE_SOURCE_SAMPLE"
+    else:
+        status = "COMPLETE_PIPELINE_SAMPLE"
+    return {
+        "status": status,
+        "collection_task_status": collection_status,
+        "collection_stop_reason": snapshot.collection_task.get("stop_reason"),
+        "collection_diagnostic_code": snapshot.collection_task.get(
+            "diagnostic_code"
+        ),
+        "collection_is_exhaustive": is_exhaustive,
+        "analysis_task_status": analysis_status,
+        "analysis_partial_reasons": list(
+            snapshot.analysis_task.get("partial_reasons") or []
+        ),
+        "end_to_end_complete": end_to_end_complete,
+    }
+
+
 def verify_truth(
     collection_dir: Path | str,
     analysis_dir: Path | str,
@@ -1170,12 +1269,13 @@ def verify_truth(
         integrity = _pipeline_integrity(snapshot)
         ac03 = _score_ac03(snapshot, truth, sample_size)
         ac06 = _score_ac06(snapshot, truth)
+        acceptance_scope = _acceptance_scope(snapshot)
         verdicts = {
             integrity["verdict"],
             ac03["verdict"],
             ac06["verdict"],
         }
-        if verdicts == {"PASS"}:
+        if verdicts == {"PASS"} and acceptance_scope["end_to_end_complete"]:
             overall_verdict = "PASS"
         elif "FAIL" in verdicts:
             overall_verdict = "FAIL"
@@ -1189,6 +1289,7 @@ def verify_truth(
             "pipeline_integrity": integrity,
             "ac03": ac03,
             "ac06": ac06,
+            "acceptance_scope": acceptance_scope,
             "overall_verdict": overall_verdict,
         }
 
@@ -1276,6 +1377,14 @@ def main(argv: list[str] | None = None) -> int:
             f"AC-06 insight/evidence coverage: "
             f"{result['ac06']['insight_coverage']:.2%} / "
             f"{result['ac06']['evidence_validity']:.2%}"
+        )
+        print(
+            "scope: "
+            f"{result['acceptance_scope']['status']} "
+            f"(collection={result['acceptance_scope']['collection_task_status']}, "
+            f"analysis={result['acceptance_scope']['analysis_task_status']}, "
+            "exhaustive="
+            f"{result['acceptance_scope']['collection_is_exhaustive']})"
         )
         print(f"overall: {result['overall_verdict']}")
     return 0 if result["overall_verdict"] == "PASS" else 1

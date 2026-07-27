@@ -4,6 +4,7 @@
 """
 import pytest
 
+import analyze
 import render_report
 
 
@@ -61,6 +62,81 @@ def test_build_publish_cadence_includes_hour_distribution():
     # HTML 含内联 SVG 图表
     assert "发布时段分布（24 小时）" in html
     assert "<svg" in html
+
+
+def test_active_publication_day_label_does_not_imply_calendar_span():
+    analysis = _sample_analysis()
+
+    md, html = render_report.build_publish_cadence(analysis)
+
+    for rendered in (md, html):
+        assert "活跃发布日数" in rendered
+        assert "覆盖天数" not in rendered
+    assert analysis["publish_cadence"]["coverage_days"] == 5
+
+
+def test_legacy_markdown_uses_same_active_publication_day_label():
+    empty_stats = {
+        "count": 0,
+        "median": None,
+        "p25": None,
+        "p75": None,
+        "minimum": None,
+        "maximum": None,
+        "missing_rate": None,
+    }
+    report = analyze.generate_report(
+        {
+            "classification_status": "pending-model",
+            "classification_coverage": {
+                "total_count": 1,
+                "classified_count": 0,
+                "rate": 0.0,
+            },
+        },
+        {
+            "requested": 1,
+            "collected": 1,
+            "valid": 1,
+            "missing": 0,
+            "restricted": 0,
+            "excluded_flagged": 0,
+            "time_range": {
+                "task_date_from": None,
+                "task_date_to": None,
+                "content_earliest": "2026-01-01",
+                "content_latest": "2026-01-30",
+            },
+            "field_coverage": {},
+        },
+        {
+            "total_posts": 2,
+            "coverage_days": 2,
+            "coverage_weeks": 5,
+            "weekly_avg": 0.4,
+            "median_interval_hours": 696,
+            "longest_gap_hours": 696,
+            "weekday_distribution": {str(index): 0 for index in range(7)},
+            "weekday_weekend": {
+                "weekday_count": 2,
+                "weekend_count": 0,
+                "weekday_pct": 1.0,
+                "weekend_pct": 0.0,
+            },
+        },
+        {},
+        {
+            "view_based_engagement_rate": empty_stats,
+            "follower_based_engagement_ratio": empty_stats,
+            "followers": None,
+        },
+        "INSUFFICIENT_SAMPLE",
+        "INSUFFICIENT_SAMPLE",
+        "views",
+    )
+
+    assert "活跃发布日数:2" in report
+    assert "覆盖天数" not in report
 
 
 def test_completed_taxonomy_report_does_not_warn_that_it_may_be_pending():
@@ -928,6 +1004,52 @@ def test_core_insights_render_source_statements_and_every_evidence_row():
     for rendered in (md, html):
         for value in expected:
             assert value in rendered
+
+
+def test_business_evidence_deduplicates_exact_records_in_first_seen_order():
+    first = {
+        "post_id": "1001",
+        "source_field": "title",
+        "excerpt": "证据甲",
+        "url": "https://www.douyin.com/video/1001",
+        "url_kind": "item",
+        "item_url_known": True,
+        "collected_at": "2026-07-03T10:00:00+08:00",
+    }
+    second = {
+        "post_id": "1001",
+        "source_field": "text",
+        "excerpt": "证据乙",
+        "url": "https://www.douyin.com/video/1001",
+        "url_kind": "item",
+        "item_url_known": True,
+        "collected_at": "2026-07-03T10:00:00+08:00",
+    }
+    analysis = {
+        "meta": {"platform": "douyin"},
+        "business_insights": {
+            "status": "completed",
+            "topic_ideas": [
+                {
+                    "id": "topic-01",
+                    "title": "可核验选题",
+                    "rationale": "依据公开样本。",
+                    "evidence": [first, second, dict(first)],
+                }
+            ],
+            "experiments": [],
+            "limitations": [],
+        },
+    }
+
+    markdown, html = render_report.build_strategy(analysis, {})
+
+    assert markdown.count("| 1001 | title | 证据甲 |") == 1
+    assert html.count("<td>title</td><td>证据甲</td>") == 1
+    assert markdown.count("| 1001 | text | 证据乙 |") == 1
+    assert html.count("<td>text</td><td>证据乙</td>") == 1
+    assert markdown.index("证据甲") < markdown.index("证据乙")
+    assert html.index("证据甲") < html.index("证据乙")
 
 
 def test_performance_and_insight_fields_escape_markup_and_reject_unsafe_urls():

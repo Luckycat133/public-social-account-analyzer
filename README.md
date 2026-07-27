@@ -38,7 +38,7 @@ public-social-account-analyzer/             # 项目根目录
 ├── README.md                              # 项目主说明文档 (Standard Readme)
 ├── USAGE.md                               # 详细使用指南与故障排查
 ├── CHANGELOG.md                           # 变更日志 (Keep a Changelog v1.1.0)
-├── ROADMAP.md                             # 历史路线图（既有条目已完成；评论洞察待实施）
+├── ROADMAP.md                             # 历史路线图与剩余外部验收
 ├── AGENTS.md                              # 仓库贡献规范
 ├── pyproject.toml                         # Python 项目与 Pytest 配置
 ├── docs/                                  # 文档总目录（按 architecture/guides/prd 分类）
@@ -181,6 +181,10 @@ python skill/scripts/run_pipeline.py \
   --output workspace/bilibili-123456-analysis
 ```
 
+采集过程需要在作品列表完成后提供可验证的异常中断恢复点时，首次运行增加 `--checkpoint-out workspace/bilibili-123456-checkpoint`。若资料采集或后续持久化前中断，使用同一账号与全部参数，并以 `--resume-checkpoint` 配合一个全新的 `--out` 恢复。checkpoint 是独立密封提交；篡改、参数变化、重复作品或未密封目录会在联网前拒绝。
+
+请求评论洞察时，采集阶段须显式增加 `--comments`。先以 `--with-comment-insights` 创建 draft，由执行 Agent 在已提交目录外填写 `comment-insight-results.json`，再从同一个 collection 传入 `--comment-insight-results` 创建 final。五类语义结果必须逐项绑定父作品、评论 ID、`source/comments.jsonl` 行号和原文摘录；没有严格结果时保持 `PARTIAL`，确定性脚本不会用关键词代替语义判断。
+
 完整分类通过后，分析会确定性生成主题×形式全矩阵、主题/形式主指标覆盖与中位数，以及高低组结构化特征。严格业务洞察结果另包含账号定位五维、6 个高低表现文案模式、10 个选题、5 个内容模式和 4 个实验；模型只能提交源字段摘录，脚本从冻结父作品补齐并校验 URL、采集时间、分组和摘要绑定。公开样本无法观察真实视频开头/结构时必须降级为 `PARTIAL_BUSINESS_INSIGHTS`，不得从标题或文案猜测视频内容。
 
 Agent Skill 收到“内容策略、选题分布、高低表现共同点”等目标时，会把分类与业务洞察都作为最终交付前置。final 必须同时为 `classification_status=completed`、`business_insight_status=completed`，并在 manifest 中封存两份模型输入原始字节；否则保持 `PARTIAL`，不会把 draft 冒充完整策略分析。
@@ -233,12 +237,13 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 - `source/collection-provenance.json` — 来源格式、来源任务 ID、采集提交 SHA-256 与清单摘要
 - `source/classification-results.json` — 可选；已严格核验并按原字节封存的完整语义分类输入
 - `source/business-insight-results.json` — 可选；绑定 collection digest 与分类原始字节摘要、经严格校验后按原字节封存的业务洞察输入
-- `taxonomy-prompt.md` / `business-insights-prompt.md` — 可选 draft 提示；只在对应模型结果尚待填写时生成
+- `source/comment-insight-results.json` — 可选；绑定评论源与规范语义输入摘要、经严格校验后按原字节封存的评论洞察输入
+- `taxonomy-prompt.md` / `business-insights-prompt.md` / `comment-insights-prompt.md` — 可选 draft 提示；只在对应模型结果尚待填写时生成
 - `source/comments.jsonl` — 可选；从同一采集提交逐字节复制的评论证据
 - `normalized-posts.csv` / `normalized-coverage.json` — 从 `source/posts.jsonl` 重新生成的归一化结果
 - `account-analysis-report.md` — 完整 Markdown 账号分析报告（含分类覆盖与矩阵、分类维度表现、高低组结构化特征、完整证据与核心洞察来源）
 - `dashboard.html` — 与 Markdown 同口径的可视化 HTML 仪表盘
-- `analysis.json` — 机器可读的统计指标、分类生命周期/矩阵、结构化高低特征、严格业务洞察与确定性评论分析 JSON
+- `analysis.json` — 机器可读的统计指标、分类生命周期/矩阵、结构化高低特征、严格业务洞察、评论证据与可选严格评论语义洞察 JSON
 - `task.json` / `pipeline-report.md` — 派生任务状态、各阶段结果，以及 `started_at`、`ended_at`、`duration_ms`、`phase_durations_ms`
 - `manifest.json` / `.complete` — 分析产物的独立、create-only 提交
 

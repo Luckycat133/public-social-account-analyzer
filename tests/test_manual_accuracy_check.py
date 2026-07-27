@@ -123,6 +123,7 @@ def _workspace_pair(
     duplicate_insight_ids: bool = False,
     report_links_are_not_real: bool = False,
     bad_provenance_inventory: bool = False,
+    collection_task_status: str = "COMPLETED",
     analysis_task_status: str = "COMPLETED",
     bad_evidence_coverage: bool = False,
 ) -> tuple[Path, Path, list[dict], dict]:
@@ -134,7 +135,20 @@ def _workspace_pair(
         "profile_url": profile["profile_url"],
         "requested_limit": 10,
         "collected_count": 10,
-        "task_status": "COMPLETED",
+        "task_status": collection_task_status,
+        "stop_reason": (
+            None
+            if collection_task_status == "COMPLETED"
+            else "ACCESS_RESTRICTED"
+        ),
+        "diagnostic_code": (
+            None
+            if collection_task_status == "COMPLETED"
+            else "TEST_PARTIAL_DISCOVERY"
+        ),
+        "collection_coverage": {
+            "is_exhaustive": collection_task_status == "COMPLETED",
+        },
     }
     profile_payload = _json_bytes(profile)
     posts_payload = b"".join(_json_bytes(post) for post in posts)
@@ -219,7 +233,13 @@ def _workspace_pair(
         "collection_commit_sha256": collection_digest,
         "task_status": analysis_task_status,
         "partial_reasons": (
-            [] if analysis_task_status == "COMPLETED" else ["TEST_PARTIAL"]
+            []
+            if analysis_task_status == "COMPLETED"
+            else (
+                ["UPSTREAM_COLLECTION_PARTIAL"]
+                if collection_task_status == "PARTIAL"
+                else ["TEST_PARTIAL"]
+            )
         ),
         "phase_results": {
             "collection_input": "VERIFIED",
@@ -532,6 +552,20 @@ def test_douyin_ac03_excludes_inapplicable_metrics_and_reports_field_accuracy(
     )
 
 
+def test_platform_post_field_matrix_excludes_inapplicable_fields():
+    bilibili = set(acceptance._post_fields("bilibili"))
+    douyin = set(acceptance._post_fields("douyin"))
+    weibo = set(acceptance._post_fields("weibo"))
+
+    assert {"duration_seconds", "favorites", "coins", "danmaku"} <= bilibili
+    assert {"duration_seconds", "favorites", "shares"} <= douyin
+    assert {"coins", "danmaku"}.isdisjoint(douyin)
+    assert {"duration_seconds", "favorites", "coins", "danmaku"}.isdisjoint(
+        weibo
+    )
+    assert {"views", "likes", "comments", "shares"} <= weibo
+
+
 def test_ac03_rejects_a_schema_invalid_visible_value_type():
     with pytest.raises(acceptance.AcceptanceError, match="followers.*type"):
         acceptance._validate_typed_value(
@@ -551,13 +585,43 @@ def test_acceptance_rejects_fake_collection_manifest_provenance(tmp_path):
         acceptance.prepare_truth(collection, analysis, sample_size=10)
 
 
-def test_acceptance_rejects_a_noncompleted_analysis_task(tmp_path):
+def test_acceptance_rejects_an_invalid_analysis_task_status(tmp_path):
     collection, analysis, _, _ = _workspace_pair(
-        tmp_path, analysis_task_status="PARTIAL"
+        tmp_path, analysis_task_status="FAILED"
     )
 
     with pytest.raises(acceptance.AcceptanceError, match="task is not completed"):
         acceptance.prepare_truth(collection, analysis, sample_size=10)
+
+
+def test_partial_but_verified_collection_can_assess_ac03_without_overall_pass(
+    tmp_path,
+):
+    collection, analysis, posts, profile = _workspace_pair(
+        tmp_path,
+        collection_task_status="PARTIAL",
+        analysis_task_status="PARTIAL",
+    )
+
+    template = acceptance.prepare_truth(collection, analysis, sample_size=10)
+    result = acceptance.verify_truth(
+        collection,
+        analysis,
+        _completed_truth(template, posts, profile),
+    )
+
+    assert result["ac03"]["verdict"] == "PASS"
+    assert result["acceptance_scope"] == {
+        "status": "PARTIAL_SOURCE_SAMPLE",
+        "collection_task_status": "PARTIAL",
+        "collection_stop_reason": "ACCESS_RESTRICTED",
+        "collection_diagnostic_code": "TEST_PARTIAL_DISCOVERY",
+        "collection_is_exhaustive": False,
+        "analysis_task_status": "PARTIAL",
+        "analysis_partial_reasons": ["UPSTREAM_COLLECTION_PARTIAL"],
+        "end_to_end_complete": False,
+    }
+    assert result["overall_verdict"] == "INCONCLUSIVE"
 
 
 def test_acceptance_rejects_incoherent_analysis_evidence_coverage(tmp_path):

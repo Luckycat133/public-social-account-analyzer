@@ -20,6 +20,7 @@ import argparse
 import contextvars
 import csv
 import functools
+import hashlib
 import io
 import json
 import os
@@ -491,6 +492,12 @@ _PUBLIC_ARTIFACTS = frozenset({
     "task.json",
     "collection-report.md",
 })
+_CHECKPOINT_ARTIFACTS = frozenset({
+    "checkpoint.json",
+    "source/posts.jsonl",
+})
+_CHECKPOINT_FORMAT = "public-social-account-analyzer/collection-checkpoint-v1"
+_CHECKPOINT_STAGE = "POST_LIST_COLLECTED"
 
 
 def _repository_root() -> str:
@@ -522,6 +529,18 @@ def _preflight_explicit_workspace(path: str, *, resume: bool) -> None:
         raise WorkspaceWriteError("workspace parent does not exist") from exc
     if not stat.S_ISDIR(metadata.st_mode):
         raise WorkspaceWriteError("workspace parent is unsafe")
+
+
+def _reject_lexical_workspace_overlap(first: str, second: str) -> None:
+    """Reject equal or nested create-only targets before either exists."""
+    left = os.path.abspath(first)
+    right = os.path.abspath(second)
+    try:
+        common = os.path.commonpath((left, right))
+    except ValueError:
+        return
+    if common in {left, right}:
+        raise WorkspaceVerificationError("workspace targets overlap")
 
 
 def _prepare_explicit_workspace(
@@ -1351,6 +1370,245 @@ def _sanitize_report_error(value) -> dict:
     return clean
 
 
+def _canonical_checkpoint_json(value: object) -> bytes:
+    """Serialize checkpoint-bound values with one stable JSON encoding."""
+    try:
+        text = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise WorkspaceWriteError("checkpoint payload is invalid") from exc
+    return text.encode("utf-8")
+
+
+def _checkpoint_parameters(
+    *,
+    requested_limit: int,
+    date_from: str | None,
+    date_to: str | None,
+    include_comments: bool,
+    enrich_details: bool,
+    collect_all: bool,
+    max_items: int | None,
+    max_seconds: float | None,
+    max_scrolls: int | None,
+    analysis_goal: str | None,
+    browser_fallback: bool | None,
+) -> dict:
+    """Return the exact user-visible parameters bound to one checkpoint."""
+    return {
+        "requested_limit": requested_limit,
+        "date_from": date_from,
+        "date_to": date_to,
+        "include_comments": include_comments,
+        "enrich_details": enrich_details,
+        "collect_all": collect_all,
+        "max_items": max_items,
+        "max_seconds": max_seconds,
+        "max_scrolls": max_scrolls,
+        "analysis_goal": analysis_goal,
+        "browser_fallback": browser_fallback,
+    }
+
+
+def _strict_checkpoint_object(payload: bytes) -> dict:
+    """Decode checkpoint metadata without duplicate keys or non-JSON numbers."""
+    def reject_constant(value: str):
+        raise ValueError(f"non-standard numeric constant {value}")
+
+    def reject_duplicate_keys(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        MemoryError,
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise WorkspaceVerificationError("checkpoint metadata is invalid") from exc
+    if not isinstance(value, dict):
+        raise WorkspaceVerificationError("checkpoint metadata is invalid")
+    return value
+
+
+def _write_collection_checkpoint(
+    path: str,
+    *,
+    platform: str,
+    profile_url: str,
+    parameters: dict,
+    posts: list[dict],
+    collected_at: str,
+    stop_reason: str | None,
+    diagnostic_code: str | None,
+    collection_coverage: dict,
+    error_log: list[dict],
+) -> str:
+    """Create and seal one post-list checkpoint; never update an old one."""
+    posts_payload = b"".join(
+        _canonical_checkpoint_json(post) + b"\n" for post in posts
+    )
+    parameter_payload = _canonical_checkpoint_json(parameters)
+    metadata = {
+        "format": _CHECKPOINT_FORMAT,
+        "stage": _CHECKPOINT_STAGE,
+        "platform": platform,
+        "profile_url": profile_url,
+        "parameters": parameters,
+        "parameters_sha256": hashlib.sha256(parameter_payload).hexdigest(),
+        "posts": {
+            "path": "source/posts.jsonl",
+            "digest_algorithm": "sha256",
+            "digest": hashlib.sha256(posts_payload).hexdigest(),
+            "count": len(posts),
+        },
+        "collected_at": _safe_timestamp(collected_at),
+        "stop_reason": (
+            _safe_stop_reason(stop_reason) if stop_reason is not None else None
+        ),
+        "diagnostic_code": _safe_diagnostic_code(diagnostic_code),
+        "collection_coverage": _sanitize_collection_coverage(
+            collection_coverage
+        ),
+        "errors": [_sanitize_report_error(error) for error in error_log],
+    }
+    reservation = _track_reservation(
+        ImmutableWorkspace.reserve(
+            os.path.abspath(path), allowed_artifacts=_CHECKPOINT_ARTIFACTS
+        )
+    )
+    try:
+        with reservation.open_binary("source/posts.jsonl") as handle:
+            handle.write(posts_payload)
+        with reservation.open_binary("checkpoint.json") as handle:
+            handle.write(_canonical_checkpoint_json(metadata) + b"\n")
+        return reservation.commit()
+    finally:
+        reservation.close()
+
+
+def _load_collection_checkpoint(
+    path: str,
+    *,
+    expected_platform: str,
+    expected_profile_url: str,
+    expected_parameters: dict,
+) -> dict:
+    """Verify and read one explicitly sealed post-list checkpoint."""
+    with VerifiedWorkspaceReader.open(
+        os.path.abspath(path), allowed_artifacts=_CHECKPOINT_ARTIFACTS
+    ) as reader:
+        metadata_payload = reader.read("checkpoint.json").payload
+        posts_payload = reader.read(
+            "source/posts.jsonl", max_bytes=_MAX_RESUME_ARTIFACT_BYTES
+        ).payload
+        reader.verify_unchanged()
+        source_digest = reader.source_digest
+
+    metadata = _strict_checkpoint_object(metadata_payload)
+    required_keys = {
+        "format",
+        "stage",
+        "platform",
+        "profile_url",
+        "parameters",
+        "parameters_sha256",
+        "posts",
+        "collected_at",
+        "stop_reason",
+        "diagnostic_code",
+        "collection_coverage",
+        "errors",
+    }
+    if set(metadata) != required_keys:
+        raise WorkspaceVerificationError("checkpoint metadata is invalid")
+    if (
+        metadata.get("format") != _CHECKPOINT_FORMAT
+        or metadata.get("stage") != _CHECKPOINT_STAGE
+        or metadata.get("platform") != expected_platform
+        or metadata.get("profile_url") != expected_profile_url
+        or canonical_profile_url(expected_platform, metadata.get("profile_url"))
+        != expected_profile_url
+    ):
+        raise WorkspaceVerificationError("checkpoint identity mismatch")
+
+    parameters = metadata.get("parameters")
+    if not isinstance(parameters, dict):
+        raise WorkspaceVerificationError("checkpoint parameters are invalid")
+    parameter_payload = _canonical_checkpoint_json(parameters)
+    parameter_digest = metadata.get("parameters_sha256")
+    if (
+        not isinstance(parameter_digest, str)
+        or parameter_digest != hashlib.sha256(parameter_payload).hexdigest()
+        or parameter_payload != _canonical_checkpoint_json(expected_parameters)
+    ):
+        raise WorkspaceVerificationError("checkpoint parameters mismatch")
+
+    posts_metadata = metadata.get("posts")
+    if (
+        not isinstance(posts_metadata, dict)
+        or set(posts_metadata)
+        != {"path", "digest_algorithm", "digest", "count"}
+        or posts_metadata.get("path") != "source/posts.jsonl"
+        or posts_metadata.get("digest_algorithm") != "sha256"
+        or not isinstance(posts_metadata.get("digest"), str)
+        or posts_metadata.get("digest")
+        != hashlib.sha256(posts_payload).hexdigest()
+        or not isinstance(posts_metadata.get("count"), int)
+        or isinstance(posts_metadata.get("count"), bool)
+        or posts_metadata.get("count") < 0
+    ):
+        raise WorkspaceVerificationError("checkpoint posts binding is invalid")
+    posts = _parse_resume_posts(posts_payload, None)
+    if len(posts) != posts_metadata["count"]:
+        raise WorkspaceVerificationError("checkpoint posts count changed")
+    deduplicated, duplicate_count = dedup_posts(posts)
+    if duplicate_count or len(deduplicated) != len(posts):
+        raise WorkspaceVerificationError("checkpoint posts are not unique")
+    if any(
+        post.get("platform") != expected_platform or not _post_key(post)
+        for post in posts
+    ):
+        raise WorkspaceVerificationError("checkpoint post identity is invalid")
+
+    stop_reason = metadata.get("stop_reason")
+    if stop_reason is not None:
+        stop_reason = _safe_stop_reason(stop_reason)
+    diagnostic_code = _safe_diagnostic_code(metadata.get("diagnostic_code"))
+    errors = metadata.get("errors")
+    if not isinstance(errors, list) or any(
+        not isinstance(error, dict) for error in errors
+    ):
+        raise WorkspaceVerificationError("checkpoint errors are invalid")
+    return {
+        "posts": posts,
+        "source_format": _CHECKPOINT_FORMAT,
+        "source_digest": source_digest,
+        "stop_reason": stop_reason,
+        "diagnostic_code": diagnostic_code,
+        "collection_coverage": _sanitize_collection_coverage(
+            metadata.get("collection_coverage")
+        ),
+        "error_log": [_sanitize_report_error(error) for error in errors],
+    }
+
+
 def _write_task_json(
     ws: str,
     *,
@@ -1372,6 +1630,8 @@ def _write_task_json(
     new_count: int = 0,
     resume_source_format: str | None = None,
     resume_source_digest: str | None = None,
+    checkpoint_source_format: str | None = None,
+    checkpoint_source_digest: str | None = None,
     collection_coverage: dict | None = None,
     comment_collection: dict | None = None,
     diagnostic_code: str | None = None,
@@ -1407,6 +1667,16 @@ def _write_task_json(
             }
             if resume_source_format is not None
             and resume_source_digest is not None
+            else None
+        ),
+        "checkpoint_source": (
+            {
+                "format": checkpoint_source_format,
+                "digest_algorithm": "sha256",
+                "digest": checkpoint_source_digest,
+            }
+            if checkpoint_source_format is not None
+            and checkpoint_source_digest is not None
             else None
         ),
         "collection_coverage": _sanitize_collection_coverage(collection_coverage),
@@ -1583,6 +1853,8 @@ def run(
     max_scrolls: int | None = None,
     enrich_details: bool = False,
     analysis_goal: str | None = None,
+    checkpoint_out: str | None = None,
+    resume_checkpoint: str | None = None,
 ) -> int:
     execution_timer = ExecutionTimer(wall_timezone=_BEIJING)
     try:
@@ -1605,6 +1877,17 @@ def run(
         return 2
     if since is not None and not resume:
         print("[FAILED] --since 必须与 --resume 联用", file=sys.stderr)
+        return 2
+    if checkpoint_out is not None and resume_checkpoint is not None:
+        print("[FAILED] --checkpoint-out 与 --resume-checkpoint 不能联用", file=sys.stderr)
+        return 2
+    if (checkpoint_out is not None or resume_checkpoint is not None) and not out_dir:
+        print("[FAILED] checkpoint 模式必须显式指定新的 --out", file=sys.stderr)
+        return 2
+    if (checkpoint_out is not None or resume_checkpoint is not None) and (
+        resume or resume_out is not None or since is not None
+    ):
+        print("[FAILED] checkpoint 恢复不能与增量 --resume 混用", file=sys.stderr)
         return 2
 
     budget_was_supplied = any(
@@ -1633,6 +1916,7 @@ def run(
     except ValueError as exc:
         print(f"[FAILED] 参数无效: {exc}", file=sys.stderr)
         return 2
+    requested_count = max_items if collect_all else limit
 
     if out_dir:
         try:
@@ -1646,6 +1930,20 @@ def run(
             reject_workspace_overlap(str(out_dir), resume_out)
         except WorkspaceContractError:
             print("[FAILED] 续采输出目录不安全或已被占用", file=sys.stderr)
+            return 2
+    if checkpoint_out is not None:
+        try:
+            _preflight_explicit_workspace(checkpoint_out, resume=False)
+            _reject_lexical_workspace_overlap(str(out_dir), checkpoint_out)
+        except WorkspaceContractError:
+            print("[FAILED] checkpoint 输出目录不安全或已被占用", file=sys.stderr)
+            return 2
+    if resume_checkpoint is not None:
+        try:
+            _preflight_explicit_workspace(resume_checkpoint, resume=True)
+            reject_workspace_overlap(resume_checkpoint, str(out_dir))
+        except WorkspaceContractError:
+            print("[FAILED] checkpoint 来源或输出目录不安全", file=sys.stderr)
             return 2
 
     user_from = _parse_date(date_from)
@@ -1694,6 +1992,41 @@ def run(
             print("[FAILED] --date-from 不能晚于 --date-to", file=sys.stderr)
             return 2
 
+    checkpoint_parameters = _checkpoint_parameters(
+        requested_limit=requested_count,
+        date_from=user_from,
+        date_to=user_to,
+        include_comments=include_comments,
+        enrich_details=enrich_details,
+        collect_all=collect_all,
+        max_items=max_items if collect_all else None,
+        max_seconds=max_seconds if collect_all else None,
+        max_scrolls=max_scrolls if collect_all else None,
+        analysis_goal=analysis_goal,
+        browser_fallback=browser_fallback,
+    )
+    checkpoint_state: dict | None = None
+    checkpoint_platform: str | None = None
+    checkpoint_profile_url: str | None = None
+    checkpoint_source_format: str | None = None
+    checkpoint_source_digest: str | None = None
+    if resume_checkpoint is not None:
+        try:
+            checkpoint_platform, checkpoint_profile_url = (
+                _canonical_resume_identity(url)
+            )
+            checkpoint_state = _load_collection_checkpoint(
+                resume_checkpoint,
+                expected_platform=checkpoint_platform,
+                expected_profile_url=checkpoint_profile_url,
+                expected_parameters=checkpoint_parameters,
+            )
+            checkpoint_source_format = checkpoint_state["source_format"]
+            checkpoint_source_digest = checkpoint_state["source_digest"]
+        except (OSError, WorkspaceContractError):
+            print("[FAILED] checkpoint 无法安全核验", file=sys.stderr)
+            return 2
+
     env_value = os.environ.get("SOCIAL_BROWSER_FALLBACK")
     douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
     # Keep the default zero-argument loader call compatible with integrations
@@ -1738,6 +2071,11 @@ def run(
     ):
         print("[FAILED] 增量续采账号身份与来源不一致", file=sys.stderr)
         return 2
+    if checkpoint_state is not None and (
+        platform != checkpoint_platform or canonical_url != checkpoint_profile_url
+    ):
+        print("[FAILED] checkpoint 账号身份与当前适配器不一致", file=sys.stderr)
+        return 2
     url = canonical_url
     safe_url = canonical_url
     task_id = new_task_id(platform)
@@ -1747,8 +2085,6 @@ def run(
     if enrich_details and platform != "douyin":
         print("[FAILED] --enrich-details 仅支持抖音账号主页", file=sys.stderr)
         return 2
-
-    requested_count = max_items if collect_all else limit
 
     account = account_output_key(platform, canonical_url)
     date = datetime.now(_BEIJING).strftime("%Y%m%d")
@@ -1793,18 +2129,38 @@ def run(
         ])
     if resume_mode:
         echo_parts.append(f"resume=on existing={len(existing_posts)} since={date_from_iso}")
+    if checkpoint_out is not None:
+        echo_parts.append("checkpoint=on")
+    if checkpoint_state is not None:
+        echo_parts.append(
+            f"checkpoint_resume=on existing={len(checkpoint_state['posts'])}"
+        )
     print(f"[echo] " + " ".join(echo_parts))
 
     collected_at = datetime.now(_BEIJING).isoformat()
     task_status = "COLLECTING"
-    stop_reason: str | None = None
-    error_log: list[dict] = []
-    posts: list = []
+    stop_reason: str | None = (
+        checkpoint_state["stop_reason"] if checkpoint_state is not None else None
+    )
+    error_log: list[dict] = (
+        list(checkpoint_state["error_log"])
+        if checkpoint_state is not None
+        else []
+    )
+    posts: list = (
+        list(checkpoint_state["posts"])
+        if checkpoint_state is not None
+        else []
+    )
     profile: dict = {}
     collection_coverage: dict = (
-        {"requested_all": True, "max_items": max_items}
-        if collect_all
-        else {}
+        dict(checkpoint_state["collection_coverage"])
+        if checkpoint_state is not None
+        else (
+            {"requested_all": True, "max_items": max_items}
+            if collect_all
+            else {}
+        )
     )
     comment_collection: dict = {}
     detail_unavailable_count = 0
@@ -1869,20 +2225,21 @@ def run(
 
     # 1) check_access:不绕过任何保护(见 base.py / exceptions.md §2)
     access_failed = False
-    try:
-        with execution_timer.phase("check_access"):
-            access = adapter.check_access(url)
-    except Exception as e:
-        # 适配器未启用(WeiboCollector._require_enabled 抛 RuntimeError 携 ADAPTER_UNAVAILABLE)
-        stop_reason = _stop_reason_from_exc(e)
-        task_status = "FAILED"
-        access_failed = True
-    else:
-        if not access.get("accessible"):
-            stop_reason = _safe_stop_reason(access.get("stop_reason"))
-            # check_access 阶段尚无已采数据,所有受阻场景统一 FAILED(见 exceptions.md §1)
+    if checkpoint_state is None:
+        try:
+            with execution_timer.phase("check_access"):
+                access = adapter.check_access(url)
+        except Exception as e:
+            # 适配器未启用(WeiboCollector._require_enabled 抛 RuntimeError 携 ADAPTER_UNAVAILABLE)
+            stop_reason = _stop_reason_from_exc(e)
             task_status = "FAILED"
             access_failed = True
+        else:
+            if not access.get("accessible"):
+                stop_reason = _safe_stop_reason(access.get("stop_reason"))
+                # check_access 阶段尚无已采数据,所有受阻场景统一 FAILED(见 exceptions.md §1)
+                task_status = "FAILED"
+                access_failed = True
     if access_failed:
         persistence_failure = persist_access_failure(stop_reason)
         if persistence_failure is not None:
@@ -1894,55 +2251,59 @@ def run(
         return 3
 
     # 2) 内容列表(先于资料,便于回填;失败不阻断资料写入)
-    try:
-        with execution_timer.phase("collect_post_list"):
-            if collect_all:
-                posts = adapter.collect_all_post_list(
-                    url,
-                    date_range=date_range,
-                    max_items=max_items,
-                    max_seconds=max_seconds,
-                    max_scrolls=max_scrolls,
-                )
-            else:
-                posts = adapter.collect_post_list(
-                    url, limit=limit, date_range=date_range
-                )
-    except Exception as e:
-        partial_posts = getattr(e, "partial_posts", None)
-        if isinstance(partial_posts, list):
-            posts = partial_posts[:requested_count]
-        diagnostic_code = getattr(e, "diagnostic_code", None)
-        stop_reason = _stop_reason_from_exc(e)
-        if platform == "douyin" and posts:
-            for post in posts:
-                if post.get("collection_status") in {"SUCCESS", "PARTIAL"}:
-                    post["collection_status"] = "PARTIAL"
-                    metrics = post.get("platform_metrics")
-                    metrics = dict(metrics) if isinstance(metrics, dict) else {}
-                    metrics["partial_reasons"] = sanitize_partial_reasons(
-                        sanitize_partial_reasons(metrics.get("partial_reasons"))
-                        + [str(stop_reason).lower()]
+    if checkpoint_state is None:
+        try:
+            with execution_timer.phase("collect_post_list"):
+                if collect_all:
+                    posts = adapter.collect_all_post_list(
+                        url,
+                        date_range=date_range,
+                        max_items=max_items,
+                        max_seconds=max_seconds,
+                        max_scrolls=max_scrolls,
                     )
-                    post["platform_metrics"] = metrics
-        # 登录/验证/频控/解析失败 → PARTIAL(已有数据保留)或 FAILED(无已采数据)
-        task_status = "PARTIAL" if posts else "FAILED"
-        entry = {
-            "url": safe_url, "stage": "collect_post_list",
-            "error_code": stop_reason,
-            "message": _ERROR_STAGE_MESSAGES["collect_post_list"],
-            "occurred_at": _event_timestamp(), "retryable": False,
-        }
-        if isinstance(diagnostic_code, str) and diagnostic_code:
-            entry["diagnostic_code"] = diagnostic_code
-        error_log.append(entry)
-        print(f"[warn] 内容列表采集异常 stop_reason={stop_reason}", file=sys.stderr)
-    try:
-        collection_coverage = _sanitize_collection_coverage(
-            adapter.get_collection_coverage()
-        )
-    except Exception:
-        collection_coverage = {}
+                else:
+                    posts = adapter.collect_post_list(
+                        url, limit=limit, date_range=date_range
+                    )
+        except Exception as e:
+            partial_posts = getattr(e, "partial_posts", None)
+            if isinstance(partial_posts, list):
+                posts = partial_posts[:requested_count]
+            diagnostic_code = getattr(e, "diagnostic_code", None)
+            stop_reason = _stop_reason_from_exc(e)
+            if platform == "douyin" and posts:
+                for post in posts:
+                    if post.get("collection_status") in {"SUCCESS", "PARTIAL"}:
+                        post["collection_status"] = "PARTIAL"
+                        metrics = post.get("platform_metrics")
+                        metrics = dict(metrics) if isinstance(metrics, dict) else {}
+                        metrics["partial_reasons"] = sanitize_partial_reasons(
+                            sanitize_partial_reasons(metrics.get("partial_reasons"))
+                            + [str(stop_reason).lower()]
+                        )
+                        post["platform_metrics"] = metrics
+            # 登录/验证/频控/解析失败 → PARTIAL(已有数据保留)或 FAILED(无已采数据)
+            task_status = "PARTIAL" if posts else "FAILED"
+            entry = {
+                "url": safe_url, "stage": "collect_post_list",
+                "error_code": stop_reason,
+                "message": _ERROR_STAGE_MESSAGES["collect_post_list"],
+                "occurred_at": _event_timestamp(), "retryable": False,
+            }
+            if isinstance(diagnostic_code, str) and diagnostic_code:
+                entry["diagnostic_code"] = diagnostic_code
+            error_log.append(entry)
+            print(
+                f"[warn] 内容列表采集异常 stop_reason={stop_reason}",
+                file=sys.stderr,
+            )
+        try:
+            collection_coverage = _sanitize_collection_coverage(
+                adapter.get_collection_coverage()
+            )
+        except Exception:
+            collection_coverage = {}
     if collect_all:
         collection_coverage["requested_all"] = True
         collection_coverage["max_items"] = max_items
@@ -1991,11 +2352,53 @@ def run(
         posts = posts[:requested_count]
 
     # 增量续采:合并既有帖子,按 post_id/bvid 去重(新抓取的覆盖旧的)
-    new_count = 0
+    new_count = len(posts) if not resume_mode else 0
     if resume_mode and existing_posts:
         posts, new_count = _merge_incremental(existing_posts, posts)
     _canonicalize_post_urls(platform, posts)
     _ensure_post_collection_status_contract(posts)
+
+    if checkpoint_out is not None:
+        checkpoint_diagnostic_code = next(
+            (
+                code
+                for error in reversed(error_log)
+                if (
+                    code := _safe_diagnostic_code(
+                        error.get("diagnostic_code")
+                    )
+                ) is not None
+            ),
+            None,
+        )
+        try:
+            _write_collection_checkpoint(
+                checkpoint_out,
+                platform=platform,
+                profile_url=url,
+                parameters=checkpoint_parameters,
+                posts=posts,
+                collected_at=collected_at,
+                stop_reason=stop_reason,
+                diagnostic_code=checkpoint_diagnostic_code,
+                collection_coverage=collection_coverage,
+                error_log=error_log,
+            )
+        except WorkspaceCommitIndeterminate:
+            raise
+        except (
+            WorkspaceCapabilityError,
+            WorkspaceExistsError,
+            WorkspaceIdentityError,
+            WorkspaceVerificationError,
+        ):
+            reservation.close()
+            print("[FAILED] checkpoint 输出目录身份已改变", file=sys.stderr)
+            return 2
+        except WorkspaceError:
+            reservation.close()
+            print("[FAILED] checkpoint 产物无法安全提交", file=sys.stderr)
+            return 3
     content_issue_count = sum(
         1
         for post in posts
@@ -2168,6 +2571,8 @@ def run(
             new_count=new_count,
             resume_source_format=resume_source_format,
             resume_source_digest=resume_source_digest,
+            checkpoint_source_format=checkpoint_source_format,
+            checkpoint_source_digest=checkpoint_source_digest,
             collection_coverage=collection_coverage,
             comment_collection=comment_collection,
             diagnostic_code=task_diagnostic_code,
@@ -2274,6 +2679,16 @@ def main() -> None:
         "--since", default=None,
         help="增量续采起点(YYYY-MM-DD 或 ISO 8601,北京时间);覆盖从既有数据推导的起始时间。仅与 --resume 联用。",
     )
+    ap.add_argument(
+        "--checkpoint-out",
+        default=None,
+        help="在内容列表阶段创建独立、密封且只读的恢复点目录。",
+    )
+    ap.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help="核验密封恢复点后跳过访问和列表采集，继续写入新 --out。",
+    )
     browser_group = ap.add_mutually_exclusive_group()
     browser_group.add_argument(
         "--browser-fallback", dest="browser_fallback", action="store_true",
@@ -2289,6 +2704,18 @@ def main() -> None:
         ap.error("--since 必须与 --resume 联用")
     if args.resume_out is not None and not args.resume:
         ap.error("--resume-out 必须与 --resume 联用")
+    if args.checkpoint_out is not None and args.resume_checkpoint is not None:
+        ap.error("--checkpoint-out 与 --resume-checkpoint 不能联用")
+    if (
+        args.checkpoint_out is not None or args.resume_checkpoint is not None
+    ) and args.out is None:
+        ap.error("checkpoint 模式必须显式指定新的 --out")
+    if (
+        args.checkpoint_out is not None or args.resume_checkpoint is not None
+    ) and (
+        args.resume or args.resume_out is not None or args.since is not None
+    ):
+        ap.error("checkpoint 恢复不能与增量 --resume 混用")
     custom_all_budget = any(
         value is not None
         for value in (args.max_items, args.max_seconds, args.max_scrolls)
@@ -2338,6 +2765,8 @@ def main() -> None:
         max_seconds=max_seconds, max_scrolls=max_scrolls,
         enrich_details=args.enrich_details,
         analysis_goal=args.analysis_goal,
+        checkpoint_out=args.checkpoint_out,
+        resume_checkpoint=args.resume_checkpoint,
     ))
 
 

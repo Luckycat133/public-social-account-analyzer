@@ -11,7 +11,7 @@ public-social-account-analyzer/
 ├── README.md                              # 项目主说明（Standard Readme）
 ├── USAGE.md                               # 使用指南与故障排查
 ├── CHANGELOG.md                           # 变更日志（Keep a Changelog v1.1.0）
-├── ROADMAP.md                             # 历史路线图（既有条目已完成；评论洞察待实施）
+├── ROADMAP.md                             # 历史路线图与当前能力状态
 ├── pyproject.toml                         # Python 项目与 pytest 配置
 ├── docs/                                  # 文档总目录（导航见 docs/README.md）
 │   ├── README.md                         # 文档地图与命名规范
@@ -20,7 +20,7 @@ public-social-account-analyzer/
 │   ├── guides/                          # 使用、部署、运营指南
 │   ├── prd/                            # 产品需求与验收
 │   ├── observations/                    # Agent 行动路径观测与验收记录
-│   └── plans/                          # 进行中 / 待实施计划
+│   └── plans/                          # 设计与实施记录
 ├── tests/                                 # pytest 回归与人工验收工具；数量以发布日志为准
 │   ├── conftest.py                        # 注入 skill/scripts/ 的测试导入配置
 │   ├── test_*.py                          # 采集、分析、报告、安全和工作区合同
@@ -113,7 +113,7 @@ public-social-account-analyzer/
 - 适配器层通过 `BaseCollector` 抽象基类实现多态；`collect.py` 负责显式加载具体适配器
 - `bilibili.py` 是 B站采集、HTTP/WBI 传输、错误映射与任务级断路器的单一实现；平台保护响应不会触发浏览器降级
 - 采集工作区与分析工作区分别提交；`run_pipeline.py` 只读核验前者，再创建后者
-- taxonomy 与 business-insight 输入由执行 Agent 在已提交目录外生成，脚本只负责严格校验、摘要绑定和封存
+- taxonomy、business-insight 与 comment-insight 输入由执行 Agent 在已提交目录外生成，脚本只负责严格校验、摘要绑定和封存
 
 ---
 
@@ -123,12 +123,12 @@ public-social-account-analyzer/
 
 | 模块 | 职责 | 关键符号 |
 |:---|:---|:---|
-| `collect.py` | 采集入口：根据 URL 路由到适配器，采集资料与内容列表/详情，支持增量续采与日期过滤；默认写入仓库根 `workspace/` | `run()` · `main()` · `_load_adapters()` · `_merge_incremental()` |
+| `collect.py` | 采集入口：根据 URL 路由到适配器，采集资料与内容列表/详情，支持增量续采、密封中断 checkpoint 与日期过滤；默认写入仓库根 `workspace/` | `run()` · `main()` · `_load_adapters()` · `_write_collection_checkpoint()` · `_merge_incremental()` |
 | `collect_douyin_authorized.py` | 账号本人授权入口：同次 OAuth 的 token + open_id 身份回证与官方公开视频分页 | `run()` · `main()` |
 | `import_index_snapshot.py` | 将 Agent 已核验的公开索引证据导入为非穷尽、可审计采集提交 | `run()` · `main()` |
 | `run_pipeline.py` | 推荐分析入口：只读核验采集提交，在新目录完成归一化、分析、渲染、验证与提交 | `run_pipeline()` · `main()` |
 | `normalize.py` | 各平台原始字段 → 统一数据模型；内存 API 由流水线使用，legacy CLI 不修改已密封工作区 | `normalize_in_memory()` · `normalize_post()` · `dedup_posts()` |
-| `analyze.py` | 确定性指标、taxonomy 与 business-insight prompt/result 严格合同；无 LLM、无网络 | `analyze_in_memory()` · `build_taxonomy_prompt()` · `validate_business_insight_results()` |
+| `analyze.py` | 确定性指标，以及 taxonomy、business-insight 与 comment-insight prompt/result 严格合同；无 LLM、无网络 | `analyze_in_memory()` · `build_taxonomy_prompt()` · `validate_business_insight_results()` · `validate_comment_insight_results()` |
 | `render_report.py` | 从已校验对象生成同合同的 Markdown 与 HTML 报告 | `render_in_memory()` · `build_metrics_dashboard()` · `build_strategy()` |
 | `immutable_workspace.py` | create-only 工作区、manifest SHA-256、`.complete` 提交与 identity-bound 读取 | `ImmutableWorkspace` · `VerifiedWorkspaceReader` |
 | `execution_timing.py` | 带时区起止时间、monotonic 总耗时和固定阶段累计 | `ExecutionTimer` |
@@ -175,11 +175,9 @@ collect.py / authorized / index importer
              │ 只读核验
              ▼
 run_pipeline.py ─→ normalize ─→ deterministic analysis ─→ render ─→ validate
-             └─→ 独立不可变分析工作区（四类标准产物 + provenance + manifest + .complete）
+             └─→ 独立不可变分析工作区（source + normalized + analysis/report + provenance + manifest + .complete）
 
-策略任务在同一个 collection 上依次创建：
-taxonomy draft → taxonomy final / business draft → business final。
-只有 final 同时封存 classification 与 business-insight JSON，才能声明完整策略分析。
+策略任务在同一个 collection 上依次创建 taxonomy draft → business draft → final；只有 final 同时封存 classification 与 business-insight JSON，才能声明完整策略分析。评论语义任务另以 comment-insight draft → final 执行；final 必须封存与评论源摘要、规范语义输入摘要及逐评论证据一致的严格 JSON。
 ```
 
 采集步骤访问公开平台页面，抖音在无明确限制且 SSR 不足时可用隔离临时浏览器作实验性传输降级；其余主流水线步骤离线执行。`normalize.py`、`analyze.py`、`render_report.py` 和 `run_pipeline.py` 不访问网络，也不在脚本内部调用 LLM。执行 Agent 在提交目录外填写 prompt 规定的严格 JSON，再由新一次流水线提交校验并封存。
@@ -193,4 +191,4 @@ python3 -m pytest tests/ -q
 python3 -m pytest tests/test_douyin.py -q
 ```
 
-测试覆盖适配器路由、字段映射、限制断路器、去重/续采、指标、归一化、不可变提交、taxonomy/business 合同、报告安全、结构化耗时与人工验收工具。用例数与耗时以当次发布日志为准。
+测试覆盖适配器路由、字段映射、限制断路器、去重/增量续采/密封 checkpoint、指标、归一化、不可变提交、taxonomy/business/comment 合同、报告安全、结构化耗时与人工验收工具。用例数与耗时以当次发布日志为准。

@@ -49,6 +49,8 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 - `--resume`：增量续采。只接受 `--out` 指向的已核验 manifest + `.complete` 采集提交，并要求其中 `task.json` / `source/profile.json` 与当前平台、规范主页完全一致；未密封 legacy、跨账号、跨平台或畸形来源在适配器加载、联网和输出预留前失败。通过后以最新 `published_at` 为起点，按 `post_id`/`bvid` 去重合并（新覆盖旧）。**必须配合 `--out`**。
 - `--resume-out PATH`：增量续采的新不可变输出目录；省略时原子预留同级 `OLD-resume-<date>` 后缀目录。
 - `--since`：增量续采起点（YYYY-MM-DD 或 ISO 8601），覆盖由既有数据推导的起始时间；仅与 `--resume` 联用。
+- `--checkpoint-out PATH`：在作品列表完成后创建独立密封 checkpoint，用于资料采集或持久化前发生异常中断时恢复；路径必须不存在。
+- `--resume-checkpoint PATH`：从显式指定的密封 checkpoint 创建新的 `--out`。账号、全部任务参数、作品数量和 SHA-256 必须一致；恢复会跳过访问检查和列表采集。它与 `--resume`、`--checkpoint-out` 互斥，绝不读取任意未密封目录。
 - `--browser-fallback`：显式启用抖音浏览器降级。抖音默认已启用：SSR 缺失或作品列表结构无法识别时，按 CDP 网络响应观察、可见 DOM 卡片的顺序尝试；已识别的空列表返回 `NO_PUBLIC_CONTENT`。B站不使用该降级处理平台保护响应。
 - `--no-browser-fallback`：最高优先级地禁止抖音启动系统浏览器，只使用 HTTP/SSR 快速路径。B站遇到登录、验证、限流或访问限制时始终立即停止。
 
@@ -69,7 +71,8 @@ python skill/scripts/run_pipeline.py \
   --input <COLLECTION_WORKSPACE> \
   --output <NEW_ANALYSIS_WORKSPACE> \
   [--with-llm-tax] [--classification-results <JSON_FILE>] \
-  [--with-business-insights] [--business-insight-results <JSON_FILE>]
+  [--with-business-insights] [--business-insight-results <JSON_FILE>] \
+  [--with-comment-insights] [--comment-insight-results <JSON_FILE>]
 ```
 
 #### 必备参数：
@@ -85,10 +88,12 @@ python skill/scripts/run_pipeline.py \
   原始字节写入 `source/classification-results.json`；路径本身不会写入产物。
 - `--with-business-insights`：要求第二阶段业务洞察；未提供结果时生成 `business-insights-prompt.md` 并保持 `PARTIAL`。
 - `--business-insight-results PATH`：读取严格 JSON 对象。结果必须绑定 collection commit 与 taxonomy 原始字节 SHA-256，并具有固定 5 项定位、6 项高低表现公开文案模式、10 个选题、5 个内容模式和 4 个实验。校验成功后原始字节写入 `source/business-insight-results.json`。
+- `--with-comment-insights`：存在有效公开评论时生成 `comment-insights-prompt.md`；未提供结果时保持 `PARTIAL`，并记录 `PENDING_COMMENT_INSIGHTS`。
+- `--comment-insight-results PATH`：读取严格 JSON 对象。结果必须绑定评论源 SHA-256 与规范语义输入 SHA-256，固定覆盖高频问题、争议、需求、顾虑和后续选题线索，且每项证据精确匹配父作品、评论 ID、1 基源行号和原文摘录。校验成功后原始字节写入 `source/comment-insight-results.json`。
 
 前五个阶段（采集核验、归一化、分析、渲染、输出验证）失败时不会创建输出路径。预留之后
 发生序列化或提交失败时可保留无有效 `.complete` 的目录，但流水线不会删除、覆盖或发布它。
-分类文件缺失、JSON 非法、记录不完整、父作品不匹配或枚举越界同样在预留前失败。
+分类或洞察文件缺失、JSON 非法、重复键、记录不完整、摘要/父作品/评论证据不匹配或枚举越界同样在预留前失败。
 分析 `task.json` 记录总耗时与 `collection_input`、`normalization`、`analysis`、`render`、`validation` 分阶段耗时；`pipeline-report.md` 同步记录总耗时。
 
 ### 3. Legacy 分阶段脚本
@@ -243,7 +248,7 @@ python skill/scripts/run_pipeline.py \
 
 ### AC-03 / AC-06 外部人工真值
 
-自动的 source → normalized 对照只能说明流水线自洽，不能替代 PRD 的人工准确率。对业务完整的 final 运行：
+自动的 source → normalized 对照只能说明流水线自洽，不能替代 PRD 的人工准确率。优先对业务完整的 final 运行：
 
 ```bash
 python3 tests/manual_accuracy_check.py prepare \
@@ -260,7 +265,7 @@ python3 tests/manual_accuracy_check.py verify \
   --json
 ```
 
-工具会核验两个不可变提交、精确来源清单、任务状态、证据覆盖和外部真值绑定；按平台排除不适用指标，分别输出总体、scope 与逐字段准确率。空表、少于 10 条、少于 3 项核心洞察、普通文本 URL、HTML 注释链接、重复洞察 ID 或 `post_id=null` 均不能得到通过结论。
+工具会核验两个不可变提交、精确来源清单、任务状态、证据覆盖和外部真值绑定；按平台排除不适用指标，分别输出总体、scope 与逐字段准确率。已密封的 `PARTIAL` 采集/分析可用于评估现有样本，但 scope 会标记 `PARTIAL_SOURCE_SAMPLE`，总体只能是 `INCONCLUSIVE` 或 `FAIL`，不能借部分样本取得 PASS。空表、少于 10 条、少于 3 项核心洞察、普通文本 URL、HTML 注释链接、重复洞察 ID 或 `post_id=null` 均不能得到通过结论。
 
 ### 示例 3：抖音公开 `--all` 与详情补全
 
@@ -322,9 +327,13 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 - `empty`：所有合格父作品均已尝试、明确为空、无失败且未中止；
 - `unavailable`：没有有效评论证据且覆盖不完整、文件缺失或受平台保护；
 - `collected_pending_model`：至少取得一条有效评论，确定性层只展示覆盖和代表样本。
+- `collected_analyzed`：严格评论洞察结果已完成并通过逐评论证据校验。
 
-确定性脚本不生成评论情绪、高频问题、争议、需求等语义结论；`semantic` 保持
-`pending-model`，且不会单独改变全局分析完成状态。
+确定性脚本不生成评论情绪、高频问题、争议或需求等语义结论。需要语义洞察时，先用
+`--with-comment-insights` 生成受评论源 SHA 与规范语义输入 SHA 绑定的 draft；Agent 在提交
+目录外填写严格 JSON，再用 `--comment-insight-results` 创建 final。五类输出固定为高频问题、
+争议、需求、顾虑和后续选题线索；每条必须引用真实父作品、评论 ID、源行号和原文摘录。
+原始结果字节封存为 `source/comment-insight-results.json`。没有结果时保持 `pending-model`。
 
 ### 分类矩阵与高低组结构化特征
 
@@ -394,6 +403,8 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 若发生在动态发现阶段，`diagnostic_code=BILIBILI_DYNAMIC_DISCOVERY`，报告会显示
 `dynamic_status=ACCESS_RESTRICTED`；已采常规投稿可以保留，但当前样本可能遗漏仅出现在动态
 入口的公开视频。程序不会在该保护响应后继续逐条标签补充。
+旧封存产物若没有任务级动态覆盖账本，分析报告会显示“未记录（旧产物 / 未知）”并作同样的
+缺口提示；缺少账本不能被解释为动态入口已成功观察。
 
 ### Q4: macOS 下把 `--out` 指向 `/tmp` 或 `/var` 为什么被拒绝？
 

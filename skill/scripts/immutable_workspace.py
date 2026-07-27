@@ -57,6 +57,8 @@ ANALYSIS_OPTIONAL_ARTIFACTS = frozenset(
         "source/classification-results.json",
         "business-insights-prompt.md",
         "source/business-insight-results.json",
+        "comment-insights-prompt.md",
+        "source/comment-insight-results.json",
     }
 )
 ANALYSIS_ARTIFACTS = ANALYSIS_REQUIRED_ARTIFACTS | ANALYSIS_OPTIONAL_ARTIFACTS

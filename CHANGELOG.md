@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added sealed collection checkpoints with explicit `--checkpoint-out` / `--resume-checkpoint`; recovery skips completed access/list work and rejects unsealed, tampered, mismatched, or duplicate-bearing checkpoints before network and output reservation.
+- Added a strict external-model comment-insight stage for frequent questions, controversies, needs, concerns, and follow-up topic clues. Results are bound to comment/source digests, preserve raw bytes, and require parent/comment/line/excerpt evidence in JSON, Markdown, and HTML.
 - Added a Bilibili regular/dynamic coverage ledger, safe discovery diagnostics, and stable per-post collection-evidence fields so partial dynamic coverage is auditable without persisting response data.
 - Added standardized `source`, `validation_data`, and held-out `test_data` documentation, a path configuration example, and an operational data usage guide.
 - Added evaluation dataset tests covering schema contracts, duplicate IDs, partition leakage, source coverage, manifest counts, and local file modes.
@@ -26,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Extended `split_dataset.py --verify` to validate JSONL structure, required fields, partition integrity, record counts, and SHA-256 checksums.
 - Upgraded the evaluation dataset manifest to schema version 2 with dataset version, path, split-policy, and quality-check metadata.
 - Consolidated the repository structure documentation around the current regression suite without embedding an expiring test count, collector dependency direction, networking boundaries, and relocated historical records.
-- Kept comment sampling explicitly best-effort; deterministic evidence persistence is implemented, while semantic comment conclusions remain pending model input rather than being fabricated.
+- Kept comment sampling explicitly best-effort; deterministic evidence persistence never fabricates semantic conclusions, and the optional strict external-model stage leaves them visibly pending until digest-bound results are supplied.
 - Clarified LLM taxonomy behavior: the Agent Skill flow assigns classification to the executing agent when valid samples exist, while `analyze.py` only exposes optional prompt-generation and result-backfill interfaces and never calls an LLM itself.
 
 - Established a local permission baseline of `0750` for dataset directories and `0640` for dataset files, with deployment guidance because Git does not preserve full Unix modes.
@@ -39,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a zero-runtime-dependency `import_index_snapshot.py` path for public Douyin Web-index evidence after direct collection is blocked. The Agent verifies source/item ownership, while the importer validates official URLs and field consistency; it supports official Jingxuan item URLs and explicitly disclosed profile-index records.
 - Added bounded public Douyin `--all` collection with explicit item/time/scroll budgets and an auditable completeness ledger. Only a validated terminal list page may set `is_exhaustive=true`; every safety or platform stop remains non-exhaustive, retaining `PARTIAL` data when posts were already collected and `FAILED` when none were available.
 - Added `collect_douyin_authorized.py` for the OpenAPI credential owner. It requires the access token and `open_id` returned by the same OAuth authorization, verifies that exact identity through official userinfo, paginates `video.list`, keeps the access token out of URLs/logs/artifacts, and declares exhaustive coverage only after the official terminal page.
-- Added deterministic comment-evidence analysis with strict JSONL/parent/ledger validation, four collection states, field and parent coverage, stable representative samples, immutable byte-for-byte evidence copying, and matching Markdown/HTML presentation. Semantic comment insights remain explicitly pending model input.
+- Added deterministic comment-evidence analysis with strict JSONL/parent/ledger validation, explicit collection states, field and parent coverage, stable representative samples, immutable byte-for-byte evidence copying, and matching Markdown/HTML presentation. Optional semantic results use the separate strict, evidence-bound model stage.
 - Added deterministic classification breakdowns after complete taxonomy input: a full topic-by-format count matrix, topic/format main-metric coverage and medians, plus high/low-group structured feature comparisons for taxonomy fields, series, public flags, hashtags, and fixed duration buckets. The output remains descriptive and never invents title/opening semantics, causality, or significance.
 - Added a PRD implementation and acceptance matrix that separates implemented contracts, conditional online capabilities, outstanding human acceptance, and the limits of anonymous third-party Douyin history collection.
 
@@ -65,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fresh collections now report every newly persisted unique post in `task.json.new_count`; report cadence labels `coverage_days` as active publication days, and exact duplicate business-evidence rows render only once in first-seen order.
+- Bilibili taxonomy rejects a model-supplied `series_name` unless it exactly matches non-null public collection evidence; missing evidence must remain `null`.
+- Comment-insight drafts now require at least one usable public comment text instead of publishing an empty model prompt.
+- Manual accuracy checks now assess sealed partial runs with an explicit scope ledger while preventing partial source samples from receiving an overall `PASS`.
 - Closed manual-acceptance bypasses involving blank or mistyped truth values, `visible + null`, missing/duplicate post or insight IDs, profile-only links, plain-text/comment URLs, mismatched canonical item URLs, inapplicable platform fields, and analysis workspaces not bound to the reviewed collection.
 - Restricted-page diagnostics now persist only a fixed `restriction_source` / `restriction_marker` pair and reject raw visible page text.
 

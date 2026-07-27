@@ -283,7 +283,7 @@ B站账号层 `platform_metrics` 约定为空对象 `{}`（获赞总量非账号
 - **置顶视频**：`top/arc` 成功返回 BV 号时，命中项写 `true`、其余项写 `false`；端点明确成功但无置顶时全部写 `false`；端点失败或结果不可验证时写 `null`。
 - **合集**：Post 顶层不新增合集布尔字段；所有 B站构建路径固定输出 `platform_metrics.collection_evidence_status/is_in_collection/series_name/season_id`。只有 `ugc_season` 正证据才写 `OBSERVED/true`；完整响应未见该节点写 `NOT_OBSERVED/null`，不具备该证据的列表路径写 `UNAVAILABLE/null`。分类阶段只可沿用非空 `series_name`。合集容器本身不作为投稿重复计数。
 - **动态视频**：动态发现先于逐条标签补充。独立 BV 标记 `content_type=dynamic` 并进入统一主列表；与正式投稿出现同一 BV 时按 `post_id` first-wins 去重，以投稿详情为主并保留 `appeared_in_dynamic_feed` 和动态指标证据。动态卡缺失收藏/投币等统一指标时单条为 `PARTIAL` 并列出 `missing_detail_metrics`。合并后统一按时间排序、日期过滤和 limit 截断，最终唯一 BV 才各补一次标签。
-- **动态覆盖账本**：`task.collection_coverage` 保存 `regular_source`、`regular_observed_count`、`dynamic_status` 与 `dynamic_observed_count`。`dynamic_status=OBSERVED` 只表示本次入口观察成功，不声称全历史穷尽；保护响应使用固定停止枚举。报告必须披露非 `OBSERVED` 状态可能遗漏动态-only公开视频。
+- **动态覆盖账本**：`task.collection_coverage` 保存 `regular_source`、`regular_observed_count`、`dynamic_status` 与 `dynamic_observed_count`。`dynamic_status=OBSERVED` 只表示本次入口观察成功，不声称全历史穷尽；保护响应使用固定停止枚举。报告必须披露非 `OBSERVED` 状态可能遗漏动态-only公开视频；读取缺少这些字段的旧封存产物时显示“未记录 / 无法确认”，不能静默按成功处理。
 - **转载**：`copyright=2` → `is_repost=true`；原创（`copyright=1`）→ `is_repost=false`；`copyright` 缺失/非法时写 `null`。未取得公开投放证据时 `is_promoted=null`。
 - **充电专属 / 不可访问内容**：单条详情明确 `-404` 时保留列表证据并标 `DELETED`，继续处理其余作品；其他普通详情解析失败仅将该条降为 `PARTIAL/detail_status=UNAVAILABLE`。平台保护响应才停止整批并携带此前 `partial_posts`。
 - **翻页与日期窗口**：medialist、arc 与动态在发现阶段按日期窗口继续翻页；观察到早于下界、末页或取得 limit 条命中后才停止。后续页触发平台保护时，把此前页面条目转为 `partial_posts`，不得丢弃。

@@ -200,3 +200,37 @@ drift 任意一条失败 → 阻塞发布。
 ## 6. 维护说明
 
 本文件随发布流程变更同步修订。任何新增模块都应加入 §1.1。
+
+---
+
+## 7. 合规 vs legacy 产物族判别
+
+采集产物有两族，必须先识别再处理。
+
+### 7.1 合规产物（当前版本生成）
+
+特征（必须全部满足）：
+
+- 根目录存在 `.complete` 文件（持久提交标记）
+- 根目录存在 `manifest.json`（含精确产物清单、字节数与 SHA-256）
+- `task.json.task_status` ∈ {COMPLETED, PARTIAL, FAILED}，且 `task.json` 字节与 manifest 一致
+
+密封和清单核验通过只代表产物完整。`collect.py --resume --out <此目录>` 还要求账号身份一致并存在可续采作品；`run_pipeline.py --input <此目录>` 只接受 `COMPLETED` / `PARTIAL` 且至少有一条可分析作品的采集提交。
+
+### 7.2 legacy 产物（2026-07-24 旧部署版生成）
+
+特征：
+
+- 仅含 `source/` + `normalized-posts.csv` + `collection-report.md` + `task.json`
+- **无 `.complete`、无 `manifest.json`** → 不符合 SKILL.md §3 的"已提交采集"合约
+- 字节内容合法、内容齐全，但**不可作为 `--resume` 输入**——`collect.py` 会因 `_load_committed_resume` 校验失败立即退出 2
+
+### 7.3 处理建议
+
+三选一：
+
+- **A. 仅作历史证据保留**：保留不动；在 CI / 验收脚本中加一条"合规 `collect.py --resume` 不得以 legacy 目录作为 `--out`"。
+- **B. 重新采集为合规产物**：在当前版本下重跑 `python3 skill/scripts/collect.py "<原账号 URL>" --limit <原 limit> --out <新目录>`；新目录将自然含 `.complete` + `manifest.json`。这不是对旧字节的“回填”，新旧任务应分别保留来源说明。
+- **C. 删除**：会丢失内容采样证据，建议先用 B。
+
+任何变更需 PR 评审至少 1 名 maintainer；选 C 时保留 30 天 git 历史可追溯。

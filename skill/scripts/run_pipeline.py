@@ -163,6 +163,44 @@ def _read_business_insight_results(path: str) -> tuple[bytes, dict[str, Any]]:
     return payload, _business_insight_json(payload)
 
 
+def _comment_insight_json(payload: bytes) -> dict[str, Any]:
+    def reject_constant(value: str):
+        raise ValueError(f"non-standard numeric constant {value}")
+
+    def reject_duplicate_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_pairs,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise PipelineError(
+            "comment insight results are not strict UTF-8 JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise PipelineError("comment insight results must be a JSON object")
+    return value
+
+
+def _read_comment_insight_results(path: str) -> tuple[bytes, dict[str, Any]]:
+    try:
+        with open(path, "rb") as handle:
+            payload = handle.read(DEFAULT_MAX_ARTIFACT_BYTES + 1)
+    except (OSError, TypeError, ValueError) as exc:
+        raise PipelineError("comment insight results cannot be read") from exc
+    if len(payload) > DEFAULT_MAX_ARTIFACT_BYTES:
+        raise PipelineError("comment insight results are too large")
+    return payload, _comment_insight_json(payload)
+
+
 def _validate_jsonl(payload: bytes, label: str) -> None:
     try:
         text = payload.decode("utf-8")
@@ -231,10 +269,16 @@ def _analysis_status(result: AnalysisResult) -> str:
         not business_required
         or result.analysis.get("business_insight_status") == "completed"
     )
+    comment_required = result.analysis.get("comment_insight_required") is True
+    comment_complete = (
+        not comment_required
+        or result.analysis.get("comment_insight_status") == "completed"
+    )
     complete = (
         classification_status == "completed"
         and evidence_status == "COMPLETE"
         and business_complete
+        and comment_complete
     )
     return "COMPLETED" if complete else "PARTIAL"
 
@@ -259,6 +303,15 @@ def _analysis_partial_reasons(analysis: dict[str, Any]) -> list[str]:
         elif business_status == "partial-model":
             reasons.append("PARTIAL_BUSINESS_INSIGHTS")
         elif business_status != "completed":
+            needs_generic_reason = True
+
+    if analysis.get("comment_insight_required") is True:
+        comment_status = analysis.get("comment_insight_status")
+        if comment_status == "pending-model":
+            reasons.append("PENDING_COMMENT_INSIGHTS")
+        elif comment_status == "partial-model":
+            reasons.append("PARTIAL_COMMENT_INSIGHTS")
+        elif comment_status != "completed":
             needs_generic_reason = True
 
     evidence_status = (analysis.get("evidence_coverage") or {}).get("status")
@@ -306,6 +359,8 @@ def _validate_output_payloads(
         _classification_json(artifacts["source/classification-results.json"])
     if "source/business-insight-results.json" in artifacts:
         _business_insight_json(artifacts["source/business-insight-results.json"])
+    if "source/comment-insight-results.json" in artifacts:
+        _comment_insight_json(artifacts["source/comment-insight-results.json"])
 
     try:
         csv_rows = list(
@@ -379,6 +434,8 @@ def run_pipeline(
     classification_results_path: str | None = None,
     with_business_insights: bool = False,
     business_insight_results_path: str | None = None,
+    with_comment_insights: bool = False,
+    comment_insight_results_path: str | None = None,
 ) -> PipelineResult:
     """Verify a sealed collection and commit a separate derived workspace."""
     execution_timer = ExecutionTimer()
@@ -406,6 +463,17 @@ def run_pipeline(
             business_insight_payload, business_insight_results = (
                 _read_business_insight_results(business_insight_results_path)
             )
+        comment_insight_payload: bytes | None = None
+        comment_insight_results: dict[str, Any] | None = None
+        if comment_insight_results_path is not None:
+            comment_insight_payload, comment_insight_results = (
+                _read_comment_insight_results(comment_insight_results_path)
+            )
+        comment_insight_results_sha256 = (
+            hashlib.sha256(comment_insight_payload).hexdigest()
+            if comment_insight_payload is not None
+            else None
+        )
 
         try:
             reader_context = VerifiedWorkspaceReader.open(
@@ -505,6 +573,9 @@ def run_pipeline(
                 with_business_insights=with_business_insights,
                 collection_commit_sha256=reader.source_digest,
                 classification_results_sha256=classification_results_sha256,
+                comment_insight_results=comment_insight_results,
+                with_comment_insights=with_comment_insights,
+                comment_insight_results_sha256=comment_insight_results_sha256,
                 comments_payload=(
                     reads["source/comments.jsonl"].payload
                     if "source/comments.jsonl" in reads
@@ -537,6 +608,7 @@ def run_pipeline(
             analysis=analysis_payload,
             taxonomy_prompt=analysis.taxonomy_prompt,
             business_insights_prompt=analysis.business_insights_prompt,
+            comment_insights_prompt=analysis.comment_insights_prompt,
         )
 
         with execution_timer.phase("render"):
@@ -625,6 +697,14 @@ def run_pipeline(
             artifacts["source/business-insight-results.json"] = (
                 business_insight_payload
             )
+        if analysis.comment_insights_prompt is not None:
+            artifacts["comment-insights-prompt.md"] = (
+                analysis.comment_insights_prompt.encode("utf-8")
+            )
+        if comment_insight_payload is not None:
+            artifacts["source/comment-insight-results.json"] = (
+                comment_insight_payload
+            )
 
         expected_artifacts = ANALYSIS_REQUIRED_ARTIFACTS | frozenset(
             relative
@@ -704,6 +784,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="严格业务洞察 JSON；验证后原字节纳入分析工作区",
     )
+    parser.add_argument(
+        "--with-comment-insights",
+        action="store_true",
+        help="要求评论语义洞察；无结果时生成 comment-insights-prompt.md",
+    )
+    parser.add_argument(
+        "--comment-insight-results",
+        default=None,
+        help="严格评论语义洞察 JSON；验证后原字节纳入分析工作区",
+    )
     args = parser.parse_args(argv)
     try:
         template = (
@@ -719,6 +809,8 @@ def main(argv: list[str] | None = None) -> int:
             classification_results_path=args.classification_results,
             with_business_insights=args.with_business_insights,
             business_insight_results_path=args.business_insight_results,
+            with_comment_insights=args.with_comment_insights,
+            comment_insight_results_path=args.comment_insight_results,
         )
     except WorkspaceCommitIndeterminate:
         print("[INDETERMINATE] analysis commit could not be confirmed", file=sys.stderr)

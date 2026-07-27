@@ -43,6 +43,7 @@ workspace/<platform>-<account>-analysis/
   source/collection-provenance.json # 来源格式、task_id、commit 与 artifact digests
   source/classification-results.json # 可选；严格核验后按原字节封存
   source/business-insight-results.json # 可选；绑定 collection/taxonomy 摘要后按原字节封存
+  source/comment-insight-results.json # 可选；绑定评论源/规范语义输入摘要后按原字节封存
   normalized-posts.csv             # 从 source/posts.jsonl 重新生成
   normalized-coverage.json         # 归一化覆盖与损失说明
   analysis.json                    # 结构化分析结果
@@ -52,6 +53,7 @@ workspace/<platform>-<account>-analysis/
   pipeline-report.md         # 流水线阶段摘要
   taxonomy-prompt.md         # 可选；请求分类提示时生成
   business-insights-prompt.md # 可选；分类完成后请求业务洞察时生成
+  comment-insights-prompt.md # 可选；存在有效评论且请求评论语义时生成
   manifest.json              # 分析产物的确定性清单
   .complete                  # 分析工作区的独立提交点
 ```
@@ -74,15 +76,16 @@ workspace/<platform>-<account>-analysis/
 即使存在旧 `normalized-posts.csv` 也必须忽略，以 `source/posts.jsonl` 重建。
 
 分析工作区的 `.complete` 只代表文件集合已持久提交。`task.json.task_status=COMPLETED` 还要求
-上游采集完整、归一化无损、语义分类完整、已请求的业务洞察完整且渲染校验全部通过；有效但受限的采集输入、
-`pending-model` / `partial-model` 分类，或已请求但未完成的业务洞察都写 `PARTIAL`。分析阶段只在语义分类为
-`completed`、高低表现证据覆盖明确为 `COMPLETE`，且 `business_insight_required=true` 时业务洞察也为
+上游采集完整、归一化无损、语义分类完整、已请求的业务洞察和评论洞察完整且渲染校验全部通过；有效但受限的采集输入、
+`pending-model` / `partial-model` 分类，或已请求但未完成的业务/评论洞察都写 `PARTIAL`。分析阶段只在语义分类为
+`completed`、高低表现证据覆盖明确为 `COMPLETE`，且所有标记为 required 的业务/评论洞察也为
 `completed`，才能为 `COMPLETED`。
 `task.json.phase_results` 必须包含
 `collection_input=VERIFIED`、`normalization/analysis=COMPLETED|PARTIAL`、
 `render=COMPLETED`、`validation=COMPLETED`。`task.json.partial_reasons` 按实际情况列出
 `UPSTREAM_COLLECTION_PARTIAL`、`NORMALIZATION_PARTIAL`、`PENDING_CLASSIFICATION`、
 `PARTIAL_CLASSIFICATION`、`PENDING_BUSINESS_INSIGHTS`、`PARTIAL_BUSINESS_INSIGHTS`、
+`PENDING_COMMENT_INSIGHTS`、`PARTIAL_COMMENT_INSIGHTS`、
 `EVIDENCE_INCOMPLETE` 或无法更具体归因时的
 `ANALYSIS_PARTIAL`；多个独立原因按稳定顺序并存且不得重复。无部分原因时为空数组。
 相同状态与原因必须同步进入 `analysis.json.meta`
@@ -126,6 +129,29 @@ B站只有 `platform_metrics.opening_text` 提供公开开头证据时才允许�
 该模式必须显式写 `observability=not_observable` 与 limitation；此时业务洞察状态为 `partial-model`，不得伪造。
 只有全部合同与作品证据完整时 `business_insight_status=completed`。原输入字节封存为
 `source/business-insight-results.json`。
+
+### 2.3 密封采集 checkpoint
+
+`collect.py --checkpoint-out <NEW_CHECKPOINT>` 在作品列表完成后创建一个独立、create-only 的不可变工作区：
+
+```text
+<checkpoint>/
+  checkpoint.json
+  source/posts.jsonl
+  manifest.json
+  .complete
+```
+
+`checkpoint.json` 根对象只接受以下字段：`format`、`stage`、`platform`、`profile_url`、
+`parameters`、`parameters_sha256`、`posts`、`collected_at`、`stop_reason`、`diagnostic_code`、
+`collection_coverage`、`errors`。其中 `format=public-social-account-analyzer/collection-checkpoint-v1`、
+`stage=POST_LIST_COLLECTED`；`posts` 固定绑定 `source/posts.jsonl` 的路径、SHA-256、记录数和摘要算法。
+`parameters` 绑定请求条数/全量预算、日期范围、评论/详情开关、分析目的和浏览器策略，摘要按规范 JSON 计算。
+
+`--resume-checkpoint` 只接受精确清单、manifest 与 `.complete` 均有效的 checkpoint，并在适配器加载、
+联网或最终输出预留前复核平台、规范主页、全部参数、作品摘要、数量、唯一键和逐条平台身份。恢复必须写入
+一个新的显式 `--out`，不得与 `--resume`、`--resume-out`、`--since` 或 `--checkpoint-out` 联用。
+恢复后的最终 `task.json.checkpoint_source` 只记录格式、摘要算法和 checkpoint commit SHA-256，不记录本地路径。
 
 最终标记的 `fsync` 最多尝试三次；提交后的用户路径核验遇 I/O 错误时也最多尝试三次。
 最终标记 `fsync` 持续失败，或标记已经成功同步但用户路径核验持续发生 I/O 错误时，提交状态为
@@ -268,6 +294,8 @@ B站限量采集复用 `collection_coverage` 保存一个独立的列表子阶�
 非 `OBSERVED` 状态必须在最终报告披露“可能遗漏仅出现在动态入口的公开视频”。覆盖账本只
 允许上述枚举和计数，不能保存 endpoint、offset、查询、响应正文或异常消息。动态发现使用
 固定安全诊断码 `BILIBILI_DYNAMIC_DISCOVERY`；诊断码不是新的 `stop_reason`。
+兼容分析不含这四个字段的旧封存产物时，报告必须把状态标为“未记录（旧产物 / 未知）”，
+并作同样的动态-only 缺口提示；不得把缺少账本解释为 `OBSERVED`。
 
 ### 3.2 授权账号 OpenAPI 覆盖账本
 
@@ -706,11 +734,15 @@ selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
 复制八个已核验字段，并增加固定 `source_artifact=source/comments.jsonl` 与 `source_line`。
 评论字段覆盖率按全部有效评论行计算，零评论时各字段 `rate=null`。
 
-`semantic` 在确定性阶段始终为 `pending-model` / `model_version=null` / `insights=null`。
-脚本不得生成高频问题、争议点或需求等评论语义结论；评论语义待处理不改变全局分析
-`PARTIAL` / `COMPLETED` 完成门。Markdown 与 HTML 在既有“内容模式”章节同步展示状态、
-父覆盖、账本、字段覆盖、代表评论、语义状态与限制；空值显示 `—`，父作品只有通过平台与
-ID 精确绑定后才能成为链接。
+`semantic` 在确定性阶段为 `pending-model` / `model_version=null` / `insights=null`。传入
+`--with-comment-insights` 后，流水线生成 `comment-insights-prompt.md`；严格结果必须绑定
+`source/comments.jsonl` SHA-256 与规范语义输入 SHA-256，原字节封存为
+`source/comment-insight-results.json`。五类数组固定为 `frequent_questions`、
+`controversies`、`needs`、`concerns`、`follow_up_topics`。每条证据必须精确引用已核验的
+`parent_post_id`、`comment_id`、1 基 `source_line` 与原文子串 `excerpt`；脚本补齐规范
+`parent_post_url` 和 `source_artifact=source/comments.jsonl`。高频问题至少绑定两条不同评论。
+模型不得注入 URL、额外字段或不存在的摘录。无结果时保持 `pending-model`；完整结果为
+`completed` 并参与全局完成门。Markdown 与 HTML 同步展示五类洞察及逐评论证据。
 
 ### 7.3 FR-011 / FR-012 确定性结构化聚合
 

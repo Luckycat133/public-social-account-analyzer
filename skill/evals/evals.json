@@ -105,7 +105,7 @@
       "id": 9,
       "name": "comments-sampling-capped",
       "prompt": "分析这个B站账号最近30条视频，顺便看看评论区大家在问什么：https://space.bilibili.com/946974",
-      "expected_output": "开启评论采样，每篇最多采20条公开可见评论；只有未明确置顶/转载/推广的 SUCCESS/PARTIAL 规范父作品进入采集和分析，评论采集失败不阻塞主任务。严格 JSONL 只以物理 LF 分隔记录并接受 CRLF。确定性报告输出评论状态、父作品覆盖、采集账本、字段覆盖和最多3条跨父代表评论；评论语义保持 pending-model，等待模型处理，不由脚本补造高频问题或需求结论。",
+      "expected_output": "开启评论采样，每篇最多采20条公开可见评论；只有未明确置顶/转载/推广的 SUCCESS/PARTIAL 规范父作品进入采集和分析，评论采集失败不阻塞主任务。确定性报告输出评论状态、覆盖、账本和代表评论；随后通过严格模型阶段生成五类评论洞察，每条绑定父作品、评论ID、源行号和原文摘录。",
       "assertions": [
         "每篇内容采集的评论不超过20条",
         "仅采集公开可见评论，未展开无限加载",
@@ -114,7 +114,8 @@
         "单条内容评论不可见/失败时跳过并继续，主流程未中断",
         "至少一条有效评论时 comment_analysis.status=collected_pending_model；明确全空与不可用没有混淆",
         "报告同步展示父作品覆盖、采集账本、字段覆盖及带 source/comments.jsonl 行号的代表评论",
-        "semantic.status=pending-model 且 model_version/insights 为 null；确定性脚本没有生成高频问题、争议点或需求结论"
+        "确定性脚本不生成评论语义；无模型结果时 semantic.status=pending-model，有严格结果时五类洞察完成且原始结果字节被 manifest 封存",
+        "每条评论语义证据精确绑定 parent_post_id、parent_post_url、comment_id、source_line 与原文 excerpt"
       ]
     },
     {
@@ -204,6 +205,20 @@
         "指出错误 occurred_at 复用了任务初始化时间，应在捕获异常时生成当前时间",
         "要求去重发生在 limit 截断前，并约束 task、JSONL、CSV、报告的唯一作品计数一致",
         "最终策略结论明确限定为 29 条普通投稿公开样本，披露动态缺口、非穷尽和非因果限制"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "bilibili-series-name-public-evidence-binding",
+      "prompt": "不要联网，不要修改任何 Skill 或测试。使用分配给你的 Skill 实现，直接调用 analyze.validate_classification_results 做一个离线负例：父作品 platform=bilibili、post_id=BVseries、is_repost=null、platform_metrics={}；分类结果除 series_name='标题猜测栏目' 外均合法，hook_type=unknown、is_original=null。记录实现实际接受或拒绝，以及异常类型和安全消息；不得只回答规范应当怎样。",
+      "expected_output": "当前实现实际以 ValueError 拒绝该结果，原因是 B站 series_name 与公开证据冲突；父作品 platform_metrics.series_name 缺失/null 时分类结果必须为 null，不能从标题、标签或相似作品猜测栏目/合集。",
+      "assertions": [
+        "没有联网、启动浏览器或修改 Skill、实现、测试与输入",
+        "实际执行分配 Skill 的 validate_classification_results，而不是只做静态规范回答",
+        "测试父作品的 platform_metrics 不含 series_name，结果只在 series_name 使用标题猜测值，其他必填字段合法",
+        "实现实际拒绝该分类结果并报告 ValueError",
+        "拒绝原因明确绑定 B站 series_name 与 public evidence 冲突",
+        "结论说明公开父字段为 null 时分类 series_name 也必须为 null，不能从标题或标签猜测"
       ]
     }
   ]
