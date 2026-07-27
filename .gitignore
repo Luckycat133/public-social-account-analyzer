@@ -37,3 +37,6 @@ evals/files/output/
 *.log
 *.tmp
 ~$*.docx
+
+# --- 本地归档备份（SDD 日志 / workspace 产物 / 工作树 bundle，不入库） ---
+archive/
