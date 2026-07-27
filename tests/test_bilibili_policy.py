@@ -1161,6 +1161,10 @@ def test_post_list_merges_dynamic_only_posts_and_deduplicates_bvid(monkeypatch):
         "regular_observed_count": 2,
         "dynamic_status": "OBSERVED",
         "dynamic_observed_count": 2,
+        # 无 date_range 时不应误报双约束；range_match_count 反映过滤后规模。
+        "range_filter_applied": False,
+        "range_match_count": 3,
+        "range_no_match": False,
     }
 
 

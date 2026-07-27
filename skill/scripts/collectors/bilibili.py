@@ -1350,7 +1350,9 @@ class BilibiliCollector(BaseCollector):
                 f"三级降级链均无可用投稿 (mid={mid})",
             )
 
-        # 日期范围过滤（Best-effort）
+        # 日期范围过滤（Best-effort）——记录过滤前的数量与匹配数，
+        # 让 collection-report.md 准确披露"双约束（数量∩窗口）"行为。
+        posts_before_range = list(posts)
         if date_range and posts:
             df, dt = date_range
             filtered = []
@@ -1362,6 +1364,16 @@ class BilibiliCollector(BaseCollector):
                     continue
                 filtered.append(p)
             posts = filtered
+        # 双约束披露：range_filter_applied 表明日期约束已参与；
+        # range_match_count 是窗口内命中数；range_no_match 是窗口命中为零。
+        # 与抖音 §范围双约束披露保持同一形状，便于 collection-report.md 渲染。
+        self._collection_coverage["range_filter_applied"] = bool(date_range)
+        self._collection_coverage["range_match_count"] = len(posts)
+        self._collection_coverage["range_no_match"] = bool(
+            date_range is not None
+            and posts_before_range
+            and not posts
+        )
 
         # search 降级且全部 view 补全失败 → 空骨架无指标，如实上抛
         if source == "search" and not any_view_ok and posts:
