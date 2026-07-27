@@ -5,6 +5,14 @@
 - parse_metric：中文单位 万/亿 → 整数换算。
 - compute_metric_coverage：各指标在有效样本中非 null 比例。
 """
+import csv
+import copy
+import io
+import json
+
+import pytest
+
+import analyze
 import normalize
 
 
@@ -97,3 +105,279 @@ def test_field_coverage_via_normalize_pipeline():
     assert cov["views"]["present"] == 1 and cov["views"]["missing"] == 1
     # likes: 0 是真实零值，仍计入 present
     assert cov["likes"]["present"] == 1 and cov["likes"]["missing"] == 1
+
+
+def test_normalized_csv_uses_canonical_json_without_losing_platform_fields():
+    raw = {
+        "platform": "bilibili",
+        "post_id": "BV1contract",
+        "post_url": "https://www.bilibili.com/video/BV1contract",
+        "published_at": "2026-07-01T09:30:00+08:00",
+        "content_type": "video",
+        "title": "完整字段保真",
+        "text": "正文",
+        "duration_seconds": 42,
+        "hashtags": ["标签|一", "标签,二"],
+        "is_pinned": None,
+        "is_repost": False,
+        "is_promoted": False,
+        "collection_status": "SUCCESS",
+        "collected_at": "2026-07-02T10:00:00+08:00",
+        "source_url": "https://www.bilibili.com/video/BV1contract",
+        "views": 123,
+        "likes": None,
+        "comments": 4,
+        "favorites": 5,
+        "shares": 6,
+        "coins": 7,
+        "danmaku": 8,
+        "field_visibility": {
+            "title": "partial",
+            "duration_seconds": "visible",
+            "views": "partial",
+            "custom_platform_field": "hidden",
+        },
+        "platform_metrics": {
+            "partition": "知识",
+            "dynamic": {"is_dynamic": True},
+            "detail_status": "SUCCESS",
+            "trace": [None, True, "x"],
+        },
+    }
+    untouched = copy.deepcopy(raw)
+
+    result = normalize.normalize_in_memory(
+        None, (json.dumps(raw, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    memory_row = result.rows[0]
+    csv_row = next(csv.DictReader(io.StringIO(result.csv_text)))
+
+    assert memory_row["hashtags"] == ["标签|一", "标签,二"]
+    assert memory_row["platform_metrics"] == raw["platform_metrics"]
+    assert memory_row["field_visibility"]["views"] == "partial"
+    assert memory_row["field_visibility"]["likes"] == "hidden"
+    assert memory_row["field_visibility"]["title"] == "partial"
+    assert memory_row["field_visibility"]["duration_seconds"] == "visible"
+    assert memory_row["field_visibility"]["custom_platform_field"] == "hidden"
+    assert raw == untouched
+    assert csv_row["hashtags"] == '["标签|一","标签,二"]'
+    assert csv_row["platform_metrics"] == (
+        '{"detail_status":"SUCCESS","dynamic":{"is_dynamic":true},'
+        '"partition":"知识","trace":[null,true,"x"]}'
+    )
+    assert csv_row["field_visibility"] == json.dumps(
+        json.loads(csv_row["field_visibility"]),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert csv_row["is_pinned"] == ""
+    assert csv_row["is_repost"] == "false"
+    assert csv_row["is_promoted"] == "false"
+
+    for row in (memory_row, csv_row):
+        post = analyze.build_posts([row])[0]
+        assert post["published_at"].isoformat() == "2026-07-01T09:30:00+08:00"
+        assert post["content_type"] == "video"
+        assert post["title"] == "完整字段保真"
+        assert post["text"] == "正文"
+        assert post["duration_seconds"] == 42
+        assert post["hashtags"] == ["标签|一", "标签,二"]
+        assert post["collection_status"] == "SUCCESS"
+        assert post["collected_at"] == "2026-07-02T10:00:00+08:00"
+        assert post["source_url"] == raw["source_url"]
+        assert {field: post[field] for field in normalize.METRIC_FIELDS} == {
+            "views": 123,
+            "likes": None,
+            "comments": 4,
+            "favorites": 5,
+            "shares": 6,
+            "coins": 7,
+            "danmaku": 8,
+        }
+        assert post["platform_metrics"] == raw["platform_metrics"]
+        assert post["field_visibility"]["views"] == "partial"
+        assert post["field_visibility"]["likes"] == "hidden"
+        assert post["field_visibility"]["title"] == "partial"
+        assert post["field_visibility"]["duration_seconds"] == "visible"
+        assert post["field_visibility"]["custom_platform_field"] == "hidden"
+        assert post["is_pinned"] is None
+        assert post["is_repost"] is False
+        assert post["is_promoted"] is False
+
+    analysis_result = analyze.analyze_in_memory(
+        {"platform": "bilibili", "followers": 100},
+        [memory_row],
+        {"task_id": "round-trip", "platform": "bilibili"},
+    )
+    analysis_post = analysis_result.analysis["posts"][0]
+    assert analysis_post["hashtags"] == ["标签|一", "标签,二"]
+    assert analysis_post["platform_metrics"] == raw["platform_metrics"]
+    assert analysis_post["field_visibility"] == memory_row["field_visibility"]
+    assert analysis_post["collected_at"] == "2026-07-02T10:00:00+08:00"
+    assert analysis_post["source_url"] == raw["source_url"]
+    assert analysis_post["is_pinned"] is None
+    assert analysis_post["is_repost"] is False
+    assert analysis_post["is_promoted"] is False
+
+
+def test_analyzer_preserves_true_flag_and_excludes_it_from_default_sample():
+    post = analyze.build_posts(
+        [
+            {
+                "platform": "douyin",
+                "post_id": "promoted",
+                "is_promoted": True,
+                "collection_status": "SUCCESS",
+            }
+        ]
+    )[0]
+
+    _, valid, flagged, _, _ = analyze.split_samples([post])
+
+    assert post["is_promoted"] is True
+    assert valid == []
+    assert [item["post_id"] for item in flagged] == ["promoted"]
+
+
+@pytest.mark.parametrize("legacy_hashtags", ["甲|乙", "甲,乙", "甲;乙"])
+def test_analyzer_backward_reads_legacy_hashtags_and_missing_json_columns(
+    legacy_hashtags,
+):
+    post = analyze.build_posts(
+        [
+            {
+                "platform": "douyin",
+                "post_id": "1",
+                "hashtags": legacy_hashtags,
+                "is_pinned": "false",
+                "is_repost": "true",
+                "is_promoted": "",
+                "collection_status": "SUCCESS",
+            }
+        ]
+    )[0]
+
+    assert post["hashtags"] == ["甲", "乙"]
+    assert post["platform_metrics"] == {}
+    assert post["field_visibility"] == {}
+    assert post["is_pinned"] is False
+    assert post["is_repost"] is True
+    assert post["is_promoted"] is None
+    assert post["local_record_key"] is False
+
+
+@pytest.mark.parametrize("raw", [None, "", "unknown", object()])
+def test_unknown_public_flags_normalize_to_null(raw):
+    assert normalize.to_bool_flag(raw) is None
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "source"),
+    [(None, "inferred_missing"), ("NOT_A_STATUS", "inferred_invalid")],
+)
+def test_missing_or_invalid_collection_status_is_partial_with_warning(
+    raw_status, source
+):
+    raw = {
+        "platform": "douyin",
+        "post_id": "status-contract",
+        "post_url": "https://www.douyin.com/video/1234567890",
+        "views": 10,
+    }
+    if raw_status is not None:
+        raw["collection_status"] = raw_status
+
+    result = normalize.normalize_in_memory(
+        None, (json.dumps(raw) + "\n").encode("utf-8")
+    )
+
+    assert result.rows[0]["collection_status"] == "PARTIAL"
+    assert result.rows[0]["collection_status_source"] == source
+    assert result.coverage["warning_count"] == 1
+    warning = result.coverage["warnings"][0]
+    assert warning["warning_code"] == "COLLECTION_STATUS_INFERRED"
+    assert warning["field"] == "collection_status"
+    assert warning["inference_source"] == source
+
+
+def test_collector_inferred_status_survives_normalization_with_warning():
+    from collectors.bilibili import BilibiliCollector
+
+    collected = BilibiliCollector().normalize_post(
+        {"platform": "douyin", "post_id": "source-status"}
+    )
+
+    result = normalize.normalize_in_memory(
+        None, (json.dumps(collected) + "\n").encode("utf-8")
+    )
+
+    assert result.rows[0]["collection_status"] == "PARTIAL"
+    assert result.rows[0]["collection_status_source"] == "inferred_missing"
+    assert result.coverage["warning_count"] == 1
+    assert result.coverage["warnings"][0]["inference_source"] == (
+        "inferred_missing"
+    )
+
+
+def test_inferred_status_source_cannot_be_attached_to_declared_success():
+    raw = {
+        "platform": "douyin",
+        "post_id": "status-source-mismatch",
+        "collection_status": "SUCCESS",
+        "collection_status_source": "inferred_missing",
+    }
+
+    result = normalize.normalize_in_memory(
+        None, (json.dumps(raw) + "\n").encode("utf-8")
+    )
+
+    assert result.rows[0]["collection_status"] == "SUCCESS"
+    assert result.rows[0]["collection_status_source"] == "declared"
+    assert result.coverage["warning_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "source"),
+    [(None, "inferred_missing"), ("NOT_A_STATUS", "inferred_invalid")],
+)
+def test_analyzer_backward_reads_untrusted_legacy_status_as_partial(
+    raw_status, source
+):
+    row = {
+        "platform": "douyin",
+        "post_id": "legacy-status",
+        "collection_status": raw_status,
+    }
+
+    post = analyze.build_posts([row])[0]
+    _, valid, _, _, _ = analyze.split_samples([post])
+
+    assert post["collection_status"] == "PARTIAL"
+    assert post["collection_status_source"] == source
+    assert [item["post_id"] for item in valid] == ["legacy-status"]
+
+
+def test_invalid_field_visibility_is_replaced_by_derived_value_with_warning():
+    raw = {
+        "platform": "douyin",
+        "post_id": "visibility-contract",
+        "post_url": "https://www.douyin.com/video/1234567890",
+        "collection_status": "SUCCESS",
+        "views": 10,
+        "field_visibility": {
+            "views": "invented-state",
+            "title": "visible",
+        },
+    }
+
+    result = normalize.normalize_in_memory(
+        None, (json.dumps(raw) + "\n").encode("utf-8")
+    )
+
+    assert result.rows[0]["field_visibility"]["views"] == "visible"
+    assert result.rows[0]["field_visibility"]["title"] == "visible"
+    assert result.coverage["warning_count"] == 1
+    warning = result.coverage["warnings"][0]
+    assert warning["warning_code"] == "FIELD_VISIBILITY_INVALID"
+    assert warning["field"] == "field_visibility.views"

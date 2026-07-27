@@ -11,6 +11,11 @@
 > `PARSER_FAILED` / `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `ACCESS_RESTRICTED`，
 > 而非缺陷。
 
+本文件主体描述匿名公开适配器。账号本人提供同次 OAuth access token + `open_id` 时，可使用
+隔离的 `collect_douyin_authorized.py` 官方列表入口；其身份回证、末页、opaque share 与令牌
+边界见 [data-schema.md §3.2/§5](data-schema.md) 和 [exceptions.md §2.1](exceptions.md)。该入口
+不是匿名降级，也不能按第三方账号查询。
+
 ## 支持的账号主页
 
 适配器 `supports(url)` 仅对**账号主页**返回 `True`。支持以下形式：
@@ -32,8 +37,9 @@
 - 搜索页：`.../search?keyword=...`。
 - 话题/音乐/直播/发现页：`/topic/`、`/music/`、`/challenge/`、`/live/`、`/discover/`。
 
-> 说明：抖音的 `sec_uid` 是用户唯一且稳定的公开标识，用作 `account_id` 的首选；
-> 抖音号（`unique_id`）是用户自定义的可变标识，单独记入 `platform_metrics.unique_id`。
+> 说明：抖音的 `sec_uid` 是用户唯一且稳定的公开标识，用作 `account_id` 的保底值；
+> 页面明确展示抖音号（`unique_id`）时优先作为 `account_id`，并同时记入
+> `platform_metrics.unique_id`。
 
 ## 账号主页与作品页区分
 
@@ -68,9 +74,16 @@
 
 映射约定：
 - `account_id`：优先 `unique_id`（抖音号）；为 `null`/空时回退到 `sec_uid`；两者皆无则为 `null`。
-- `verified`：有企业/个人认证文案或 `verification.type>0` → 记认证文案或 `True`；否则 `False`。
+- `verified`：公开 `enterprise_verify_reason` / `custom_verify` 文案或账号头中已绑定的
+  可见认证徽章优先于布尔值；generic `verified` 字符串不是认证证据。明确
+  `verified=false` 或认证类型 `0` / `-1` 才记 `False`，有限正数认证类型记 `True`；
+  其他负数、非有限数、布尔类型码及没有认证证据的情况均记 `null`，不得把未知伪装成
+  未认证，也不得把 `"false"` / `"未认证"` 当认证文案。
 - 获赞总量只进 `platform_metrics.total_likes`，统一层 `platform_metrics` 为必填对象。
 - 页面未展示的字段一律写 `null`（绝不用 `0` 代替未知，见 `data-schema.md` §7 / §8）。
+- `field_visibility` 必须覆盖 `account_id`、`verified` 与 `total_likes`：URL 中的
+  `sec_uid` 回退为 `partial`，公开抖音号/明确认证证据/明确的获赞数（包括 0）为
+  `visible`，无证据为 `hidden`。
 
 ## 内容字段
 
@@ -89,8 +102,12 @@
 映射约定：
 - `content_type`：抖音作品默认 `video`；图文/图文笔记可能为 `image_text`（best-effort 判定）。
 - `title` 取 `desc` 首行（按换行截断）；`text` 取 `desc` 全文。
-- `hashtags` 从 `text_extra` 的 `hashtag_name` 抽取；无话题时为 `[]`。
-- `is_pinned` / `is_repost` / `is_promoted` 默认 `false`；未知不得臆测为 `true`。
+- `hashtags` 优先从结构有效的 `text_extra` 中提取 `hashtag_name`，并可从公开文案中的
+  `#话题` 补充。明确观察到 `text_extra=[]` 且文案也没有话题时，才表示“已知无话题”，
+  归一化为 `hashtags=[]` 且不标记详情缺失；`text_extra` 缺失或结构无效、文案中也无法
+  提取话题时，不能据此断言无话题。兼容性输出虽仍为 `[]`，但必须在
+  `platform_metrics.missing_detail_fields` 中保留 `hashtags`。
+- `is_pinned` / `is_repost` / `is_promoted` 仅在公开证据明确时写 `true` / `false`；字段缺失或不可验证时写 `null`。
 
 ## 公开指标
 
@@ -140,13 +157,96 @@
 - 命中上述任一**任务级**限制时，**立即停止**对应请求；`check_access` 返回
   `{"accessible": False, "reason": <说明>, "stop_reason": <上表值>}`；
   `collect_*` 抛 `DouyinError(stop_reason)` 由上层按 `exceptions.md` 决策表降级。
-- **抖音 JS 虚拟机/动态渲染排查与传输层降级**：
-  1. 当直连 HTTP 仅获取到 `_$jsvmprt` 打桩页抛出 `PARSER_FAILED` 时，此为抖音前端架构向客户端动态渲染演进的正常表现。
-  2. 可使用 `--browser-fallback` 参数开启传输层降级，利用环境中的 Headless Chrome 加载完整 DOM 树再试。
-  3. 后续 `normalize.py` / `analyze.py` / `render_report.py` 即使在 0 条数据时亦会完成无缝降级，输出完整的标准产物与 Dashboard，绝不中断崩溃。
+- **抖音 JS 虚拟机/动态渲染与浏览器降级（实验性）**：
+  1. 当 SSR 缺失或作品列表结构无法识别（例如直连 HTTP 仅获取到 `_$jsvmprt` 打桩页）时，默认自动启动浏览器降级；真正识别到空作品列表时不启动浏览器，返回 `NO_PUBLIC_CONTENT`。`SOCIAL_BROWSER_FALLBACK=0` 可禁用抖音默认降级；`--no-browser-fallback` 优先级最高。这两个开关仅控制抖音浏览器降级；B站的平台保护停止策略不由它们改变。
+  2. 降级不会声称加载“完整 DOM”。实现会先观察来自公开 Douyin/iesdouyin 域名的 CDP XHR/Fetch JSON 响应并提取已验证的作品结构；不足时才从可见的 `/video/<id>` 或 `/note/<id>` 卡片提取最小字段。浏览器不参与签名生成或保护绕过。
+  3. 系统 Chrome、Chromium、Edge 或 Brave 是可选前置条件，可通过 `BROWSER_BIN` / `CHROME_BIN` 指定。未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外 `stop_reason` 仍为 `PARSER_FAILED`。
+  4. 浏览器运行不新增 pip 或其他 Python 运行时依赖。每次启动均创建并删除临时用户目录，不附着或复用本机浏览器的登录状态、Cookie 或用户配置；不持久化 Cookie、请求头、带签名 URL、完整响应或媒体。
+  5. 遇到登录、验证码、滑块、频控或其他限制立即停止；若时间预算尚存，只读取当前
+     精确账号路径下已可见的主页标题区（含认证徽章），不再滚动且不查询/接纳 DOM
+     作品卡片，原限制状态保持不变。已采集的公开作品可作为部分结果保留。后续
+     `run_pipeline.py` 仅在至少有 1 条有效可分析作品时提交独立分析工作区；0 条有效
+     数据会在输出预留前失败，不发布空分析。
+  6. API、SSR、网络响应和可见账号头只在 `sec_uid` 与规范化主页 URL 均不矛盾时合并；
+     任一显式账号绑定冲突都以 `PARSER_FAILED` 关闭，不用请求参数覆盖响应身份，也不以
+     旧缓存掩盖冲突。浏览器缓存按证据强度合并并重新净化，后到的档案片段不会清除已
+     确认的抖音号、获赞数（包括 0）或更强认证证据。
+  7. 主页网络作品列表以规范主页路径中的 `sec_uid` 为预期账号。候选响应必须具有精确数值
+     HTTP 200；顶层 `status_code` / `error_code` 若存在，必须是整数 0。非空列表要求每一条原始项
+     都是可映射、数字 ID 且冻结路径 `author.sec_uid` 精确等于预期账号；所有非空
+     `aweme_id` / `aweme_id_str` 必须指向同一数字 ID，可解析的官方 `share_url` 直接作品路径
+     也必须绑定该 ID。稀疏、非对象、非法或冲突 ID/URL、缺作者、外账号或混合作者都会使整个候选丧失分页/末页证明，已验证作品仅可保留为
+     部分证据，不能过滤坏项后继续沿用同页的 `has_more` 或游标。账号分页响应 pathname 当前只接受冻结的
+     `/aweme/v1/web/aweme/post/`，JSON 只读取根对象或根 `data` 对象直接拥有的冻结作品列表
+     键；推荐、搜索、详情响应，以及 recommendation sibling 或任意深层同名键都不贡献
+     作品和分页事实。空列表必须由同一列表容器上的 `sec_uid` / `sec_user_id`，或该冻结
+     响应 URL 中唯一、严格解码且精确匹配的同名参数证明归属；缺失、空白、控制字符、重复、冲突、非法编码
+     和无关响应都不能证明空页。只有通过这些检查的观测才影响网络作品、页数、游标、
+     terminal 与 `is_exhaustive`。即使较晚响应已给出可信末页，只要任一可能属于目标账号的
+     列表候选仍未读取、HTTP/API 状态失败、绑定重复/非法而有歧义、加载失败、JSON 解析失败，或合法 JSON 无法
+     通过列表结构与作者绑定校验形成分页观测，就只能保留末页已观察事实并将
+     `is_exhaustive` 置为 `false`。每个 frozen owner 内 `max_cursor` / `cursor` / `min_cursor`
+     只接受非负整数或非空有界字符串且必须一致；根/data 等多个有效 owner 先合并成一个
+     逻辑页，只向全局页数、游标和 terminal 原子提交一次。官方直接作品 URL 的可选尾斜杠
+     不得绕过作品 ID 一致性校验。owner 间分页事实冲突时，其中已
+     验证作品只作为部分证据。末页后停止滚动，但继续消费 CDP 事件直到一次静默轮询或预算
+     到期；DOM、正文或响应体 CDP 调用都会使旧静默证明失效，最终空轮询后不再调用 CDP。
+     响应
+     query 仅用于会话内判断，诊断仍只保留去 query 的安全路径及失败/未决候选计数。DOM 降级只读取可见 `[data-e2e="user-post-item"]` 根内的可见作品链接，且
+     同一次快照必须带有与规范请求精确匹配的 `profile.sec_uid`；旧 list-only 快照、缺失或
+     外账号 profile 均不接纳卡片，DOM 空卡片也不能证明 terminal / 穷尽。
+  8. `collect_post_detail` 对**已经由作品列表或调用方提供的规范作品 URL**支持独立匿名
+     浏览器降级。它先尝试原有 HTTP/SSR 详情；仅在详情不存在或结构无法解析并对应
+     `PARSER_FAILED` 时，最多启动一次临时浏览器会话。HTTP `401` / `403` / `429`、页面
+     登录/验证/频控提示及其他明确限制均保持原 `stop_reason` 并立即停止，不进入该降级。
+     `SOCIAL_BROWSER_FALLBACK=0` 与 `--no-browser-fallback` 同样禁用这条路径。
+  9. 已知作品详情降级不是发现接口，也不改变 `supports()` 只接受账号主页的规则。网络
+     响应只读取冻结的单条详情路径：顶层 `aweme_detail` / `awemeDetail`、`data` 下同名
+     字段、`aweme.detail`、`video.aweme`、`app.aweme.detail`；明确忽略 `aweme_list`、推荐
+     列表及任意递归命中的作品 ID。网络详情优先；没有可绑定网络详情时才读取一次当前
+     `/video/<id>` 或 `/note/<id>` 页面中的可见详情快照，不滚动、不点击。
+  10. 该路径要求请求 URL、原始 `aweme_id` / `aweme_id_str` / `share_url`（凡是响应明确
+     提供的字段）和归一化后的 `post_id` / `post_url` / `source_url` 全部一致。任一显式
+     冲突立即以 `PARSER_FAILED` 关闭，不能用另一候选覆盖，也不写入缓存。一次调用最多
+     返回一条绑定作品；多条或畸形载荷同样失败关闭。冻结路径和一致的 ID/地址只证明
+     路由身份，不单独构成详情：候选还须至少包含一个有效且可映射的公开字段，例如非空
+     `desc`、结构有效的 `text_extra`（明确的空数组也表示已知无话题）、有效发布时间、
+     非负互动数/时长、明确布尔标记、有效图文载荷或非空合集名。空 `desc` 单独不可信；
+     ID-only 候选在启用降级时继续一次浏览器详情采集，禁用时返回 `PARSER_FAILED`，但其
+     显式身份冲突仍优先立即失败。
+  11. 已知作品详情会话的默认/硬上限分别为：20/90 秒、8/32 个候选响应、
+      1,000,000/4,000,000 个响应正文字符。会话计时包含浏览器启动，不滚动、不点击、
+      不刷新、不重试响应正文、不生成签名；仍使用同一套零 Python 依赖的系统浏览器
+      CDP 传输和临时用户目录。达到边界只返回诚实的空详情/`PARSER_FAILED`，不扩大采集。
 - **绝不**刷新、重试破解、伪造签名或模拟浏览器绕过；`urllib` 直连或浏览器传输层拿到的风控页即如实认定。
 - 单条内容级问题（`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE`）只下钻到内容级，
   **不**写入任务级 `stop_reason`（见 `exceptions.md` §1.1）。
+
+## 无登录 Web 索引证据降级（Skill/Agent 层）
+
+当 HTTP/SSR 与临时浏览器路径已经以 `LOGIN_REQUIRED`、`VERIFICATION_REQUIRED`、
+`ACCESS_RESTRICTED` 或 `PARSER_FAILED` 停止时，若 Agent 环境有 Web 搜索/打开连接器，可
+继续取得公开索引证据。该能力不属于 `DouyinCollector` 网络适配器：Agent 通过连接器负责
+核验精确来源、作者和作品区边界，`scripts/import_index_snapshot.py` 只做离线结构、域名与
+字段一致性校验并导入，不能独立证明 JSON 中自报的作者归属。
+
+- A 级 `douyin_jingxuan`：官方精选页给出真实数字作品 ID、官方 URL、同作者标题等，可进入
+  统一流水线；未展示指标保持 `null`。
+- B 级 `douyin_search_index`：仅精确账号主页索引快照；没有作品 ID/详情 URL 时使用明确披露
+  的本地 `idx-*` 记录键和主页证据锚点，不能冒充平台作品。当前只接受卡片标题与明确显示的
+  点赞数，其余作品时间、时长和互动字段固定为 `null`。
+- 两级都要求 Agent 先逐条核对连接器页面中的目标主页/作者归属；脚本再检查将导入条目的
+  主页 ID、官方域名、`author_name`/账号名和作品 ID/URL 是否自洽。
+- 通用推荐区、热门区、页脚作品卡片、标题反搜命中和作者不一致内容必须在 Agent 取证阶段
+  排除，不能靠填写相同 `author_name` 送入导入器。
+- 两级始终为 `PARTIAL`、非穷尽、可能陈旧；无法确认页面区域或作者归属时不得导入。
+- 两级只能描述可见子集的日期分布，不计算账号周均、发布间隔、断更、季节性或排播建议。
+- 搜索索引的账号 `account_id` 使用主页路径 `sec_uid`，可见抖音号另存
+  `platform_metrics.douyin_id`；这与直连适配器从页面结构拿到 `unique_id` 时的优先规则不同。
+
+完整取证顺序、JSON 格式、命令和报告语义见
+[douyin-index-evidence.md](douyin-index-evidence.md)。没有 Web 连接器且沙箱不能联网时不可用，
+不得声称完成新数据采集。
 
 ## 平台特有测试样例
 
@@ -180,6 +280,12 @@
   "post_count": 67,
   "platform_metrics": { "total_likes": 890000, "sec_uid": "...", "unique_id": "..." },
   "collected_at": "2026-07-23T09:00:00+08:00",
-  "field_visibility": { "followers": "visible", "post_count": "visible" }
+  "field_visibility": {
+    "account_id": "visible",
+    "verified": "visible",
+    "followers": "visible",
+    "post_count": "visible",
+    "total_likes": "visible"
+  }
 }
 ```

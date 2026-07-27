@@ -13,14 +13,20 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import io
 import json
 import os
 import re
 import sys
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
+
+from immutable_workspace import WorkspaceError, reject_sealed_workspace
+from csv_contract import canonical_json, normalize_hashtags, serialize_csv_row
 
 # 中国平台默认时区（无 tz 时区信息时标注 +08:00）。
 CST = timezone(timedelta(hours=8))
@@ -55,6 +61,20 @@ POST_FIELDS = [
     "source_url",
 ]
 
+# 证据来源与标识语义。普通平台适配器可留空；索引降级必须完整填写，确保
+# `idx-*` 本地记录键和账号主页证据锚点不会在下游被误称为平台作品 ID/详情页。
+PROVENANCE_FIELDS = [
+    "collection_source",
+    "collection_status_source",
+    "platform_post_id_known",
+    "local_record_key",
+    "item_url_known",
+    "source_rank",
+    "published_at_precision",
+]
+
+STRUCTURED_FIELDS = ["platform_metrics", "field_visibility"]
+
 # 分析阶段占位的空列（data-schema.md §7），交由 analyze 阶段填充。
 ANALYSIS_FIELDS = [
     "topic",
@@ -68,7 +88,13 @@ ANALYSIS_FIELDS = [
     "classification_version",
 ]
 
-CSV_COLUMNS = POST_FIELDS + METRIC_FIELDS + ANALYSIS_FIELDS
+CSV_COLUMNS = (
+    POST_FIELDS
+    + PROVENANCE_FIELDS
+    + METRIC_FIELDS
+    + STRUCTURED_FIELDS
+    + ANALYSIS_FIELDS
+)
 
 # content_type 有效枚举（data-schema.md §9.4）。
 CONTENT_TYPES = {
@@ -90,6 +116,17 @@ COLLECTION_STATUS_CANON = {
     "deleted": "DELETED",
     "restricted": "RESTRICTED",
 }
+COLLECTION_STATUSES = frozenset(
+    {"SUCCESS", "PARTIAL", "FAILED", "DELETED", "RESTRICTED"}
+)
+VISIBILITY_VALUES = frozenset({"visible", "hidden", "partial"})
+
+
+@dataclass(frozen=True)
+class NormalizationResult:
+    rows: list[dict]
+    csv_text: str
+    coverage: dict
 
 
 # ---------------------------------------------------------------------------
@@ -227,22 +264,23 @@ def parse_time(raw: Any) -> Optional[datetime]:
 # ---------------------------------------------------------------------------
 # 类型规范化辅助（纯函数）
 # ---------------------------------------------------------------------------
-def to_bool_flag(raw: Any) -> bool:
-    """把 is_pinned/is_repost/is_promoted 规范为 bool；未知一律 False。
-
-    依据 data-schema.md §5 约束：默认 False，未知时不得臆测为 True。
-    """
+def to_bool_flag(raw: Any) -> Optional[bool]:
+    """Normalize public flag evidence to the tri-state true/false/null contract."""
     if isinstance(raw, bool):
         return raw
     if isinstance(raw, (int, float)):
-        return raw not in (0, 0.0)
+        if raw in (0, 0.0):
+            return False
+        if raw in (1, 1.0):
+            return True
+        return None
     if isinstance(raw, str):
         low = raw.strip().lower()
         if low in ("true", "1", "yes", "是"):
             return True
-        if low in ("false", "0", "no", "否", ""):
+        if low in ("false", "0", "no", "否"):
             return False
-    return False
+    return None
 
 
 def normalize_content_type(raw: Any) -> str:
@@ -254,11 +292,18 @@ def normalize_content_type(raw: Any) -> str:
 
 
 def normalize_collection_status(raw: Any) -> str:
-    """collection_status 规范为枚举；缺失 → "SUCCESS"（schema 默认值）。"""
-    if raw is None:
-        return "SUCCESS"
+    """Normalize untrusted status without inventing successful collection."""
+    return normalize_collection_status_with_source(raw)[0]
+
+
+def normalize_collection_status_with_source(raw: Any) -> tuple[str, str]:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "PARTIAL", "inferred_missing"
     value = str(raw).strip().lower()
-    return COLLECTION_STATUS_CANON.get(value, raw)
+    status = COLLECTION_STATUS_CANON.get(value)
+    if status in COLLECTION_STATUSES:
+        return status, "declared"
+    return "PARTIAL", "inferred_invalid"
 
 
 def get_metric_value(raw: dict, field: str) -> Any:
@@ -276,20 +321,13 @@ def get_metric_value(raw: dict, field: str) -> Any:
 
 
 def join_hashtags(raw: Any) -> str:
-    """hashtags（array[str] 或 str）以 '|' 连接。"""
-    if raw is None:
-        return ""
-    if isinstance(raw, str):
-        return raw
-    if isinstance(raw, (list, tuple)):
-        return "|".join(str(t) for t in raw if t is not None)
-    return str(raw)
-
+    """Backward-compatible helper; new CSV writers use JSON arrays."""
+    return "|".join(normalize_hashtags(raw))
 
 # ---------------------------------------------------------------------------
 # 单条 Post 归一化（纯函数）
 # ---------------------------------------------------------------------------
-def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
+def _normalize_post_record(raw: dict) -> tuple[dict, list[dict], list[dict]]:
     """把一条原始 Post 字典归一化为统一模型的一行（dict，键即 CSV 列）。
 
     返回 (row, errors)：
@@ -299,6 +337,7 @@ def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
         **不含** 墙钟时间戳（deterministic，occurred_at 省略）。
     """
     errors: list[dict] = []
+    warnings: list[dict] = []
     url = raw.get("post_url") or "profile"
 
     def log_parse_error(field: str, value: Any) -> None:
@@ -309,6 +348,22 @@ def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
             "message": f"无法解析字段 '{field}' 的原始值: {value!r}",
             "field": field,
         })
+
+    def log_warning(
+        warning_code: str,
+        field: str,
+        *,
+        inference_source: str | None = None,
+    ) -> None:
+        warning = {
+            "url": url,
+            "stage": "normalize",
+            "warning_code": warning_code,
+            "field": field,
+        }
+        if inference_source is not None:
+            warning["inference_source"] = inference_source
+        warnings.append(warning)
 
     platform = raw.get("platform")
     post_id = raw.get("post_id")
@@ -324,17 +379,72 @@ def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
     if raw_collected is not None and str(raw_collected).strip() != "" and collected is None:
         log_parse_error("collected_at", raw_collected)
 
-    # 指标换算 + 可见性。
+    # 指标换算 + 可见性。有效的来源标注优先于派生值；非法标注被替换并告警。
     metric_values: dict[str, Optional[int]] = {}
+    raw_visibility = raw.get("field_visibility")
     field_visibility: dict[str, str] = {}
+    if isinstance(raw_visibility, dict):
+        for field, value in raw_visibility.items():
+            if isinstance(value, str) and value.strip().lower() in VISIBILITY_VALUES:
+                field_visibility[str(field)] = value.strip().lower()
+            else:
+                log_warning("FIELD_VISIBILITY_INVALID", f"field_visibility.{field}")
+    elif raw_visibility is not None:
+        log_warning("FIELD_VISIBILITY_INVALID", "field_visibility")
+
     for field in METRIC_FIELDS:
         raw_val = get_metric_value(raw, field)
-        value, status = parse_metric(raw_val)
+        value, derived_status = parse_metric(raw_val)
         metric_values[field] = value
-        field_visibility[field] = status
+        field_visibility.setdefault(field, derived_status)
         # 字段出现但无法解析出数值 → 记录结构化错误（缺失/空值不算失败）。
-        if status == "partial":
+        if derived_status == "partial":
             log_parse_error(field, raw_val)
+
+    platform_metrics = raw.get("platform_metrics")
+    if isinstance(platform_metrics, dict):
+        platform_metrics = copy.deepcopy(platform_metrics)
+    else:
+        platform_metrics = {}
+    precision = platform_metrics.get("published_at_precision")
+    if precision not in ("datetime", "date", "unknown"):
+        if isinstance(raw_published, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_published.strip()):
+            precision = "date"
+        else:
+            precision = "datetime" if published is not None else "unknown"
+
+    def optional_bool(key: str, default: bool) -> bool:
+        value = platform_metrics.get(key)
+        return value if isinstance(value, bool) else default
+
+    source_rank = platform_metrics.get("source_rank")
+    if isinstance(source_rank, bool) or not isinstance(source_rank, int) or source_rank < 1:
+        source_rank = None
+
+    collection_status, derived_status_source = (
+        normalize_collection_status_with_source(raw.get("collection_status"))
+    )
+    supplied_status_source = raw.get("collection_status_source")
+    if (
+        derived_status_source == "declared"
+        and (
+            supplied_status_source == "declared"
+            or (
+                collection_status == "PARTIAL"
+                and supplied_status_source
+                in {"inferred_missing", "inferred_invalid"}
+            )
+        )
+    ):
+        collection_status_source = supplied_status_source
+    else:
+        collection_status_source = derived_status_source
+    if collection_status_source != "declared":
+        log_warning(
+            "COLLECTION_STATUS_INFERRED",
+            "collection_status",
+            inference_source=collection_status_source,
+        )
 
     row = {
         "platform": platform,
@@ -348,15 +458,26 @@ def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
         if isinstance(raw.get("duration_seconds"), (int, float))
         and not isinstance(raw.get("duration_seconds"), bool)
         else None,
-        "hashtags": join_hashtags(raw.get("hashtags")),
+        "hashtags": normalize_hashtags(raw.get("hashtags")),
         "is_pinned": to_bool_flag(raw.get("is_pinned")),
         "is_repost": to_bool_flag(raw.get("is_repost")),
         "is_promoted": to_bool_flag(raw.get("is_promoted")),
-        "collection_status": normalize_collection_status(
-            raw.get("collection_status")
-        ),
+        "collection_status": collection_status,
+        "collection_status_source": collection_status_source,
         "collected_at": collected.isoformat() if collected else None,
         "source_url": raw.get("source_url") or raw.get("post_url"),
+        "collection_source": platform_metrics.get("collection_source")
+        if isinstance(platform_metrics.get("collection_source"), str)
+        else None,
+        "platform_post_id_known": optional_bool(
+            "platform_post_id_known", bool(post_id)
+        ),
+        "local_record_key": optional_bool("local_record_key", False),
+        "item_url_known": optional_bool("item_url_known", bool(raw.get("post_url"))),
+        "source_rank": source_rank,
+        "published_at_precision": precision,
+        "platform_metrics": platform_metrics,
+        "field_visibility": field_visibility,
     }
     row.update(metric_values)
     # 分析占位列留空，交由 analyze 阶段填充。
@@ -364,6 +485,12 @@ def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
         row[field] = None
     # _visibility 仅供覆盖率统计，不写入 CSV（write_csv 用 extrasaction="ignore"）。
     row["_visibility"] = field_visibility
+    return row, errors, warnings
+
+
+def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
+    """Normalize one post while retaining the established two-value API."""
+    row, errors, _warnings = _normalize_post_record(raw)
     return row, errors
 
 
@@ -451,27 +578,99 @@ def dedup_posts(raw_posts: list[dict]) -> tuple[list[dict], int]:
     return kept, duplicate_count
 
 
+def _write_csv_rows(rows: list[dict], handle) -> None:
+    writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(serialize_csv_row(row, CSV_COLUMNS))
+
+
 def write_csv(rows: list[dict], path: str) -> None:
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            out = {}
-            for col in CSV_COLUMNS:
-                value = row.get(col)
-                if col in ("is_pinned", "is_repost", "is_promoted"):
-                    out[col] = "true" if value else "false"
-                elif value is None:
-                    out[col] = ""
-                elif col == "duration_seconds":
-                    try:
-                        fval = float(value)
-                        out[col] = "" if math.isnan(fval) or math.isinf(fval) else int(fval)
-                    except (ValueError, TypeError, OverflowError):
-                        out[col] = ""
-                else:
-                    out[col] = value
-            writer.writerow(out)
+        _write_csv_rows(rows, fh)
+
+
+def normalize_in_memory(
+    profile: dict | None, posts_jsonl: bytes | str
+) -> NormalizationResult:
+    """Normalize verified JSONL bytes without reading from or writing to disk."""
+    if profile is not None and not isinstance(profile, dict):
+        raise ValueError("profile must be an object")
+    if isinstance(posts_jsonl, bytes):
+        try:
+            text = posts_jsonl.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("posts JSONL is not UTF-8") from exc
+    elif isinstance(posts_jsonl, str):
+        text = posts_jsonl
+    else:
+        raise TypeError("posts_jsonl must be bytes or text")
+
+    raw_posts: list[dict] = []
+    parse_errors: list[str] = []
+    input_line_count = 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        input_line_count += 1
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            parse_errors.append(f"line {lineno}: {exc}")
+            continue
+        if not isinstance(value, dict):
+            parse_errors.append(f"line {lineno}: post must be an object")
+            continue
+        raw_posts.append(value)
+
+    kept_raw, duplicate_count = dedup_posts(raw_posts)
+    normalized: list[dict] = []
+    per_post_visibility: dict[str, dict] = {}
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    for raw in kept_raw:
+        row, post_errors, post_warnings = _normalize_post_record(raw)
+        errors.extend(post_errors)
+        warnings.extend(post_warnings)
+        normalized.append(row)
+        key = f"{row.get('platform')}:{row.get('post_id')}"
+        per_post_visibility[key] = row["_visibility"]
+
+    platforms: dict[str, int] = {}
+    for row in normalized:
+        platform = row.get("platform") or "unknown"
+        platforms[platform] = platforms.get(platform, 0) + 1
+
+    coverage = {
+        "input_line_count": input_line_count,
+        "raw_count": len(raw_posts),
+        "parse_errors": len(parse_errors),
+        "duplicate_count": duplicate_count,
+        "post_count": len(normalized),
+        "valid_count": sum(1 for row in normalized if post_is_valid(row)),
+        "platforms": platforms,
+        "metric_coverage": compute_metric_coverage(normalized),
+        "per_post_field_visibility": per_post_visibility,
+        "errors": errors,
+        "warnings": warnings,
+        "warning_count": len(warnings),
+        "profile_field_visibility": (
+            profile.get("field_visibility") if isinstance(profile, dict) else None
+        ),
+        "profile": (
+            {
+                "platform": profile.get("platform"),
+                "account_name": profile.get("account_name"),
+                "account_id": profile.get("account_id"),
+                "collected_at": profile.get("collected_at"),
+            }
+            if isinstance(profile, dict)
+            else None
+        ),
+    }
+    output = io.StringIO(newline="")
+    _write_csv_rows(normalized, output)
+    return NormalizationResult(normalized, output.getvalue(), coverage)
 
 
 def run(input_dir: str, output_dir: str) -> dict:
@@ -500,9 +699,11 @@ def run(input_dir: str, output_dir: str) -> dict:
     normalized: list[dict] = []
     per_post_visibility: dict[str, dict] = {}
     errors: list[dict] = []
+    warnings: list[dict] = []
     for raw in kept_raw:
-        row, post_errors = normalize_post(raw)
+        row, post_errors, post_warnings = _normalize_post_record(raw)
         errors.extend(post_errors)
+        warnings.extend(post_warnings)
         normalized.append(row)
         key = f"{row.get('platform')}:{row.get('post_id')}"
         per_post_visibility[key] = row["_visibility"]
@@ -533,6 +734,8 @@ def run(input_dir: str, output_dir: str) -> dict:
         "metric_coverage": metric_coverage,
         "per_post_field_visibility": per_post_visibility,
         "errors": errors,
+        "warnings": warnings,
+        "warning_count": len(warnings),
         "profile_field_visibility": (
             profile.get("field_visibility") if isinstance(profile, dict) else None
         ),
@@ -574,8 +777,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     output_dir = args.output or args.input
     try:
+        reject_sealed_workspace(args.input)
+        if os.path.abspath(output_dir) != os.path.abspath(args.input):
+            reject_sealed_workspace(output_dir)
         summary = run(args.input, output_dir)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, WorkspaceError) as exc:
         sys.stderr.write(f"[error] {exc}\n")
         return 2
 

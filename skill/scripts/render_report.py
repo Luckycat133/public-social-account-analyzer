@@ -30,8 +30,14 @@ import math
 import re
 import sys
 from collections import Counter
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from immutable_workspace import WorkspaceError, reject_sealed_workspace
+from collectors.url_policy import canonical_item_url, canonical_profile_url
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +55,12 @@ METRIC_LABELS = {
     "coins": "投币",
     "danmaku": "弹幕",
 }
+COLLECTION_STATUSES = ("SUCCESS", "PARTIAL", "FAILED", "DELETED", "RESTRICTED")
+INDEX_COLLECTION_SOURCES = frozenset({
+    "douyin_jingxuan",
+    "douyin_search_index",
+})
+AUTHORIZED_DOUYIN_SOURCE = "douyin_openapi_token_owner"
 
 # 12 个占位符 -> 报告节标题（顺序固定，对应模板 SECTION 标记）
 SECTION_DEFS = [
@@ -66,9 +78,23 @@ SECTION_DEFS = [
     ("sources", "来源链接"),
 ]
 PLACEHOLDERS = [name for name, _ in SECTION_DEFS]
+_PLACEHOLDER_PATTERN = re.compile(
+    r"\{\{(" + "|".join(re.escape(name) for name in PLACEHOLDERS) + r")\}\}"
+)
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-DISCLAIMER = "本报告基于公开页面快照，不代表账号后台真实曝光、触达、完播或转化数据。"
+PUBLIC_PAGE_DISCLAIMER = "本报告基于公开页面快照，不代表账号后台真实曝光、触达、完播或转化数据。"
+AUTHORIZED_DISCLAIMER = (
+    "本报告基于账号本人授权 OpenAPI 返回的公开来源证据，"
+    "不代表账号后台真实曝光、触达、完播或转化数据。"
+)
+PUBLIC_PAGE_FOOTER = "本报告由公开页面快照自动生成 · 数据仅供参考，不构成后台真实指标"
+AUTHORIZED_FOOTER = (
+    "本报告由账号本人授权 OpenAPI 公开证据自动生成 · "
+    "数据仅供参考，不构成后台真实指标"
+)
+# 保留公开页面默认常量名，兼容调用方与既有合同。
+DISCLAIMER = PUBLIC_PAGE_DISCLAIMER
 EMPTY_MD = "暂无数据"
 EMPTY_HTML = '<p class="empty">暂无数据</p>'
 
@@ -78,11 +104,42 @@ KNOWN_POST_URLS: set[str] = set()
 REFERENCED_POST_URLS: set[str] = set()
 
 
+@dataclass
+class _RenderState:
+    diagnostics: list[str] = field(default_factory=list)
+    known_post_urls: set[str] = field(default_factory=set)
+    referenced_post_urls: set[str] = field(default_factory=set)
+
+
+_RENDER_STATE: ContextVar[_RenderState | None] = ContextVar(
+    "render_state", default=None
+)
+
+
+class RenderError(RuntimeError):
+    """Rendering failed validation and must not be published."""
+
+    def __init__(self, message: str, diagnostics=()) -> None:
+        super().__init__(message)
+        self.diagnostics = tuple(diagnostics)
+
+
+@dataclass(frozen=True)
+class RenderResult:
+    markdown: str
+    html: str
+    diagnostics: tuple[str, ...]
+
+
 # ---------------------------------------------------------------------------
 # 基础工具
 # ---------------------------------------------------------------------------
 
 def warn(msg: str) -> None:
+    state = _RENDER_STATE.get()
+    if state is not None:
+        state.diagnostics.append(msg)
+        return
     WARNINGS.append(msg)
     print(f"[WARN] {msg}", file=sys.stderr)
 
@@ -101,6 +158,16 @@ def h_esc(s) -> str:
 
 class Raw:
     """包装已在调用处拼好的 HTML 片段，html_table 不再二次转义。"""
+
+    def __init__(self, s: str):
+        self.s = s
+
+    def __str__(self) -> str:
+        return self.s
+
+
+class MdRaw:
+    """包装由本渲染器生成的可信 Markdown，避免表格层再次转义。"""
 
     def __init__(self, s: str):
         self.s = s
@@ -155,18 +222,74 @@ def fmt_metric(v) -> str:
 
 # 链接 ---------------------------------------------------------------------
 
-def link_md(url: str, text: str) -> str:
-    return f"[{text}]({url})"
+def md_escape_text(value) -> str:
+    """把外部文本变成 Markdown 纯文本，阻断表格、链接、图片和 HTML 注入。"""
+    s = "" if value is None else str(value)
+    s = " ".join(s.replace("\r\n", "\n").replace("\r", "\n").splitlines())
+    s = s.replace("\\", "\\\\")
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for char in ("|", "!", "[", "]", "`", "*"):
+        s = s.replace(char, "\\" + char)
+    return s
+
+
+def _is_safe_public_url(url) -> bool:
+    """Accept only canonical HTTPS report links without ambiguous authority."""
+    if not isinstance(url, str) or not url or url != url.strip():
+        return False
+    if any(char.isspace() or ord(char) < 32 for char in url) or "\\" in url:
+        return False
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _md_link_destination(url: str) -> str:
+    """转义可信 URL 中会提前结束 Markdown link destination 的字符。"""
+    return (
+        str(url)
+        .replace("\\", "%5C")
+        .replace(" ", "%20")
+        .replace("(", "%28")
+        .replace(")", "%29")
+        .replace("<", "%3C")
+        .replace(">", "%3E")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+
+
+def link_md(url: str, text: str) -> MdRaw:
+    if not _is_safe_public_url(url):
+        return MdRaw(md_escape_text(text))
+    return MdRaw(f"[{md_escape_text(text)}]({_md_link_destination(url)})")
 
 
 def link_html(url: str, text: str) -> Raw:
+    if not _is_safe_public_url(url):
+        return Raw(h_esc(text))
     return Raw(f'<a href="{h_esc(url)}">{h_esc(text)}</a>')
 
 
 def ref_post(url) -> None:
     """登记被报告引用的内容 URL，供坏链检查。"""
     if url:
-        REFERENCED_POST_URLS.add(str(url))
+        state = _RENDER_STATE.get()
+        if state is not None:
+            state.referenced_post_urls.add(str(url))
+        else:
+            REFERENCED_POST_URLS.add(str(url))
 
 
 # 表格 ---------------------------------------------------------------------
@@ -190,10 +313,17 @@ def html_table(headers, rows) -> str:
 def md_table(headers, rows) -> str:
     if not rows:
         return EMPTY_MD
-    lines = ["| " + " | ".join(str(h) for h in headers) + " |",
+    def cell(value) -> str:
+        if isinstance(value, MdRaw):
+            return value.s
+        if value is None or value == "":
+            return "—"
+        return md_escape_text(value)
+
+    lines = ["| " + " | ".join(cell(h) for h in headers) + " |",
              "| " + " | ".join("---" for _ in headers) + " |"]
     for r in rows:
-        cells = [("—" if c is None or c == "" else str(c)) for c in r]
+        cells = [cell(c) for c in r]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -308,13 +438,37 @@ def svg_post_hour_distribution(hour_distribution: dict, width: int = 600, height
 
 def svg_high_low_radar(high, low, metrics: list, width: int = 340, height: int = 300) -> str:
     """高低表现雷达图：高/低组在各指标上的中位数对比（按列最大值归一化）。"""
+    def _metric_values(group, metric):
+        if not isinstance(group, list):
+            return []
+        values = []
+        for post in group:
+            if not isinstance(post, dict):
+                continue
+            value = (post.get("metrics") or {}).get(metric)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and not (isinstance(value, float) and (math.isnan(value) or math.isinf(value)))
+            ):
+                values.append(float(value))
+        return values
+
+    # 雷达图需要至少三个在高低两组都真实可见的维度。缺失值不能用 0 补画。
+    metrics = [
+        metric for metric in metrics
+        if _metric_values(high, metric) and _metric_values(low, metric)
+    ]
+    if len(metrics) < 3:
+        return ""
+
     def _collect(group):
         if not isinstance(group, list):
             return None
         vals = []
         for m in metrics:
-            col = [((p.get("metrics") or {}).get(m) or 0) for p in group if isinstance(p, dict)]
-            vals.append((sum(col) / len(col)) if col else 0.0)
+            col = _metric_values(group, m)
+            vals.append(sum(col) / len(col))
         return vals
 
     series = []
@@ -419,7 +573,11 @@ def load_posts_csv(path: Path) -> list[dict]:
                 rows.append(row)
                 url = (row.get("post_url") or "").strip()
                 if url:
-                    KNOWN_POST_URLS.add(url)
+                    state = _RENDER_STATE.get()
+                    if state is not None:
+                        state.known_post_urls.add(url)
+                    else:
+                        KNOWN_POST_URLS.add(url)
     except Exception as exc:  # noqa: BLE001
         warn(f"读取 CSV 失败 {path}: {exc}")
     return rows
@@ -440,11 +598,55 @@ def _safe_get(d, *keys, default=None):
     return cur
 
 
+def _classification_lifecycle_rows(analysis) -> list[list[str]]:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+
+    def lifecycle_value(key):
+        if isinstance(analysis, dict) and key in analysis:
+            return analysis.get(key)
+        return meta.get(key) if isinstance(meta, dict) else None
+
+    status = lifecycle_value("classification_status")
+    status_labels = {
+        "pending-model": "pending-model（待分类）",
+        "partial-model": "partial-model（部分分类）",
+        "completed": "completed（已完成）",
+    }
+    coverage = lifecycle_value("classification_coverage")
+    if not isinstance(coverage, dict):
+        coverage = {}
+    rate = coverage.get("rate")
+    rate_label = "—" if rate is None else fmt_float(rate, 4)
+    return [
+        ["分类状态 (classification_status)", status_labels.get(status, status or "—")],
+        ["分类版本 (classification_version)", lifecycle_value("classification_version") or "—"],
+        ["分类总数 (total_count)", fmt_int(coverage.get("total_count"))],
+        ["已分类数 (classified_count)", fmt_int(coverage.get("classified_count"))],
+        ["待分类数 (pending_count)", fmt_int(coverage.get("pending_count"))],
+        ["分类覆盖率 (rate)", rate_label],
+    ]
+
+
+def _status_count_rows(sample_boundary) -> list[list[str]]:
+    counts = sample_boundary.get("status_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+    return [
+        [f"采集状态 {status}", fmt_int(counts.get(status, 0))]
+        for status in COLLECTION_STATUSES
+    ]
+
+
 def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
     meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
     account_name = meta.get("account_name") or (profile or {}).get("account_name") or "未知账号"
     platform = meta.get("platform") or (profile or {}).get("platform") or "—"
     profile_url = meta.get("profile_url") or (profile or {}).get("profile_url") or "—"
+    profile_label = (
+        "资料来源（OpenAPI userinfo）"
+        if meta.get("collection_source") == AUTHORIZED_DOUYIN_SOURCE
+        else "账号主页"
+    )
     title = f"{account_name}（{platform}）公开账号分析报告"
 
     rows = [
@@ -452,19 +654,32 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         ["任务 ID", meta.get("task_id") or "—"],
         ["平台", platform],
         ["账号名称", account_name],
-        ["账号主页", link_md(profile_url, profile_url) if profile_url != "—" else "—"],
+        [profile_label, link_md(profile_url, profile_url) if profile_url != "—" else "—"],
         ["请求采集数量", fmt_int(meta.get("requested_limit"))],
         ["采集时间范围", f"{meta.get('date_from') or '—'} ~ {meta.get('date_to') or '—'}"],
         ["分析目的", meta.get("analysis_goal") or "—"],
+        [
+            "部分状态原因",
+            ", ".join(meta.get("partial_reasons") or []) or "—",
+        ],
+        ["任务状态", meta.get("task_status") or "—"],
+        ["停止原因", meta.get("stop_reason") or "—"],
+        ["采集来源", meta.get("collection_source") or "—"],
+        ["索引快照时间", meta.get("snapshot_crawled_at") or "—"],
+        ["索引年龄标注", meta.get("snapshot_age_label") or "—"],
+        ["证据是否穷尽", (
+            "否" if meta.get("evidence_is_exhaustive") is False
+            else ("是" if meta.get("evidence_is_exhaustive") is True else "—")
+        )],
         ["主排序指标", meta.get("main_sort_metric") or "—"],
-        ["分类状态", meta.get("classification_status") or "—"],
     ]
+    rows.extend(_classification_lifecycle_rows(analysis))
     md = md_table(["字段", "值"], rows)
 
-    # 账号主页行需要渲染为链接
+    # 账号主页或授权资料来源行需要渲染为链接
     html_rows = []
     for k, v in rows:
-        if k == "账号主页" and profile_url != "—":
+        if k == profile_label and profile_url != "—":
             html_rows.append([Raw(h_esc(k)), link_html(profile_url, profile_url)])
         else:
             html_rows.append([Raw(h_esc(k)), Raw(h_esc(v))])
@@ -489,6 +704,7 @@ def build_quality_summary(analysis) -> tuple[str, str]:
         ["被排除标记内容 (excluded_flagged)", fmt_int(sb.get("excluded_flagged"))],
         ["有效内容时间范围", time_range],
     ]
+    rows.extend(_status_count_rows(sb))
     md = md_table(["样本边界指标", "数值"], rows)
 
     # 字段覆盖率子表
@@ -512,22 +728,66 @@ def build_quality_summary(analysis) -> tuple[str, str]:
 def build_account_card(profile) -> tuple[str, str]:
     if not profile:
         return EMPTY_MD, EMPTY_HTML
+    verified = profile.get("verified")
+    if verified is True:
+        verified_label = "是"
+    elif verified is False:
+        verified_label = "否"
+    elif verified is None or verified == "":
+        verified_label = "—"
+    else:
+        verified_label = str(verified)
+    platform = profile.get("platform") or "—"
+    platform_key = str(platform).casefold()
+    platform_metrics = profile.get("platform_metrics")
+    if not isinstance(platform_metrics, dict):
+        platform_metrics = {}
+    profile_label = (
+        "资料来源（OpenAPI userinfo）"
+        if platform_metrics.get("authorization_source")
+        == AUTHORIZED_DOUYIN_SOURCE
+        else "主页"
+    )
     rows = [
-        ["平台", profile.get("platform") or "—"],
+        ["平台", platform],
         ["账号 ID", profile.get("account_id") or "—"],
         ["账号名称", profile.get("account_name") or "—"],
-        ["认证信息", profile.get("verified") or "—"],
+        ["认证信息", verified_label],
         ["粉丝数", fmt_int(profile.get("followers"))],
         ["作品数", fmt_int(profile.get("post_count"))],
-        ["简介", (profile.get("bio") or "—")],
-        ["主页", link_md(profile.get("profile_url") or "", profile.get("profile_url") or "—")
-         if profile.get("profile_url") else "—"],
     ]
+    if platform_key == "bilibili":
+        rows.append(["账号等级", fmt_int(profile.get("level"))])
+    elif platform_key == "douyin":
+        douyin_id = (
+            platform_metrics.get("douyin_id")
+            or platform_metrics.get("unique_id")
+            or profile.get("unique_id")
+        )
+        rows.extend(
+            [
+                ["抖音号", douyin_id or "—"],
+                ["获赞总量", fmt_int(platform_metrics.get("total_likes"))],
+            ]
+        )
+    elif platform_key == "weibo":
+        rows.append(["关注数", fmt_int(platform_metrics.get("following"))])
+    rows.extend(
+        [
+            ["简介", profile.get("bio") or "—"],
+            [
+                profile_label,
+                link_md(profile.get("profile_url") or "", profile.get("profile_url") or "—")
+                if profile.get("profile_url")
+                else "—",
+            ],
+        ]
+    )
     md = md_table(["字段", "值"], rows)
 
     html_rows = []
     for k, v in rows:
-        if k == "主页" and profile.get("profile_url"):
+        if k == profile_label and profile.get("profile_url"):
             html_rows.append([Raw(h_esc(k)), link_html(profile["profile_url"], profile["profile_url"])])
         else:
             html_rows.append([Raw(h_esc(k)), Raw(h_esc(v))])
@@ -562,14 +822,23 @@ def build_content_structure(analysis, posts_csv) -> tuple[str, str]:
     return md, html
 
 
+def _cadence_inference_allowed(analysis, cadence) -> bool:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    return not (
+        meta.get("evidence_is_exhaustive") is False
+        or cadence.get("cadence_inference_allowed") is False
+    )
+
+
 def build_publish_cadence(analysis) -> tuple[str, str]:
     cad = _safe_get(analysis, "publish_cadence", default={}) or {}
     if not cad:
         return EMPTY_MD, EMPTY_HTML
 
+    inference_allowed = _cadence_inference_allowed(analysis, cad)
     unit = cad.get("interval_unit", "hours")
     rows = [
-        ["总发布数量", fmt_int(cad.get("total_posts"))],
+        ["总发布数量" if inference_allowed else "可见样本数量", fmt_int(cad.get("total_posts"))],
         ["覆盖天数", fmt_int(cad.get("coverage_days"))],
         ["覆盖周数", fmt_int(cad.get("coverage_weeks"))],
         ["周均发布量", fmt_float(cad.get("weekly_avg"))],
@@ -588,6 +857,17 @@ def build_publish_cadence(analysis) -> tuple[str, str]:
 
     html = html_table(["节奏指标", "数值"],
                       [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
+    if not inference_allowed:
+        sample_note = (
+            "索引证据并非穷尽作品列表；以下仅描述可见样本的日期分布，"
+            "不用于推断账号发布频率、发布间隔或排播规律。"
+        )
+        md += f"\n\n> {sample_note}"
+        html += f'<p class="note">{h_esc(sample_note)}</p>'
+    cadence_note = cad.get("note")
+    if cadence_note:
+        md += f"\n\n> {md_escape_text(cadence_note)}"
+        html += f'<p class="note">{h_esc(cadence_note)}</p>'
     if ww:
         html += '<p class="note">工作日 / 周末分布</p>' + html_table(
             ["类别", "数量", "占比"],
@@ -696,74 +976,370 @@ def build_metrics_dashboard(analysis) -> tuple[str, str]:
     return md, html
 
 
-def _render_perf_group(group, main_metric: str | None = None) -> tuple[str, str]:
-    if isinstance(group, str):
-        return (f"样本不足（{group}），本模块不输出高低表现组，不补造结论。",
-                f'<p class="note warn">样本不足（{h_esc(group)}），本模块不输出高低表现组，不补造结论。</p>')
+def _metrics_contract_text(metrics) -> str:
+    values = metrics if isinstance(metrics, dict) else {}
+    return "; ".join(
+        f"{metric}={fmt_metric(values.get(metric))}"
+        for metric in METRIC_FIELDS
+    )
+
+
+def _canonical_jingxuan_report_item(url, post_id, platform) -> str | None:
+    expected = str(post_id or "").strip()
+    if platform != "douyin" or not expected.isdigit() or not _is_safe_public_url(url):
+        return None
+    parsed = urlsplit(url)
+    if parsed.hostname != "jingxuan.douyin.com":
+        return None
+    if parsed.path != f"/m/video/{expected}":
+        return None
+    return f"https://jingxuan.douyin.com/m/video/{expected}"
+
+
+def _canonical_report_item_url(
+    record, url, default_platform, default_collection_source
+) -> str | None:
+    platform = record.get("platform") or default_platform
+    post_id = record.get("post_id")
+    if not isinstance(platform, str) or not str(post_id or "").strip():
+        return None
+    collection_source = (
+        record.get("collection_source") or default_collection_source
+    )
+    if collection_source == "douyin_jingxuan":
+        return _canonical_jingxuan_report_item(url, post_id, platform)
+    return canonical_item_url(platform, url, post_id)
+
+
+def _report_reference(
+    record,
+    *,
+    url_field: str,
+    require_item_known: bool,
+    default_platform=None,
+    default_collection_source=None,
+) -> tuple[MdRaw, Raw]:
+    kind = record.get("url_kind") if isinstance(record, dict) else None
+    if kind == "item":
+        url = record.get(url_field)
+        item_known = not require_item_known or record.get("item_url_known") is True
+        canonical_url = _canonical_report_item_url(
+            record, url, default_platform, default_collection_source
+        )
+        if item_known and canonical_url is not None and canonical_url == url:
+            ref_post(canonical_url)
+            label = "item（作品链接）"
+            md_link = link_md(canonical_url, "作品链接")
+            html_link = link_html(canonical_url, "作品链接")
+            return (
+                MdRaw(f"{md_escape_text(label)}：{md_link.s}"),
+                Raw(f"{h_esc(label)}：{html_link.s}"),
+            )
+        label = "item（无安全作品链接）"
+        return MdRaw(md_escape_text(label)), Raw(h_esc(label))
+
+    if kind == "profile_index":
+        url = record.get(url_field)
+        label = "profile_index（主页证据锚点，不是作品链接）"
+        platform = record.get("platform") or default_platform
+        canonical_url = (
+            canonical_profile_url("douyin", url)
+            if platform == "douyin"
+            else None
+        )
+        if canonical_url is not None and canonical_url == url:
+            md_link = link_md(canonical_url, "主页证据锚点")
+            html_link = link_html(canonical_url, "主页证据锚点")
+            return (
+                MdRaw(f"{md_escape_text(label)}：{md_link.s}"),
+                Raw(f"{h_esc(label)}：{html_link.s}"),
+            )
+        return MdRaw(md_escape_text(label)), Raw(h_esc(label))
+
+    kind_label = str(kind) if kind not in (None, "") else "missing"
+    label = f"{kind_label}（无单条作品链接）"
+    return MdRaw(md_escape_text(label)), Raw(h_esc(label))
+
+
+def _performance_reference(
+    record, default_platform=None, default_collection_source=None
+) -> tuple[MdRaw, Raw]:
+    if record.get("url_kind") == "profile_index":
+        return _report_reference(
+            record,
+            url_field="evidence_url",
+            require_item_known=True,
+            default_platform=default_platform,
+            default_collection_source=default_collection_source,
+        )
+    return _report_reference(
+        record,
+        url_field="post_url",
+        require_item_known=True,
+        default_platform=default_platform,
+        default_collection_source=default_collection_source,
+    )
+
+
+def _main_metric_text(record, main_metric, metric_label) -> str:
+    metric = record.get("main_metric") or main_metric
+    label = metric_label or (METRIC_LABELS.get(metric, metric) if metric else "—")
+    metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+    raw_value = record.get("value") if "value" in record else metrics.get(metric)
+    metric_name = str(metric) if metric else "—"
+    return f"{label}: {fmt_metric(raw_value)} ({metric_name})"
+
+
+def _relative_to_main_median(record, main_metric) -> str:
+    value = record.get("relative_to_main_median")
+    if value is None:
+        relative_performance = record.get("relative_performance")
+        if isinstance(relative_performance, dict) and main_metric:
+            value = relative_performance.get(main_metric)
+    return fmt_float(value, 4)
+
+
+def _render_perf_group(
+    group,
+    main_metric: str | None = None,
+    metric_label: str | None = None,
+    default_platform=None,
+    default_collection_source=None,
+) -> tuple[str, str]:
     if not isinstance(group, list) or not group:
         return EMPTY_MD, EMPTY_HTML
 
-    headers = ["内容", "发布时间", "主指标值", "相对中位表现", "播放互动率"]
+    headers = [
+        "排名",
+        "post_id",
+        "内容",
+        "URL 类型 / 证据",
+        "发布时间",
+        "主指标名称与值",
+        "relative_to_main_median",
+        "完整 metrics",
+        "collected_at",
+    ]
     rows_md, rows_html = [], []
     for p in group:
         if not isinstance(p, dict):
             continue
         pid = p.get("post_id") or "—"
-        url = p.get("post_url") or ""
+        display = p.get("title") or pid
         pub = p.get("published_at") or "—"
-        metrics = p.get("metrics", {}) or {}
-        rp = p.get("relative_performance", {}) or {}
-        # 主指标：优先使用调用方给定的 main_metric
-        mm = _PERF_MAIN_METRIC
-        mm_label = METRIC_LABELS.get(mm, mm) if mm else "—"
-        mm_val = fmt_metric(metrics.get(mm)) if mm else "—"
-        rp_val = fmt_float(rp.get(mm)) if (mm and mm in rp and rp.get(mm) is not None) else "—"
-        vber = fmt_pct(p.get("view_based_engagement_rate"))
-        if url:
-            ref_post(url)
-            md_link = link_md(url, pid)
-            html_link = link_html(url, pid)
-        else:
-            md_link, html_link = pid, Raw(h_esc(pid))
-        rows_md.append([md_link, pub, f"{mm_label}: {mm_val}", rp_val, vber])
-        rows_html.append([html_link, Raw(h_esc(pub)),
-                          Raw(h_esc(f"{mm_label}: {mm_val}")), Raw(h_esc(rp_val)), Raw(h_esc(vber))])
+        md_reference, html_reference = _performance_reference(
+            p, default_platform, default_collection_source
+        )
+        main_metric_text = _main_metric_text(p, main_metric, metric_label)
+        relative = _relative_to_main_median(p, p.get("main_metric") or main_metric)
+        metrics_text = _metrics_contract_text(p.get("metrics"))
+        collected_at = p.get("collected_at") or "—"
+        rows_md.append(
+            [
+                fmt_int(p.get("rank")),
+                pid,
+                display,
+                md_reference,
+                pub,
+                main_metric_text,
+                relative,
+                metrics_text,
+                collected_at,
+            ]
+        )
+        rows_html.append(
+            [
+                fmt_int(p.get("rank")),
+                pid,
+                display,
+                html_reference,
+                pub,
+                main_metric_text,
+                relative,
+                metrics_text,
+                collected_at,
+            ]
+        )
     if not rows_md:
         return EMPTY_MD, EMPTY_HTML
     return md_table(headers, rows_md), html_table(headers, rows_html)
 
 
-_PERF_MAIN_METRIC = None  # 由 build_high/low 设置
+def _render_core_insights(
+    analysis,
+    kind: str,
+    default_platform=None,
+    default_collection_source=None,
+) -> tuple[str, str]:
+    insights = analysis.get("core_insights") if isinstance(analysis, dict) else None
+    if not isinstance(insights, list):
+        return "", ""
+    md_blocks: list[str] = []
+    html_blocks: list[str] = []
+    for insight in insights:
+        if not isinstance(insight, dict) or insight.get("kind") != kind:
+            continue
+        insight_id = insight.get("id") or "—"
+        statement = insight.get("statement") or "—"
+        main_metric = insight.get("main_metric") or "—"
+        evidence_rows_md = []
+        evidence_rows_html = []
+        evidence_items = insight.get("evidence")
+        if not isinstance(evidence_items, list):
+            evidence_items = []
+        for evidence in evidence_items:
+            if not isinstance(evidence, dict):
+                continue
+            md_reference, html_reference = _report_reference(
+                evidence,
+                url_field="url",
+                require_item_known=False,
+                default_platform=default_platform,
+                default_collection_source=default_collection_source,
+            )
+            metric_value = f"{main_metric}={fmt_metric(evidence.get('value'))}"
+            rank = f"rank={fmt_int(evidence.get('rank'))}"
+            metrics_text = _metrics_contract_text(evidence.get("metrics"))
+            collected_at = evidence.get("collected_at") or "—"
+            evidence_rows_md.append(
+                [
+                    evidence.get("post_id") or "—",
+                    md_reference,
+                    rank,
+                    metric_value,
+                    metrics_text,
+                    collected_at,
+                ]
+            )
+            evidence_rows_html.append(
+                [
+                    evidence.get("post_id") or "—",
+                    html_reference,
+                    rank,
+                    metric_value,
+                    metrics_text,
+                    collected_at,
+                ]
+            )
+        headers = [
+            "post_id",
+            "URL 类型 / 证据",
+            "全局排名",
+            "主指标名称与值",
+            "完整 metrics",
+            "collected_at",
+        ]
+        md_blocks.append(
+            f"**核心洞察 {md_escape_text(insight_id)}**\n\n"
+            f"- statement: {md_escape_text(statement)}\n\n"
+            + md_table(headers, evidence_rows_md)
+        )
+        html_blocks.append(
+            '<div class="core-insight">'
+            f"<p><strong>核心洞察 {h_esc(insight_id)}</strong></p>"
+            f"<p>statement: {h_esc(statement)}</p>"
+            + html_table(headers, evidence_rows_html)
+            + "</div>"
+        )
+    return "\n\n".join(md_blocks), "".join(html_blocks)
+
+
+def _append_report_block(
+    md: str, html: str, extra_md: str, extra_html: str
+) -> tuple[str, str]:
+    if not extra_md and not extra_html:
+        return md, html
+    combined_md = extra_md if md == EMPTY_MD else md + "\n\n" + extra_md
+    combined_html = extra_html if html == EMPTY_HTML else html + extra_html
+    return combined_md, combined_html
+
+
+def _performance_metric_context(analysis) -> tuple[str | None, str | None, str | None]:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    performance_meta = (
+        analysis.get("performance_meta", {}) if isinstance(analysis, dict) else {}
+    )
+    main_metric = meta.get("main_sort_metric")
+    metric_label = None
+    if meta.get("collection_source") == "douyin_search_index" and main_metric == "likes":
+        metric_label = "索引可见点赞"
+    metric_note = performance_meta.get("metric_note")
+    if not isinstance(metric_note, str) or not metric_note.strip():
+        metric_note = None
+    return main_metric, metric_label, metric_note
+
+
+def _performance_provenance_context(analysis) -> tuple[object, object]:
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    return meta.get("platform"), meta.get("collection_source")
+
+
+def _append_performance_note(md: str, html: str, note: str | None) -> tuple[str, str]:
+    if note is None:
+        return md, html
+    return (
+        md + f"\n\n> 指标口径：{md_escape_text(note)}",
+        html + f'<p class="note">指标口径：{h_esc(note)}</p>',
+    )
 
 
 def build_high_performance(analysis) -> tuple[str, str]:
-    global _PERF_MAIN_METRIC
-    _PERF_MAIN_METRIC = (analysis.get("meta", {}) or {}).get("main_sort_metric")
+    main_metric, metric_label, metric_note = _performance_metric_context(analysis)
+    platform, collection_source = _performance_provenance_context(analysis)
     high = analysis.get("high_performance")
     low = analysis.get("low_performance")
-    md, html = _render_perf_group(high)
+    md, html = _render_perf_group(
+        high,
+        main_metric,
+        metric_label,
+        platform,
+        collection_source,
+    )
+    insight_md, insight_html = _render_core_insights(
+        analysis,
+        "high_performance",
+        platform,
+        collection_source,
+    )
+    md, html = _append_report_block(md, html, insight_md, insight_html)
     # 高低表现雷达图：对比两组在各指标上的均值形态（仅作形态对比，不构成因果）
     radar = svg_high_low_radar(high, low, METRIC_FIELDS)
     if radar:
         md += ("\n\n**高低表现指标对比（雷达图）**\n\n"
                "> 说明：以各组在各指标上的均值按列最大值归一化，仅作形态对比，不构成因果结论。")
         html += '<p class="note">高低表现指标对比（雷达图）</p>' + radar
-    return md, html
+    return _append_performance_note(md, html, metric_note)
 
 
 def build_low_performance(analysis) -> tuple[str, str]:
-    global _PERF_MAIN_METRIC
-    _PERF_MAIN_METRIC = (analysis.get("meta", {}) or {}).get("main_sort_metric")
+    main_metric, metric_label, metric_note = _performance_metric_context(analysis)
+    platform, collection_source = _performance_provenance_context(analysis)
     group = analysis.get("low_performance")
-    return _render_perf_group(group)
+    md, html = _render_perf_group(
+        group,
+        main_metric,
+        metric_label,
+        platform,
+        collection_source,
+    )
+    insight_md, insight_html = _render_core_insights(
+        analysis,
+        "low_performance",
+        platform,
+        collection_source,
+    )
+    md, html = _append_report_block(md, html, insight_md, insight_html)
+    return _append_performance_note(md, html, metric_note)
 
 
 def _dist_table(posts, key, label) -> tuple[str, str]:
     counter = Counter()
     for p in posts:
         v = p.get(key)
-        if v in (None, "", "unknown"):
-            counter["未分类/unknown"] += 1
+        if v in (None, ""):
+            counter["待分类"] += 1
+        elif v == "unknown":
+            counter["unknown（模型无法判断）"] += 1
         else:
             counter[str(v)] += 1
     if not counter:
@@ -775,28 +1351,488 @@ def _dist_table(posts, key, label) -> tuple[str, str]:
     return md, html
 
 
+def _contract_limitations(contract: dict) -> tuple[str, str]:
+    values = contract.get("limitations")
+    limitations = (
+        [value for value in values if isinstance(value, str) and value]
+        if isinstance(values, list)
+        else []
+    )
+    if not limitations:
+        return "", ""
+    return (
+        "\n".join(f"> {md_escape_text(value)}" for value in limitations),
+        "".join(f'<p class="note">{h_esc(value)}</p>' for value in limitations),
+    )
+
+
+def _analysis_html_text(value) -> str:
+    """Escape HTML plus Markdown-link delimiters in untrusted analysis labels."""
+    escaped = h_esc(value)
+    for char, entity in (
+        ("!", "&#33;"),
+        ("[", "&#91;"),
+        ("]", "&#93;"),
+        ("(", "&#40;"),
+        (")", "&#41;"),
+    ):
+        escaped = escaped.replace(char, entity)
+    return escaped
+
+
+def _analysis_html_rows(rows: list[list[object]]) -> list[list[Raw]]:
+    return [
+        [Raw(_analysis_html_text(value)) for value in row]
+        for row in rows
+    ]
+
+
+def _classification_breakdown_block(analysis: dict) -> tuple[str, str]:
+    contract = analysis.get("classification_breakdown")
+    if not isinstance(contract, dict):
+        return "", ""
+    status = contract.get("status")
+    if status != "completed":
+        return _contract_limitations(contract)
+
+    matrix = contract.get("topic_format_matrix")
+    performance = contract.get("dimension_performance")
+    if not isinstance(matrix, dict) or not isinstance(performance, dict):
+        return "", ""
+    formats = matrix.get("formats") if isinstance(matrix.get("formats"), list) else []
+    matrix_rows = matrix.get("rows") if isinstance(matrix.get("rows"), list) else []
+    md_parts = ["### 主题 × 形式计数矩阵"]
+    html_parts = ['<h3 class="subsection">主题 × 形式计数矩阵</h3>']
+    rendered_matrix_rows = []
+    for row in matrix_rows:
+        if not isinstance(row, dict):
+            continue
+        counts = row.get("counts") if isinstance(row.get("counts"), list) else []
+        rendered_matrix_rows.append(
+            [row.get("topic"), fmt_int(row.get("post_count"))]
+            + [fmt_int(value) for value in counts]
+        )
+    matrix_headers = ["主题", "合计"] + [str(value) for value in formats]
+    if rendered_matrix_rows:
+        md_parts.extend(["", md_table(matrix_headers, rendered_matrix_rows)])
+        html_parts.append(
+            html_table(matrix_headers, _analysis_html_rows(rendered_matrix_rows))
+        )
+
+    main_metric = contract.get("main_metric")
+    md_parts.extend(["", "### 分类维度主指标表现"])
+    html_parts.append('<h3 class="subsection">分类维度主指标表现</h3>')
+    perf_headers = [
+        "维度",
+        "值",
+        "作品数",
+        "实测数",
+        "缺失数",
+        "实测率",
+        f"{main_metric} 中位数",
+    ]
+    perf_rows = []
+    for field in ("topic", "format"):
+        values = performance.get(field)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            perf_rows.append(
+                [
+                    field,
+                    item.get("value"),
+                    fmt_int(item.get("post_count")),
+                    fmt_int(item.get("measured_count")),
+                    fmt_int(item.get("missing_count")),
+                    fmt_float(item.get("measurement_rate"), 4),
+                    fmt_metric(item.get("main_metric_median")),
+                ]
+            )
+    if perf_rows:
+        md_parts.extend(["", md_table(perf_headers, perf_rows)])
+        html_parts.append(html_table(perf_headers, _analysis_html_rows(perf_rows)))
+
+    limitation_md, limitation_html = _contract_limitations(contract)
+    if limitation_md:
+        md_parts.extend(["", limitation_md])
+        html_parts.append(limitation_html)
+    return "\n".join(md_parts), "".join(html_parts)
+
+
+def _feature_value_text(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "—"
+    return str(value)
+
+
+def _feature_values_text(values) -> str:
+    if not isinstance(values, list) or not values:
+        return "—"
+    return "、".join(_feature_value_text(value) for value in values)
+
+
+def _high_low_feature_block(analysis: dict) -> tuple[str, str]:
+    contract = analysis.get("high_low_feature_comparison")
+    if not isinstance(contract, dict):
+        return "", ""
+    if contract.get("status") != "completed":
+        return _contract_limitations(contract)
+
+    features = contract.get("features")
+    if not isinstance(features, list):
+        return "", ""
+    md_parts = ["### 高低组结构化特征对比"]
+    html_parts = ['<h3 class="subsection">高低组结构化特征对比</h3>']
+
+    coverage_headers = [
+        "字段",
+        "高组已知/缺失",
+        "低组已知/缺失",
+        "共同值",
+        "高组独有",
+        "低组独有",
+    ]
+    coverage_rows = []
+    comparison_headers = [
+        "字段",
+        "值",
+        "高组 count/rate",
+        "低组 count/rate",
+        "rate_delta",
+    ]
+    comparison_rows = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        field = feature.get("field")
+        coverage_rows.append(
+            [
+                field,
+                f"{fmt_int(feature.get('high_known_count'))}/{fmt_int(feature.get('high_missing_count'))}",
+                f"{fmt_int(feature.get('low_known_count'))}/{fmt_int(feature.get('low_missing_count'))}",
+                _feature_values_text(feature.get("common_values")),
+                _feature_values_text(feature.get("high_only_values")),
+                _feature_values_text(feature.get("low_only_values")),
+            ]
+        )
+        values = feature.get("values")
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            comparison_rows.append(
+                [
+                    field,
+                    _feature_value_text(item.get("value")),
+                    f"{fmt_int(item.get('high_count'))}/{fmt_float(item.get('high_rate'), 4)}",
+                    f"{fmt_int(item.get('low_count'))}/{fmt_float(item.get('low_rate'), 4)}",
+                    fmt_float(item.get("rate_delta"), 4),
+                ]
+            )
+    if coverage_rows:
+        md_parts.extend(["", md_table(coverage_headers, coverage_rows)])
+        html_parts.append(
+            html_table(coverage_headers, _analysis_html_rows(coverage_rows))
+        )
+    if comparison_rows:
+        md_parts.extend(["", md_table(comparison_headers, comparison_rows)])
+        html_parts.append(
+            html_table(comparison_headers, _analysis_html_rows(comparison_rows))
+        )
+
+    limitation_md, limitation_html = _contract_limitations(contract)
+    if limitation_md:
+        md_parts.extend(["", limitation_md])
+        html_parts.append(limitation_html)
+    return "\n".join(md_parts), "".join(html_parts)
+
+
+def _comment_scalar(value) -> str:
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _comment_parent_reference(
+    item: dict,
+    *,
+    default_platform,
+    default_collection_source,
+) -> tuple[MdRaw, Raw]:
+    parent_id = item.get("parent_post_id")
+    parent_url = item.get("parent_post_url")
+    record = {
+        "platform": default_platform,
+        "post_id": parent_id,
+        "collection_source": default_collection_source,
+    }
+    canonical = _canonical_report_item_url(
+        record,
+        parent_url,
+        default_platform,
+        default_collection_source,
+    )
+    label = f"作品 {_comment_scalar(parent_id)}"
+    if canonical is not None and canonical == parent_url:
+        ref_post(canonical)
+        return link_md(canonical, label), link_html(canonical, label)
+    return MdRaw(md_escape_text(label)), Raw(h_esc(label))
+
+
+def _comment_evidence_block(analysis: dict) -> tuple[str, str]:
+    comments = analysis.get("comment_analysis")
+    if not isinstance(comments, dict):
+        return "", ""
+
+    meta = analysis.get("meta") if isinstance(analysis.get("meta"), dict) else {}
+    default_platform = meta.get("platform")
+    default_collection_source = meta.get("collection_source")
+    eligible = comments.get("eligible_parent_posts")
+    covered = comments.get("covered_parent_posts")
+    coverage_rate = comments.get("parent_coverage_rate")
+    coverage_label = (
+        f"{_comment_scalar(covered)}/{_comment_scalar(eligible)} "
+        f"(rate={fmt_float(coverage_rate, 4)})"
+    )
+    summary_rows = [
+        ["schema_version", _comment_scalar(comments.get("schema_version"))],
+        ["status", _comment_scalar(comments.get("status"))],
+        ["requested", _comment_scalar(comments.get("requested"))],
+        [
+            "sampled_comment_count",
+            _comment_scalar(comments.get("sampled_comment_count")),
+        ],
+        ["parent_coverage", coverage_label],
+    ]
+    md_parts = ["### 评论证据（确定性）", "", md_table(["字段", "值"], summary_rows)]
+    html_parts = [
+        '<h3 class="subsection">评论证据（确定性）</h3>',
+        html_table(
+            ["字段", "值"],
+            [
+                [Raw(h_esc(field)), Raw(h_esc(value))]
+                for field, value in summary_rows
+            ],
+        ),
+    ]
+
+    ledger = comments.get("collection_ledger")
+    if isinstance(ledger, dict):
+        ledger_fields = (
+            "attempted_posts",
+            "comments_collected",
+            "empty_results",
+            "failures",
+            "per_post_limit",
+            "stop_reason",
+        )
+        rows = [
+            [field, _comment_scalar(ledger.get(field))]
+            for field in ledger_fields
+        ]
+        md_parts.extend(["", "**采集账本**", "", md_table(["字段", "值"], rows)])
+        html_parts.extend(
+            [
+                '<p class="note">采集账本</p>',
+                html_table(
+                    ["字段", "值"],
+                    [
+                        [Raw(h_esc(field)), Raw(h_esc(value))]
+                        for field, value in rows
+                    ],
+                ),
+            ]
+        )
+
+    field_coverage = comments.get("field_coverage")
+    if isinstance(field_coverage, dict) and field_coverage:
+        rows = []
+        for field in ("author", "text", "likes", "published_at", "collected_at"):
+            evidence = field_coverage.get(field)
+            if not isinstance(evidence, dict):
+                continue
+            rows.append(
+                [
+                    field,
+                    _comment_scalar(evidence.get("present")),
+                    _comment_scalar(evidence.get("total")),
+                    fmt_float(evidence.get("rate"), 4),
+                ]
+            )
+        if rows:
+            md_parts.extend(
+                [
+                    "",
+                    "**字段覆盖率**",
+                    "",
+                    md_table(["字段", "present", "total", "rate"], rows),
+                ]
+            )
+            html_parts.extend(
+                [
+                    '<p class="note">字段覆盖率</p>',
+                    html_table(
+                        ["字段", "present", "total", "rate"],
+                        [
+                            [Raw(h_esc(value)) for value in row]
+                            for row in rows
+                        ],
+                    ),
+                ]
+            )
+
+    selection = comments.get("representative_selection")
+    if isinstance(selection, dict):
+        selection_text = (
+            "max_parent_posts="
+            f"{_comment_scalar(selection.get('max_parent_posts'))}; "
+            "max_per_parent="
+            f"{_comment_scalar(selection.get('max_per_parent'))}; "
+            f"order={_comment_scalar(selection.get('order'))}"
+        )
+        md_parts.extend(["", f"> 代表评论选择：{md_escape_text(selection_text)}"])
+        html_parts.append(
+            f'<p class="note">代表评论选择：{h_esc(selection_text)}</p>'
+        )
+
+    representatives = comments.get("representative_comments")
+    if isinstance(representatives, list) and representatives:
+        md_rows = []
+        html_rows = []
+        for item in representatives:
+            if not isinstance(item, dict):
+                continue
+            parent_md, parent_html = _comment_parent_reference(
+                item,
+                default_platform=default_platform,
+                default_collection_source=default_collection_source,
+            )
+            artifact = item.get("source_artifact")
+            source_line = item.get("source_line")
+            source = f"{_comment_scalar(artifact)}:{_comment_scalar(source_line)}"
+            values = [
+                _comment_scalar(item.get("comment_id")),
+                parent_md,
+                _comment_scalar(item.get("author")),
+                _comment_scalar(item.get("text")),
+                _comment_scalar(item.get("likes")),
+                _comment_scalar(item.get("published_at")),
+                _comment_scalar(item.get("collected_at")),
+                source,
+            ]
+            md_rows.append(values)
+            html_rows.append(
+                [
+                    Raw(h_esc(values[0])),
+                    parent_html,
+                    Raw(h_esc(values[2])),
+                    Raw(h_esc(values[3])),
+                    Raw(h_esc(values[4])),
+                    Raw(h_esc(values[5])),
+                    Raw(h_esc(values[6])),
+                    Raw(h_esc(values[7])),
+                ]
+            )
+        if md_rows:
+            headers = [
+                "comment_id",
+                "父作品",
+                "author",
+                "text",
+                "likes",
+                "published_at",
+                "collected_at",
+                "source",
+            ]
+            md_parts.extend(["", "**代表评论**", "", md_table(headers, md_rows)])
+            html_parts.extend(
+                [
+                    '<p class="note">代表评论</p>',
+                    html_table(headers, html_rows),
+                ]
+            )
+
+    semantic = comments.get("semantic")
+    semantic_status = (
+        semantic.get("status") if isinstance(semantic, dict) else None
+    )
+    semantic_version = (
+        semantic.get("model_version") if isinstance(semantic, dict) else None
+    )
+    semantic_note = (
+        "语义洞察待模型处理"
+        f"（status={_comment_scalar(semantic_status)}, "
+        f"model_version={_comment_scalar(semantic_version)}）；"
+        "确定性阶段不生成评论语义结论。"
+    )
+    md_parts.extend(["", f"> {md_escape_text(semantic_note)}"])
+    html_parts.append(f'<p class="note">{h_esc(semantic_note)}</p>')
+
+    limitations = comments.get("limitations")
+    if isinstance(limitations, list) and limitations:
+        safe_limitations = [
+            item for item in limitations if isinstance(item, str) and item
+        ]
+        if safe_limitations:
+            md_parts.extend(
+                [
+                    "",
+                    "**限制**",
+                    "",
+                    "\n".join(f"- {md_escape_text(item)}" for item in safe_limitations),
+                ]
+            )
+            html_parts.extend(
+                [
+                    '<p class="note">限制</p>',
+                    "<ul class='tight'>"
+                    + "".join(f"<li>{h_esc(item)}</li>" for item in safe_limitations)
+                    + "</ul>",
+                ]
+            )
+    return "\n".join(md_parts), "".join(html_parts)
+
+
 def build_content_patterns(analysis) -> tuple[str, str]:
     posts = analysis.get("posts", []) if isinstance(analysis, dict) else []
-    if not posts:
-        return EMPTY_MD, EMPTY_HTML
     blocks = []
-    for key, label in [("topic", "主题"), ("format", "内容形式"),
-                       ("funnel_stage", "漏斗阶段"), ("hook_type", "开头钩子")]:
-        md, html = _dist_table(posts, key, label)
-        if md:
+    if posts:
+        for key, label in [("topic", "主题"), ("format", "内容形式"),
+                           ("funnel_stage", "漏斗阶段"), ("hook_type", "开头钩子")]:
+            md, html = _dist_table(posts, key, label)
+            if md:
+                blocks.append((md, html))
+        # 栏目 / 合集
+        series = Counter()
+        for p in posts:
+            s = p.get("series_name")
+            if s:
+                series[str(s)] += 1
+        if series:
+            rows = [[k, fmt_int(v)] for k, v in series.most_common(10)]
+            md = "**栏目 / 合集 分布**\n\n" + md_table(["栏目", "数量"], rows)
+            html = '<p class="note">栏目 / 合集 分布</p>' + html_table(
+                ["栏目", "数量"], [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
             blocks.append((md, html))
-    # 栏目 / 合集
-    series = Counter()
-    for p in posts:
-        s = p.get("series_name")
-        if s:
-            series[str(s)] += 1
-    if series:
-        rows = [[k, fmt_int(v)] for k, v in series.most_common(10)]
-        md = "**栏目 / 合集 分布**\n\n" + md_table(["栏目", "数量"], rows)
-        html = '<p class="note">栏目 / 合集 分布</p>' + html_table(
-            ["栏目", "数量"], [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
-        blocks.append((md, html))
+
+    breakdown_md, breakdown_html = _classification_breakdown_block(analysis)
+    if breakdown_md:
+        blocks.append((breakdown_md, breakdown_html))
+
+    feature_md, feature_html = _high_low_feature_block(analysis)
+    if feature_md:
+        blocks.append((feature_md, feature_html))
+
+    comment_md, comment_html = _comment_evidence_block(analysis)
+    if comment_md:
+        blocks.append((comment_md, comment_html))
 
     if not blocks:
         return EMPTY_MD, EMPTY_HTML
@@ -810,19 +1846,20 @@ def build_strategy(analysis, profile) -> tuple[str, str]:
     tips = []
 
     cad = _safe_get(analysis, "publish_cadence", default={}) or {}
-    ww = cad.get("weekday_weekend", {}) or {}
-    if ww:
-        wc, ec = int(ww.get("weekday_count") or 0), int(ww.get("weekend_count") or 0)
-        if ec and wc:
-            dom = "周末" if ec > wc else "工作日"
-            tips.append(f"有效样本中 {dom}发布占比更高（周末 {fmt_pct(ww.get('weekend_pct'))} / "
-                        f"工作日 {fmt_pct(ww.get('weekday_pct'))}），可在该时段优先排播，但需注意样本量是否足以支撑结论。")
-    wd = cad.get("weekday_distribution", {}) or {}
-    if wd:
-        top_day = max(((int(wd.get(str(i), 0)), i) for i in range(7)), default=(0, 0))
-        if top_day[0] > 0:
-            tips.append(f"发布最密集的星期为 {WEEKDAY_NAMES[top_day[1]]}（{top_day[0]} 条），"
-                        f"可作为稳定更新锚点，但仍应结合表现数据验证。")
+    if _cadence_inference_allowed(analysis, cad):
+        ww = cad.get("weekday_weekend", {}) or {}
+        if ww:
+            wc, ec = int(ww.get("weekday_count") or 0), int(ww.get("weekend_count") or 0)
+            if ec and wc:
+                dom = "周末" if ec > wc else "工作日"
+                tips.append(f"有效样本中 {dom}发布占比更高（周末 {fmt_pct(ww.get('weekend_pct'))} / "
+                            f"工作日 {fmt_pct(ww.get('weekday_pct'))}），可在该时段优先排播，但需注意样本量是否足以支撑结论。")
+        wd = cad.get("weekday_distribution", {}) or {}
+        if wd:
+            top_day = max(((int(wd.get(str(i), 0)), i) for i in range(7)), default=(0, 0))
+            if top_day[0] > 0:
+                tips.append(f"发布最密集的星期为 {WEEKDAY_NAMES[top_day[1]]}（{top_day[0]} 条），"
+                            f"可作为稳定更新锚点，但仍应结合表现数据验证。")
 
     eng = _safe_get(analysis, "engagement", default={}) or {}
     vber = eng.get("view_based_engagement_rate", {}) or {}
@@ -860,7 +1897,7 @@ def build_strategy(analysis, profile) -> tuple[str, str]:
     if not tips:
         return EMPTY_MD, EMPTY_HTML
 
-    md = "\n".join(f"{i}. {t}" for i, t in enumerate(tips, 1))
+    md = "\n".join(f"{i}. {md_escape_text(t)}" for i, t in enumerate(tips, 1))
     html = "<ul class='tight'>" + "".join(f"<li>{h_esc(t)}</li>" for t in tips) + "</ul>"
     return md, html
 
@@ -878,12 +1915,41 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
         ["受限内容", fmt_int(sb.get("restricted"))],
         ["被排除标记内容", fmt_int(sb.get("excluded_flagged"))],
     ]
+    rows.extend(_status_count_rows(sb))
     # 字段可见性（来自 profile）
     fv = (profile or {}).get("field_visibility", {}) or {}
     hidden = [k for k, v in fv.items() if v in ("hidden", "partial")]
 
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    collection_source = meta.get("collection_source")
+    disclaimer = (
+        AUTHORIZED_DISCLAIMER
+        if collection_source == AUTHORIZED_DOUYIN_SOURCE
+        else PUBLIC_PAGE_DISCLAIMER
+    )
     md = md_table(["样本边界", "数值"], rows)
-    md += "\n\n> " + DISCLAIMER
+    md += "\n\n> " + disclaimer
+    if collection_source in INDEX_COLLECTION_SOURCES:
+        md += (
+            f"\n\n> 当前数据来自 `{collection_source}` 公开索引快照，属于非实时、非穷尽样本；"
+            "不能据此推断账号完整发布量或后台表现。"
+        )
+        if collection_source == "douyin_search_index":
+            md += (
+                "\n\n> `idx-*` 是本地记录键；账号主页仅为证据锚点，"
+                "不是单条作品详情链接。"
+            )
+    elif collection_source == AUTHORIZED_DOUYIN_SOURCE:
+        if meta.get("evidence_is_exhaustive") is True:
+            md += (
+                "\n\n> 当前数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "覆盖账本已观察到官方末页，对该授权接口返回集合为穷尽遍历。"
+            )
+        else:
+            md += (
+                "\n\n> 当前数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "尚未观察到官方末页，当前结果非穷尽。"
+            )
     if hidden:
         md += f"\n\n> 受限/不可见字段：{', '.join(hidden)}（相关指标覆盖率相应下调）。"
     md += ("\n\n> 默认排除置顶/转载/投放内容；统计仅基于有效样本，"
@@ -891,7 +1957,25 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
 
     html = html_table(["样本边界", "数值"],
                       [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
-    notes = [DISCLAIMER]
+    notes = [disclaimer]
+    if collection_source in INDEX_COLLECTION_SOURCES:
+        notes.append(
+            f"当前数据来自 {collection_source} 公开索引快照，属于非实时、非穷尽样本；"
+            "不能据此推断账号完整发布量或后台表现。"
+        )
+        if collection_source == "douyin_search_index":
+            notes.append("idx-* 是本地记录键；账号主页仅为证据锚点，不是单条作品详情链接。")
+    elif collection_source == AUTHORIZED_DOUYIN_SOURCE:
+        if meta.get("evidence_is_exhaustive") is True:
+            notes.append(
+                "当前数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "覆盖账本已观察到官方末页，对该授权接口返回集合为穷尽遍历。"
+            )
+        else:
+            notes.append(
+                "当前数据来自账号本人授权 OpenAPI 公热视频列表；"
+                "尚未观察到官方末页，当前结果非穷尽。"
+            )
     if hidden:
         notes.append("受限/不可见字段：" + ", ".join(hidden) + "（相关指标覆盖率相应下调）。")
     notes.append("默认排除置顶/转载/投放内容；统计仅基于有效样本，确定性数字由脚本计算，"
@@ -902,14 +1986,36 @@ def build_sample_limits(analysis, profile) -> tuple[str, str]:
 
 def build_sources(analysis, profile) -> tuple[str, str]:
     urls = []
+    meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+    default_platform = (
+        meta.get("platform") or (profile or {}).get("platform")
+    )
+    default_collection_source = meta.get("collection_source")
     prof_url = (profile or {}).get("profile_url")
-    if prof_url:
-        urls.append(("账号主页", prof_url))
+    canonical_profile = (
+        canonical_profile_url(default_platform, prof_url)
+        if isinstance(default_platform, str)
+        else None
+    )
+    if canonical_profile is not None and canonical_profile == prof_url:
+        urls.append(("账号主页", canonical_profile))
     posts = analysis.get("posts", []) if isinstance(analysis, dict) else []
     for p in posts:
-        if isinstance(p, dict) and p.get("post_url"):
-            ref_post(p["post_url"])
-            urls.append((p.get("post_id") or p["post_url"], p["post_url"]))
+        if not isinstance(p, dict):
+            continue
+        if p.get("url_kind") != "item" or p.get("item_url_known") is not True:
+            continue
+        post_url = p.get("post_url")
+        canonical_post = _canonical_report_item_url(
+            p,
+            post_url,
+            default_platform,
+            default_collection_source,
+        )
+        if canonical_post is None or canonical_post != post_url:
+            continue
+        ref_post(canonical_post)
+        urls.append((p.get("post_id") or canonical_post, canonical_post))
 
     if not urls:
         return EMPTY_MD, EMPTY_HTML
@@ -924,23 +2030,145 @@ def build_sources(analysis, profile) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def render_dashboard(template: str, sections_html: dict[str, str]) -> str:
-    out = template
-    for name in PLACEHOLDERS:
-        content = sections_html.get(name) or EMPTY_HTML
-        out = out.replace("{{" + name + "}}", content)
-    # 兜底：任何残留占位符
-    out = re.sub(r"\{\{[^}]*\}\}", '<span class="empty">暂无数据</span>', out)
-    return out
+    return _PLACEHOLDER_PATTERN.sub(
+        lambda match: sections_html.get(match.group(1)) or EMPTY_HTML,
+        template,
+    )
 
 
 def post_render_checks(html: str) -> None:
     # 坏链检查：被引用的内容 URL 不在 known 集合中
-    for url in REFERENCED_POST_URLS:
-        if url not in KNOWN_POST_URLS:
+    state = _RENDER_STATE.get()
+    referenced = (
+        state.referenced_post_urls
+        if state is not None
+        else REFERENCED_POST_URLS
+    )
+    known = state.known_post_urls if state is not None else KNOWN_POST_URLS
+    for url in referenced:
+        if url not in known:
             warn(f"bad_link: 报告引用了不在 normalized-posts.csv 中的 post_url: {url}")
     # 空图检查：残留外部图片
     for m in re.finditer(r'<img[^>]+src=["\']http', html, re.IGNORECASE):
         warn(f"empty_image: 发现未替换的外部图片标签: {m.group(0)[:80]}")
+
+
+def render_in_memory(
+    *,
+    profile: dict,
+    posts_csv: list[dict],
+    analysis: dict,
+    template: str,
+) -> RenderResult:
+    """Render and validate reports without filesystem or process-global state."""
+    if not isinstance(profile, dict):
+        raise RenderError("missing or invalid profile input")
+    if not isinstance(posts_csv, list) or not all(
+        isinstance(row, dict) for row in posts_csv
+    ):
+        raise RenderError("missing or invalid normalized posts input")
+    if not isinstance(analysis, dict):
+        raise RenderError("missing or invalid analysis input")
+    if not isinstance(template, str) or not template:
+        raise RenderError("missing or invalid report template")
+    template_without_comments = re.sub(
+        r"<!--.*?-->", "", template, flags=re.DOTALL
+    )
+    template_tokens = re.findall(
+        r"\{\{([^{}]+)\}\}", template_without_comments
+    )
+    if sorted(template_tokens) != sorted(PLACEHOLDERS):
+        raise RenderError("report template placeholder inventory is invalid")
+
+    state = _RenderState(
+        known_post_urls={
+            str(row.get("post_url")).strip()
+            for row in posts_csv
+            if row.get("post_url")
+        }
+    )
+    token = _RENDER_STATE.set(state)
+    try:
+        builders = {
+            "task_info": lambda: build_task_info(analysis, profile, posts_csv),
+            "quality_summary": lambda: build_quality_summary(analysis),
+            "account_card": lambda: build_account_card(profile),
+            "content_structure": lambda: build_content_structure(
+                analysis, posts_csv
+            ),
+            "publish_cadence": lambda: build_publish_cadence(analysis),
+            "metrics_dashboard": lambda: build_metrics_dashboard(analysis),
+            "high_performance": lambda: build_high_performance(analysis),
+            "low_performance": lambda: build_low_performance(analysis),
+            "content_patterns": lambda: build_content_patterns(analysis),
+            "strategy": lambda: build_strategy(analysis, profile),
+            "sample_limits": lambda: build_sample_limits(analysis, profile),
+            "sources": lambda: build_sources(analysis, profile),
+        }
+
+        sections_md: dict[str, str] = {}
+        sections_html: dict[str, str] = {}
+        for name, function in builders.items():
+            try:
+                markdown, html = function()
+            except Exception as exc:  # noqa: BLE001
+                raise RenderError(f"render section {name} failed") from exc
+            sections_md[name] = markdown or EMPTY_MD
+            sections_html[name] = html or EMPTY_HTML
+
+        account_name = (
+            (analysis.get("meta", {}) or {}).get("account_name")
+            or profile.get("account_name")
+            or "未知账号"
+        )
+        platform = (
+            (analysis.get("meta", {}) or {}).get("platform")
+            or profile.get("platform")
+            or ""
+        )
+        safe_account_name = md_escape_text(account_name)
+        safe_platform = md_escape_text(platform)
+        title = (
+            f"公开社媒账号分析报告：{safe_account_name}（{safe_platform}）"
+            if platform
+            else f"公开社媒账号分析报告：{safe_account_name}"
+        )
+        collection_source = (
+            (analysis.get("meta", {}) or {}).get("collection_source")
+        )
+        authorized_source = collection_source == AUTHORIZED_DOUYIN_SOURCE
+        disclaimer = (
+            AUTHORIZED_DISCLAIMER
+            if authorized_source
+            else PUBLIC_PAGE_DISCLAIMER
+        )
+        md_parts = [f"# {title}", "", disclaimer, ""]
+        for index, (name, section_title) in enumerate(SECTION_DEFS, 1):
+            md_parts.extend(
+                [
+                    f"## {index}. {section_title}",
+                    "",
+                    sections_md[name],
+                    "",
+                ]
+            )
+        markdown_text = "\n".join(md_parts).rstrip() + "\n"
+        dashboard_template = template
+        if authorized_source:
+            dashboard_template = dashboard_template.replace(
+                PUBLIC_PAGE_DISCLAIMER, AUTHORIZED_DISCLAIMER
+            ).replace(PUBLIC_PAGE_FOOTER, AUTHORIZED_FOOTER)
+        html_text = render_dashboard(dashboard_template, sections_html)
+        post_render_checks(html_text)
+        if state.diagnostics:
+            raise RenderError(
+                "; ".join(state.diagnostics), state.diagnostics
+            )
+        if not markdown_text.strip() or not html_text.strip():
+            raise RenderError("render output is empty")
+        return RenderResult(markdown_text, html_text, ())
+    finally:
+        _RENDER_STATE.reset(token)
 
 
 def main(argv=None) -> int:
@@ -957,84 +2185,61 @@ def main(argv=None) -> int:
     input_dir = Path(args.input).resolve()
     output_dir = Path(args.output).resolve() if args.output else input_dir
 
-    # 模板：默认取脚本所在目录的上级 assets
+    try:
+        reject_sealed_workspace(str(input_dir))
+        if output_dir != input_dir:
+            reject_sealed_workspace(str(output_dir))
+    except WorkspaceError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    WARNINGS.clear()
+    KNOWN_POST_URLS.clear()
+    REFERENCED_POST_URLS.clear()
+
     if args.template:
         template_path = Path(args.template).resolve()
     else:
         template_path = Path(__file__).resolve().parent.parent / "assets" / "report-template.html"
 
-    if not template_path.exists():
-        warn(f"模板不存在: {template_path}；将输出未填充的占位符。")
-        template_text = ""
-    else:
+    try:
         template_text = template_path.read_text(encoding="utf-8")
+        profile = json.loads(
+            (input_dir / "source" / "profile.json").read_text(encoding="utf-8")
+        )
+        analysis = json.loads(
+            (input_dir / "analysis.json").read_text(encoding="utf-8")
+        )
+        with (input_dir / "normalized-posts.csv").open(
+            encoding="utf-8", newline=""
+        ) as handle:
+            posts_csv = list(csv.DictReader(handle))
+        rendered = render_in_memory(
+            profile=profile,
+            posts_csv=posts_csv,
+            analysis=analysis,
+            template=template_text,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, csv.Error) as exc:
+        print(f"[ERROR] renderer input failed: {exc}", file=sys.stderr)
+        return 2
+    except RenderError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
 
-    # 加载数据
-    profile = load_json(input_dir / "source" / "profile.json") or {}
-    posts_csv = load_posts_csv(input_dir / "normalized-posts.csv")
-    analysis = load_json(input_dir / "analysis.json") or {}
-
-    # 构建各节
-    builders = {
-        "task_info": lambda: build_task_info(analysis, profile, posts_csv),
-        "quality_summary": lambda: build_quality_summary(analysis),
-        "account_card": lambda: build_account_card(profile),
-        "content_structure": lambda: build_content_structure(analysis, posts_csv),
-        "publish_cadence": lambda: build_publish_cadence(analysis),
-        "metrics_dashboard": lambda: build_metrics_dashboard(analysis),
-        "high_performance": lambda: build_high_performance(analysis),
-        "low_performance": lambda: build_low_performance(analysis),
-        "content_patterns": lambda: build_content_patterns(analysis),
-        "strategy": lambda: build_strategy(analysis, profile),
-        "sample_limits": lambda: build_sample_limits(analysis, profile),
-        "sources": lambda: build_sources(analysis, profile),
-    }
-
-    sections_md: dict[str, str] = {}
-    sections_html: dict[str, str] = {}
-    for name, fn in builders.items():
-        try:
-            md, html = fn()
-        except Exception as exc:  # noqa: BLE001
-            warn(f"渲染节 {name} 失败: {exc}")
-            md, html = EMPTY_MD, EMPTY_HTML
-        sections_md[name] = md or EMPTY_MD
-        sections_html[name] = html or EMPTY_HTML
-
-    # 组装 Markdown
-    account_name = ((analysis.get("meta", {}) or {}).get("account_name")
-                    or (profile or {}).get("account_name") or "未知账号")
-    platform = ((analysis.get("meta", {}) or {}).get("platform")
-                or (profile or {}).get("platform") or "")
-    title = f"公开社媒账号分析报告：{account_name}（{platform}）" if platform else \
-        f"公开社媒账号分析报告：{account_name}"
-    md_parts = [f"# {title}", "", DISCLAIMER, ""]
-    for idx, (name, sec_title) in enumerate(SECTION_DEFS, 1):
-        md_parts.append(f"## {idx}. {sec_title}")
-        md_parts.append("")
-        md_parts.append(sections_md[name])
-        md_parts.append("")
-    md_text = "\n".join(md_parts).rstrip() + "\n"
-
-    # 组装 HTML
-    html_text = render_dashboard(template_text, sections_html)
-
-    # 输出
-    output_dir.mkdir(parents=True, exist_ok=True)
-    md_path = output_dir / "account-analysis-report.md"
-    html_path = output_dir / "dashboard.html"
-    md_path.write_text(md_text, encoding="utf-8")
-    html_path.write_text(html_text, encoding="utf-8")
-
-    # 后置检查
-    post_render_checks(html_text)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        md_path = output_dir / "account-analysis-report.md"
+        html_path = output_dir / "dashboard.html"
+        md_path.write_text(rendered.markdown, encoding="utf-8")
+        html_path.write_text(rendered.html, encoding="utf-8")
+    except OSError as exc:
+        print(f"[ERROR] renderer output failed: {exc}", file=sys.stderr)
+        return 2
 
     print(f"已生成: {md_path}")
     print(f"已生成: {html_path}")
-    if WARNINGS:
-        print(f"完成，含 {len(WARNINGS)} 条告警。", file=sys.stderr)
-    else:
-        print("完成，无告警。")
+    print("完成，无告警。")
     return 0
 
 

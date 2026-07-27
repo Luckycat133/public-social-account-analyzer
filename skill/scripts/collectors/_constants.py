@@ -1,31 +1,116 @@
-"""采集器共享常量。
+"""Shared public collection limits, stop reasons, and Douyin page states."""
 
-仅聚合各平台适配器共用的枚举值与时区常量，不引入业务逻辑。
-所有字符串值严格对齐 skill/references/exceptions.md §9.2 枚举。
-"""
-from __future__ import annotations
+import math
+import re
 
-from datetime import timezone, timedelta
 
-# 北京时间（中国平台默认时区，见 references/data-schema.md §1）
-BEIJING_TZ = timezone(timedelta(hours=8))
+PUBLIC_LIMIT_DEFAULT = 30
+PUBLIC_LIMIT_MAX = 100
 
-# --------------------------------------------------------------------------
-# stop_reason 枚举（严格对齐 references/exceptions.md §9.2 / data-schema.md §9.2）
-# --------------------------------------------------------------------------
-STOP_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
-STOP_ADAPTER_UNAVAILABLE = "ADAPTER_UNAVAILABLE"
+PUBLIC_ALL_DEFAULT_MAX_ITEMS = 10_000
+PUBLIC_ALL_DEFAULT_MAX_SECONDS = 1_800.0
+PUBLIC_ALL_DEFAULT_MAX_SCROLLS = 2_000
+
+PUBLIC_ALL_HARD_MAX_ITEMS = 50_000
+PUBLIC_ALL_HARD_MAX_SECONDS = 14_400.0
+PUBLIC_ALL_HARD_MAX_SCROLLS = 20_000
+
+
+def validate_public_limit(value):
+    """Return a valid limited-mode request without coercion or clamping."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > PUBLIC_LIMIT_MAX
+    ):
+        raise ValueError(f"limit must be an integer from 1 to {PUBLIC_LIMIT_MAX}")
+    return value
+
+
+def validate_public_all_budgets(max_items, max_seconds, max_scrolls):
+    """Return accepted public ``--all`` budgets without silently changing them."""
+    if (
+        isinstance(max_items, bool)
+        or not isinstance(max_items, int)
+        or max_items < 1
+        or max_items > PUBLIC_ALL_HARD_MAX_ITEMS
+    ):
+        raise ValueError(
+            f"max_items must be an integer from 1 to {PUBLIC_ALL_HARD_MAX_ITEMS}"
+        )
+    if (
+        isinstance(max_seconds, bool)
+        or not isinstance(max_seconds, (int, float))
+        or not math.isfinite(max_seconds)
+        or max_seconds <= 0
+        or max_seconds > PUBLIC_ALL_HARD_MAX_SECONDS
+    ):
+        raise ValueError(
+            f"max_seconds must be finite, greater than 0, and at most "
+            f"{PUBLIC_ALL_HARD_MAX_SECONDS}"
+        )
+    if (
+        isinstance(max_scrolls, bool)
+        or not isinstance(max_scrolls, int)
+        or max_scrolls < 1
+        or max_scrolls > PUBLIC_ALL_HARD_MAX_SCROLLS
+    ):
+        raise ValueError(
+            f"max_scrolls must be an integer from 1 to "
+            f"{PUBLIC_ALL_HARD_MAX_SCROLLS}"
+        )
+    return max_items, float(max_seconds), max_scrolls
+
 STOP_LOGIN = "LOGIN_REQUIRED"
 STOP_VERIFICATION = "VERIFICATION_REQUIRED"
 STOP_ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
 STOP_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
 STOP_PARSER_FAILED = "PARSER_FAILED"
 STOP_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
+STOP_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
 STOP_INTERNAL = "INTERNAL_ERROR"
 
-# 已知 stop_reason 集合（用于从异常消息前缀 [REASON] 兜底识别）
-KNOWN_STOP_REASONS = frozenset({
-    STOP_UNSUPPORTED, STOP_ADAPTER_UNAVAILABLE, STOP_LOGIN, STOP_VERIFICATION,
-    STOP_ACCOUNT_UNAVAILABLE, STOP_ACCESS_RESTRICTED, STOP_PARSER_FAILED,
-    STOP_NO_PUBLIC_CONTENT, STOP_INTERNAL,
-})
+
+# Order is the public status priority.  Parser failure is deliberately absent:
+# callers run these page-state checks before deciding that a structure changed.
+DOUYIN_PAGE_STATE_PATTERNS = (
+    (
+        re.compile(
+            r"滑动验证|人机验证|安全验证|verify you are human|please verify",
+            re.I,
+        ),
+        STOP_VERIFICATION,
+    ),
+    (
+        re.compile(
+            r"登录后查看|请先登录|登录抖音|需登录|登录后访问|扫码登录",
+            re.I,
+        ),
+        STOP_LOGIN,
+    ),
+    (
+        re.compile(
+            r"访问过于频繁|操作过于频繁|请求频率过高|"
+            r"网络异常[，, ]?请稍后|访问受限|频繁",
+            re.I,
+        ),
+        STOP_ACCESS_RESTRICTED,
+    ),
+    (
+        re.compile(
+            r"账号不存在|用户不存在|该账号已被封禁|账号已注销|帐号不存在|"
+            r"用户已注销|账号不可用",
+            re.I,
+        ),
+        STOP_ACCOUNT_UNAVAILABLE,
+    ),
+    (
+        re.compile(
+            r"暂无公开作品|暂无作品|还没有发布(?:任何)?(?:公开)?作品|"
+            r"尚未发布(?:任何)?作品|没有公开内容",
+            re.I,
+        ),
+        STOP_NO_PUBLIC_CONTENT,
+    ),
+)

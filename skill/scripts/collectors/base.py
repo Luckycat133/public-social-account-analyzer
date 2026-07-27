@@ -48,23 +48,36 @@ class BaseCollector(ABC):
         """Optional public comment sampling."""
         return []
 
+    def get_collection_coverage(self) -> dict[str, Any]:
+        """Return sanitized task-level coverage metadata, when available."""
+        return {}
+
     def _canon_status(self, cs) -> str:
         """Canonicalize a raw collection_status string to the unified enum.
 
         Raw builders emit "ok" for a successfully collected post; the unified
         schema (data-schema.md §9) uses "SUCCESS"/"PARTIAL"/"FAILED"/"DELETED"/
-        "RESTRICTED". analyze.py's VALID_STATUS only accepts "SUCCESS"/"PARTIAL",
-        so we normalize "ok" -> "SUCCESS" here at the single choke point instead
-        of leaving every collected post filtered out downstream.
+        "RESTRICTED". Missing or invalid input is untrusted and therefore becomes
+        ``PARTIAL`` rather than an invented success.
         """
-        if cs is None:
-            return "SUCCESS"
+        return self._canon_status_with_source(cs)[0]
+
+    @staticmethod
+    def _canon_status_with_source(cs) -> tuple[str, str]:
+        if cs is None or (isinstance(cs, str) and not cs.strip()):
+            return "PARTIAL", "inferred_missing"
         s = str(cs).strip().lower()
         if s in ("ok", "success"):
-            return "SUCCESS"
+            return "SUCCESS", "declared"
         if s == "partial":
-            return "PARTIAL"
-        return str(cs).upper()
+            return "PARTIAL", "declared"
+        if s in ("failed", "fail"):
+            return "FAILED", "declared"
+        if s == "deleted":
+            return "DELETED", "declared"
+        if s == "restricted":
+            return "RESTRICTED", "declared"
+        return "PARTIAL", "inferred_invalid"
 
     def normalize_profile(self, raw: dict) -> dict:
         """Map a platform-specific raw profile dict to the unified Profile schema.
@@ -128,8 +141,9 @@ class BaseCollector(ABC):
     def normalize_post(self, raw: dict) -> dict:
         """Map a platform-specific raw post dict to the unified Post schema.
 
-        Defaults boolean flags to False, hashtags to [], content_type to
-        "other" when unknown, and collection_status to "SUCCESS". Interaction
+        Preserves explicit boolean flags and leaves unknown flags as None,
+        defaults hashtags to [] and content_type to "other" when unknown.
+        Missing/invalid collection_status becomes auditable ``PARTIAL``. Interaction
         metrics that the adapter actually supplied are passed through (views /
         likes / comments / favorites / shares / coins / danmaku); when absent
         they stay None — never invented. platform_metrics carries any
@@ -160,6 +174,29 @@ class BaseCollector(ABC):
         )
 
         platform_metrics = dict(raw.get("platform_metrics") or {})
+        field_visibility = dict(raw.get("field_visibility") or {})
+        collection_status, derived_status_source = (
+            self._canon_status_with_source(raw.get("collection_status"))
+        )
+        supplied_status_source = raw.get("collection_status_source")
+        if (
+            derived_status_source == "declared"
+            and (
+                supplied_status_source == "declared"
+                or (
+                    collection_status == "PARTIAL"
+                    and supplied_status_source
+                    in {"inferred_missing", "inferred_invalid"}
+                )
+            )
+        ):
+            collection_status_source = supplied_status_source
+        else:
+            collection_status_source = derived_status_source
+
+        def public_boolean(field: str) -> bool | None:
+            value = raw.get(field)
+            return value if isinstance(value, bool) else None
 
         result = {
             "platform": raw.get("platform"),
@@ -171,13 +208,15 @@ class BaseCollector(ABC):
             "text": raw.get("text"),
             "duration_seconds": raw.get("duration_seconds"),
             "hashtags": hashtags,
-            "is_pinned": bool(raw.get("is_pinned", False)),
-            "is_repost": bool(raw.get("is_repost", False)),
-            "is_promoted": bool(raw.get("is_promoted", False)),
-            "collection_status": self._canon_status(raw.get("collection_status")),
+            "is_pinned": public_boolean("is_pinned"),
+            "is_repost": public_boolean("is_repost"),
+            "is_promoted": public_boolean("is_promoted"),
+            "collection_status": collection_status,
+            "collection_status_source": collection_status_source,
             "collected_at": raw.get("collected_at") or now,
             "source_url": raw.get("source_url") or raw.get("post_url"),
             "platform_metrics": platform_metrics,
+            "field_visibility": field_visibility,
         }
         for field in metric_fields:
             result[field] = raw.get(field)

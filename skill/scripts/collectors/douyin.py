@@ -1,14 +1,15 @@
-"""抖音公开账号采集适配器（P0）。
+"""抖音公开账号采集适配器（标准库 HTTP + 可选系统浏览器 CDP）。
 
-仅用标准库 `urllib` 访问 douyin.com / iesdouyin.com / v.douyin.com 的**公开**
-账号主页，把可解析到的字段映射到统一 `Profile` / `Post` 结构（见
-`data-schema.md`），并如实上抛访问限制 `stop_reason`（见 `exceptions.md`）。
+HTTP/SSR 是快速路径；SSR 缺失或作品结构无法识别时，可用项目自带的标准库
+CDP 客户端驱动独立临时浏览器，观察页面公开响应并读取可见作品卡片。两条路径
+都映射到统一 `Profile` / `Post` 结构，并如实上抛访问限制 `stop_reason`。
 
 现实约束（务必遵守）：
 - 抖音站点是重度 JS 渲染 + 风控（WAF / 滑块 / 签名）站点。标准库 `urllib` 直连
   通常只能拿到 JS 外壳或风控页，拿不到完整 SSR 数据。这是**预期且诚实**的结果：
   解析不到即 `PARSER_FAILED`，触发登录/验证/频控即对应 `stop_reason`。
-- **绝不绕过**登录、验证码、滑块或频控；不伪造签名、不模拟浏览器、不重试破解。
+- **绝不绕过**登录、验证码、滑块或频控；不伪造签名、不重试破解，也不复用
+  用户日常浏览器登录态。
 - 字段不可见写 `None`（绝不以 `0` 代替未知，见 `data-schema.md` §7/§8）。
 - 本适配器只采集、只映射，不分析、不存储（由上层脚本落盘）。
 
@@ -18,39 +19,55 @@
 - `check_access`：返回 `{"accessible", "reason", "stop_reason"}`，不绕过。
 - `collect_profile` / `collect_post_list` / `collect_post_detail`：best-effort 解析
   页面内嵌 `RENDER_DATA`（URL 编码 JSON）；解析失败或受限如实上抛。
-- `collect_comments`：覆盖基类，best-effort，任何限制/错误一律返回 `[]`。
+- `collect_comments`：覆盖基类；明确空列表返回 `[]`，不可用则上抛内容级原因。
 """
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 
-from .base import BaseCollector
-from ._constants import (  # 共享常量（re-export：测试通过 from collectors.douyin import STOP_* 仍可用）
-    BEIJING_TZ as _BEIJING,
-    STOP_LOGIN,
-    STOP_VERIFICATION,
-    STOP_ACCOUNT_UNAVAILABLE,
+from ._constants import (
+    DOUYIN_PAGE_STATE_PATTERNS,
+    PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+    PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
+    PUBLIC_ALL_DEFAULT_MAX_SECONDS,
+    PUBLIC_ALL_HARD_MAX_ITEMS,
+    PUBLIC_LIMIT_DEFAULT,
     STOP_ACCESS_RESTRICTED,
-    STOP_PARSER_FAILED,
-    STOP_NO_PUBLIC_CONTENT,
-    STOP_UNSUPPORTED,
+    STOP_ACCOUNT_UNAVAILABLE,
     STOP_INTERNAL,
+    STOP_LOGIN,
+    STOP_NO_PUBLIC_CONTENT,
+    STOP_PARSER_FAILED,
+    STOP_UNSUPPORTED,
+    STOP_VERIFICATION,
+    validate_public_all_budgets,
+    validate_public_limit,
 )
-from ._utils import (  # 共享工具函数（本地别名以最小化调用点改动）
-    now_iso as _now_iso,
-    parse_int as _int,
-    ts_to_iso as _ts_to_iso,
-    extract_hashtags,
+from .base import BaseCollector
+from ._douyin_detail_contract import (
+    MISSING_P0_DETAIL,
+    missing_detail_fields,
 )
+from .url_policy import (
+    canonical_item_url,
+    canonical_profile_url,
+    sanitize_routing_url,
+)
+
+
+# 抖音公开接口 / 主页均使用北京时间（+08:00）
+_BEIJING = timezone(timedelta(hours=8))
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -59,47 +76,200 @@ _UA = (
 
 _TIMEOUT = 12
 
-# 访问限制识别：语句片段 → stop_reason（按优先级从上到下匹配）
-_RESTRICTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"滑动验证|人机验证|安全验证|verify you are human|please verify", re.I),
-     STOP_VERIFICATION),
-    (re.compile(r"登录后查看|请先登录|登录抖音|需登录|登录后访问|扫码登录", re.I),
-     STOP_LOGIN),
-    (re.compile(r"访问过于频繁|操作过于频繁|请求频率过高|网络异常[，, ]?请稍后|频繁"),
-     STOP_ACCESS_RESTRICTED),
-    (re.compile(r"账号不存在|用户不存在|该账号已被封禁|账号已注销|帐号不存在", re.I),
-     STOP_ACCOUNT_UNAVAILABLE),
-]
+# Shared with the browser transport so both paths use identical priority.
+_RESTRICTION_PATTERNS = DOUYIN_PAGE_STATE_PATTERNS
+_COLLECTION_SOURCES = frozenset({"list", "network", "dom", "network+dom", "detail"})
+_IMAGE_TEXT_AWEME_TYPES = frozenset({68})
 
 
 class DouyinError(Exception):
-    """采集错误，携带 stop_reason 供上层决策（不绕过、如实上抛）。"""
+    """采集错误，携带 stop_reason 和可安全保留的部分结果。"""
 
-    def __init__(self, stop_reason: str, message: str, raw: Any = None):
+    def __init__(
+        self,
+        stop_reason: str,
+        message: str,
+        raw: Any = None,
+        partial_posts: list[dict[str, Any]] | None = None,
+        diagnostic_code: str | None = None,
+    ):
         super().__init__(message)
         self.stop_reason = stop_reason
         self.message = message
         self.raw = raw
+        self.partial_posts = list(partial_posts or [])
+        self.diagnostic_code = diagnostic_code
 
 
 # --------------------------------------------------------------------------
-# 工具函数（_now_iso / _ts_to_iso / _int 已下沉至 _utils.py，此处仅保留
-# 抖音特有的 _extract_hashtags —— 它需从 text_extra 结构化字段提取，并复用
-# 共享 extract_hashtags 处理 desc 文本部分）
+# 工具函数
 # --------------------------------------------------------------------------
+def _now_iso() -> str:
+    """当前北京时间 ISO 8601。"""
+    return datetime.now(_BEIJING).isoformat()
+
+
+def _ts_to_iso(ts: Any) -> str | None:
+    """Unix 秒 → 北京时间 ISO 8601；失败返回 None。"""
+    if not ts or isinstance(ts, bool):
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=_BEIJING).isoformat()
+    except (ValueError, OverflowError, OSError, TypeError):
+        return None
+
+
+def _int(v: Any) -> int | None:
+    """宽松数字解析：支持 '1.2万' / '3.4亿' / 纯数字；失败返回 None。"""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v) if math.isfinite(v) else None
+    s = str(v).strip()
+    if not s:
+        return None
+    mult = 1
+    if "亿" in s:
+        mult = 100_000_000
+    if "万" in s:
+        mult = 10_000
+    s = s.replace("亿", "").replace("万", "").replace(",", "").replace("+", "").strip()
+    try:
+        return int(float(s) * mult)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _public_boolean(source: dict[str, Any], *keys: str) -> bool | None:
+    """Preserve explicit public boolean evidence and leave absence unknown."""
+    values = [source[key] for key in keys if isinstance(source.get(key), bool)]
+    if True in values:
+        return True
+    if False in values:
+        return False
+    return None
+
+
+def _collection_source(value: Any, fallback: Any = "unknown") -> str:
+    if isinstance(value, str) and value in _COLLECTION_SOURCES:
+        return value
+    if isinstance(fallback, str) and fallback in _COLLECTION_SOURCES:
+        return fallback
+    return "unknown"
+
+
 def _extract_hashtags(desc: Any, text_extra: Any) -> list[str]:
     """从文案与 text_extra 抽取话题标签，去重保序。"""
     tags: list[str] = []
     if isinstance(text_extra, list):
         for item in text_extra:
             name = (item or {}).get("hashtag_name") if isinstance(item, dict) else None
-            if name and name not in tags:
-                tags.append(name)
+            if isinstance(name, str) and name.strip() and name.strip() not in tags:
+                tags.append(name.strip())
     if isinstance(desc, str):
-        for m in extract_hashtags(desc):
-            if m not in tags:
-                tags.append(m)
+        for m in re.findall(r"#([^#\s]+)#?", desc):
+            tag = m.strip()
+            if tag and tag not in tags:
+                tags.append(tag)
     return tags
+
+
+def _text_extra_is_structurally_observed(value: Any) -> bool:
+    """Accept only an explicit, structurally valid public hashtag array."""
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        name = item.get("hashtag_name")
+        if not isinstance(name, str) or not name.strip():
+            return False
+    return True
+
+
+def _is_trusted_image_text(aweme_type: Any, images: Any) -> bool:
+    """Recognize image-text only from the platform's typed image payload."""
+    def has_public_reference(image: Any) -> bool:
+        if not isinstance(image, dict):
+            return False
+        url_list = image.get("url_list")
+        return bool(
+            isinstance(url_list, list)
+            and url_list
+            and all(
+                isinstance(url, str) and bool(url.strip())
+                for url in url_list
+            )
+        )
+
+    return bool(
+        isinstance(aweme_type, int)
+        and not isinstance(aweme_type, bool)
+        and aweme_type in _IMAGE_TEXT_AWEME_TYPES
+        and isinstance(images, list)
+        and images
+        and all(has_public_reference(image) for image in images)
+    )
+
+
+def _has_trustworthy_detail_evidence(aweme: Any) -> bool:
+    """Require one valid, mappable public field beyond item identity."""
+    if not isinstance(aweme, dict):
+        return False
+
+    description = aweme.get("desc")
+    if isinstance(description, str) and bool(description.strip()):
+        return True
+    if _text_extra_is_structurally_observed(aweme.get("text_extra")):
+        return True
+
+    created_at = _int(aweme.get("create_time"))
+    if created_at is not None and created_at > 0 and _ts_to_iso(created_at) is not None:
+        return True
+
+    statistics = aweme.get("statistics")
+    if isinstance(statistics, dict):
+        for key in (
+            "play_count",
+            "digg_count",
+            "comment_count",
+            "collect_count",
+            "share_count",
+        ):
+            count = _int(statistics.get(key))
+            if count is not None and count >= 0:
+                return True
+
+    video = aweme.get("video")
+    if isinstance(video, dict):
+        duration = _int(video.get("duration"))
+        if duration is not None and duration >= 0:
+            return True
+
+    if any(
+        isinstance(aweme.get(key), bool)
+        for key in (
+            "is_top",
+            "is_top_aweme",
+            "is_repost",
+            "is_forward",
+            "is_ad",
+            "is_commerce",
+        )
+    ):
+        return True
+
+    if _is_trusted_image_text(aweme.get("aweme_type"), aweme.get("images")):
+        return True
+
+    collection = aweme.get("mix_info") or aweme.get("collection")
+    if isinstance(collection, dict):
+        collection_name = collection.get("mix_name")
+        if isinstance(collection_name, str) and bool(collection_name.strip()):
+            return True
+    return False
 
 
 def _extract_render_data(html: str) -> dict | None:
@@ -171,58 +341,71 @@ def _dig(data: dict | None, *path: str) -> Any:
 class DouyinCollector(BaseCollector):
     platform = "douyin"
 
+    def __init__(
+        self,
+        browser_fallback: bool = True,
+        browser_collect=None,
+        browser_collect_detail=None,
+    ):
+        """Configure the optional, dependency-free browser collection fallback."""
+        if browser_collect is None or browser_collect_detail is None:
+            from ._douyin_browser_transport import (
+                collect_account_page,
+                collect_post_page,
+            )
+
+            if browser_collect is None:
+                browser_collect = collect_account_page
+            if browser_collect_detail is None:
+                browser_collect_detail = collect_post_page
+        self.browser_fallback = bool(browser_fallback)
+        self._browser_collect = browser_collect
+        self._browser_collect_detail = browser_collect_detail
+        self._collection_coverage: dict[str, Any] = {}
+        self._browser_profile_cache: dict[str, dict[str, Any]] = {}
+        self._detail_provenance: dict[
+            int, tuple[dict[str, Any], tuple[str, ...], bool]
+        ] = {}
+
     # -- 路由 ---------------------------------------------------------------
     def supports(self, url: str) -> bool:
         """仅支持抖音账号主页（含短链 best-effort 解析）；拒绝作品/搜索/其他。"""
-        if not isinstance(url, str) or not url.strip():
+        u = sanitize_routing_url(url)
+        if u is None:
             return False
-        u = url.strip()
         try:
-            parsed = urllib.parse.urlparse(u)
+            parsed = urllib.parse.urlsplit(u)
         except ValueError:
             return False
-        host = parsed.netloc.lower()
+        host = parsed.hostname
         path = parsed.path
 
         if host == "v.douyin.com":
-            # 短链：best-effort 解析为长链后再判定；解析失败则按短链形式保守支持。
-            final = self._resolve_final_url(u)
-            if final:
-                return self._is_user_url(final)
-            # 解析失败：短链形式本身作为合法入口 best-effort 判为支持。
-            return bool(
-                re.match(r"^https?://v\.douyin\.com/[A-Za-z0-9_\-]+/?(\?[^/]*)?$", u)
-            )
+            return re.fullmatch(r"/[A-Za-z0-9_-]+/?", path) is not None
 
-        if host in ("www.douyin.com", "douyin.com", "iesdouyin.com"):
-            # 明确拒绝作品/搜索/话题/直播/发现页。
-            if any(
-                seg in path
-                for seg in ("/video/", "/note/", "/search", "/topic/", "/music/",
-                            "/challenge/", "/live/", "/discover/")
-            ):
-                return False
-            if "/user/" in path or "/share/user/" in path:
-                return True
-            return False
+        return canonical_profile_url("douyin", u) is not None
 
-        return False
+    def canonicalize_profile_url(self, url: str) -> str | None:
+        """Resolve a sanitized short link once, then apply strict profile policy."""
+        safe_url = sanitize_routing_url(url)
+        if safe_url is None:
+            return None
+        direct = canonical_profile_url("douyin", safe_url)
+        if direct is not None:
+            return direct
+        parsed = urllib.parse.urlsplit(safe_url)
+        if (
+            parsed.hostname != "v.douyin.com"
+            or re.fullmatch(r"/[A-Za-z0-9_-]+/?", parsed.path) is None
+        ):
+            return None
+        final_url = self._resolve_final_url(safe_url)
+        return canonical_profile_url("douyin", final_url)
 
     @staticmethod
     def _is_user_url(url: str) -> bool:
         """判定解析后的长链是否为账号主页。"""
-        try:
-            p = urllib.parse.urlparse(url)
-        except ValueError:
-            return False
-        path = p.path
-        if any(
-            seg in path
-            for seg in ("/video/", "/note/", "/search", "/topic/", "/music/",
-                        "/challenge/", "/live/", "/discover/")
-        ):
-            return False
-        return "/user/" in path or "/share/user/" in path
+        return canonical_profile_url("douyin", url) is not None
 
     @staticmethod
     def _resolve_final_url(url: str) -> str | None:
@@ -236,16 +419,7 @@ class DouyinCollector(BaseCollector):
 
     # -- 传输 ---------------------------------------------------------------
     def _fetch(self, url: str) -> str:
-        """urllib 取页面文本；如开启浏览器降级且 urllib 直连无可用 RENDER_DATA，则通过 BrowserSession 发起 CDP 页面导航渲染。"""
-        import os
-
-        html: str | None = None
-        use_fallback = bool(
-            os.environ.get("DOUYIN_BROWSER_FALLBACK") == "1"
-            or os.environ.get("BILIBILI_BROWSER_FALLBACK") == "1"
-            or os.environ.get("BROWSER_FALLBACK") == "1"
-        )
-
+        """urllib 取页面文本；HTTP/网络错误如实上抛对应 stop_reason。"""
         req = urllib.request.Request(
             url,
             headers={
@@ -257,7 +431,7 @@ class DouyinCollector(BaseCollector):
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
                 charset = resp.headers.get_content_charset() or "utf-8"
-                html = resp.read().decode(charset, errors="replace")
+                return resp.read().decode(charset, errors="replace")
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 429):
                 raise DouyinError(
@@ -269,37 +443,10 @@ class DouyinCollector(BaseCollector):
                 )
             raise DouyinError(STOP_ACCESS_RESTRICTED, f"HTTP {e.code}: {url}")
         except urllib.error.URLError as e:
-            if not use_fallback:
-                raise DouyinError(
-                    STOP_ACCESS_RESTRICTED, f"网络错误: {e.reason} ({url})"
-                )
-
-        # 直连页面已明确提示登录/验证/访问受限时，立即停止；浏览器降级不是
-        # 绕过这些保护的路径。
-        if html:
-            restriction = _detect_restriction(html)
-            if restriction:
-                raise DouyinError(restriction, f"页面命中访问限制标记: {restriction}")
-
-        # 尝试浏览器降级：仅在直连无明确限制、且没有可解析数据时进行。
-        if use_fallback and (not html or _extract_render_data(html) is None):
-            try:
-                from .browser_backend import BrowserSession, find_browser
-
-                if find_browser():
-                    with BrowserSession() as b:
-                        rendered_html = b.navigate_and_get_html(url, wait_seconds=3.5)
-                        if rendered_html and _detect_restriction(rendered_html) is None:
-                            return rendered_html
-                        if rendered_html:
-                            html = rendered_html
-            except Exception:
-                pass
-
-        if html:
-            return html
-        raise DouyinError(STOP_ACCESS_RESTRICTED, f"页面抓取失败: {url}")
-
+            # 网络层错误（DNS/连接被拒等），按访问受限如实上抛，不重试绕过。
+            raise DouyinError(
+                STOP_ACCESS_RESTRICTED, f"网络错误: {e.reason} ({url})"
+            )
 
     # -- 访问检查（不绕过） -------------------------------------------------
     def check_access(self, url: str) -> dict[str, Any]:
@@ -346,6 +493,9 @@ class DouyinCollector(BaseCollector):
         """fallback 降级调用 iesdouyin 公开 API 提取公开资料。"""
         if not sec_uid:
             return None
+        canonical_url = canonical_profile_url("douyin", url)
+        if canonical_url is None:
+            return None
         api_url = f"https://www.iesdouyin.com/web/api/v2/user/info/?sec_uid={sec_uid}"
         try:
             req = urllib.request.Request(
@@ -358,30 +508,75 @@ class DouyinCollector(BaseCollector):
                 ui = data.get("user_info")
                 if not ui:
                     return None
+                if "sec_uid" in ui and ui.get("sec_uid") is not None:
+                    response_sec_uid = ui.get("sec_uid")
+                    if (
+                        not isinstance(response_sec_uid, str)
+                        or response_sec_uid.strip() != sec_uid
+                    ):
+                        raise DouyinError(
+                            STOP_PARSER_FAILED,
+                            "iesdouyin API 返回账号标识与请求主页不一致",
+                        )
+                    bound_sec_uid = response_sec_uid.strip()
+                else:
+                    bound_sec_uid = sec_uid
+                response_profile_url = None
+                for key in ("profile_url", "share_url"):
+                    if key not in ui or ui.get(key) is None:
+                        continue
+                    candidate_url = ui.get(key)
+                    if (
+                        not isinstance(candidate_url, str)
+                        or canonical_profile_url("douyin", candidate_url)
+                        != canonical_url
+                    ):
+                        raise DouyinError(
+                            STOP_PARSER_FAILED,
+                            "iesdouyin API 返回主页地址与请求主页不一致",
+                        )
+                    response_profile_url = candidate_url
+                follower_value = ui.get("follower_count")
+                if follower_value is None:
+                    follower_value = ui.get("mplatform_followers_count")
+                followers = _int(follower_value)
+                post_count = _int(ui.get("aweme_count"))
                 raw = {
                     "platform": "douyin",
-                    "account_id": ui.get("unique_id") or ui.get("short_id") or sec_uid,
+                    "account_id": ui.get("unique_id") or ui.get("short_id") or bound_sec_uid,
                     "account_name": ui.get("nickname"),
-                    "profile_url": url,
+                    "profile_url": response_profile_url or canonical_url,
                     "bio": ui.get("signature") or None,
-                    "verified": bool(ui.get("custom_verify") or ui.get("enterprise_verify_reason") or ui.get("verification_type")),
-                    "followers": _int(ui.get("follower_count") or ui.get("mplatform_followers_count")),
-                    "post_count": _int(ui.get("aweme_count")),
+                    "verified": self._extract_verified(ui),
+                    "enterprise_verify_reason": ui.get("enterprise_verify_reason"),
+                    "custom_verify": ui.get("custom_verify"),
+                    "verification_type": ui.get("verification_type"),
+                    "followers": followers,
+                    "post_count": post_count,
                     "platform_metrics": {
                         "total_likes": _int(ui.get("total_favorited")),
-                        "sec_uid": sec_uid,
+                        "sec_uid": bound_sec_uid,
                         "unique_id": ui.get("unique_id"),
-                        "enterprise_verify_reason": ui.get("enterprise_verify_reason"),
                     },
-                    "collected_at": datetime.now(_BEIJING).isoformat(),
+                    "collected_at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
                     "field_visibility": {
                         "account_name": "visible" if ui.get("nickname") else "hidden",
                         "bio": "visible" if ui.get("signature") else "hidden",
-                        "followers": "visible" if (ui.get("follower_count") or ui.get("mplatform_followers_count")) is not None else "hidden",
-                        "post_count": "visible" if ui.get("aweme_count") is not None else "hidden",
+                        "followers": "visible" if followers is not None else "hidden",
+                        "post_count": "visible" if post_count is not None else "hidden",
                     }
                 }
-                return self.normalize_profile(raw)
+                from ._douyin_browser_transport import sanitize_profile_raw
+
+                clean = sanitize_profile_raw(raw, canonical_url)
+                if clean is None:
+                    raise DouyinError(
+                        STOP_PARSER_FAILED,
+                        "iesdouyin API 账号证据无法绑定到请求主页",
+                    )
+                return self.normalize_profile(clean)
+        except DouyinError:
+            raise
         except Exception:
             return None
 
@@ -407,19 +602,479 @@ class DouyinCollector(BaseCollector):
             if sec_uid:
                 fallback = self._fetch_profile_via_iesdouyin_api(sec_uid, url)
                 if fallback:
-                    return fallback
+                    merged = self._merge_cached_profile(url, fallback)
+                    if merged is not None:
+                        return merged
+            cached = self._browser_profile_cache.get(
+                canonical_profile_url("douyin", url) or ""
+            )
+            if cached is not None:
+                return self.normalize_profile(dict(cached))
             raise DouyinError(
                 STOP_PARSER_FAILED, "RENDER_DATA 中未识别到用户结构（可能为 JS 外壳页）"
             )
 
         raw = self._build_profile_raw(url, user)
-        return self.normalize_profile(raw)
+        merged = self._merge_cached_profile(url, raw)
+        if merged is None:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "SSR 账号证据与请求主页不一致，已拒绝输出",
+            )
+        return merged
+
+    def _merge_cached_profile(
+        self, url: str, profile_raw: Any
+    ) -> dict[str, Any] | None:
+        """Merge only profile evidence bound to the same canonical account."""
+        from ._douyin_browser_transport import (
+            _merge_profile_evidence,
+            sanitize_profile_raw,
+        )
+
+        canonical_url = canonical_profile_url("douyin", url)
+        if canonical_url is None:
+            return None
+        primary = sanitize_profile_raw(profile_raw, canonical_url)
+        if primary is None:
+            return None
+        cached = self._browser_profile_cache.get(canonical_url)
+        if cached is not None:
+            _merge_profile_evidence(primary, cached)
+        clean = sanitize_profile_raw(
+            primary, canonical_url, allow_dom_badge=True
+        )
+        return self.normalize_profile(clean) if clean is not None else None
+
+    def _cache_browser_profile(self, url: str, profile_raw: Any) -> None:
+        """Re-sanitize browser profile evidence and bind it to one account."""
+        from ._douyin_browser_transport import (
+            _merge_profile_evidence,
+            sanitize_profile_raw,
+        )
+
+        canonical_url = canonical_profile_url("douyin", url)
+        if canonical_url is None:
+            return
+        incoming = sanitize_profile_raw(
+            profile_raw, canonical_url, allow_dom_badge=True
+        )
+        if incoming is None:
+            return
+        existing = self._browser_profile_cache.get(canonical_url)
+        if existing is not None:
+            clean_existing = sanitize_profile_raw(
+                existing, canonical_url, allow_dom_badge=True
+            )
+            if clean_existing is not None:
+                _merge_profile_evidence(clean_existing, incoming)
+                incoming = clean_existing
+        clean = sanitize_profile_raw(
+            incoming, canonical_url, allow_dom_badge=True
+        )
+        if clean is not None:
+            self._browser_profile_cache[canonical_url] = clean
 
     # -- 作品列表 -----------------------------------------------------------
+    def _request_browser_result(
+        self,
+        url: str,
+        limit: int,
+        date_range: tuple[str | None, str | None] | None,
+    ):
+        if not self.browser_fallback:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "账号主页 SSR 缺失或作品列表结构无法识别，且浏览器降级已禁用",
+            )
+        try:
+            result = self._browser_collect(
+                url=url,
+                limit=limit,
+                date_range=date_range,
+            )
+        except Exception as exc:
+            code = (
+                "BROWSER_UNAVAILABLE"
+                if "未找到可用的浏览器" in str(exc)
+                else "BROWSER_TRANSPORT_FAILED"
+            )
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                f"抖音浏览器降级失败: {exc}",
+                diagnostic_code=code,
+            ) from exc
+        self._cache_browser_profile(url, getattr(result, "profile_raw", None))
+        return result
+
+    def _normalized_posts_from_items(
+        self,
+        url: str,
+        items: list[dict[str, Any]],
+        default_source: str,
+    ) -> list[dict[str, Any]]:
+        posts: list[dict[str, Any]] = []
+        for item in items:
+            raw = self._build_post_raw(
+                url,
+                item,
+                source=_collection_source(
+                    item.get("_collection_source"), default_source
+                ),
+            )
+            trusted_missing = tuple(raw.pop("_trusted_detail_missing_fields", ()))
+            duration_not_applicable = bool(
+                raw.pop("_trusted_duration_not_applicable", False) is True
+            )
+            post = self.normalize_post(raw)
+            if trusted_missing or duration_not_applicable:
+                self._detail_provenance[id(post)] = (
+                    post,
+                    trusted_missing,
+                    duration_not_applicable,
+                )
+            posts.append(post)
+        return posts
+
+    def _take_trusted_detail_provenance(
+        self, post: dict[str, Any]
+    ) -> tuple[tuple[str, ...], bool] | None:
+        """Consume same-process builder provenance for this exact post object."""
+        entry = self._detail_provenance.pop(id(post), None)
+        if entry is None or entry[0] is not post:
+            return None
+        return entry[1], entry[2]
+
+    def _clear_detail_provenance(self) -> None:
+        """Drop all non-persistable detail provenance at the output boundary."""
+        self._detail_provenance.clear()
+
+    def _retain_detail_provenance(self, posts: Any) -> None:
+        """Keep provenance only for exact post objects exposed by this batch."""
+        exposed = (
+            {
+                id(post): post
+                for post in posts
+                if isinstance(post, dict)
+            }
+            if isinstance(posts, list)
+            else {}
+        )
+        self._detail_provenance = {
+            identity: entry
+            for identity, entry in self._detail_provenance.items()
+            if exposed.get(identity) is entry[0]
+        }
+
+    @staticmethod
+    def _date_summary(
+        posts: list[dict[str, Any]],
+        date_range: tuple[str | None, str | None] | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        unknown_count = sum(
+            DouyinCollector._parse_post_date(post.get("published_at")) is None
+            for post in posts
+        )
+        if date_range is None:
+            return list(posts), unknown_count
+        return DouyinCollector._filter_by_date(posts, date_range), unknown_count
+
+    def _record_limited_coverage(
+        self,
+        posts_before_range: list[dict[str, Any]],
+        matched_posts: list[dict[str, Any]],
+        date_range: tuple[str | None, str | None] | None,
+        transport_coverage: Any = None,
+    ) -> None:
+        clean = self._sanitize_collection_coverage(transport_coverage)
+        _, unknown_count = self._date_summary(posts_before_range, date_range)
+        clean.update({
+            "requested_all": False,
+            "terminal_page_observed": False,
+            "is_exhaustive": False,
+            "observed_post_count": max(
+                clean.get("observed_post_count", 0), len(posts_before_range)
+            ),
+            "range_filter_applied": date_range is not None,
+            "range_match_count": len(matched_posts),
+            "range_no_match": bool(
+                date_range is not None and posts_before_range and not matched_posts
+            ),
+        })
+        if date_range is not None:
+            clean["unknown_date_count"] = max(
+                clean.get("unknown_date_count", 0), unknown_count
+            )
+        self._collection_coverage = self._sanitize_collection_coverage(clean)
+
+    def _collect_posts_via_browser(
+        self,
+        url: str,
+        limit: int,
+        date_range: tuple[str | None, str | None] | None,
+    ) -> list[dict[str, Any]]:
+        """Run the optional browser path and preserve its status semantics."""
+        result = self._request_browser_result(url, limit, date_range)
+
+        valid_items = self._validated_aweme_items(result.aweme_items)
+        normalized = self._normalized_posts_from_items(
+            url, valid_items, str(result.source or "network")
+        )
+        matched, _unknown_count = self._date_summary(normalized, date_range)
+        posts = matched[:limit]
+        self._record_limited_coverage(
+            normalized,
+            matched,
+            date_range,
+            getattr(result, "coverage", {}),
+        )
+        if result.restriction:
+            raise DouyinError(
+                result.restriction,
+                f"浏览器采集中止: {result.restriction}",
+                raw=result.diagnostics,
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if result.diagnostic_code:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器采集完成，但资源清理失败",
+                raw=result.diagnostics,
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if result.aweme_items and not valid_items:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器作品载荷未包含有效的数字平台作品 ID",
+                partial_posts=[],
+                diagnostic_code="INVALID_PLATFORM_POST_ID",
+            )
+        if not posts:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器未识别到可验证的作品结构",
+                raw=result.diagnostics,
+            )
+        return posts
+
+    @staticmethod
+    def _sanitize_collection_coverage(value: Any) -> dict[str, Any]:
+        """Keep only the bounded coverage ledger; never retain transport secrets."""
+        if not isinstance(value, dict):
+            return {}
+        count_fields = (
+            "observed_page_count",
+            "observed_post_count",
+            "cursor_fingerprint_count",
+            "repeated_cursor_count",
+            "range_match_count",
+            "unknown_date_count",
+        )
+        allowed_stops = {
+            "terminal_page",
+            "idle",
+            "timeout",
+            "repeated_cursor",
+            "max_items",
+            "max_scrolls",
+            "date_lower_bound",
+            "limit",
+        }
+        clean: dict[str, Any] = {}
+        requested_all = value.get("requested_all") is True
+        terminal_observed = value.get("terminal_page_observed") is True
+        clean["requested_all"] = requested_all
+        clean["terminal_page_observed"] = terminal_observed
+        for key in count_fields:
+            field_value = value.get(key)
+            if isinstance(field_value, int) and not isinstance(field_value, bool):
+                clean[key] = max(0, field_value)
+        max_items = value.get("max_items")
+        if (
+            isinstance(max_items, int)
+            and not isinstance(max_items, bool)
+            and 1 <= max_items <= PUBLIC_ALL_HARD_MAX_ITEMS
+        ):
+            clean["max_items"] = max_items
+        stop_condition = value.get("stop_condition")
+        if isinstance(stop_condition, str) and stop_condition in allowed_stops:
+            clean["stop_condition"] = stop_condition
+        clean["is_exhaustive"] = bool(
+            value.get("is_exhaustive") is True
+            and requested_all
+            and terminal_observed
+            and stop_condition == "terminal_page"
+        )
+        range_filter_applied = value.get("range_filter_applied") is True
+        range_match_count = clean.get("range_match_count")
+        clean["range_filter_applied"] = range_filter_applied
+        clean["range_no_match"] = bool(
+            value.get("range_no_match") is True
+            and range_filter_applied
+            and clean.get("observed_post_count", 0) > 0
+            and range_match_count == 0
+        )
+        return clean
+
+    def get_collection_coverage(self) -> dict[str, Any]:
+        """Return a detached copy of the current sanitized coverage ledger."""
+        return dict(self._collection_coverage)
+
+    def collect_all_post_list(
+        self,
+        url: str,
+        date_range: tuple[str | None, str | None] | None = None,
+        max_items: int = PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+        max_seconds: float = PUBLIC_ALL_DEFAULT_MAX_SECONDS,
+        max_scrolls: int = PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
+    ) -> list[dict[str, Any]]:
+        """Run one isolated all-post batch and retain only its returned evidence."""
+        self._clear_detail_provenance()
+        try:
+            posts = self._collect_all_post_list_current(
+                url,
+                date_range=date_range,
+                max_items=max_items,
+                max_seconds=max_seconds,
+                max_scrolls=max_scrolls,
+            )
+        except Exception as exc:
+            self._retain_detail_provenance(getattr(exc, "partial_posts", None))
+            raise
+        self._retain_detail_provenance(posts)
+        return posts
+
+    def _collect_all_post_list_current(
+        self,
+        url: str,
+        date_range: tuple[str | None, str | None] | None = None,
+        max_items: int = PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+        max_seconds: float = PUBLIC_ALL_DEFAULT_MAX_SECONDS,
+        max_scrolls: int = PUBLIC_ALL_DEFAULT_MAX_SCROLLS,
+    ) -> list[dict[str, Any]]:
+        """Passively observe public post-list pages until a verified terminal page."""
+        self._collection_coverage = {}
+        if not self.supports(url):
+            raise DouyinError(STOP_UNSUPPORTED, f"不支持的账号主页 URL: {url}")
+        max_items, max_seconds, max_scrolls = validate_public_all_budgets(
+            max_items, max_seconds, max_scrolls
+        )
+        self._collection_coverage = {
+            "requested_all": True,
+            "max_items": max_items,
+        }
+        if not self.browser_fallback:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "全量作品采集需要启用公开浏览器传输层",
+                diagnostic_code="BROWSER_DISABLED",
+            )
+        try:
+            result = self._browser_collect(
+                url=url,
+                limit=max_items,
+                date_range=date_range,
+                all_posts=True,
+                max_seconds=max_seconds,
+                max_scrolls=max_scrolls,
+            )
+        except Exception as exc:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "抖音全量浏览器采集失败",
+                diagnostic_code="BROWSER_TRANSPORT_FAILED",
+            ) from exc
+
+        self._cache_browser_profile(url, getattr(result, "profile_raw", None))
+        self._collection_coverage = self._sanitize_collection_coverage(
+            getattr(result, "coverage", {})
+        )
+        self._collection_coverage["max_items"] = max_items
+        valid_items = self._validated_aweme_items(result.aweme_items)
+        normalized = self._normalized_posts_from_items(
+            url, valid_items, str(result.source or "network")
+        )
+        matched, unknown_count = self._date_summary(normalized, date_range)
+        posts = matched[:max_items]
+        self._collection_coverage["observed_post_count"] = max(
+            self._collection_coverage.get("observed_post_count", 0),
+            len(valid_items),
+        )
+        if date_range is not None:
+            self._collection_coverage["unknown_date_count"] = max(
+                self._collection_coverage.get("unknown_date_count", 0),
+                unknown_count,
+            )
+        self._collection_coverage["range_filter_applied"] = date_range is not None
+        self._collection_coverage["range_match_count"] = len(matched)
+        self._collection_coverage["range_no_match"] = bool(
+            date_range is not None and valid_items and not posts
+        )
+
+        if result.restriction:
+            raise DouyinError(
+                result.restriction,
+                f"浏览器全量采集中止: {result.restriction}",
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if result.diagnostic_code:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "全量作品采集完成，但资源清理失败",
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if result.aweme_items and not valid_items:
+            self._collection_coverage["terminal_page_observed"] = False
+            self._collection_coverage["is_exhaustive"] = False
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器作品载荷未包含有效的数字平台作品 ID",
+                partial_posts=[],
+                diagnostic_code="INVALID_PLATFORM_POST_ID",
+            )
+        if not self._collection_coverage.get("is_exhaustive", False):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "全量作品采集在安全边界停止，结果不具完备性",
+                partial_posts=posts,
+                diagnostic_code="ALL_POSTS_INCOMPLETE",
+            )
+        if not valid_items:
+            raise DouyinError(
+                STOP_NO_PUBLIC_CONTENT,
+                "公开作品列表已到末页，账号没有可验证的公开作品",
+                partial_posts=[],
+            )
+        return posts
+
     def collect_post_list(
         self,
         url: str,
-        limit: int = 30,
+        limit: int = PUBLIC_LIMIT_DEFAULT,
+        date_range: tuple[str | None, str | None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run one isolated limited batch and retain only its returned evidence."""
+        self._clear_detail_provenance()
+        try:
+            posts = self._collect_post_list_current(
+                url,
+                limit=limit,
+                date_range=date_range,
+            )
+        except Exception as exc:
+            self._retain_detail_provenance(getattr(exc, "partial_posts", None))
+            raise
+        self._retain_detail_provenance(posts)
+        return posts
+
+    def _collect_post_list_current(
+        self,
+        url: str,
+        limit: int = PUBLIC_LIMIT_DEFAULT,
         date_range: tuple[str | None, str | None] | None = None,
     ) -> list[dict[str, Any]]:
         """采集作品摘要列表（标记 is_pinned），归一化后返回。
@@ -427,6 +1082,8 @@ class DouyinCollector(BaseCollector):
         Best-effort：从 RENDER_DATA 抽取作品数组。尊重 limit 与 date_range。
         命中任务级限制抛 DouyinError；单条缺失不影响整体（保持 null，不臆造）。
         """
+        self._collection_coverage = {}
+        limit = validate_public_limit(limit)
         if not self.supports(url):
             raise DouyinError(STOP_UNSUPPORTED, f"不支持的账号主页 URL: {url}")
         html = self._fetch(url)
@@ -435,92 +1092,291 @@ class DouyinCollector(BaseCollector):
             raise DouyinError(restriction, f"采集列表时命中访问限制: {restriction}")
 
         data = _extract_render_data(html)
-        if data is None:
-            raise DouyinError(STOP_PARSER_FAILED, "账号主页可访问但无 RENDER_DATA，无法解析作品列表")
+        expected_sec_uid = self._extract_sec_uid(url)
+        aweme_list = (
+            self._find_aweme_list(data, expected_sec_uid)
+            if data is not None and expected_sec_uid is not None
+            else None
+        )
+        if data is None or aweme_list is None:
+            return self._collect_posts_via_browser(url, limit, date_range)
 
-        aweme_list = self._find_aweme_list(data)
-        if aweme_list is None:
+        if len(aweme_list) == 0:
             raise DouyinError(
-                STOP_PARSER_FAILED, "RENDER_DATA 中未识别到作品列表结构"
+                STOP_NO_PUBLIC_CONTENT,
+                "账号主页明确显示没有公开作品",
             )
 
-        posts: list[dict[str, Any]] = []
-        for item in aweme_list:
+        valid_items = self._validated_aweme_items(aweme_list)
+        if aweme_list and not valid_items:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "SSR 作品载荷未包含有效的数字平台作品 ID",
+                partial_posts=[],
+                diagnostic_code="INVALID_PLATFORM_POST_ID",
+            )
+        ssr_items = []
+        for item in valid_items:
+            prepared = dict(item)
+            prepared["_collection_source"] = "list"
+            ssr_items.append(prepared)
+        normalized = self._normalized_posts_from_items(url, ssr_items, "list")
+        matched, _unknown_count = self._date_summary(normalized, date_range)
+
+        if len(matched) >= limit or not self.browser_fallback:
+            self._record_limited_coverage(normalized, matched, date_range)
+            return matched[:limit]
+
+        result = self._request_browser_result(url, limit, date_range)
+        browser_items = self._validated_aweme_items(result.aweme_items)
+        browser_payload_invalid = bool(result.aweme_items and not browser_items)
+        prepared_browser_items: list[dict[str, Any]] = []
+        for item in browser_items:
+            prepared = dict(item)
+            prepared["_collection_source"] = _collection_source(
+                prepared.get("_collection_source"),
+                _collection_source(result.source, "network"),
+            )
+            prepared_browser_items.append(prepared)
+        merged_items = self._validated_aweme_items(ssr_items + prepared_browser_items)
+        merged_normalized = self._normalized_posts_from_items(url, merged_items, "list")
+        merged_matched, _unknown_count = self._date_summary(
+            merged_normalized, date_range
+        )
+        posts = merged_matched[:limit]
+        self._record_limited_coverage(
+            merged_normalized,
+            merged_matched,
+            date_range,
+            getattr(result, "coverage", {}),
+        )
+        if result.restriction:
+            raise DouyinError(
+                result.restriction,
+                f"浏览器采集中止: {result.restriction}",
+                raw=result.diagnostics,
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if result.diagnostic_code:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器采集完成，但资源清理失败",
+                raw=result.diagnostics,
+                partial_posts=posts,
+                diagnostic_code=result.diagnostic_code,
+            )
+        if browser_payload_invalid:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器作品载荷未包含有效的数字平台作品 ID",
+                partial_posts=posts,
+                diagnostic_code="INVALID_PLATFORM_POST_ID",
+            )
+        return posts
+
+    @classmethod
+    def _validated_aweme_items(cls, items: Any) -> list[dict[str, Any]]:
+        """Keep numeric platform items and fill duplicate gaps without overwrites."""
+        by_id: dict[str, dict[str, Any]] = {}
+        if not isinstance(items, list):
+            return []
+        for item in items:
             if not isinstance(item, dict):
                 continue
-            if len(posts) >= limit:
-                break
-            raw = self._build_post_raw(url, item, source="list")
-            posts.append(self.normalize_post(raw))
+            post_id = str(item.get("aweme_id") or item.get("aweme_id_str") or "")
+            if re.fullmatch(r"\d+", post_id) is None:
+                continue
+            if post_id not in by_id:
+                by_id[post_id] = copy.deepcopy(item)
+                continue
+            cls._merge_missing_values(by_id[post_id], item)
+        return list(by_id.values())
 
-        if not posts and len(aweme_list) == 0:
-            # 账号存在但确无作品（且非受限）→ 如实返回空列表（上层可判 NO_PUBLIC_CONTENT）。
-            return []
+    @classmethod
+    def _merge_missing_values(cls, target: dict[str, Any], incoming: dict[str, Any]) -> None:
+        for key, value in incoming.items():
+            current = target.get(key)
+            if isinstance(current, dict) and isinstance(value, dict):
+                cls._merge_missing_values(current, value)
+            elif cls._missing_value(current) and not cls._missing_value(value):
+                target[key] = copy.deepcopy(value)
 
-        if date_range:
-            posts = self._filter_by_date(posts, date_range)
-        return posts[:limit]
+    @staticmethod
+    def _missing_value(value: Any) -> bool:
+        return value is None or value == "" or value == [] or value == {}
 
     # -- 单条详情 -----------------------------------------------------------
+    def _normalize_bound_post_detail(
+        self,
+        canonical_url: str,
+        aweme: Any,
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        """Normalize one detail only when raw and normalized identities agree."""
+        expected_post_id = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+        if not isinstance(aweme, dict):
+            raise DouyinError(STOP_PARSER_FAILED, "单条作品详情结构无效")
+        identifiers = [
+            str(aweme[key]).strip()
+            for key in ("aweme_id", "aweme_id_str")
+            if key in aweme and aweme[key] is not None
+        ]
+        if not identifiers or any(
+            identifier != expected_post_id for identifier in identifiers
+        ):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "单条作品详情标识与请求 URL 不一致",
+            )
+        share_url = aweme.get("share_url")
+        if share_url is not None and (
+            canonical_item_url("douyin", share_url, expected_post_id)
+            != canonical_url
+        ):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "单条作品详情地址与请求 URL 不一致",
+            )
+        if not _has_trustworthy_detail_evidence(aweme):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "单条作品详情未包含可信的公开字段",
+            )
+        raw = self._build_post_raw(canonical_url, aweme, source=source)
+        normalized = self.normalize_post(raw)
+        if (
+            str(normalized.get("post_id") or "").strip() != expected_post_id
+            or normalized.get("post_url") != canonical_url
+            or normalized.get("source_url") != canonical_url
+        ):
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "归一化作品详情与请求 URL 不一致",
+            )
+        return normalized
+
     def collect_post_detail(self, post_url: str) -> dict[str, Any]:
         """采集单条作品详情并归一化。播放数可能不公开 → views=None。"""
-        if not isinstance(post_url, str) or not post_url.strip():
+        canonical_url = canonical_item_url("douyin", post_url)
+        if canonical_url is None:
             raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL")
-        html = self._fetch(post_url)
+        expected_post_id = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+        html = self._fetch(canonical_url)
         restriction = _detect_restriction(html)
         if restriction:
             raise DouyinError(restriction, f"采集作品详情时命中访问限制: {restriction}")
 
         data = _extract_render_data(html)
-        if data is None:
-            raise DouyinError(STOP_PARSER_FAILED, "作品页可访问但无 RENDER_DATA，无法解析")
-        aweme = self._find_aweme_detail(data)
-        if not aweme:
-            raise DouyinError(
-                STOP_PARSER_FAILED, "RENDER_DATA 中未识别到单条作品结构"
+        if data:
+            detail_candidates = self._aweme_detail_candidates(data)
+            if any(
+                self._post_detail_identity_conflicts(canonical_url, candidate)
+                for candidate in detail_candidates
+            ):
+                raise DouyinError(
+                    STOP_PARSER_FAILED,
+                    "单条作品详情标识与请求 URL 不一致",
+                )
+            aweme = self._find_aweme_detail(data, expected_post_id)
+        else:
+            aweme = None
+        if aweme:
+            return self._normalize_bound_post_detail(
+                canonical_url, aweme, source="detail"
             )
-        raw = self._build_post_raw(post_url, aweme, source="detail")
-        return self.normalize_post(raw)
+        if not self.browser_fallback:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "作品页无可解析单条详情，且浏览器降级已禁用",
+            )
+        try:
+            result = self._browser_collect_detail(url=canonical_url)
+        except Exception as exc:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "抖音匿名作品详情浏览器降级失败",
+                diagnostic_code="BROWSER_DETAIL_TRANSPORT_FAILED",
+            ) from exc
+        result_restriction = getattr(result, "restriction", None)
+        diagnostic_code = getattr(result, "diagnostic_code", None)
+        if result_restriction:
+            raise DouyinError(
+                result_restriction,
+                f"浏览器详情采集中止: {result_restriction}",
+                diagnostic_code=diagnostic_code,
+            )
+        if diagnostic_code == "BROWSER_CLEANUP_FAILED":
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器详情采集完成，但资源清理失败",
+                diagnostic_code=diagnostic_code,
+            )
+        aweme_items = getattr(result, "aweme_items", None)
+        if not isinstance(aweme_items, list) or len(aweme_items) != 1:
+            raise DouyinError(
+                STOP_PARSER_FAILED,
+                "浏览器详情页未提供可绑定的公开作品数据",
+                diagnostic_code=diagnostic_code,
+            )
+        aweme = aweme_items[0]
+        return self._normalize_bound_post_detail(
+            canonical_url,
+            aweme,
+            source=_collection_source(
+                aweme.get("_collection_source")
+                if isinstance(aweme, dict)
+                else None,
+                _collection_source(getattr(result, "source", None), "network"),
+            ),
+        )
 
     # -- 评论（覆盖基类，best-effort） -------------------------------------
     def collect_comments(
         self, post_url: str, limit: int = 20
     ) -> list[dict[str, Any]]:
-        """公开评论采样（best-effort）。
-
-        抖音评论走签名接口，urllib 直连不可达；任何限制/错误一律返回 []，不绕过、
-        不报错。上层按 COMMENTS_UNAVAILABLE 行为处理（不影响任务状态）。
-        """
-        try:
-            if not isinstance(post_url, str) or not post_url.strip():
-                return []
-            html = self._fetch(post_url)
-            restriction = _detect_restriction(html)
-            if restriction:
-                return []
-            data = _extract_render_data(html)
-            if data is None:
-                return []
-            comments_raw = self._find_comments(data)
-            out: list[dict[str, Any]] = []
-            for c in (comments_raw or [])[:limit]:
-                if not isinstance(c, dict):
-                    continue
-                out.append(
-                    {
-                        "comment_id": c.get("cid") or c.get("id"),
-                        "post_url": post_url,
-                        "author": (c.get("user") or {}).get("nickname"),
-                        "text": c.get("text") or c.get("content"),
-                        "likes": _int(c.get("digg_count")),
-                        "published_at": _ts_to_iso(c.get("create_time")),
-                        "collected_at": _now_iso(),
-                    }
-                )
-            return out
-        except Exception:
-            # 任何异常（含限制）均降级为 []，不绕过、不向上抛。
-            return []
+        """公开评论采样；区分明确空结果与不可用，均不绕过保护。"""
+        canonical_url = canonical_item_url("douyin", post_url)
+        if canonical_url is None:
+            raise DouyinError(STOP_UNSUPPORTED, "无效的作品 URL")
+        html = self._fetch(canonical_url)
+        restriction = _detect_restriction(html)
+        if restriction:
+            raise DouyinError(restriction, "公开评论采样命中访问限制")
+        data = _extract_render_data(html)
+        if data is None:
+            raise DouyinError(STOP_PARSER_FAILED, "作品页无可解析公开数据")
+        comments_raw = self._find_comments(data)
+        if comments_raw is None:
+            raise DouyinError("COMMENTS_UNAVAILABLE", "作品页未提供公开评论结构")
+        for comment in comments_raw[:limit]:
+            if not isinstance(comment, dict):
+                raise DouyinError("COMMENTS_UNAVAILABLE", "公开评论结构无效")
+            comment_id = comment.get("cid") or comment.get("id")
+            user = comment.get("user")
+            text = comment.get("text") or comment.get("content")
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, (str, int))
+                or (user is not None and not isinstance(user, dict))
+                or (text is not None and not isinstance(text, str))
+            ):
+                raise DouyinError("COMMENTS_UNAVAILABLE", "公开评论结构无效")
+        out: list[dict[str, Any]] = []
+        for c in comments_raw[:limit]:
+            out.append(
+                {
+                    "comment_id": c.get("cid") or c.get("id"),
+                    "post_url": canonical_url,
+                    "author": (c.get("user") or {}).get("nickname"),
+                    "text": c.get("text") or c.get("content"),
+                    "likes": _int(c.get("digg_count")),
+                    "published_at": _ts_to_iso(c.get("create_time")),
+                    "collected_at": _now_iso(),
+                }
+            )
+        return out
 
     # ----------------------------------------------------------------------
     # 内部解析（best-effort，安全取值）
@@ -542,33 +1398,114 @@ class DouyinCollector(BaseCollector):
             return found
         return None
 
-    def _find_aweme_list(self, data: dict) -> list | None:
-        """在 RENDER_DATA 中定位作品列表数组。"""
+    def _find_aweme_list(
+        self, data: dict, expected_sec_uid: str
+    ) -> list | None:
+        """Return only a frozen SSR account-post list with exact ownership."""
+        user_root = _dig(data, "user")
+        app_user_root = _dig(data, "app", "user")
+        numbered_user_root = _dig(data, "8", "user")
         candidates = [
-            _dig(data, "user", "post", "data"),
-            _dig(data, "user", "user", "awemeList"),
-            _dig(data, "app", "user", "post", "data"),
-            _dig(data, "8", "user", "post", "data"),
+            (
+                _dig(data, "user", "post"),
+                "data",
+                (user_root, _dig(data, "user", "user")),
+            ),
+            (
+                _dig(data, "user", "user"),
+                "awemeList",
+                (),
+            ),
+            (
+                _dig(data, "app", "user", "post"),
+                "data",
+                (app_user_root, _dig(data, "app", "user", "user")),
+            ),
+            (
+                _dig(data, "8", "user", "post"),
+                "data",
+                (
+                    numbered_user_root,
+                    _dig(data, "8", "user", "user"),
+                ),
+            ),
         ]
-        for c in candidates:
-            if isinstance(c, list):
-                return c
-        found = self._search_list_of_key(data, "aweme_id")
-        return found
+        for owner, list_key, related in candidates:
+            if not isinstance(owner, dict):
+                continue
+            items = owner.get(list_key)
+            if not isinstance(items, list):
+                continue
+            binding_values = [
+                node[key]
+                for node in (owner, *related)
+                if isinstance(node, dict)
+                for key in ("sec_uid", "sec_user_id")
+                if key in node
+            ]
+            if any(
+                not isinstance(value, str) or value != expected_sec_uid
+                for value in binding_values
+            ):
+                continue
+            if items:
+                if all(
+                    isinstance(item, dict)
+                    and isinstance(item.get("author"), dict)
+                    and item["author"].get("sec_uid") == expected_sec_uid
+                    for item in items
+                ):
+                    return items
+                continue
+            if binding_values:
+                return items
+        return None
 
-    def _find_aweme_detail(self, data: dict) -> dict | None:
-        """在 RENDER_DATA 中定位单条作品结构。"""
+    @staticmethod
+    def _aweme_detail_candidates(data: dict) -> list[dict[str, Any]]:
+        """Return only detail objects from the frozen SSR detail paths."""
         candidates = [
+            _dig(data, "aweme_detail"),
+            _dig(data, "awemeDetail"),
+            _dig(data, "data", "aweme_detail"),
+            _dig(data, "data", "awemeDetail"),
             _dig(data, "aweme", "detail"),
             _dig(data, "video", "aweme"),
             _dig(data, "app", "aweme", "detail"),
         ]
-        for c in candidates:
-            if isinstance(c, dict) and c.get("aweme_id"):
-                return c
-        found = self._search_key(data, "aweme_id")
-        if isinstance(found, dict) and found.get("aweme_id"):
-            return found
+        return [candidate for candidate in candidates if isinstance(candidate, dict)]
+
+    @staticmethod
+    def _post_detail_identity_conflicts(
+        canonical_url: str,
+        aweme: dict[str, Any],
+    ) -> bool:
+        expected_post_id = canonical_url.rstrip("/").rsplit("/", 1)[-1]
+        identifiers = [
+            str(aweme[key]).strip()
+            for key in ("aweme_id", "aweme_id_str")
+            if key in aweme and aweme[key] is not None
+        ]
+        if any(identifier != expected_post_id for identifier in identifiers):
+            return True
+        share_url = aweme.get("share_url")
+        return share_url is not None and (
+            canonical_item_url("douyin", share_url, expected_post_id)
+            != canonical_url
+        )
+
+    def _find_aweme_detail(self, data: dict, expected_post_id: str) -> dict | None:
+        """在冻结的 RENDER_DATA 路径中定位与请求绑定的单条作品结构。"""
+        for candidate in self._aweme_detail_candidates(data):
+            identifiers = [
+                str(candidate[key]).strip()
+                for key in ("aweme_id", "aweme_id_str")
+                if key in candidate and candidate[key] is not None
+            ]
+            if identifiers and all(
+                identifier == expected_post_id for identifier in identifiers
+            ) and _has_trustworthy_detail_evidence(candidate):
+                return candidate
         return None
 
     def _find_comments(self, data: dict) -> list | None:
@@ -630,16 +1567,27 @@ class DouyinCollector(BaseCollector):
         unique_id = user.get("unique_id")  # 抖音号（用户自定义，可能为空）
         account_id = unique_id or sec_uid  # 优先抖音号，回退 sec_uid
         verified = DouyinCollector._extract_verified(user)
-        followers = _int(user.get("follower_count") or user.get("followers"))
-        post_count = _int(user.get("aweme_count") or user.get("aweme_counts"))
+        follower_value = user.get("follower_count")
+        if follower_value is None:
+            follower_value = user.get("followers")
+        post_count_value = user.get("aweme_count")
+        if post_count_value is None:
+            post_count_value = user.get("aweme_counts")
+        followers = _int(follower_value)
+        post_count = _int(post_count_value)
         total_likes = _int(user.get("total_favorited"))
         return {
             "platform": "douyin",
             "account_id": account_id,
             "account_name": user.get("nickname"),
-            "profile_url": url,
+            "profile_url": user.get("profile_url") or user.get("share_url") or url,
             "bio": user.get("signature"),
             "verified": verified,
+            "enterprise_verify_reason": user.get("enterprise_verify_reason"),
+            "custom_verify": user.get("custom_verify"),
+            "verification_type": user.get("verification_type"),
+            "verification": user.get("verification"),
+            "verify_info": user.get("verify_info"),
             "followers": followers,
             "post_count": post_count,
             "platform_metrics": {
@@ -656,51 +1604,80 @@ class DouyinCollector(BaseCollector):
         }
 
     @staticmethod
-    def _extract_verified(user: dict) -> bool | str:
-        """认证信息：有企业/个人认证文案 → 返回文案；否则布尔。"""
-        enterprise = user.get("enterprise_verify_reason")
-        custom = user.get("custom_verify")
-        if enterprise:
-            return enterprise
-        if custom:
-            return custom
-        v = user.get("verification") or user.get("verify_info")
-        if isinstance(v, dict):
-            vtype = v.get("type")
-            if vtype not in (None, 0, -1):
-                return True
-        return False
+    def _extract_verified(user: dict) -> bool | str | None:
+        """Return strict, shared public certification evidence."""
+        from ._douyin_browser_transport import _public_verified
+
+        return _public_verified(user)
 
     @staticmethod
     def _build_post_raw(url: str, aweme: dict, source: str) -> dict:
+        from ._douyin_browser_transport import canonical_post_url_for_item
+
         desc = aweme.get("desc") or ""
         text_extra = aweme.get("text_extra")
-        statistics = aweme.get("statistics") or {}
-        video = aweme.get("video") or {}
-        is_top = bool(aweme.get("is_top") or aweme.get("is_top_aweme"))
-        is_ad = bool(aweme.get("is_ad") or aweme.get("is_commerce"))
-        # 图文/笔记 best-effort 判定。
-        content_type = "video"
-        if aweme.get("images") and not video:
-            content_type = "image_text"
+        supplied_statistics = aweme.get("statistics")
+        statistics = supplied_statistics if isinstance(supplied_statistics, dict) else {}
+        supplied_video = aweme.get("video")
+        video = supplied_video if isinstance(supplied_video, dict) else {}
+        is_top = _public_boolean(aweme, "is_top", "is_top_aweme")
+        is_repost = _public_boolean(aweme, "is_repost", "is_forward")
+        is_ad = _public_boolean(aweme, "is_ad", "is_commerce")
+        trusted_image_text = _is_trusted_image_text(
+            aweme.get("aweme_type"), aweme.get("images")
+        )
+        content_type = "image_text" if trusted_image_text else "video"
         collection = aweme.get("mix_info") or aweme.get("collection")
         collection_name = (collection or {}).get("mix_name") if isinstance(collection, dict) else None
         single_text = (desc or "").split("\n")[0] if isinstance(desc, str) else None
-        # 抖音 duration 单位为毫秒，归一化为秒；_int 对非数字返回 None，需先判空避免 TypeError。
+        post_id = str(aweme.get("aweme_id") or aweme.get("aweme_id_str") or "")
+        post_url = canonical_post_url_for_item(aweme, post_id)
+        collection_source = _collection_source(
+            aweme.get("_collection_source"), source
+        )
+        published_at = _ts_to_iso(aweme.get("create_time"))
         duration_ms = _int(video.get("duration"))
-        duration_seconds = (duration_ms // 1000) if duration_ms is not None else None
+        duration_seconds = (
+            duration_ms // 1000
+            if duration_ms is not None and duration_ms >= 0
+            else None
+        )
+        hashtags = _extract_hashtags(desc, text_extra)
+        browser_source = collection_source in {"dom", "network", "network+dom"}
+        raw_missing_evidence = (
+            {"hashtags"}
+            if not hashtags
+            and not _text_extra_is_structurally_observed(text_extra)
+            else set()
+        )
+        p0_missing_fields = missing_detail_fields(
+            {
+                "title": single_text,
+                "published_at": published_at,
+                "duration_seconds": duration_seconds,
+                "hashtags": hashtags,
+                "content_type": content_type,
+            },
+            trusted_missing_fields=raw_missing_evidence,
+            trusted_duration_not_applicable=trusted_image_text,
+        )
+        collection_status = (
+            "PARTIAL"
+            if browser_source and p0_missing_fields
+            else "SUCCESS"
+        )
         return {
             "platform": "douyin",
-            "post_id": str(aweme.get("aweme_id") or aweme.get("aweme_id_str")),
-            "post_url": aweme.get("share_url") or url,
-            "published_at": _ts_to_iso(aweme.get("create_time")),
+            "post_id": post_id,
+            "post_url": post_url,
+            "published_at": published_at,
             "content_type": content_type,
             "title": single_text,
             "text": desc,
             "duration_seconds": duration_seconds,
-            "hashtags": _extract_hashtags(desc, text_extra),
+            "hashtags": hashtags,
             "is_pinned": is_top,
-            "is_repost": False,
+            "is_repost": is_repost,
             "is_promoted": is_ad,
             # 播放可能不公开 → None（绝不以互动数反推）。
             "views": _int(statistics.get("play_count")),
@@ -710,39 +1687,70 @@ class DouyinCollector(BaseCollector):
             "shares": _int(statistics.get("share_count")),
             "coins": None,
             "danmaku": None,
-            "collection_status": "SUCCESS",
+            "collection_status": collection_status,
             "collected_at": _now_iso(),
-            "source_url": aweme.get("share_url") or url,
+            "source_url": post_url,
+            **(
+                {"_trusted_detail_missing_fields": p0_missing_fields}
+                if p0_missing_fields
+                else {}
+            ),
+            **(
+                {"_trusted_duration_not_applicable": True}
+                if trusted_image_text
+                else {}
+            ),
             "platform_metrics": {
                 "collection_name": collection_name,
                 "aweme_type": aweme.get("aweme_type"),
+                "collection_source": collection_source,
+                **(
+                    {
+                        "missing_detail_fields": p0_missing_fields,
+                        "partial_reasons": (
+                            [MISSING_P0_DETAIL]
+                            if p0_missing_fields
+                            else []
+                        ),
+                    }
+                    if browser_source
+                    else {}
+                ),
+                "visible_is_pinned": (
+                    True
+                    if collection_source == "dom" and aweme.get("is_top") is True
+                    else None
+                    if collection_source == "dom"
+                    else is_top
+                ),
             },
         }
+
+    @staticmethod
+    def _parse_post_date(iso: Any) -> datetime | None:
+        if not isinstance(iso, str) or not iso:
+            return None
+        try:
+            parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_BEIJING)
+        return parsed
 
     @staticmethod
     def _filter_by_date(
         posts: list[dict[str, Any]],
         date_range: tuple[str | None, str | None],
     ) -> list[dict[str, Any]]:
-        """按 published_at（ISO 8601，+08:00）做 best-effort 过滤。"""
+        """Strictly intersect known publication dates with an explicit range."""
         df, dt = date_range
-
-        def parse(iso: str | None) -> datetime | None:
-            if not iso:
-                return None
-            try:
-                return datetime.fromisoformat(iso)
-            except (ValueError, TypeError):
-                return None
-
-        lo = parse(df)
-        hi = parse(dt)
+        lo = DouyinCollector._parse_post_date(df)
+        hi = DouyinCollector._parse_post_date(dt)
         out: list[dict[str, Any]] = []
         for p in posts:
-            pa = parse(p.get("published_at"))
+            pa = DouyinCollector._parse_post_date(p.get("published_at"))
             if pa is None:
-                # 无法判定时间的保留（不臆造排除）。
-                out.append(p)
                 continue
             if lo is not None and pa < lo:
                 continue

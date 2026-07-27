@@ -1,34 +1,37 @@
 ---
 name: public-social-account-analyzer
-description: 当用户提供 B站或抖音公开账号主页 URL，并要求分析账号内容策略、选题、发布节奏或公开互动表现时使用本 Skill。若微博适配器已安装并启用，也可处理微博公开账号。仅采集无需登录即可查看的公开页面数据，输出具有来源证据的账号内容分析报告。适用于生成账号分析报告、内容结构拆解、高低表现对比等需求。不得用于任意网站私有/后台数据采集、绕过验证码或登录墙，也不得用于接管或运营被分析账号。
+description: 当用户提供 B站或抖音公开账号主页 URL，并要求分析账号内容策略、选题、发布节奏或公开互动表现时使用本 Skill。若微博适配器已安装并启用，也可处理微博公开账号。匿名默认路径仅采集无需登录即可查看的公开页面；账号本人另可显式提供同次 OAuth 的抖音 access token + open_id，使用隔离的官方公开视频列表入口。输出具有来源证据的账号内容分析报告。不得用于第三方账号授权查询、任意网站私有/后台数据采集、绕过验证码或登录墙，也不得用于接管或运营被分析账号。
 ---
 
 # 公开社交媒体账号内容分析 Skill
 
 ## 用途与合规边界
 
-本 Skill 仅基于**无需登录即可查看的公开页面**采集账号资料与近期内容，完成归一化、指标计算、内容分类与策略归类，输出可复核的账号内容分析报告。
+本 Skill 的匿名默认路径仅基于**无需登录即可查看的公开页面**采集账号资料与近期内容。抖音账号本人可选择隔离的官方 OpenAPI 路径，明确提供同次 OAuth 返回的 access token + `open_id` 后，仅遍历该授权账号的公开视频。两条路径都进入相同的不可变归一化、分析与报告链路，不采后台私有指标。
 
-- **正式支持（P0）**：B站（bilibili）、抖音（douyin）
+- **正式支持（P0）**：B站（bilibili）
+- **实验性支持（P0）**：抖音（douyin，支持有界公开 `--all`、已知作品详情补全、诚实的 Web 索引 `PARTIAL`；另有仅限同次 OAuth 凭据所绑定账号的官方列表入口）
 - **条件支持（P1）**：微博（weibo，仅在适配器已实现并启用时）
 - **不支持**：小红书、视频号及任意其他平台
 
 ### 环境与兼容性
-需要 Python 3.9+ 环境，能访问目标平台公开页面。不保存密码、登录凭证或私人 Cookie；公开指纹 cookie（如 B站 buvid3/buvid4）仅在内存中临时使用，不落盘、不跨任务复用。不下载完整媒体文件。
+需要 Python 3.9+ 环境，能访问目标平台公开页面。核心 Python 运行时零额外依赖；抖音浏览器路径需要系统已有 Chrome/Chromium/Edge/Brave。不保存密码或私人 Cookie；公开指纹 cookie（如 B站 buvid3/buvid4）仅在内存中临时使用，不落盘、不跨任务复用。不下载完整媒体文件。抖音索引降级还需要 Agent 环境已有的 Web 搜索/打开连接器。授权路径只从环境读取 access token + `open_id`，token 不得进入 URL、日志或产物。
 
 ### 合规边界（任何情况下不得违反）
-1. **不登录/不接管**：不登录、不接管、不运营被分析账号。
+1. **匿名不登录/不接管**：公开路径不登录；任何路径都不接管、不运营被分析账号。官方授权入口只消费账号本人已经取得的 OAuth 凭据，不实现登录、授权码交换或 token 刷新。
 2. **不上后台指标**：不采集曝光、触达、完播率、转化率、粉丝画像、私信等私有数据。
 3. **不绕过风控**：遇到验证码、滑块、登录墙、访问频控时立即停止，绝不上爬虫逆向手段绕过。
 4. **不修改数据**：不自动发布、修改、删除内容，不自动回复评论或私信。
 5. **严禁推测**：未公开显示的字段写 `null`，禁止用 `0` 代替未知，禁止强行推测。
-6. **传输层浏览器降级**：当 IP 被封禁时仅作为传输层重试机制，绝不用于规避验证码或登录墙。
+6. **抖音实验性浏览器降级**：仅在 SSR 缺失或作品列表结构无法识别时使用；已识别的空列表直接报告 `NO_PUBLIC_CONTENT`。绝不用于规避验证码、登录墙或其他保护。
+7. **索引证据不冒充实时采集**：直连受限后可读取公开 Web 索引，但 Agent 必须核验账号、作者与作品区，离线脚本只做结构/字段一致性校验；任务标为 `PARTIAL`，不把推荐卡片、标题搜索命中、本地 `idx-*` 或账号主页冒充真实作品 ID/详情页。
+8. **授权入口不扩权**：只采同次 access token + `open_id` 经 userinfo 精确回证的账号；只有官方列表明确 `has_more=false` 才称穷尽。非数字 opaque share 只作来源，不冒充 ID 绑定作品 URL；不查询第三方账号，不采后台私有指标，token 绝不落盘。
 
 ## 核心流程
 
 1. **任务初始化**
    - 规范化参数：账号主页 URL、采集数量（默认 30，上限 100）、日期范围（可选）、分析目的（可选）、评论采样（默认关闭）。
-   - 创建任务独立目录：仓库根 `workspace/<platform>-<account>-<date>/`（从 `skill/` 目录执行下文命令时为 `../workspace/...`；如已存在则追加后缀或 ID，防止覆盖）。
+   - 创建任务独立目录：`workspace/<platform>-<account>-<date>/`（如已存在则追加后缀或 ID，防止覆盖）。
    - 设置初始状态 `task_status = CREATED`。
 
 2. **平台识别与合规检查**
@@ -38,28 +41,31 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 3. **数据采集**
    - 调用平台适配器（`scripts/collect.py`），采集账号资料与内容列表。
    - 记录 `source_url` 与 `collected_at`。置顶内容单独标记，不混入近期原创列表。
-   - **增量续采**：加 `--resume --out <既有任务目录>` 时，读取既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧），避免重复打满配额；`--since` 可显式指定续采起点。必须配合 `--out`。
+   - **增量续采**：加 `--resume --out <既有任务目录>` 时，只接受 manifest + `.complete` 核验通过且与当前平台、规范主页一致的不可变采集提交；在联网和预留输出前拒绝 legacy、跨平台、跨账号或畸形来源。以最新 `published_at` 为起点，按 `post_id`/`bvid` 去重合并（新覆盖旧）。来源目录永不修改；新结果写入 `--resume-out <新目录>`，省略时原子预留同级 `OLD-resume-<date>` 数字后缀目录。`--since` 可显式指定续采起点。
+   - **抖音公开尽力全量**：`collect.py --all` 必须设置有界条数/时间/滚动预算；账号列表候选只接受精确 HTTP 200，可选顶层 API 状态须为整数 0，作品 ID 别名及可解析官方直接作品 URL 须一致。每个候选再按 owner、原始条目和分页事实逐项审计并原子合并为一个逻辑页，末页后停止滚动并排空到无尾随 CDP 调用的静默轮询。只有账号绑定、全部候选一致与可信末页同时成立，才写 `is_exhaustive=true`。`--enrich-details` 只补列表中已有真实作品，不能发现新作品。
+   - **抖音本人授权列表**：`collect_douyin_authorized.py --all` 同时要求 `DOUYIN_OPENAPI_ACCESS_TOKEN` 与 `DOUYIN_OPENAPI_OPEN_ID`；userinfo 精确回证后才分页。真实凭据在线验收未完成，官方 userinfo 编码和 `video.list` cursor/count 参数表仍需实测确认。
    - 平台降级逻辑与数据映射详见 [references/platform-bilibili.md](references/platform-bilibili.md) / [platform-douyin.md](references/platform-douyin.md) / [platform-weibo.md](references/platform-weibo.md)。
+   - 抖音直连以既有受限原因停止且 Web 连接器可用时，按 [references/douyin-index-evidence.md](references/douyin-index-evidence.md) 由 Agent 核验公开来源/作品区，再用离线脚本校验结构与字段一致性并导入；无连接器则保留原失败结果。
 
-4. **数据归一化**
-   - 调用 `scripts/normalize.py`，去重并映射至统一结构（详见 [references/data-schema.md](references/data-schema.md)）。
-   - 输出 `normalized-posts.csv` 并生成采集质量报告。
+4. **核验采集提交并创建分析任务**
+   - 已提交采集目录是只读证据，禁止在其中运行写入型归一化、分析或渲染命令。
+   - 调用 `scripts/run_pipeline.py --input <collection> --output <new-analysis>`。流水线通过同一组 identity-bound 句柄核验 `.complete`、`manifest.json`、精确清单与摘要；所有输入读取必须报告相同的采集 commit SHA-256。
+   - 输出路径必须尚不存在。核验、归一化、分析、渲染和输出校验均在预留输出目录前完成；失败时不得创建分析目录。
 
-5. **指标计算与模型分类**
-   - 调用 `scripts/analyze.py`，使用确定性算法计算中位数/分位数分布（详见 [references/analysis-rules.md](references/analysis-rules.md)）。
+5. **内存归一化、指标计算与模型分类**
+   - 流水线从已核验的 `source/posts.jsonl` 重新生成 `normalized-posts.csv`，忽略采集快照中任何旧派生 CSV；详见 [references/data-schema.md](references/data-schema.md)。
+   - 使用确定性算法计算中位数/分位数分布（详见 [references/analysis-rules.md](references/analysis-rules.md)）。
    - **互动率四分法（分母透明、独立命名）**：`view_based_engagement_rate`（互动/播放）、`follower_based_engagement_ratio`（互动/粉丝）、`deep_approval_rate`（(投币+收藏)/播放）、`community_discussion_rate`（(评论+弹幕)/播放），均独立计算 `count/median/p25/p75/min/max/missing_rate`。
    - **IQR 散布比**：对每项可见指标额外输出 `iqr = p75-p25` 与 `dispersion_ratio = iqr/median`（`median` 为 0/`null` 时置 `null`）。
    - **季节性 / 学期检测**：输出 `monthly_distribution`、`seasonal_intensity`（月变异系数）、`break_month_share`（寒暑假月份 1/2/7/8 占比）。
    - **内联可视化**：报告含发布时间-播放量散点图、高低表现雷达图、字段覆盖率徽章、发布时段分布（24 小时）柱状图（零依赖 SVG/HTML）。
-   - **LLM 分类（默认执行）**：本 Skill 的执行者（即 LLM agent 自身）负责完成内容语义分类，**默认在每次分析中产出分类值**，不输出 `pending-model` 占位。流程为两步式底层接口（脚本本身保持确定性，不在内部调用模型）：
-     1. `python scripts/analyze.py --input <workspace> --with-llm-tax` 生成分类 Prompt 模版（`taxonomy-prompt.md`）与含占位分类的 `analysis.json`。
-     2. 执行者（LLM agent）读取 `taxonomy-prompt.md`，**自身作为标注 LLM**，按 [references/analysis-rules.md §5](references/analysis-rules.md) 的枚举与一致性规则为每条 `post_id` 产出 `topic/format/funnel_stage/hook_type/series_name/is_original/has_product_placement/analysis_labels/classification_confidence`，写成 JSON 数组文件 `taxonomy-results.json`（与 `taxonomy-prompt.md` 同目录）。**不得修改任何确定性数字**（播放/互动率/中位数/高低表现），仅填充分类槽位。
-     3. `python scripts/analyze.py --input <workspace> --llm-tax-results <workspace>/taxonomy-results.json` 回填，`apply_taxonomy` 经枚举校验后写入 `analysis.json`，`classification_version = llm-1`，`classification_status = llm-1`。
-     - 约束：当有效样本为 0、或采集受限导致无 `posts` 可标注时，可跳过本步骤并在报告中显式说明（仍输出完整空值标准化产物）。不得在无内容时臆造分类。
+   - **LLM 协同分类（可选）**：`--with-llm-tax` 生成分类 Prompt 模版（`taxonomy-prompt.md`），交给外部 LLM 打标后用 `--llm-tax-results` 回填；回填内容经枚举校验后写入 `analysis.json`，`classification_version = llm-1`。不得在无 `--llm-tax-results` 时臆造分类。
    - 标注主题、形式、钩子类型等策略维度，提取高低表现对比特征。
 
-6. **报告渲染**
-   - 调用 `scripts/render_report.py`，生成 `account-analysis-report.md`、`dashboard.html`、`analysis.json`。
+6. **报告渲染与独立提交**
+   - 流水线在内存中生成 `account-analysis-report.md`、`dashboard.html` 与 `analysis.json`；缺输入、任一章节异常、坏链接或输出校验失败均为致命错误。
+   - Markdown 与 HTML 在既有 12 个章节中同步显示平台账号字段、五类采集状态、分类生命周期、主题-形式矩阵、分类维度主指标表现、高低组结构化特征、高/低表现完整证据、`core_insights` 及评论证据状态/覆盖/账本/代表样本；待分类不与模型 `unknown`/`other` 混用，主页锚点不渲染为作品链接。
+   - 校验通过后才排他预留分析目录，create-only 写入精确白名单并创建新的 `manifest.json` / `.complete`。`.complete` 表示持久提交；`task.json.task_status` 表示业务完整性。
    - 报告中显著标记声明：“公开页面快照，不代表账号后台真实曝光和转化”。
 
 ## 平台适配器统一接口
@@ -80,15 +86,17 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - **互动率分母明确**：仅在播放数已知时使用“互动数/播放数”，仅有粉丝数时标为“粉丝基准比”，不同分母严禁混用。
 - **不跨平台打总分**：不同平台指标可见度不同，不构造统一总分。
 - **中位数优先**：聚合指标优先采用中位数与四分位数，避免极值拉偏平均数。
-- **证据 100% 覆盖**：报告中每项核心洞察必须至少附带一个具体帖子 URL 作为证据。
-- **抖音动态 JS 虚拟机渲染与降级**：当抖音页面由静态 SSR `RENDER_DATA` 切换为客户端 `_$jsvmprt` JS 虚拟机渲染时，HTTP 直连将诚信上报 `PARSER_FAILED`。此为预期风控/架构表现，可带 `--browser-fallback` 参数通过 Headless Chrome 传输层渲染；后置流水线会在 0 数据时无缝降级输出完整的空值标准化报告。
+- **证据 100% 覆盖**：报告中每项核心洞察必须有可复核证据；正常/A 级数据使用具体作品 URL，B 级搜索索引只能使用精确账号主页并明确“无单条详情链接”。
+- **评论空结果 ≠ 不可用**：只有已请求、明确空文件、所有合格父作品均返回空、无失败且无中止时才写 `empty`；文件缺失、保护中止或覆盖不完整写 `unavailable`。未请求却出现评论文件或非空账本必须在输出前失败。
+- **抖音动态 JS 虚拟机渲染与降级（实验性）**：SSR 缺失或作品列表结构无法识别时默认自动降级：使用新的临时用户目录启动可选系统浏览器，先观察公开 CDP 网络响应，再从可见作品卡片提取最小字段；不附着或复用登录状态。已识别的空列表返回 `NO_PUBLIC_CONTENT`。`SOCIAL_BROWSER_FALLBACK=0` 和 `--no-browser-fallback` 仅控制抖音浏览器降级。B站收到登录、验证、限流或访问限制等平台保护响应时立即停止当前任务，不重试、不轮换身份、不转浏览器。抖音未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外仍为 `PARSER_FAILED`。不复现签名或绕过登录、验证码、滑块、频控。
+- **抖音 Web 索引降级（实验性）**：仅在直连已经诚实停止后由 Agent 编排；优先官方精选真实作品页，其次精确主页搜索索引。Agent 核验来源/作品区，离线脚本全批校验结构与字段一致性；零 Python 第三方依赖，始终 `PARTIAL`。搜索索引不计算精确发布时段或衍生互动率，详见专门参考。
 
 ## 任务状态与停止原因
 
 `task_status`（生命周期）与 `stop_reason`（停止原因）互相隔离：
 
 - **task_status**: `CREATED` | `COLLECTING` | `NORMALIZING` | `ANALYZING` | `COMPLETED` | `PARTIAL` | `FAILED`
-- **stop_reason**: `LOGIN_REQUIRED` | `VERIFICATION_REQUIRED` | `ACCOUNT_UNAVAILABLE` | `ACCESS_RESTRICTED` | `PARSER_FAILED` | `NO_PUBLIC_CONTENT` | `UNSUPPORTED_PLATFORM` | `ADAPTER_UNAVAILABLE` | `INTERNAL_ERROR`
+- **stop_reason**: `LOGIN_REQUIRED` | `VERIFICATION_REQUIRED` | `RATE_LIMITED` | `ACCOUNT_UNAVAILABLE` | `ACCESS_RESTRICTED` | `PARSER_FAILED` | `NO_PUBLIC_CONTENT` | `OPENAPI_ERROR` | `UNSUPPORTED_PLATFORM` | `ADAPTER_UNAVAILABLE` | `INTERNAL_ERROR`
 
 详细异常处理规范见 [references/exceptions.md](references/exceptions.md)。
 
@@ -98,10 +106,8 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 
 1. `python scripts/collect.py "<url>" --limit <N> [--date-from ... --date-to ...] [--comments] [--browser-fallback] [--resume --out <dir> [--since ...]]`
 2. `python scripts/normalize.py --input <workspace_path>`
-3. `python scripts/analyze.py --input <workspace_path> --with-llm-tax`  # 生成 taxonomy-prompt.md 与含占位分类的 analysis.json
-4. **LLM 自标注（执行者默认执行）**：读取 `<workspace_path>/taxonomy-prompt.md`，由执行者自身按 [references/analysis-rules.md §5](references/analysis-rules.md) 枚举为每条 `post_id` 产出分类 JSON 数组，写入 `<workspace_path>/taxonomy-results.json`；**仅填充分类槽位，不得修改任何确定性数字**。
-5. `python scripts/analyze.py --input <workspace_path> --llm-tax-results <workspace_path>/taxonomy-results.json`  # 回填分类，`classification_status = llm-1`
-6. `python scripts/render_report.py --input <workspace_path>`
+3. `python scripts/analyze.py --input <workspace_path> [--with-llm-tax | --llm-tax-results <file>]`
+4. `python scripts/render_report.py --input <workspace_path>`
 
 - 当第 3 步产出 `valid_count == 0`（无有效样本可标注）时，跳过第 4-5 步，在报告中显式说明，仍继续第 6 步输出完整空值标准化产物。
 - 在数据有效样本少于 15 条时，标记 `INSUFFICIENT_SAMPLE`，不做完整高低表现归纳（分类仍可执行）。
@@ -114,7 +120,6 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - [ ] 核心洞察证据 URL 覆盖率达 100%
 - [ ] 附带“公开页面快照”免责声明
 - [ ] `task_status` 与 `stop_reason` 设置准确
-- [ ] `analysis.json` 的 `classification_status = llm-1`（有效样本 > 0 时）；有效样本为 0 时已在报告中显式说明跳过原因
 
 ## 参考文件索引
 
@@ -122,6 +127,7 @@ description: 当用户提供 B站或抖音公开账号主页 URL，并要求分�
 - [references/analysis-rules.md](references/analysis-rules.md) — 指标计算与分析规则
 - [references/platform-bilibili.md](references/platform-bilibili.md) — B站特定处理与接口降级
 - [references/platform-douyin.md](references/platform-douyin.md) — 抖音特定处理与风控说明
+- [references/douyin-index-evidence.md](references/douyin-index-evidence.md) — 抖音无登录 Web 索引证据降级与导入格式
 - [references/platform-weibo.md](references/platform-weibo.md) — 微博适配说明
 - [references/exceptions.md](references/exceptions.md) — 异常状态码与处理策略
 - [assets/report-template.html](assets/report-template.html) — HTML 仪表盘模版

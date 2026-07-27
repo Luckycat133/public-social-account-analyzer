@@ -7,16 +7,16 @@ import os
 import sys
 import json
 
-# pytest 由 conftest.py 注入 sys.path；此处仅为 `python tests/test_xxx.py` 独立运行保留
+import pytest
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SCRIPTS = os.path.join(_REPO_ROOT, "skill", "scripts")
-if _SCRIPTS not in sys.path:
-    sys.path.insert(0, _SCRIPTS)
+for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT, "scripts")):
+    if os.path.isdir(_d) and _d not in sys.path:
+        sys.path.insert(0, _d)
 
 from collectors.bilibili import (  # noqa: E402
     BilibiliCollector,
-    _Retryable,
-    _backoff,
+    _build_post_raw_from_medialist,
     _build_post_raw_from_vlist,
     _build_post_raw_from_view,
     enc_wbi,
@@ -138,6 +138,39 @@ def test_vlist():
     check("partition=单机游戏(typeid静态映射)", post["platform_metrics"]["partition"] == "单机游戏")
 
 
+def test_vlist_missing_boolean_evidence_stays_null():
+    item = {"bvid": "BVunknown", "title": "unknown evidence"}
+
+    post = BilibiliCollector().normalize_post(
+        _build_post_raw_from_vlist(item, "https://space.bilibili.com/1")
+    )
+
+    assert post["is_pinned"] is None
+    assert post["is_repost"] is None
+    assert post["is_promoted"] is None
+
+
+@pytest.mark.parametrize("malformed", [True, 1.9, 2.9])
+@pytest.mark.parametrize(
+    ("builder", "field", "identifier"),
+    [
+        (_build_post_raw_from_medialist, "copy_right", "bv_id"),
+        (_build_post_raw_from_vlist, "copyright", "bvid"),
+        (_build_post_raw_from_view, "copyright", "bvid"),
+    ],
+)
+def test_bilibili_builders_do_not_coerce_malformed_copyright_enums(
+    malformed, builder, field, identifier
+):
+    payload = {identifier: "BVmalformed", field: malformed}
+
+    post = BilibiliCollector().normalize_post(
+        builder(payload, "https://space.bilibili.com/1")
+    )
+
+    assert post["is_repost"] is None
+
+
 def test_view():
     raw = _build_post_raw_from_view(VIEW_DATA, "https://www.bilibili.com/video/BV1JMKx6sE6Q")
     post = BilibiliCollector().normalize_post(raw)
@@ -168,12 +201,6 @@ def test_wbi():
     check("wts 存在", "wts" in signed)
     check("web_location 参与签名(仍在参数中)", signed.get("web_location") == "333.1007")
     check("mixin 表长度 64", len(MIXIN_KEY_ENC_TAB) == 64)
-
-
-def test_transport_compatibility_reexports():
-    """拆分传输层后，既有从 bilibili 模块导入私有兼容符号的路径仍可用。"""
-    assert _Retryable.__name__ == "_Retryable"
-    assert _backoff(0) > 0
 
 
 def test_stop_reason_codes():
@@ -281,6 +308,12 @@ def test_dynamics_parse():
     # 转发卡
     fwd = _extract_dynamic_card(_mk_dyn_item("BVdyn02", is_forward=True))
     check("转发卡 is_forward=True", fwd["is_forward"] is True)
+    unknown_forward = _mk_dyn_item("BVdyn03")
+    unknown_forward.pop("orig")
+    unknown_card = _extract_dynamic_card(unknown_forward)
+    check("动态卡缺失 orig → is_forward=None", unknown_card["is_forward"] is None)
+    unknown_post = c.normalize_post(_build_dynamic_raw(unknown_card))
+    check("动态卡缺失 orig → is_repost=None", unknown_post["is_repost"] is None)
     # 非视频类（无 bvid）应被丢弃
     none_card = _extract_dynamic_card(_mk_dyn_item("", with_bvid=False))
     check("非视频动态(无bvid)→None", none_card is None)
