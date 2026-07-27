@@ -156,15 +156,15 @@ done
 
 # 3. 采集 CLI 标志对齐
 python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/collect.py --help 2>&1 \
-  | grep -oE -- "--(all|enrich-details|no-browser-fallback|resume-out|max-items)" \
+  | grep -oE -- "--(all|enrich-details|no-browser-fallback|resume-out|max-items|checkpoint-out|resume-checkpoint)" \
   | sort -u
-# 应输出全部 5 个 → 部署版与 dev 版 CLI 一致
+# 应输出全部 7 个 → 部署版与 dev 版 CLI 一致
 
 # 4. 分析 CLI 标志对齐
 python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/run_pipeline.py --help 2>&1 \
-  | grep -oE -- "--(with-llm-tax|classification-results|with-business-insights|business-insight-results)" \
+  | grep -oE -- "--(with-llm-tax|classification-results|with-business-insights|business-insight-results|with-comment-insights|comment-insight-results)" \
   | sort -u
-# 应输出全部 4 个；taxonomy → business insights 的两阶段入口缺一不可
+# 应输出全部 6 个；taxonomy、business insights 与 comment insights 三阶段入口缺一不可
 
 # 5. 完整测试回归
 cd /Users/jack/Documents/public-social-account-analyzer

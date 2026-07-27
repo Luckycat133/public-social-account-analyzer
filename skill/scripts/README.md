@@ -40,8 +40,7 @@
 | 模块 | 职责 |
 |---|---|
 | `base.py` | 统一采集器接口。 |
-| `bilibili.py` | B站业务编排与原始字段构建；为兼容性 re-export B站传输层公共符号。 |
-| `collectors/bilibili.py` | B站采集与 HTTP/WBI 传输的单一实现；平台保护响应立即停止。 |
+| `bilibili.py` | B站采集、业务编排、原始字段构建与 HTTP/WBI 传输的单一实现；为兼容性 re-export 公共传输符号；平台保护响应立即停止。 |
 | `douyin.py` | 抖音公开页面与内嵌数据解析，以及可选浏览器传输降级。 |
 | `weibo.py` | 环境变量显式启用的微博公开 AJAX 适配器。 |
 | `browser_backend.py` | 仅用于传输降级的 headless 浏览器后端。 |
