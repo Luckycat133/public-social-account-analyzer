@@ -19,6 +19,7 @@
 | `bilibili-2026-07-27-subagent-end-to-end.md` | B站 4 个 subagent 端到端验证（默认 30 / 日期×数量 / 拒识 / 两阶段 JSON 回填）。 | 🟢 VALID；含 Bug 1（双约束披露）+ Bug 2（拒识内联平台清单）修复实证。 |
 | `douyin-browser-fallback-acceptance.md` / `douyin-sandbox-index-acceptance.md` | 抖音降级 / 索引降级的在线验收记录。 | 当前实现参考，结论以相应验收日期为准。 |
 | `douyin-2026-07-27-subagent-boundary-exploration.md` | 抖音 4 条独立路径（公开限量 / `--all` / OpenAPI fake-token / Web 索引导入）的边界探索。 | 🟢 VALID；含 Bug 3（search-card `post_url=null` 纪律）修复实证 + 全 gitignored 范围 token 泄漏审计。 |
+| `bilibili-2026-07-27-performance-baseline.md` | PRD §15 PARTIAL 路径性能基线（946974 + 546195 端到端 wall-clock）。 | 🟢 VALID；946974 42.3s / 546195 6.2s，均占 10 分钟预算 < 1%。**不**覆盖正向穷尽路径（需"未风控"账号样本）。 |
 
 > 历史文件 `bilibili-collection-gap-analysis.md`、`bilibili-subagent-traces.md`、`t2-running-path-analysis.md` 已于 2026-07-27 文档整理中移除（时效标记分别为 🟡SUPERSEDED / 🔴STALE / 🟡SUPERSEDED，结论已并入本目录保留文档或当前实现/测试）。
 
