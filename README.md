@@ -54,8 +54,6 @@ public-social-account-analyzer/             # 项目根目录
     ├── scripts/                           # Python 执行脚本 (collect/normalize/analyze/render)
     │   ├── README.md                       # 脚本入口、模块边界与依赖说明
     │   └── collectors/                    # 平台适配器 (bilibili / douyin / weibo + 共享层)
-    ├── scripts/                           # Python 执行脚本（采集、不可变分析流水线）
-    │   └── collectors/                    # 平台适配器 (bilibili / douyin / weibo)
     ├── references/                        # 领域数据模型与分析规则规范
     ├── assets/                            # HTML 仪表盘模版 (report-template.html)
     └── evals/                             # 评估与验收
@@ -70,8 +68,6 @@ public-social-account-analyzer/             # 项目根目录
 
 | 平台 | 成熟度 | 适配器路径 | 核心能力 |
 |:---|:---|:---|:---|
-| **B站 (Bilibili)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/bilibili.py` + `_bilibili_transport.py` | 三级接口降级链、WBI 签名、置顶/合集标识、传输层降级重试 |
-| **抖音 (Douyin)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/douyin.py` | SSR `RENDER_DATA` 解析、公开指标提取、风控模式识别 |
 | **B站 (Bilibili)** | 🟢 P0 (MVP 默认) | `skill/scripts/collectors/bilibili.py` | 三级接口降级链、WBI 签名、置顶/合集标识、任务级平台保护断路器 |
 | **抖音 (Douyin)** | 🟡 P0（实验性支持） | `skill/scripts/collectors/douyin.py` | 限量或有界 `--all` 公开采集、已知作品详情补全、临时浏览器 CDP；另有仅限同次 OAuth 凭据所绑定账号的官方 OpenAPI 全量入口与非穷尽 Web 索引证据 |
 | **微博 (Weibo)** | 🟡 P1 (条件支持) | `skill/scripts/collectors/weibo.py` | 需显式启用适配器；未启用时返回 `ADAPTER_UNAVAILABLE` |
@@ -83,6 +79,12 @@ public-social-account-analyzer/             # 项目根目录
 ## 需求实现状态
 
 PRD 的 FR-001～FR-015、AC-01～AC-10 逐项证据、未完成验收和“所有视频”可达边界见 [需求实现状态与抖音能力边界](docs/需求实现状态与抖音能力边界.md)。当前不能保证任意第三方抖音账号的全部历史作品：公开路径受页面可见性和平台保护约束，官方全量路径只适用于账号本人授权。
+
+### 验收辅助制品
+
+- PRD AC-03 / AC-06 人工验收工具：[`tests/manual_accuracy_check.py`](tests/manual_accuracy_check.py) — `prepare` 只生成绑定两份不可变提交的空白抽查表；必须由人工打开公开页面填写外部真值，再由 `verify` 分别核算字段准确率（阈值 ≥95%）和核心洞察证据覆盖。源数据与 CSV 的一致性只算流水线完整性，不能替代人工真值。
+- PRD AC-10 运营人员试用反馈结构化模板：[`docs/operations-trial-template.md`](docs/operations-trial-template.md) — 10 章节覆盖任务输入、产物清单、数据真实性核查、可用性评分、阻碍清单与提交归档流程；填写后 commit 到 `docs/operations-trial-records/` 即可计入 AC-10 验收。
+- dev → 部署打包与 drift 检测清单：[`docs/deployment-package-checklist.md`](docs/deployment-package-checklist.md) — 列出必须随部署版打包的 4 类内容、4 个部署位置、4 步 drift 检测与发布流程；新发布前必跑。
 
 ---
 
@@ -127,49 +129,50 @@ pip install -e ".[dev]"
 
 ## 快速上手
 
-系统通过确定性流水线完成账号分析；在有有效样本时，Agent Skill 流程默认再执行一轮分类标注：
-系统先提交只读采集快照，再把所有派生结果提交到另一个不可变分析工作区：
+系统先提交只读采集快照，再从同一个 collection 创建互不修改的分析提交。仅需确定性指标时，一次 `run_pipeline.py` 即可；需要内容策略时，执行 taxonomy 与 business-insight 两阶段模型协作：
 
 ```bash
 # 步骤 1：采集公开账号数据（以 B站 为例）
 python skill/scripts/collect.py "https://space.bilibili.com/123456" \
   --limit 30 --out workspace/bilibili-123456-collection
 
-# 步骤 2：数据归一化
-python skill/scripts/normalize.py --input workspace/bilibili-123456-20260724
+# 步骤 2：先生成 taxonomy prompt；脚本不自行调用模型
+python skill/scripts/run_pipeline.py \
+  --input workspace/bilibili-123456-collection \
+  --output workspace/bilibili-123456-taxonomy-draft \
+  --with-llm-tax
 
-# 步骤 3：计算确定性指标，并生成分类 Prompt（CLI 不会自行调用 LLM）
-python skill/scripts/analyze.py --input workspace/bilibili-123456-20260724 --platform bilibili --with-llm-tax
+# 步骤 3：Agent 在所有已提交目录外填写 taxonomy-results.json。
 
-# 步骤 4：由执行 Agent 读取 taxonomy-prompt.md，按分类规则写 taxonomy-results.json
-# 仅填分类槽位，不修改确定性数值；这一步由 Agent 执行，不是脚本自动调用 LLM。
+# 步骤 4：绑定分类原始字节，生成业务洞察 prompt
+python skill/scripts/run_pipeline.py \
+  --input workspace/bilibili-123456-collection \
+  --output workspace/bilibili-123456-business-draft \
+  --classification-results /path/to/taxonomy-results.json \
+  --with-business-insights
 
-# 步骤 5：回填 Agent 产出的分类结果
-python skill/scripts/analyze.py --input workspace/bilibili-123456-20260724 --llm-tax-results workspace/bilibili-123456-20260724/taxonomy-results.json
+# 步骤 5：Agent 在所有已提交目录外填写 business-insight-results.json。
 
-# 步骤 6：生成报告与 HTML 仪表盘
-python skill/scripts/render_report.py --input workspace/bilibili-123456-20260724
-# 步骤 2：核验采集提交，在新目录中完成归一化、分析与渲染
+# 步骤 6：从同一个 collection 创建最终分析提交
+python skill/scripts/run_pipeline.py \
+  --input workspace/bilibili-123456-collection \
+  --output workspace/bilibili-123456-final \
+  --classification-results /path/to/taxonomy-results.json \
+  --with-business-insights \
+  --business-insight-results /path/to/business-insight-results.json
+```
+
+只需要确定性指标与报告时可使用：
+
+```bash
 python skill/scripts/run_pipeline.py \
   --input workspace/bilibili-123456-collection \
   --output workspace/bilibili-123456-analysis
 ```
 
-如需把语义分类也纳入完整性判定，可提供覆盖每个有效作品且通过严格枚举/类型校验的 JSON：
+完整分类通过后，分析会确定性生成主题×形式全矩阵、主题/形式主指标覆盖与中位数，以及高低组结构化特征。严格业务洞察结果另包含账号定位五维、6 个高低表现文案模式、10 个选题、5 个内容模式和 4 个实验；模型只能提交源字段摘录，脚本从冻结父作品补齐并校验 URL、采集时间、分组和摘要绑定。公开样本无法观察真实视频开头/结构时必须降级为 `PARTIAL_BUSINESS_INSIGHTS`，不得从标题或文案猜测视频内容。
 
-```bash
-python skill/scripts/run_pipeline.py \
-  --input workspace/bilibili-123456-collection \
-  --output workspace/bilibili-123456-analysis-classified \
-  --classification-results /path/to/classification-results.json
-```
-
-完整分类通过后，分析会确定性生成主题×形式全矩阵、主题/形式主指标覆盖与中位数，以及高低组的结构化特征对比。它只使用已校验分类字段、栏目、公开标志、话题和固定时长桶，不从标题或正文猜测开头结构、因果关系或策略优劣。
-
-Agent Skill 收到“内容策略、选题分布、高低表现共同点”等目标时，会把分类作为最终交付前置：
-先从同一 collection 创建带 `taxonomy-prompt.md` 的 draft，由 Agent 在已提交目录外生成完整
-分类 JSON，再创建封存 `source/classification-results.json` 的 final。无法完成全部分类时保持
-`pending-model/PARTIAL`，不会把 draft 冒充完整共同点分析。
+Agent Skill 收到“内容策略、选题分布、高低表现共同点”等目标时，会把分类与业务洞察都作为最终交付前置。final 必须同时为 `classification_status=completed`、`business_insight_status=completed`，并在 manifest 中封存两份模型输入原始字节；否则保持 `PARTIAL`，不会把 draft 冒充完整策略分析。
 
 抖音公开账号的有界尽力全量与详情补全：
 
@@ -228,12 +231,14 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 - `source/collection-task.json` — 原采集任务的逐字节副本
 - `source/collection-provenance.json` — 来源格式、来源任务 ID、采集提交 SHA-256 与清单摘要
 - `source/classification-results.json` — 可选；已严格核验并按原字节封存的完整语义分类输入
+- `source/business-insight-results.json` — 可选；绑定 collection digest 与分类原始字节摘要、经严格校验后按原字节封存的业务洞察输入
+- `taxonomy-prompt.md` / `business-insights-prompt.md` — 可选 draft 提示；只在对应模型结果尚待填写时生成
 - `source/comments.jsonl` — 可选；从同一采集提交逐字节复制的评论证据
 - `normalized-posts.csv` / `normalized-coverage.json` — 从 `source/posts.jsonl` 重新生成的归一化结果
 - `account-analysis-report.md` — 完整 Markdown 账号分析报告（含分类覆盖与矩阵、分类维度表现、高低组结构化特征、完整证据与核心洞察来源）
 - `dashboard.html` — 与 Markdown 同口径的可视化 HTML 仪表盘
-- `analysis.json` — 机器可读的统计指标、分类生命周期/矩阵、结构化高低特征与确定性评论分析 JSON
-- `task.json` / `pipeline-report.md` — 派生任务状态与各阶段结果
+- `analysis.json` — 机器可读的统计指标、分类生命周期/矩阵、结构化高低特征、严格业务洞察与确定性评论分析 JSON
+- `task.json` / `pipeline-report.md` — 派生任务状态、各阶段结果，以及 `started_at`、`ended_at`、`duration_ms`、`phase_durations_ms`
 - `manifest.json` / `.complete` — 分析产物的独立、create-only 提交
 
 分析工作区的 `.complete` 只表示上述文件已持久提交；业务完整性由 `task.json.task_status`
@@ -249,7 +254,7 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 pytest tests/
 ```
 
-当前包含 128 项单元测试，覆盖适配器解析、浏览器降级接线、日期时间计算、去重与增量续采、指标统计、归一化、报告渲染、微博适配器及数据集划分。
+测试覆盖适配器解析、浏览器降级接线、日期时间计算、去重与增量续采、指标统计、归一化、报告渲染、不可变工作区、业务洞察、外部人工真值验收、微博适配器及数据集划分。用例数以当前 `pytest` 结果为准，不在文档中固化。
 
 ---
 

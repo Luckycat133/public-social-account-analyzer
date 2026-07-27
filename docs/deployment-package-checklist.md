@@ -1,0 +1,199 @@
+# Dev → 部署打包清单
+
+> 防止 dev 版本与部署版本 drift。本清单回答：
+> "我刚改了 dev `skill/`，需要把哪些内容打包/同步到部署位置（如 `~/.agents/skills/public-social-account-analyzer`、`.workbuddy/skills/public-social-account-analyzer`）才不会出现 3 天 drift？"
+
+---
+
+## 1. 必须随 dev 版本一并打包的内容
+
+> 如果你的部署是软链接到 dev `skill/`，则下表全部自动跟随；本节只在你需要做独立打包/分发时阅读。
+
+### 1.1 脚本层（运行时必需）
+
+```
+skill/
+├── SKILL.md                           # Agent 入口指令
+├── scripts/
+│   ├── collect.py                     # 采集入口
+│   ├── normalize.py                   # 归一化
+│   ├── analyze.py                     # 指标 + 分类槽位
+│   ├── render_report.py               # 报告渲染
+│   ├── run_pipeline.py                # 一体化流水线（创建独立分析工作区）
+│   ├── collect_douyin_authorized.py   # 抖音官方 OpenAPI 路径
+│   ├── import_index_snapshot.py       # Web 索引证据导入
+│   ├── split_dataset.py               # 数据集分层随机划分
+│   ├── csv_contract.py                # CSV 字段契约
+│   ├── execution_timing.py            # 结构化起止时间与分阶段耗时
+│   ├── immutable_workspace.py         # 不可变工作区协议
+│   ├── task_contract.py               # task_status / stop_reason 枚举
+│   └── collectors/                    # 平台适配器子包
+│       ├── __init__.py
+│       ├── base.py
+│       ├── bilibili.py
+│       ├── douyin.py
+│       ├── douyin_openapi.py
+│       ├── weibo.py
+│       ├── browser_backend.py
+│       ├── _douyin_browser_transport.py
+│       ├── _douyin_detail_contract.py
+│       ├── _constants.py
+│       ├── _utils.py
+│       └── url_policy.py
+├── references/                        # 平台规范与决策表
+│   ├── data-schema.md
+│   ├── analysis-rules.md
+│   ├── exceptions.md
+│   ├── platform-bilibili.md
+│   ├── platform-douyin.md
+│   ├── platform-weibo.md
+│   └── douyin-index-evidence.md
+└── assets/
+    └── report-template.html
+```
+
+### 1.2 自动化测试（验收必需）
+
+```
+tests/
+├── conftest.py
+├── test_*.py                          # 完整自动化回归；数量以发布日志为准
+└── manual_accuracy_check.py           # AC-03 / AC-06 外部人工真值验收
+```
+
+部署包**必须**含 `tests/`。否则 AC-09（≥15 个自动化测试）无法在部署端验证。
+
+### 1.3 评估与数据集（验收支撑）
+
+```
+skill/evals/
+├── cases.md
+├── evals.json
+└── datasets/
+    ├── README.md
+    ├── USAGE.md
+    ├── config.example.json
+    ├── source/
+    ├── test_data/
+    ├── validation_data/
+    └── manifest.json
+```
+
+### 1.4 文档（用户与 AI 必需）
+
+```
+docs/
+├── STRUCTURE.md
+├── 公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx
+├── 需求实现状态与抖音能力边界.md
+├── operations-trial-template.md        # AC-10 模板
+└── deployment-package-checklist.md     # 本文件
+```
+
+---
+
+## 2. 已知部署位置与同步策略
+
+| 路径 | 类型 | 同步策略 | 优先级 |
+|---|---|---|---|
+| `/Users/jack/.agents/skills/public-social-account-analyzer` | 软链接 | 应指向 dev `skill/`，零拷贝 | P0 |
+| `/Users/jack/.claude/skills/public-social-account-analyzer` | 软链接 | 应指向 `/Users/jack/.agents/skills/public-social-account-analyzer` | P0 |
+| `/Users/jack/.workbuddy/skills/public-social-account-analyzer` | 真实目录快照 | 历史快照，仅在显式打包时更新；推荐改软链接 | P1 |
+| `/Users/jack/.trae-cn/worktrees/public-social-account-analyzer` | 工作树 | 由 Trae IDE 管理 | P2 |
+
+### 2.1 推荐做法
+
+```bash
+# 项目级入口软链接（一次性）
+ln -sfn /Users/jack/Documents/public-social-account-analyzer/skill \
+        /Users/jack/.agents/skills/public-social-account-analyzer
+
+# Claude 标准发现路径
+ln -sfn /Users/jack/.agents/skills/public-social-account-analyzer \
+        /Users/jack/.claude/skills/public-social-account-analyzer
+```
+
+验证：
+
+```bash
+readlink /Users/jack/.claude/skills/public-social-account-analyzer
+# → /Users/jack/.agents/skills/public-social-account-analyzer
+python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/collect.py --help | head -5
+```
+
+---
+
+## 3. drift 检测
+
+部署包每次发布前跑一次：
+
+```bash
+# 1. 路径链完整性
+for p in \
+  /Users/jack/.claude/skills/public-social-account-analyzer \
+  /Users/jack/.agents/skills/public-social-account-analyzer \
+  /Users/jack/.workbuddy/skills/public-social-account-analyzer ; do
+    if [ -L "$p" ]; then
+      echo "SOFTLINK: $p -> $(readlink "$p")"
+    else
+      echo "REAL DIR: $p ($(find "$p" -maxdepth 2 -name 'SKILL.md' | head -1))"
+    fi
+done
+
+# 2. 关键模块存在性
+for f in skill/scripts/run_pipeline.py skill/scripts/execution_timing.py \
+         tests/conftest.py tests/manual_accuracy_check.py \
+         skill/references/douyin-index-evidence.md skill/evals/evals.json ; do
+  if [ -e "/Users/jack/Documents/public-social-account-analyzer/$f" ]; then
+    echo "OK  : $f"
+  else
+    echo "MISS: $f"
+  fi
+done
+
+# 3. 采集 CLI 标志对齐
+python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/collect.py --help 2>&1 \
+  | grep -oE -- "--(all|enrich-details|no-browser-fallback|resume-out|max-items)" \
+  | sort -u
+# 应输出全部 5 个 → 部署版与 dev 版 CLI 一致
+
+# 4. 分析 CLI 标志对齐
+python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/run_pipeline.py --help 2>&1 \
+  | grep -oE -- "--(with-llm-tax|classification-results|with-business-insights|business-insight-results)" \
+  | sort -u
+# 应输出全部 4 个；taxonomy → business insights 的两阶段入口缺一不可
+
+# 5. 完整测试回归
+cd /Users/jack/Documents/public-social-account-analyzer
+python3 -m pytest tests/ -q --tb=no 2>&1 | tail -3
+# 必须 0 failed；用例数和耗时记录到当次发布日志，不在文档中写死
+```
+
+drift 任意一条失败 → 阻塞发布。
+
+---
+
+## 4. 版本发布流程（建议）
+
+1. dev 版本打 tag：`git tag v1.x.y`
+2. 在 dev `skill/SKILL.md` 顶部 frontmatter 注明版本（如项目采用该字段）
+3. 用第 3 节的 drift 检测全绿
+4. 更新 `CHANGELOG.md`（Keep a Changelog 1.1.0）
+5. 仅当选择"独立打包"时，打包 §1 列出的全部内容为 `public-social-account-analyzer-v1.x.y.zip`
+6. 否则保持软链接，本节不适用
+
+---
+
+## 5. 历史教训
+
+- 2026-07-24 部署版与 2026-07-27 dev 版的实际差异：3 天
+- 缺 `tests/`、缺 `run_pipeline.py`、缺 `collect_douyin_authorized.py`、缺 `csv_contract.py`、缺 `immutable_workspace.py`、缺 `import_index_snapshot.py`、缺 `task_contract.py`
+- 缺 `references/douyin-index-evidence.md`、缺 `evals/`
+- 后果：AC-09 无法在部署版直接验证；AC-05 跨平台归一化有 31 列 vs 31 列（实际少了 provenance 字段）；CLI 缺少 `--all` 等关键标志
+- 修复：见 §2.1 的两条软链接命令
+
+---
+
+## 6. 维护说明
+
+本文件随发布流程变更同步修订。任何新增模块都应加入 §1.1。

@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added standardized `source`, `validation_data`, and held-out `test_data` documentation, a path configuration example, and an operational data usage guide.
 - Added evaluation dataset tests covering schema contracts, duplicate IDs, partition leakage, source coverage, manifest counts, and local file modes.
 - Added script-layer and historical-observation indexes that document entry-point contracts, module boundaries, and evidence freshness.
+- Added PRD AC-03 / AC-06 外部人工真值工具 `tests/manual_accuracy_check.py`：绑定采集与分析提交、确定性抽样，分别输出逐字段准确率、流水线自洽性和具体作品证据覆盖；自动 source→CSV 对照不再冒充人工真值。
+- Added PRD AC-10 运营人员试用反馈模板 `docs/operations-trial-template.md`，记录两份不可变提交、两阶段模型产物、外部真值、证据逐项核验、结构化耗时，以及反馈驱动修改的合并闭环。
+- Added dev → 部署打包与 drift 检测清单 `docs/deployment-package-checklist.md`，覆盖运行脚本、人工验收工具、两阶段 CLI 标志和不写死用例数的完整回归。
+- Added a strict taxonomy → business-insight workflow with digest-bound model inputs, five account-positioning claims, six public-copy performance patterns, ten topic ideas, five reusable content modes, and four falsifiable experiments.
+- Added timezone-aware start/end timestamps, monotonic total duration, and fixed phase timings to collection and analysis task artifacts.
 
 ### Changed
 - Strategy/commonality requests in the Agent Skill now use a two-stage taxonomy workflow and only treat the classified, manifest-sealed analysis as final.
@@ -22,7 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kept comment sampling explicitly best-effort only; comment persistence and comment-insight conclusions remain unimplemented rather than being claimed by evaluation data.
 - Clarified LLM taxonomy behavior: the Agent Skill flow assigns classification to the executing agent when valid samples exist, while `analyze.py` only exposes optional prompt-generation and result-backfill interfaces and never calls an LLM itself.
 
-### Security
 - Established a local permission baseline of `0750` for dataset directories and `0640` for dataset files, with deployment guidance because Git does not preserve full Unix modes.
 - Added deterministic high/low evidence coverage and structured core insights whose evidence rows map exactly to selected records.
 - Added `run_pipeline.py`, which verifies a committed collection through one identity-bound reader and publishes normalization, analysis, provenance, Markdown, and HTML as a separate create-only immutable workspace.
@@ -37,7 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added deterministic classification breakdowns after complete taxonomy input: a full topic-by-format count matrix, topic/format main-metric coverage and medians, plus high/low-group structured feature comparisons for taxonomy fields, series, public flags, hashtags, and fixed duration buckets. The output remains descriptive and never invents title/opening semantics, causality, or significance.
 - Added a PRD implementation and acceptance matrix that separates implemented contracts, conditional online capabilities, outstanding human acceptance, and the limits of anonymous third-party Douyin history collection.
 
-### Changed
 - Public Douyin exhaustive coverage now accepts account-list candidates only on exact HTTP 200 and rejects any supplied top-level API status other than integer zero. It atomically audits each candidate's frozen owners, every raw item, post-ID aliases, parseable official direct-post URL (including its optional trailing slash), cursor aliases, and pagination facts before committing one logical page. Empty, whitespace, control-character, duplicate, or malformed response account bindings remain ambiguous and block exhaustiveness; only a valid non-target identifier is explicitly foreign. Consistent duplicate owners update page/cursor/terminal once; malformed, mixed, or identity-conflicting entries preserve only other validated posts as partial evidence. A terminal page stops scrolling and drains through a final quiet poll with no trailing CDP command, so events queued during response-body, DOM, or text calls cannot be missed. HTTP/API errors, ambiguous bindings, unresolved/load-failed/invalid bodies, unknown schemas, author failures, or conflicting pagination facts keep `is_exhaustive=false`.
 - Douyin profile collection now fails closed on conflicting API/SSR account bindings and merges only same-account API, SSR, network, cached, and visible-header evidence. Certification parsing shares a strict finite tri-state domain, accepts text only from explicit certification fields or a bound DOM badge, and prevents later partial snapshots from erasing public IDs, exact zero metrics, or stronger evidence. Restricted pages retain their original stop reason while allowing one profile-header-only read, never a post-card scan; account ID, verification, and total-likes visibility distinguish public, fallback, and unknown evidence.
 - Known Douyin item enrichment can fall back once from missing public SSR detail to a bounded temporary-browser detail snapshot. The fallback accepts only the requested canonical `/video/<id>` or `/note/<id>`, rejects recommendation/list pollution and identity conflicts, preserves explicit access restrictions, and never scrolls, clicks, retries, signs requests, or discovers new posts.
@@ -59,6 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cadence analysis no longer fabricates a weekly average when all publication dates are unknown, and date-only evidence is excluded from hour-of-day and exact-hour interval claims.
 
 ### Fixed
+
+- Closed manual-acceptance bypasses involving blank or mistyped truth values, `visible + null`, missing/duplicate post or insight IDs, profile-only links, plain-text/comment URLs, mismatched canonical item URLs, inapplicable platform fields, and analysis workspaces not bound to the reviewed collection.
+- Restricted-page diagnostics now persist only a fixed `restriction_source` / `restriction_marker` pair and reject raw visible page text.
 
 - Web-index imports now preserve and enforce explicit date windows before limiting results; unknown-date search cards cannot enter bounded rankings, and derived task metadata retains the requested window.
 - Web-index imports can overlay newer public profile fields only from a sealed, same-account anonymous collection commit, with digest-bound provenance and null-preserving field merges. Authorized-owner data is rejected, and freshness must be provably later than the observation/date-precision baseline.

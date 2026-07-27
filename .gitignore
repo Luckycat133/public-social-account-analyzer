@@ -11,7 +11,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-  venv/
+venv/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -19,13 +19,19 @@ htmlcov/
 # --- 本地环境与密钥 ---
 .env
 .env.*
+!.env.example
 
 # --- WorkBuddy / Superpowers Agent 本地会话与上下文数据 ---
 .workbuddy/
 .superpowers/
 
+# --- 本地 Agent Skill 入口（通过软链接指向 skill/，不入库） ---
+.agents/skills/
+.claude/skills/
+
 # --- 评估运行产物（evals 定义入库，运行结果不入库） ---
 evals/files/output/
+skill/evals/files/output/
 *-workspace/
 
 # --- macOS / 编辑器 ---

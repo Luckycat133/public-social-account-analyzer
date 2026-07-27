@@ -42,7 +42,6 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 - `--out PATH`：指定输出目录路径。默认自动生成为仓库根 `workspace/<platform>-<account>-<date>/`（从仓库根执行命令）。
 - `--all`：仅用于抖音公开主页；在有界临时浏览器会话中尽量观察到可信列表末页，不能与显式 `--limit` 联用。
 - `--max-items / --max-seconds / --max-scrolls`：公开 `--all` 的安全预算。默认 `10000 / 1800 / 2000`，硬上限 `50000 / 14400 / 20000`；只能与 `--all` 联用。
-- `--out PATH`：指定输出目录路径。默认自动生成为 `workspace/<platform>-<account>-<date>/`。
 - `--analysis-goal STRING`：可选分析目的，最多 500 字符且不允许控制字符。
 - `--comments`：开启评论采样（默认关闭）。
 - `--enrich-details`：仅用于抖音；对列表中已有真实作品 URL 补充缺失的公开详情。不会据此发现新作品，单条失败只记详情状态。
@@ -53,7 +52,9 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 - `--browser-fallback`：显式启用抖音浏览器降级。抖音默认已启用：SSR 缺失或作品列表结构无法识别时，按 CDP 网络响应观察、可见 DOM 卡片的顺序尝试；已识别的空列表返回 `NO_PUBLIC_CONTENT`。B站不使用该降级处理平台保护响应。
 - `--no-browser-fallback`：最高优先级地禁止抖音启动系统浏览器，只使用 HTTP/SSR 快速路径。B站遇到登录、验证、限流或访问限制时始终立即停止。
 
-抖音浏览器降级是实验性能力，不代表任何账号均可采集成功。它只读取无需登录可见的公开页面：每次运行创建并在退出时删除临时用户目录，不附着或复用本机 Chrome 的登录状态、Cookie 或用户配置。系统不会复现签名、绕过登录/验证码/滑块，或尝试规避频控；遇到这些限制会如实停止。公开 `--all` 见到可信末页后停止滚动，并处理网络事件到一个无尾随 CDP 调用的静默轮询。账号列表候选须为精确 HTTP 200，顶层 `status_code` / `error_code` 若存在须为整数 0；owner、原始条目与分页事实先逐项验证并原子合并成一个逻辑页，`aweme_id` / `aweme_id_str` 及可解析官方直接作品 URL 必须指向同一作品。只有全部候选一致且可信列表明确给出末页时才可标记穷尽。HTTP/API 错误、歧义绑定、候选加载、JSON、结构、坏条目或分页冲突和其他停止条件均为非穷尽。
+抖音浏览器降级是实验性能力，不代表任何账号均可采集成功。它只读取无需登录可见的公开页面：每次运行创建并在退出时删除临时用户目录，不附着或复用本机 Chrome 的登录状态、Cookie 或用户配置。系统不会复现签名、绕过登录/验证码/滑块，或尝试规避频控；遇到这些限制会如实停止。可见限制页只写安全枚举 `restriction_source=browser_visible_text` 与固定 `restriction_marker`，页面登录提示原文不落盘。公开 `--all` 见到可信末页后停止滚动，并处理网络事件到一个无尾随 CDP 调用的静默轮询。账号列表候选须为精确 HTTP 200，顶层 `status_code` / `error_code` 若存在须为整数 0；owner、原始条目与分页事实先逐项验证并原子合并成一个逻辑页，`aweme_id` / `aweme_id_str` 及可解析官方直接作品 URL 必须指向同一作品。只有全部候选一致且可信列表明确给出末页时才可标记穷尽。HTTP/API 错误、歧义绑定、候选加载、JSON、结构、坏条目或分页冲突和其他停止条件均为非穷尽。
+
+采集 `task.json` 记录带时区的 `started_at` / `ended_at`、`duration_ms`，以及访问检查、列表、资料、可选详情和持久化的 `phase_durations_ms`。失败任务同样记录这些字段。
 
 ---
 
@@ -67,7 +68,8 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 python skill/scripts/run_pipeline.py \
   --input <COLLECTION_WORKSPACE> \
   --output <NEW_ANALYSIS_WORKSPACE> \
-  [--with-llm-tax] [--classification-results <JSON_FILE>]
+  [--with-llm-tax] [--classification-results <JSON_FILE>] \
+  [--with-business-insights] [--business-insight-results <JSON_FILE>]
 ```
 
 #### 必备参数：
@@ -81,10 +83,13 @@ python skill/scripts/run_pipeline.py \
 - `--classification-results PATH`：读取严格 JSON 数组。每个有效父作品必须且只能出现一次，
   `post_id` 必须匹配分析样本，分类枚举、布尔值、标签数组和 0–1 置信度均须合法。校验成功后
   原始字节写入 `source/classification-results.json`；路径本身不会写入产物。
+- `--with-business-insights`：要求第二阶段业务洞察；未提供结果时生成 `business-insights-prompt.md` 并保持 `PARTIAL`。
+- `--business-insight-results PATH`：读取严格 JSON 对象。结果必须绑定 collection commit 与 taxonomy 原始字节 SHA-256，并具有固定 5 项定位、6 项高低表现公开文案模式、10 个选题、5 个内容模式和 4 个实验。校验成功后原始字节写入 `source/business-insight-results.json`。
 
 前五个阶段（采集核验、归一化、分析、渲染、输出验证）失败时不会创建输出路径。预留之后
 发生序列化或提交失败时可保留无有效 `.complete` 的目录，但流水线不会删除、覆盖或发布它。
 分类文件缺失、JSON 非法、记录不完整、父作品不匹配或枚举越界同样在预留前失败。
+分析 `task.json` 记录总耗时与 `collection_input`、`normalization`、`analysis`、`render`、`validation` 分阶段耗时；`pipeline-report.md` 同步记录总耗时。
 
 ### 3. Legacy 分阶段脚本
 
@@ -227,12 +232,35 @@ python skill/scripts/run_pipeline.py \
 `analysis=PARTIAL`；索引证据等上游受限输入也会保持 `PARTIAL`。`.complete` 表示持久提交，
 不等同于业务数据完备。
 
-当用户要求内容策略、高低表现共同点或分类分布，并且存在有效样本时，Agent Skill 不把上述
-`pending-model` draft 当作最终交付。先运行 `run_pipeline.py --with-llm-tax` 创建 draft，
-由 Agent 按 `taxonomy-prompt.md` 在提交目录外生成覆盖全部父作品的分类 JSON，再从同一个
-collection 运行 `run_pipeline.py --classification-results ...` 创建 final。只有 final 的
-`classification_status=completed` 且 manifest 封存 `source/classification-results.json`，
-才可声称共同点分析完成。
+当用户要求内容策略、高低表现共同点或分类分布，并且存在有效样本时，Agent Skill 不把任何
+`pending-model` draft 当作最终交付：
+
+1. `--with-llm-tax` 创建 taxonomy draft；Agent 在提交目录外生成覆盖全部父作品的分类 JSON。
+2. 从同一个 collection 传 `--classification-results ... --with-business-insights` 创建 business draft；Agent 根据绑定分类摘要的 prompt 在目录外生成业务洞察 JSON。
+3. 从同一个 collection 同时传两份结果创建 final。只有 `classification_status=completed`、`business_insight_status=completed` 且 manifest 封存两份原始结果，才可声称完整策略分析完成。
+
+业务证据只能引用 prompt 中的父 `post_id`、源字段和精确摘录；URL、指标、排名与采集时间由脚本补齐。标题模式只引用标题；公开文案“开头”限前 120 字；没有公开字幕/转写时不得把文案结构说成真实视频结构，不可观察项会使 final 变为 `PARTIAL_BUSINESS_INSIGHTS`。
+
+### AC-03 / AC-06 外部人工真值
+
+自动的 source → normalized 对照只能说明流水线自洽，不能替代 PRD 的人工准确率。对业务完整的 final 运行：
+
+```bash
+python3 tests/manual_accuracy_check.py prepare \
+  --collection workspace/<collection> \
+  --analysis workspace/<final-analysis> \
+  --out /path/outside/workspaces/external-truth.json \
+  --sample 10
+
+# 人工逐个打开表内主页/作品 URL，填写 reviewer、observed_at、字段外部真值和洞察证据判断后：
+python3 tests/manual_accuracy_check.py verify \
+  --collection workspace/<collection> \
+  --analysis workspace/<final-analysis> \
+  --truth /path/outside/workspaces/external-truth.json \
+  --json
+```
+
+工具会核验两个不可变提交、精确来源清单、任务状态、证据覆盖和外部真值绑定；按平台排除不适用指标，分别输出总体、scope 与逐字段准确率。空表、少于 10 条、少于 3 项核心洞察、普通文本 URL、HTML 注释链接、重复洞察 ID 或 `post_id=null` 均不能得到通过结论。
 
 ### 示例 3：抖音公开 `--all` 与详情补全
 
