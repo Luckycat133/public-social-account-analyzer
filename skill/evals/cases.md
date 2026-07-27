@@ -3,15 +3,15 @@
 本文件是 **public-social-account-analyzer** 的**完整验收规范（acceptance spec）**。
 它分三层：
 
-1. **MVP 验收标准 + 12 条端到端用例摘要**（见 `evals/evals.json` 机器可读子集）。
-2. **单元测试（§单元测试）**：17 条确定性、可自动化、离线的单元用例，对应脚本
+1. **MVP 验收标准 + 行为/合同用例摘要**（见 `evals/evals.json` 机器可读子集）。
+2. **离线合同用例（§单元测试）**：确定性、可自动化的用例，对应脚本
    `scripts/normalize.py` 与 `scripts/analyze.py` 的纯函数，以及 `scripts/collectors/*.py`
-   的路由/降级行为。每条均给出 **输入** 与 **预期**，可直接映射为 pytest 用例
-   （见 `tests/`）。
+   的路由、分页、授权与降级行为。每条均给出 **输入** 与 **预期**，作为 `tests/`
+   中 pytest 回归的合同来源；本文件本身不替代测试运行日志。
 3. **端到端验收（§B站端到端 / §抖音端到端）**：每平台必须完成的真实账号抽查，
-   并保存可复测证据。
+   并保存可复测证据。历史探测、当前离线合同与尚待完成的在线/人工验收必须分开记录。
 
-> 机器可读的 12 条端到端用例子集位于 `evals/evals.json`（prompt + expected_output +
+> 机器可读的行为与合同用例子集位于 `evals/evals.json`（prompt + expected_output +
 > assertions）。**不要覆盖 `evals.json`**——本文件只描述与扩展验收规范，二者互补。
 
 ---
@@ -32,12 +32,13 @@
 ## 测试对象要求
 
 - 每个平台选择一个品牌/机构账号和一个个人创作者账号
-- 测试账号必须公开可访问，不使用测试人员私人登录态
+- 匿名公开路径的测试账号必须公开可访问，不使用测试人员私人登录态；账号本人 OpenAPI
+  是隔离的授权验收，只接受测试账号所有者明确提供的同次 OAuth 凭据
 - 保存测试日期、账号 URL、样本数量和当时页面可见字段，便于复测
 
-## 自动化评估用例（12 条摘要）
+## 自动化评估用例（机器可读摘要）
 
-端到端行为评估用例见 [evals.json](evals.json)，共 12 个用例，覆盖：
+行为与合同评估用例见 [evals.json](evals.json)，当前覆盖：
 
 | ID | 用例 | 验证点 |
 |----|------|--------|
@@ -53,15 +54,17 @@
 | 10 | 拒绝虚假完成 | 无采集不出报告 |
 | 11 | 抖音无登录沙箱索引降级 | Agent 来源核验 + 脚本字段一致性校验、PARTIAL、本地键披露、不伪造链接 |
 | 12 | 分类矩阵与结构化高低特征 | 完整分类门、全矩阵、透明实测分母、固定字段/时长桶、双格式转义 |
+| 13 | 抖音公开 `--all` 穷尽合同 | 账号/作者绑定 + 可信末页唯一全量条件；预算与平台保护保持非穷尽 |
+| 14 | 抖音本人授权 OpenAPI 合同 | 同次双凭据回证、防泄漏、拒绝第三方、官方末页唯一全量条件 |
 
 ---
 
 # 单元测试
 
-> 以下 17 条用例为 **确定性、离线、可自动化** 的单元测试，覆盖 `scripts/normalize.py`、
-> `scripts/analyze.py` 的纯函数与 `scripts/collectors/*.py` 的路由/降级逻辑。
-> 每条用例给出「输入（Input）」与「预期（Expected）」，已落地为 `tests/` 下的 pytest
-> 用例并全部通过（见报告 `.workbuddy/sdd/task-13-report.md`）。
+> 以下用例是 **确定性、离线、可自动化** 的合同，覆盖 `scripts/normalize.py`、
+> `scripts/analyze.py` 的纯函数与 `scripts/collectors/*.py` 的路由、分页、授权和降级逻辑。
+> 每条用例给出「输入（Input）」与「预期（Expected）」。实际通过状态以当前分支的 pytest
+> 验证日志为准，不引用仓库外或不存在的报告文件。
 
 ### CASE-001 null 与 0
 
@@ -209,19 +212,74 @@
   - JSON、Markdown、HTML 展示同一组计数/中位数/rate delta，所有外部字符串均转义；旧版
     JSON 缺少新键时仍可渲染，不生成虚假占位内容。
 
+### CASE-018 抖音公开 `--all` 账号绑定与穷尽合同
+
+- **输入**：离线构造三类公开主页分页轨迹：目标主页、每页作品作者与可信列表末页均绑定；
+  已保留作品但仅因 `max_items` / 超时停止；零作品前出现登录墙。另构造缺作者、异作者、
+  混合作者、推荐流和无作品列表所有权的 `has_more=false`；以及末页先完成、较早目标账号
+  列表候选的响应头在末页后才出现，或候选仍未决、歧义绑定、加载失败、JSON 非法的乱序
+  轨迹；再构造非 200/缺失/非法 HTTP 状态、顶层 API 错误状态、空白/控制字符账号绑定、同一候选根/data owner 的
+  `has_more` 或有效游标冲突、单 owner 游标别名冲突、有效作品与稀疏/非对象/非法 ID 条目
+  混排、`aweme_id` / `aweme_id_str` 冲突、带或不带尾斜杠的官方直接作品 URL 异 ID，以及多个一致 owner。
+- **预期**：
+  - 只有账号主页身份、每页作品作者、可信作品列表对象明确末页和全部目标账号候选形成一致观测同时成立时，才写
+    `terminal_page_observed=true`、`is_exhaustive=true`、`stop_condition=terminal_page`；
+  - 数量、时间、滚动、空闲、重复页/游标或日期边界停止均非穷尽；有作品为 `PARTIAL`，
+    零作品为 `FAILED`；
+  - 登录、验证、频控或访问限制立即触发任务级断路，不绕过；有作品时保留为 `PARTIAL`，
+    零作品时为 `FAILED`，并记录准确 `stop_reason`；
+  - 未绑定、异作者、混合作者、推荐流和非列表对象不能贡献作品，其末页信号也不能证明全量；
+  - 每个候选先验证精确 HTTP 200、可选顶层 API 整数零状态，再逐项验证 frozen owner、
+    原始条目身份和游标别名；作品 ID 别名及可解析官方直接 URL 必须一致。之后合并成一个逻辑页；一致的
+    多 owner 只提交一次页数/游标/terminal，任一坏项使分页事实失败但保留可验证作品；
+  - 末页后停止滚动并继续处理到一次静默轮询；任何响应体、DOM 或正文 CDP 调用都会使旧
+    静默证明失效，最终空轮询后不得再发 CDP 命令；响应头晚到但可验证的较早候选仍须接纳；
+    HTTP/API 错误、仍未决、歧义绑定、`loadingFailed`、JSON/owner/原始条目校验失败或候选内分页事实冲突时，即使
+    `terminal_page_observed=true` 也必须保持 `is_exhaustive=false`。
+
+### CASE-019 抖音账号本人 OpenAPI 身份、保密与末页合同
+
+- **输入**：通过注入传输离线构造：userinfo 精确回证同次 OAuth `open_id` 且 `--all` 到达
+  `has_more=false`；userinfo 返回异账号；`--all` 取得一页作品后分别发生游标不前进/连续
+  零新增与 API/响应错误；普通 `--limit` 达到请求数但未见末页；请求用当前凭据查询第三方账号。
+- **预期**：
+  - access token 与 `open_id` 仅从环境读取；先在固定 HTTPS userinfo 端点提交两项凭据并要求
+    `data.open_id` 逐字一致，身份未回证时不得请求 `video.list`；
+  - `video.list` 只处理该凭据所有者，token 只在 `access-token` 请求头出现；第三方 `open_id`
+    查询或身份替换请求必须拒绝；
+  - token 不得进入 URL、命令行、shell 历史、日志、异常、诊断或产物；回证后的 `open_id`
+    可作为授权账号身份保存；
+  - 只有官方列表明确 `has_more=false` 才能声明穷尽。身份错误在列表前写
+    `FAILED / OPENAPI_ERROR`；
+  - `--all` 的游标不前进或连续零新增属于保护性解析停止：已有作品写
+    `PARTIAL / PARSER_FAILED`，零作品写 `FAILED / PARSER_FAILED`，覆盖保持非穷尽并保留
+    `repeated_cursor` / `repeated_zero_new_page`；
+  - 抛出的 API/响应错误使用 `OPENAPI_ERROR`：已有作品为 `PARTIAL`，零作品为 `FAILED`，覆盖
+    `stop_condition=api_error` 且非穷尽；
+  - 普通授权 `--limit` 达到请求数时业务任务可为 `COMPLETED`，但
+    `terminal_page_observed=false`、`is_exhaustive=false`、`stop_condition=limit`，不得表述为
+    全部作品；
+  - userinfo 编码差异与 `video.list` 的 `cursor` / `count` 在线兼容性必须由同次真实 OAuth
+    凭据验收；注入响应的离线合同不能替代在线可用性证明。
+
 ---
 
 # B站端到端
 
 > 每类账号完成一次真实公开采集（无需登录态），并**保存复测证据**：测试日期、
 > 账号主页 URL、成功采集的样本数量、当时页面可见字段清单。
+> 当前交付使用两个独立不可变提交：采集工作区保存原始证据、任务与质量报告；分析工作区在
+> 核验采集 manifest + `.complete` 后重新归一化、分析和渲染，并记录采集提交摘要。旧式在同一
+> 目录原地追加分析产物只属于历史流程，不能作为当前验收证据。
 
 ## 品牌 / 机构账号
 
 - **目标**：验证机构/媒体/企业号公开字段（粉丝、视频数、播放、点赞、投币、弹幕）映射正确。
-- **复测证据**：`workspace/bilibili-<account>-<date>/` 下 `source/profile.json`、
-  `source/posts.jsonl`、`normalized-posts.csv`、`analysis.json`；记录采集日期、
-  `profile_url`、实际 `collected`/`valid` 数量、各指标 `field_visibility`。
+- **复测证据**：采集工作区保存 `source/profile.json`、`source/posts.jsonl`、`task.json`、
+  `collection-report.md` 与自身 manifest/`.complete`；独立分析工作区保存重新生成的
+  `normalized-posts.csv`、`analysis.json`、Markdown/HTML 报告、采集来源摘要与自身
+  manifest/`.complete`。记录采集日期、`profile_url`、实际 `collected`/`valid` 数量及各指标
+  `field_visibility`。
 - **重点断言**：置顶/转载标记正确；不可见字段为 `null`；默认 30 条（或页面可得上限）。
 
 ## 个人创作者账号
@@ -234,18 +292,53 @@
 
 # 抖音端到端
 
+> 历史无登录真实页探测与当前合同状态必须分开。已记录的两个抖音账号曾在临时无登录浏览器
+> 中停于 `LOGIN_REQUIRED`，没有取得可供 AC-01/02/03 通过的作品样本；详见
+> [抖音浏览器降级在线验收记录](../../docs/observations/douyin-browser-fallback-acceptance.md)。
+> 这些记录证明安全停止，不证明匿名列表当前可用。当前实现的分页、绑定、断路与 OpenAPI
+> 身份合同由离线回归覆盖；公开账号正式端到端与账号本人授权在线验收仍须另行完成。
+>
+> 抖音同样使用两个独立不可变提交。采集工作区保存原始公开/OpenAPI 响应映射后的白名单证据、
+> 任务、覆盖账本和质量报告；`run_pipeline.py` 核验该提交后写入新的分析工作区。两个目录各自
+> 具有 manifest + `.complete`，分析提交不能回写或替换采集提交。
+
 ## 品牌 / 机构账号
 
 - **目标**：验证抖音品牌号公开视频字段（播放、点赞、评论、收藏、分享）映射正确。
-- **复测证据**：`workspace/douyin-<account>-<date>/` 下四件套；记录采集日期、
-  `profile_url`、样本数、可见字段（抖音公开页是否展示播放/收藏）。
-- **重点断言**：置顶标记；登录/验证码出现时如实停止（PARTIAL + stop_reason）。
+- **复测证据**：采集工作区中的 profile/posts/task/质量报告/覆盖账本与提交清单，加上独立分析
+  工作区中的 CSV、JSON、Markdown、HTML、采集提交摘要与提交清单；记录采集日期、
+  `profile_url`、样本数和当时公开可见字段。
+- **重点断言**：置顶三态；登录/验证码出现时如实停止并保持非穷尽——已有作品为 `PARTIAL`，
+  零作品为 `FAILED`，两者都记录准确 `stop_reason`。
 
 ## 个人创作者账号
 
 - **目标**：验证个人创作者公开内容的可达性与字段覆盖。
-- **复测证据**：同上。
+- **复测证据**：同上；历史 0 条阻断记录只用于验证安全停止，不能计为正式内容字段抽查。
 - **重点断言**：有效样本 < 15 时高低表现标记 `INSUFFICIENT_SAMPLE`；不补造结论。
+
+## 公开主页 `--all` 合同验收
+
+- **离线合同**：使用受控响应验证主页 `sec_uid`、每页作者和列表所有权绑定；只有可信作品列表
+  明确 `has_more=false` 才允许 `is_exhaustive=true`。对应机器可读 eval 13 与 CASE-018。
+- **非穷尽停止**：`max_items`、超时、滚动/空闲预算、重复页/游标、日期边界和平台保护均不能
+  宣称全量；有作品保留 `PARTIAL`，零作品为 `FAILED`。
+- **在线验收**：仍需在无需登录且页面正常公开可访问时，对机构号和个人创作者号各完成一次
+  可复现采集、30 条字段抽查和可信末页验证。当前历史登录墙记录不满足该门槛。
+
+## 账号本人授权 OpenAPI 合同验收
+
+- **离线合同**：同次 OAuth 的 access token + `open_id` 必须先由 userinfo 精确回证；之后
+  `video.list` 只查询该凭据所有者，第三方 ID 请求拒绝。只有官方 `has_more=false` 才允许
+  `is_exhaustive=true`；令牌不进入 URL、命令行、日志、异常或产物。对应机器可读 eval 14 与
+  CASE-019。
+- **部分失败**：身份不一致在列表调用前 `FAILED / OPENAPI_ERROR`；`--all` 的游标不前进或连续
+  零新增在已有作品时为非穷尽 `PARTIAL / PARSER_FAILED`，真正的 API/响应错误才是
+  `PARTIAL / OPENAPI_ERROR`。普通 `--limit` 达到请求数可业务 `COMPLETED`，但覆盖仍非穷尽。
+  三类结果都不得把离线 fixture 或达到数量称为全量证明。
+- **在线验收**：尚需账号所有者提供具备 `video.list` 权限、来自同次 OAuth 的真实 token +
+  `open_id`，验证 userinfo 当前编码、`cursor` / `count`、末页、真实 share URL 与全程防泄漏。
+  未完成前只能表述为“离线合同已实现，在线授权待验收”。
 
 ## 无登录沙箱索引降级
 
@@ -269,5 +362,7 @@
 - 每次页面结构变化后，优先复用 `tests/` 离线单元用例（不依赖网络、秒级回归）。
 - 端到端用例的「复测证据」用于人工/脚本抽查字段准确率（目标 ≥ 95%），并在页面改版后
   快速定位映射失效。
-- `evals/evals.json` 持有机器可读的 12 条端到端子集，本规范与其保持一致、互为补充，
+- `evals/evals.json` 持有机器可读的行为与合同子集，本规范与其保持一致、互为补充，
   **不被本文件覆盖**。
+- 历史验收记录须写明日期、被测提交、命令、停止原因和产物可得性；当前发布结论只引用仍可
+  复核的仓库内记录或交付时验证日志，不用历史成功数替代当前在线/人工门槛。

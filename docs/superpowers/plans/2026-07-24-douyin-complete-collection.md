@@ -1,10 +1,12 @@
 # Douyin Complete Collection Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Historical plan:** checkboxes were not backfilled during implementation. Current verified status and remaining online/human acceptance are tracked in [`docs/需求实现状态与抖音能力边界.md`](../../需求实现状态与抖音能力边界.md) and [`TODO.md`](../../../TODO.md); unchecked boxes below are not evidence that shipped code is absent.
 
 **Goal:** Add an honest best-effort all-public-post mode, an official OAuth-authorized full-history mode, and close the collection-integrity/documentation gaps identified against the PRD.
 
-**Architecture:** Public accounts continue through SSR and an isolated no-login browser that passively observes page-owned pagination; a coverage ledger distinguishes an explicit terminal page from every partial stop. A separate standard-library OpenAPI command handles only the token owner's authorized account and follows official cursors. Shared workspace artifacts record coverage, per-item enrichment and persisted comment outcomes without ever storing credentials.
+**Architecture:** Public accounts continue through SSR and an isolated no-login browser that passively observes page-owned pagination; a coverage ledger distinguishes an explicit terminal page from every partial stop. A separate standard-library OpenAPI command handles only the account identified by the access token and `open_id` returned by the same OAuth authorization, then follows official cursors. Shared workspace artifacts record the verified account identity, coverage, per-item enrichment and persisted comment outcomes without ever storing the access token.
 
 **Tech Stack:** Python 3.9+ standard library, Chrome DevTools Protocol through the repository browser backend, pytest as a development-only dependency, Markdown.
 
@@ -15,7 +17,7 @@
 - Public `is_exhaustive=true` is allowed only after a verified post-list payload explicitly reports `has_more=false`.
 - Authorized `is_exhaustive=true` is allowed only after the official `/video/list/` response reports `has_more=false`.
 - Idle, timeout, date cutoff, requested limit, max items, max scrolls, repeated page/cursor, index evidence, login, verification and access restriction are never exhaustive.
-- OAuth credentials are read only from `DOUYIN_OPENAPI_ACCESS_TOKEN`; token values must never appear in URLs, files, stdout/stderr, exceptions or diagnostics.
+- OAuth inputs are read only from `DOUYIN_OPENAPI_ACCESS_TOKEN` and `DOUYIN_OPENAPI_OPEN_ID`. The access token must never appear in URLs, files, stdout/stderr, exceptions or diagnostics; the verified `open_id` is intentionally persisted as the authorized account identity.
 - Unknown public fields remain `null`; invalid/missing platform post IDs never produce an account-profile URL as item evidence.
 - Every production behavior change follows RED -> GREEN -> REFACTOR and records exact test evidence.
 - Work only in `/Users/jack/Documents/public-social-account-analyzer/.worktrees/douyin-browser-fallback`; preserve the unrelated deletion in the main checkout.
@@ -64,7 +66,7 @@ Keep normal limited collection behavior compatible. In exhaustive mode continue 
 
 - [ ] **Step 4: Add failing CLI/workspace coverage tests**
 
-Tests must prove: `--all` rejects non-Douyin URLs; positive budget validation; explicit terminal page produces `is_exhaustive=true`; idle/timeout/repeat/max budget with partial posts produces `task_status=PARTIAL`; standard `--limit 30` remains compatible.
+Tests must prove: `--all` rejects non-Douyin URLs; positive budget validation; an explicit terminal page produces `is_exhaustive=true` only after every possible target-account list candidate has exact HTTP 200, no nonzero or malformed supplied top-level API status, and yields one account-, schema-, raw-item-identity-, and pagination-consistent logical page. Post-ID aliases and any parseable official direct-post URL must agree. Terminal stops scrolling but polls to a quiet boundary, including candidates whose response header arrives afterward and events queued during CDP body/DOM/text commands; the final quiet poll has no trailing CDP command. Non-success/malformed HTTP or API status, unresolved bodies, `loadingFailed`, ambiguous bindings, invalid JSON, unknown schemas, invalid/mixed/conflicting raw items, invalid cursor aliases, and conflicting owner-level `has_more`/cursor facts remain non-exhaustive; consistent duplicate owners commit page/cursor/terminal only once; idle/timeout/repeat/max budget with partial posts produces `task_status=PARTIAL`; standard `--limit 30` remains compatible.
 
 - [ ] **Step 5: Implement `collect_all_post_list` and workspace reporting**
 
@@ -86,14 +88,14 @@ Run the focused tests, then `python3 -m pytest -q`. Commit as `feat(douyin): add
 
 **Interfaces:**
 
-- `DouyinOpenAPIClient(access_token, transport=None)` calls fixed-host official endpoints only.
-- `collect_profile()` calls `POST https://open.douyin.com/oauth/userinfo/`.
+- `DouyinOpenAPIClient(access_token, open_id, transport=None)` calls fixed-host official endpoints only.
+- `collect_profile()` submits form-encoded `access_token` + `open_id` to `POST https://open.douyin.com/oauth/userinfo/`, requires integer `err_no == 0`, and binds the response to the exact input `open_id`.
 - `collect_video_pages(limit=None, page_size=20)` calls `GET https://open.douyin.com/video/list/` using `cursor`/`count`, returning normalized items plus a coverage ledger.
-- CLI reads only `DOUYIN_OPENAPI_ACCESS_TOKEN` and writes the existing workspace artifact contract.
+- CLI reads both `DOUYIN_OPENAPI_ACCESS_TOKEN` and `DOUYIN_OPENAPI_OPEN_ID` and writes the existing workspace artifact contract.
 
 - [ ] **Step 1: Write failing transport, mapping and secrecy tests**
 
-Use an injected fake transport with two pages: cursor `0 -> 20`, second page `has_more=false`, and a duplicate video across pages. Assert stable order, ID deduplication, mapped title/time/pinned/type/metrics/official share URL, `is_exhaustive=true`, and no token substring in any requested URL, serialized artifact, captured stdout/stderr or exception.
+Use an injected fake transport with a matching userinfo response and two pages: cursor `0 -> 20`, second page `has_more=false`, and a duplicate video across pages. Assert exact `open_id` binding and persistence as `account_id`, stable order, ID deduplication, mapped title/time/pinned/type/metrics/official share URL, `is_exhaustive=true`, and no access-token substring in any requested URL, serialized artifact, captured stdout/stderr or exception. Add foreign/missing identity responses that fail before any video-list request.
 
 - [ ] **Step 2: Verify RED**
 
@@ -101,7 +103,7 @@ Run `python3 -m pytest tests/test_douyin_openapi.py -q`; expected failure is mis
 
 - [ ] **Step 3: Implement the minimal fixed-host client and mapper**
 
-Use `urllib.request`; token is an `access-token` header. Validate top-level and data-level error codes, list type, boolean/integer `has_more`, cursor progress, non-empty numeric `video_id`, and Douyin-owned HTTPS share URLs. Strip query/fragment before persistence.
+Use `urllib.request`; userinfo receives a form body containing both credentials, while the video list receives JSON Content-Type and the token only in an `access-token` header. Validate the exact user identity, top-level error contracts, list type, boolean/integer `has_more`, cursor progress and non-empty numeric `video_id`. Accept an ID-bound direct or numeric share item URL as `post_url`; keep only a nonnumeric official opaque iesdouyin share path as `source_url`, and reject account/root/numeric-mismatch paths. Strip query/fragment before persistence.
 
 - [ ] **Step 4: Implement partial-stop and workspace tests**
 
@@ -109,7 +111,7 @@ Cover missing token, API error before page one, API error after one page, repeat
 
 - [ ] **Step 5: Implement the CLI and partial-result contract**
 
-Only the token owner returned by `/oauth/userinfo/` is collected. `--all` requires terminal `has_more=false` for `COMPLETED`; partial API failures preserve acquired items. Do not implement OAuth login, token exchange, token refresh or third-party account lookup.
+Only the account proven by the exact access-token + `open_id` pair through `/oauth/userinfo/` is collected. `--all` requires terminal `has_more=false` for `COMPLETED`; partial API failures preserve acquired items. Do not implement OAuth login, token exchange, token refresh or third-party account lookup.
 
 - [ ] **Step 6: Run focused/full tests and commit**
 
@@ -172,7 +174,7 @@ Write UTF-8 JSONL atomically enough for the existing workspace model; run focuse
 - Modify: `skill/evals/evals.json`
 - Modify: `docs/observations/douyin-browser-fallback-acceptance.md`
 - Modify: `docs/observations/douyin-sandbox-index-acceptance.md`
-- Create: `docs/抖音需求实现状态.md`
+- Create: `docs/需求实现状态与抖音能力边界.md`
 - Test: relevant documentation/eval tests
 
 - [ ] **Step 1: Write failing documentation-contract tests**
@@ -181,7 +183,7 @@ Assert that public best-effort, authorized full-history, terminal-page semantics
 
 - [ ] **Step 2: Update human and Skill documentation**
 
-Follow Standard Readme and Keep a Changelog. Explain that arbitrary public accounts cannot be guaranteed full history, official OAuth applies only to the token owner, index evidence is never exhaustive, and no-login `--all` is a bounded best-effort traversal.
+Follow Standard Readme and Keep a Changelog. Explain that arbitrary public accounts cannot be guaranteed full history, official OAuth applies only to the account proven by the same authorization's token + `open_id`, index evidence is never exhaustive, and no-login `--all` is a bounded best-effort traversal.
 
 - [ ] **Step 3: Refresh real-account evidence**
 
@@ -189,7 +191,7 @@ Record the 2026-07-24 current probes for 中国政府网 and 大漠叔叔: both 
 
 - [ ] **Step 4: Publish a PRD coverage matrix**
 
-`docs/抖音需求实现状态.md` must map PRD account fields, post fields, metrics, special handling, comments and AC-01/02/03/06/08/10 to `done`, `partial`, `authorized-only`, or `not-yet-live-verified`, with file/test evidence and no inflated claims.
+`docs/需求实现状态与抖音能力边界.md` must map PRD account fields, post fields, metrics, special handling, comments and AC-01/02/03/06/08/10 to `done`, `partial`, `authorized-only`, or `not-yet-live-verified`, with file/test evidence and no inflated claims.
 
 - [ ] **Step 5: Final validation and commit**
 

@@ -11,6 +11,11 @@
 > `PARSER_FAILED` / `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `ACCESS_RESTRICTED`，
 > 而非缺陷。
 
+本文件主体描述匿名公开适配器。账号本人提供同次 OAuth access token + `open_id` 时，可使用
+隔离的 `collect_douyin_authorized.py` 官方列表入口；其身份回证、末页、opaque share 与令牌
+边界见 [data-schema.md §3.2/§5](data-schema.md) 和 [exceptions.md §2.1](exceptions.md)。该入口
+不是匿名降级，也不能按第三方账号查询。
+
 ## 支持的账号主页
 
 适配器 `supports(url)` 仅对**账号主页**返回 `True`。支持以下形式：
@@ -166,17 +171,28 @@
      任一显式账号绑定冲突都以 `PARSER_FAILED` 关闭，不用请求参数覆盖响应身份，也不以
      旧缓存掩盖冲突。浏览器缓存按证据强度合并并重新净化，后到的档案片段不会清除已
      确认的抖音号、获赞数（包括 0）或更强认证证据。
-  7. 主页网络作品列表以规范主页路径中的 `sec_uid` 为预期账号。非空列表只有在每一条
-     可识别作品的冻结路径 `author.sec_uid` 都明确且精确等于预期账号时才整页接纳；缺失、
-     外账号或混合作者的整条列表观测都会忽略，不能过滤作品后继续沿用同页的 `has_more`
-     或游标。账号分页响应 pathname 当前只接受冻结的
+  7. 主页网络作品列表以规范主页路径中的 `sec_uid` 为预期账号。候选响应必须具有精确数值
+     HTTP 200；顶层 `status_code` / `error_code` 若存在，必须是整数 0。非空列表要求每一条原始项
+     都是可映射、数字 ID 且冻结路径 `author.sec_uid` 精确等于预期账号；所有非空
+     `aweme_id` / `aweme_id_str` 必须指向同一数字 ID，可解析的官方 `share_url` 直接作品路径
+     也必须绑定该 ID。稀疏、非对象、非法或冲突 ID/URL、缺作者、外账号或混合作者都会使整个候选丧失分页/末页证明，已验证作品仅可保留为
+     部分证据，不能过滤坏项后继续沿用同页的 `has_more` 或游标。账号分页响应 pathname 当前只接受冻结的
      `/aweme/v1/web/aweme/post/`，JSON 只读取根对象或根 `data` 对象直接拥有的冻结作品列表
      键；推荐、搜索、详情响应，以及 recommendation sibling 或任意深层同名键都不贡献
      作品和分页事实。空列表必须由同一列表容器上的 `sec_uid` / `sec_user_id`，或该冻结
-     响应 URL 中唯一、严格解码且精确匹配的同名参数证明归属；缺失、重复、冲突、非法编码
+     响应 URL 中唯一、严格解码且精确匹配的同名参数证明归属；缺失、空白、控制字符、重复、冲突、非法编码
      和无关响应都不能证明空页。只有通过这些检查的观测才影响网络作品、页数、游标、
-     terminal 与 `is_exhaustive`；响应 query 仅用于会话内判断，诊断仍只保留去 query 的
-     安全路径。DOM 降级只读取可见 `[data-e2e="user-post-item"]` 根内的可见作品链接，且
+     terminal 与 `is_exhaustive`。即使较晚响应已给出可信末页，只要任一可能属于目标账号的
+     列表候选仍未读取、HTTP/API 状态失败、绑定重复/非法而有歧义、加载失败、JSON 解析失败，或合法 JSON 无法
+     通过列表结构与作者绑定校验形成分页观测，就只能保留末页已观察事实并将
+     `is_exhaustive` 置为 `false`。每个 frozen owner 内 `max_cursor` / `cursor` / `min_cursor`
+     只接受非负整数或非空有界字符串且必须一致；根/data 等多个有效 owner 先合并成一个
+     逻辑页，只向全局页数、游标和 terminal 原子提交一次。官方直接作品 URL 的可选尾斜杠
+     不得绕过作品 ID 一致性校验。owner 间分页事实冲突时，其中已
+     验证作品只作为部分证据。末页后停止滚动，但继续消费 CDP 事件直到一次静默轮询或预算
+     到期；DOM、正文或响应体 CDP 调用都会使旧静默证明失效，最终空轮询后不再调用 CDP。
+     响应
+     query 仅用于会话内判断，诊断仍只保留去 query 的安全路径及失败/未决候选计数。DOM 降级只读取可见 `[data-e2e="user-post-item"]` 根内的可见作品链接，且
      同一次快照必须带有与规范请求精确匹配的 `profile.sec_uid`；旧 list-only 快照、缺失或
      外账号 profile 均不接纳卡片，DOM 空卡片也不能证明 terminal / 穷尽。
   8. `collect_post_detail` 对**已经由作品列表或调用方提供的规范作品 URL**支持独立匿名

@@ -83,6 +83,12 @@
   `application/x-www-form-urlencoded` 请求体中的 `access_token` 与 `open_id`；响应顶层
   `err_no` 必须是整数 `0`，且响应 `data.open_id` 必须与输入逐字一致，否则关闭失败。
   `GET /video/list/` 仍只在 `access-token` 请求头携带令牌。
+- userinfo 编码遵循官方当前 curl 示例；同页 Content-Type 参数表写为 JSON。实现不携带同一
+  access token 自动重试另一种编码，该外部文档差异必须在真实授权在线验收中确认。
+- `video.list` 发送 JSON Content-Type 和 `access-token` 请求头。响应的直接或数字 share 作品
+  URL 必须与 `video_id` 绑定；非数字 iesdouyin opaque share 路径只作为来源，账号/根路径、
+  数字异 ID 或其他同域页面也按 `INVALID_RESPONSE` 失败关闭。官方页面当前未列 URL 参数表，
+  `cursor` / `count` 仍需真实凭据在线确认。
 - 授权入口不得接受已构造、可携带其他账号状态的 client 实例；它必须始终用上述两项环境
   凭据构造 client，测试缝最多注入无账号状态的 transport。即使 client 层已经校验身份，
   编排层仍须在请求作品页前再次确认归一化资料的 `account_id` 与输入 `open_id` 逐字一致；
@@ -92,6 +98,8 @@
 - `--all` 遇游标不前进或连续两页没有新增作品时，以 `PARSER_FAILED` 停止；有既有作品为
   `PARTIAL`，否则为 `FAILED`。只有官方 `/video/list/` 明确返回 `has_more=false` 才能
   `COMPLETED`。
+- 授权限量模式只接受 `--limit 1–100`，并在网络和输出预留前校验。任一页返回的条目数超过
+  请求 `count` 时按 `INVALID_RESPONSE` 关闭失败且保持非穷尽；不得本地截断后接受末页证明。
 - 错误描述只写固定的清洗后分类，不写服务端描述、请求头、查询字符串、响应正文或底层
   transport 异常。令牌不得进入 URL、文件、stdout/stderr、异常链或诊断字段。
 - 不实现 OAuth 登录、授权码交换、token refresh 或第三方账号查询。当前仍未提供真实

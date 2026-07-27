@@ -39,15 +39,20 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 
 #### 可选选项：
 - `--limit INT`：最大采集条数。默认值：`30`，上限：`100`。
+- `--all`：仅用于抖音公开主页；在有界临时浏览器会话中尽量观察到可信列表末页，不能与显式 `--limit` 联用。
+- `--max-items / --max-seconds / --max-scrolls`：公开 `--all` 的安全预算。默认 `10000 / 1800 / 2000`，硬上限 `50000 / 14400 / 20000`；只能与 `--all` 联用。
 - `--out PATH`：指定输出目录路径。默认自动生成为 `workspace/<platform>-<account>-<date>/`。
+- `--analysis-goal STRING`：可选分析目的，最多 500 字符且不允许控制字符。
 - `--comments`：开启评论采样（默认关闭）。
-- `--date-from / --date-to`：采集时间范围（YYYY-MM-DD 或 ISO 8601，北京时间）。两者与 `--limit` 共同限定结果。
-- `--resume`：增量续采。读取 `--out` 指定目录既有 `source/posts.jsonl`，以其最新 `published_at` 为起点续采，按 `post_id`/`bvid` 去重合并（新覆盖旧）。**必须配合 `--out`**，否则直接报错退出。
+- `--enrich-details`：仅用于抖音；对列表中已有真实作品 URL 补充缺失的公开详情。不会据此发现新作品，单条失败只记详情状态。
+- `--date-from / --date-to`：采集时间范围（YYYY-MM-DD 或 ISO 8601，北京时间）。两者与所选限量或抖音 `--all` 范围共同限定结果。
+- `--resume`：增量续采。只接受 `--out` 指向的已核验 manifest + `.complete` 采集提交，并要求其中 `task.json` / `source/profile.json` 与当前平台、规范主页完全一致；未密封 legacy、跨账号、跨平台或畸形来源在适配器加载、联网和输出预留前失败。通过后以最新 `published_at` 为起点，按 `post_id`/`bvid` 去重合并（新覆盖旧）。**必须配合 `--out`**。
+- `--resume-out PATH`：增量续采的新不可变输出目录；省略时原子预留同级 `OLD-resume-<date>` 后缀目录。
 - `--since`：增量续采起点（YYYY-MM-DD 或 ISO 8601），覆盖由既有数据推导的起始时间；仅与 `--resume` 联用。
 - `--browser-fallback`：显式启用抖音浏览器降级。抖音默认已启用：SSR 缺失或作品列表结构无法识别时，按 CDP 网络响应观察、可见 DOM 卡片的顺序尝试；已识别的空列表返回 `NO_PUBLIC_CONTENT`。B站不使用该降级处理平台保护响应。
 - `--no-browser-fallback`：最高优先级地禁止抖音启动系统浏览器，只使用 HTTP/SSR 快速路径。B站遇到登录、验证、限流或访问限制时始终立即停止。
 
-抖音浏览器降级是实验性能力，不代表任何账号均可采集成功。它只读取无需登录可见的公开页面：每次运行创建并在退出时删除临时用户目录，不附着或复用本机 Chrome 的登录状态、Cookie 或用户配置。系统不会复现签名、绕过登录/验证码/滑块，或尝试规避频控；遇到这些限制会如实停止。
+抖音浏览器降级是实验性能力，不代表任何账号均可采集成功。它只读取无需登录可见的公开页面：每次运行创建并在退出时删除临时用户目录，不附着或复用本机 Chrome 的登录状态、Cookie 或用户配置。系统不会复现签名、绕过登录/验证码/滑块，或尝试规避频控；遇到这些限制会如实停止。公开 `--all` 见到可信末页后停止滚动，并处理网络事件到一个无尾随 CDP 调用的静默轮询。账号列表候选须为精确 HTTP 200，顶层 `status_code` / `error_code` 若存在须为整数 0；owner、原始条目与分页事实先逐项验证并原子合并成一个逻辑页，`aweme_id` / `aweme_id_str` 及可解析官方直接作品 URL 必须指向同一作品。只有全部候选一致且可信列表明确给出末页时才可标记穷尽。HTTP/API 错误、歧义绑定、候选加载、JSON、结构、坏条目或分页冲突和其他停止条件均为非穷尽。
 
 ---
 
@@ -139,6 +144,8 @@ python skill/scripts/render_report.py --input <WORKSPACE_DIR>
 | `BILIBILI_BROWSER_FALLBACK` | `0` | 兼容保留；B站平台保护响应不会触发浏览器重试。 |
 | `SOCIAL_BROWSER_FALLBACK` | `1` | 抖音浏览器降级策略：`0` 禁用，`1` 启用；未设置时默认启用。命令行显式开关优先于此变量。 |
 | `BROWSER_BIN` / `CHROME_BIN` | 空 | 指定抖音浏览器降级使用的 Chrome/Chromium/Edge 可执行文件路径。 |
+| `DOUYIN_OPENAPI_ACCESS_TOKEN` | 空 | 仅供 `collect_douyin_authorized.py` 读取的账号本人授权令牌；不得记录或持久化。 |
+| `DOUYIN_OPENAPI_OPEN_ID` | 空 | 与 access token 同次 OAuth 授权返回的账号标识；userinfo 响应必须逐字回证该值。 |
 
 浏览器为可选的系统前置条件，不新增 Python 运行时依赖。未发现可用浏览器时，抖音采集对外仍返回 `PARSER_FAILED`；采集报告可包含经过清理的诊断码 `BROWSER_UNAVAILABLE`，不记录 Cookie、请求头、签名查询参数或响应正文。
 
@@ -205,6 +212,83 @@ python skill/scripts/run_pipeline.py \
 `analysis=PARTIAL`；索引证据等上游受限输入也会保持 `PARTIAL`。`.complete` 表示持久提交，
 不等同于业务数据完备。
 
+### 示例 3：抖音公开 `--all` 与详情补全
+
+```bash
+python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" \
+  --all \
+  --max-items 10000 \
+  --max-seconds 1800 \
+  --max-scrolls 2000 \
+  --enrich-details \
+  --out workspace/douyin-public-all
+```
+
+`task.json.collection_coverage` 会记录 `is_exhaustive`、`terminal_page_observed`、观察页数、
+作品数和遍历停止条件。达到 `max_items`、超时、空闲、重复游标或滚动预算都不能称为全量；
+登录、验证、频控和访问限制写入根级 `task.json.stop_reason`，同样保持非穷尽。已经取得的作品
+会作为可审计部分结果保留。
+
+### 示例 4：账号本人授权的官方作品列表
+
+```bash
+# 先输入 OAuth 返回的 open_id，再静默输入 token
+read -r DOUYIN_OPENAPI_OPEN_ID
+read -r -s DOUYIN_OPENAPI_ACCESS_TOKEN
+export DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
+python skill/scripts/collect_douyin_authorized.py \
+  --all \
+  --out workspace/douyin-authorized-all \
+  --analysis-goal "分析本人账号全部公开视频"
+unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
+```
+
+该入口先用固定官方 userinfo 端点提交 form-urlencoded 的 `access_token` + `open_id`，要求响应
+`open_id` 逐字一致，再分页调用官方 `/video/list/`；只处理该组 OAuth 凭据所属账号，不接受
+任意第三方账号 ID。作品列表请求只在 `access-token` 请求头携带令牌。令牌不得进入 URL、
+命令行参数、shell 历史、日志、异常或产物；也可由受信任的秘密管理器直接注入环境。限量模式
+默认 30 条、只接受 1–100；越界值在网络和输出预留前失败。只有官方 `has_more=false` 才写 `is_exhaustive=true`。当前实现
+已通过离线注入测试，真实令牌在线验收仍待完成。
+官方 userinfo 页面当前把 Content-Type 参数表写为 JSON，但同页 curl 示例使用 form-urlencoded；
+实现遵循可执行的 curl 示例且不带秘密重试另一种编码，最终兼容性必须由真实同次 OAuth 凭据验收。
+`video.list` 按官方页面发送 JSON Content-Type 与 `access-token` 请求头。响应中的直接
+`/video/<video_id>` 或 `/note/<video_id>` 可以成为 `post_url`；iesdouyin 数字 share 路径仅在
+末段与 `video_id` 一致时规范化为直接作品 URL，数字异 ID 拒绝，非数字 opaque share 只保留为
+去查询参数的 `source_url`。官方 `video.list` 页面当前未列出 URL 参数表，`cursor` / `count`
+的在线兼容性也必须在真实凭据验收中确认。
+如果单页响应条目数超过本次请求的 `count`，实现按 `INVALID_RESPONSE` 失败并保持非穷尽，
+不会截断后再把该页冒充为可信末页。
+
+### 评论证据与分析状态
+
+`--comments` 默认关闭；开启后，每篇最多采样 20 条无需登录即可查看的公开评论。采集工作区
+可包含 `source/comments.jsonl`，`task.json.comment_collection` 分开记录尝试、取得、明确空结果、
+失败和平台保护停止。分析流水线严格校验每条评论的父作品 ID/规范 URL、字段、时间和上限，
+并输出四种确定性状态：
+
+- `not_requested`：未请求评论；
+- `empty`：所有合格父作品均已尝试、明确为空、无失败且未中止；
+- `unavailable`：没有有效评论证据且覆盖不完整、文件缺失或受平台保护；
+- `collected_pending_model`：至少取得一条有效评论，确定性层只展示覆盖和代表样本。
+
+确定性脚本不生成评论情绪、高频问题、争议、需求等语义结论；`semantic` 保持
+`pending-model`，且不会单独改变全局分析完成状态。
+
+### 分类矩阵与高低组结构化特征
+
+只有 `--classification-results` 覆盖全部有效作品并通过严格校验后，`analysis.json`、Markdown
+和 HTML 才同步输出：
+
+- 完整主题×形式计数矩阵，不按 top-N 截断；
+- topic / format 各桶的作品数、主指标实测/缺失数、实测率和中位数；真实 `0` 计入实测，
+  `null` 只计缺失；
+- 既有高低表现组在 topic、format、funnel stage、hook type、series、原创/产品露出、hashtags
+  与固定时长桶上的共同值、组内独有值、计数、比例和比例差。
+
+分类未完成时矩阵保持 `pending-model`，不会用部分分类生成偏置聚合；主指标实测样本少于 15
+时结构化高低对比为 `insufficient-sample`。这些结果是样本内描述，不解析标题/正文来猜测
+“开头结构”，也不宣称因果、显著性或策略优劣。
+
 ---
 
 ## 任务状态与错误码说明
@@ -223,9 +307,13 @@ python skill/scripts/run_pipeline.py \
 ### `stop_reason` 枚举：
 - `LOGIN_REQUIRED`：页面要求登录才能继续访问。
 - `VERIFICATION_REQUIRED`：页面弹出验证码或滑块拦截。
+- `RATE_LIMITED`：公开请求触发频率限制；任务停止且不自动重试、切换身份或绕过。
 - `ACCESS_RESTRICTED`：由于 WAF 或 IP 封禁导致访问被拒。
 - `ACCOUNT_UNAVAILABLE`：账号不存在、已被封禁或注销。
 - `ADAPTER_UNAVAILABLE`：平台适配器未安装或未启用。
+- `PARSER_FAILED`：公开页面可访问但没有可验证的结构化数据，或证据身份发生冲突。
+- `NO_PUBLIC_CONTENT`：账号存在且可信列表明确为空。
+- `OPENAPI_ERROR`：授权 OpenAPI 请求/响应失败；不会输出令牌或服务端原始敏感描述。
 
 ### 采集命令退出码：
 

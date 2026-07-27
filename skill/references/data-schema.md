@@ -160,6 +160,9 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 - `requested_limit` 与 `date_from`/`date_to` 同时存在时，取两者共同限定的结果，不得超出任一范围。
 - `--all` 与显式 `--limit` 互斥；`--since` 仅可与 `--resume` 联用；公开全量预算参数仅可与
   `--all` 联用。参数错误不得触发适配器网络调用或任务目录写入，也不得静默截断或忽略。
+- 普通采集与授权 OpenAPI 限量模式的 `--limit` 都必须在 1–100；授权入口也必须在 transport
+  调用和输出预留前拒绝越界值。`video.list` 单页返回条目数超过请求 `count` 时按
+  `INVALID_RESPONSE` 失败并保持非穷尽，不得截断后接受末页证明。
 - `--resume` 必须先校验并只读加载 `--out` 既有作品，再结合 `--since` / 最新作品时间计算
   有效 `date_from`；有效 `date_from > date_to` 时以参数错误退出。`--resume-out` 只能与
   `--resume` 联用，且不得与来源相同、互为祖先/后代或经现有祖先目录身份发生重叠。以上
@@ -180,7 +183,7 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 |---|---|---|
 | `requested_all` | boolean | 本次是否请求公开作品全量观察 |
 | `max_items` | integer | 接受后的公开全量作品预算；必须与 `task.requested_limit` 及传输层请求一致 |
-| `is_exhaustive` | boolean | 是否观察到经验证的作品列表末页 |
+| `is_exhaustive` | boolean | 是否观察到经验证的作品列表末页，且全部目标账号列表候选均形成一致观测 |
 | `terminal_page_observed` | boolean | 是否在拥有已知作品列表键的对象上明确观察到 `has_more=false` |
 | `observed_page_count` | integer | 已验证作品列表载荷数量 |
 | `observed_post_count` | integer | 去重后保留作品数量 |
@@ -191,9 +194,19 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 | `range_no_match` | boolean | 已观察到有效作品但日期范围内匹配数为零 |
 | `stop_condition` | enum | `terminal_page` / `idle` / `timeout` / `repeated_cursor` / `max_items` / `max_scrolls` / `date_lower_bound` |
 
-只有已验证作品列表载荷上的显式 `has_more=false` 可以令 `is_exhaustive=true`。空闲、超时、
-重复游标、数量/滚动预算或日期边界停止都属于非穷尽结果；若已保留作品，任务状态为
-`PARTIAL`。原始游标、请求头、查询字符串、响应正文和请求体不得写入账本或其他任务产物。
+只有精确 HTTP 200、可选顶层 `status_code` / `error_code` 为整数 0 的已验证作品列表载荷上的显式 `has_more=false`，并且会话内每个可能属于目标账号的列表
+候选都合并成一个经过账号绑定、作品身份和列表结构校验、且候选内分页事实一致的逻辑页，才可以令
+`is_exhaustive=true`。末页出现后停止滚动，但继续轮询并处理新候选，直到至少一次
+`poll_event=None` 的静默边界或预算到期；最终空轮询后不得再调用可能排入新事件的 CDP
+命令，DOM 与页面文本读取产生的事件也必须在此之前排空。这能覆盖较早请求在末页完成后才
+发布响应头的乱序。
+仍未读取、HTTP/API 状态不成功、收到 `loadingFailed`、绑定为空白/控制字符/重复/非法而有歧义、JSON 解析失败、合法 JSON 无法形成
+可信分页观测、任一 frozen owner/非空原始条目无法逐项验证（包括 `aweme_id` / `aweme_id_str` 或带可选尾斜杠的可解析官方直接作品 URL 冲突），或同一 owner 的游标别名、
+多个 owner 的 `has_more` / 有效游标互相冲突时，保留
+`terminal_page_observed=true`，但 `is_exhaustive` 必须为 `false`。清洗诊断可记录整数
+`unresolved_account_post_count` 与 `failed_account_post_count`，不得记录响应内容或查询值。
+空闲、超时、重复游标、数量/滚动预算或日期边界停止也都属于非穷尽结果；若已保留作品，
+任务状态为 `PARTIAL`。原始游标、请求头、查询字符串、响应正文和请求体不得写入账本或其他任务产物。
 当公开列表已验证到末页、存在有效数字作品 ID，但日期范围过滤后为零条时，任务可以
 `COMPLETED`；此时 `observed_post_count>0`、`range_filter_applied=true`、
 `range_match_count=0`、`range_no_match=true`，不得与账号原始公开作品列表为空混淆。
@@ -210,6 +223,8 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 `application/x-www-form-urlencoded` 请求体提交 `access_token` 与 `open_id`，响应顶层
 `err_no` 必须是整数 `0`，且 `data.open_id` 必须与输入逐字一致；确认后再
 `GET https://open.douyin.com/video/list/` 仅以集中构造的 `cursor` / `count` 查询分页。
+该编码遵循官方当前 curl 请求示例；同页 Content-Type 参数表写为 JSON，存在文档内部不一致。
+实现不使用同一 access token 自动重试另一种编码，真实兼容性必须由在线授权验收确认。
 它不是任意公开账号主页采集的降级路径，也不支持按第三方账号查找。
 授权入口不接受已构造的 client 实例，必须始终由这两项环境凭据构造 client；测试缝只允许
 注入不携带账号身份的 transport。编排层在作品分页前还要独立确认归一化资料的
@@ -229,6 +244,16 @@ form-urlencoded 请求体，video.list 请求放在 `access-token` 请求头；�
 userinfo 响应精确回证。账本不得保存请求头、原始游标、查询字符串、响应正文或请求体。
 当前仍无真实 token/open_id 在线授权验收，端到端验证保持 **pending**；在完成该验证前，
 不增加 OAuth 登录、授权码交换、刷新令牌或未文档化内部接口。
+
+采集持久化边界会丢弃覆盖账本未知键；分析流水线仍把已密封任务视为非信任输入，只允许上述
+boolean、非负 exact integer 与停止枚举进入派生 `analysis.meta.collection_coverage`。因为分析
+工作区还会逐字节封存原采集任务，外部提交若仍含原始游标、请求头、嵌套载荷或其他未知键，
+以及任一已知键类型非法，必须在分析工作区预留前失败。任何 `is_exhaustive=true` 都必须
+与可信末页、任务 `COMPLETED`、根级 `stop_reason=null`、请求范围及归一化作品计数一致；授权
+任务还要求 `observed_post_count == task.collected_count == normalized rows`。普通授权限量请求若在
+达到本地数量停止前已真实观察到官方末页，仍可据末页证明接口返回集合已遍历；若仅因 `limit`
+停止则始终非穷尽。公开 `--all` 在登录、验证、频控等任务级保护前可能没有页面级停止条件，
+这种稀疏账本只可传播 `is_exhaustive=false`，不得因缺失 `stop_condition` 被改写成末页证明。
 
 ### 3.3 comment_collection 评论采样账本
 
@@ -281,7 +306,7 @@ userinfo 响应精确回证。账本不得保存请求头、原始游标、查�
 - 微博：`following`（关注数）
 - B站：一般为空对象 `{}`
 
-授权 OpenAPI 例外：接口只确认令牌所有者的 `open_id`，不得把 `open_id` 猜测成公开主页
+授权 OpenAPI 例外：接口确认同次 access token + `open_id` 对应的账号，不得把 `open_id` 猜测成公开主页
 路径。此模式的 `profile_url` 使用固定的官方 userinfo 端点作为来源证据，
 `platform_metrics.authorization_source=douyin_openapi_token_owner`；它不表示可访问的公众
 主页 URL。
@@ -308,7 +333,7 @@ userinfo 响应精确回证。账本不得保存请求头、原始游标、查�
 |---|---|---:|---:|---|
 | platform | string | 是 | 否 | 平台标识 |
 | post_id | string | 是 | 否 | 平台内容 ID（BV号 / 作品ID / 博文ID）；索引降级例外见 §5.1 |
-| post_url | string | 是 | 否 | 内容详情页 URL（证据锚点）；索引降级例外见 §5.1 |
+| post_url | string | 是 | 是 | 内容详情页 URL（证据锚点）；授权 opaque share 例外见 §3.2/本节约束，索引降级例外见 §5.1 |
 | published_at | datetime | 否 | 是 | 发布时间（ISO 8601） |
 | content_type | enum | 是 | 否 | 内容形态（§9.4） |
 | title | string | 否 | 是 | 标题 / 文案首行 |
@@ -328,7 +353,12 @@ userinfo 响应精确回证。账本不得保存请求头、原始游标、查�
 - `collection_status` 缺失或非法时必须归一为 `PARTIAL`，并分别标记 `inferred_missing` / `inferred_invalid`；禁止默认为 `SUCCESS`。归一化覆盖率须记录 `COLLECTION_STATUS_INFERRED` warning，流水线因此降为 `PARTIAL`。
 - `normalized-posts.csv` 使用紧凑、排序键的 JSON 序列化 `hashtags`、`platform_metrics` 与 `field_visibility`；布尔值统一写小写 `true` / `false`，`null` 写为空单元格。读取端仍兼容旧 CSV 中用 `|` / `,` / `;` 分隔的话题串，以及旧采集器写出的 Python `list` / `tuple` / `dict` 字面量；后者只在严格单元格大小、AST 复杂度、目标类型及 JSON 兼容性校验后读取，绝不执行表达式，也不再以旧格式写出。
 - 默认分析排除置顶、转载、投放内容（见 `analysis-rules.md`），但须在数据中保留标记。
-- 授权 OpenAPI 作品必须使用响应提供的、经校验属于抖音的 HTTPS `share_url`；持久化前移除查询参数与片段。缺失或非法 `video_id` / `share_url` 视为响应错误，不得合成证据 URL。
+- 授权 OpenAPI 作品必须使用响应提供的 HTTPS `share_url`，持久化前移除查询参数与片段。
+  与 `video_id` 精确一致的直接 `/video/<id>` / `/note/<id>` 规范化为 `post_url`；官方
+  `iesdouyin.com/share/video|note/<id>` 若末段为同一数字 ID，也规范化为直接作品 URL，数字
+  异 ID 关闭失败。只有非数字 opaque share 无法绑定 ID，只保留为 `source_url`，此时
+  `post_url=null` / `item_url_known=false`。账号主页、根路径、其他主机/路径均视为响应错误；
+  不得仅从 `video_id` 合成证据 URL。
 - 公开抖音列表仅接受数字平台作品 ID，并按 ID 去重；重复项只能补齐先前缺失字段，不能覆盖
   先出现的可靠列表证据。缺失或非法 ID 的记录必须跳过，账号主页不能充当作品 URL。
 - 启用 `--enrich-details` 时，只有真实、数字 ID 匹配的 `/video/<id>` 或 `/note/<id>` URL，
@@ -427,8 +457,10 @@ userinfo 响应精确回证。账本不得保存请求头、原始游标、查�
 异常文本和诊断元数据只能使用固定阶段消息及受控枚举，不能透传适配器异常或上游敏感值。
 账号主页 URL 同样必须在访问检查、列表和资料适配器调用前完成平台级规范化；凭据、显式端口
 或非账号路径必须在调用及创建任务目录前拒绝。`profile.profile_url` 与 `task.profile_url` 只写
-该规范 URL。每条作品的 `post_url` 和 `source_url` 都在产物边界独立校验；无法关联当前平台与
-作品 ID 的值写为 `null`，不得保留原始 query、fragment 或任意外域证据。
+该规范 URL。每条作品的 `post_url` 和 `source_url` 都在产物边界独立校验；`post_url` 无法关联
+当前平台与作品 ID 时写为 `null`。`source_url` 仅有两项显式例外：经固定官方路径校验的授权
+OpenAPI 非数字 opaque share，以及 §5.1 已披露的搜索索引账号主页锚点；二者都不能渲染成
+ID 绑定作品证据。任何来源 URL 均不得保留原始 query、fragment 或任意外域值。
 
 平台路由本身也属于不可信边界：调用任一适配器 `supports` 前，必须先要求 HTTPS、精确的
 无凭据/无端口 authority，并拒绝分号 path params、百分号编码 authority/path 和其他混淆形式；

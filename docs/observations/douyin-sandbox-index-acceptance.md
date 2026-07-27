@@ -93,7 +93,9 @@ python3 skill/scripts/render_report.py --input <workspace>
   或 HTML；政府样本只有点赞可见，雷达图已确认省略。
 - 敏感扫描：任务目录未出现 Cookie、Authorization、Bearer、X-Bogus、msToken、sessionid
   或 CSRF token。
-- 离线 pytest、Python 编译、Skill 校验和完整差异检查见最终验证记录。
+- 当时的本地工作区被 `.gitignore` 排除，远端读者无法仅凭仓库重放其字节；当前离线 pytest、
+  Python 编译、CLI/JSON 与差异检查汇总见
+  [需求实现状态与抖音能力边界](../需求实现状态与抖音能力边界.md#发布检查与剩余工作)。
 
 ## 能力定位
 
@@ -104,3 +106,16 @@ python3 skill/scripts/render_report.py --input <workspace>
 - 精确主页搜索索引只能得到较弱、可能陈旧的 B 级标题/点赞快照；
 - 不能承诺最近 30 条、实时性、完整性或所有账号都有索引；
 - 没有合格证据时必须继续失败，不能为了“成功”混入推荐内容或伪造标识。
+
+## 2026-07-27 合同复核
+
+- 上述 2026-07-24 命令记录保留为当时的 legacy 分阶段验收。当前推荐链路是
+  `import_index_snapshot.py -> 已提交 collection workspace -> run_pipeline.py -> 独立 analysis workspace`；
+  分析流水线在 0 个有效作品时于输出预留前失败，不发布空分析。
+- 官方精选与搜索索引仍固定为 `evidence_is_exhaustive=false`。已知作品详情补全只能补已有真实
+  作品 URL 的公开字段，不能把精选子集或主页搜索索引升级为最近 30 条或账号全量。
+- 账号本人授权的 `collect_douyin_authorized.py --all` 是独立 OpenAPI 路径，不是索引降级；
+  当前只有 access token + open_id 的 userinfo 回证、分页与令牌防泄漏离线合同，尚未用同次
+  OAuth 的真实凭据完成在线身份和末页验收。
+- 索引路径的定位保持黄色实验性。它证明“受登录墙阻断后仍可导入一批经过核验的公开证据”，
+  不证明任意账号均有索引，也不证明抖音匿名公开主页当前可在线采集作品列表。
