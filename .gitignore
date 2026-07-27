@@ -38,11 +38,18 @@ skill/evals/files/output/
 .DS_Store
 .idea/
 .vscode/
+*.swp
+*.swo
+Thumbs.db
 
 # --- 临时文件 ---
 *.log
 *.tmp
+*.bak
 ~$*.docx
 
 # --- 本地归档备份（SDD 日志 / workspace 产物 / 工作树 bundle，不入库） ---
 archive/
+
+# --- Python 构建中间产物 ---
+pip-wheel-metadata/
