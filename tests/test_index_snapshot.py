@@ -223,7 +223,9 @@ def test_search_index_uses_deterministic_disclosed_local_keys():
     assert all(p["post_id"].startswith("idx-") for p in first["posts"])
     assert len(set(p["post_id"] for p in first["posts"])) == 2
     for post in first["posts"]:
-        assert post["post_url"] == PROFILE_URL
+        # search-card 没有真实作品 URL:post_url 必须为 null,避免下游
+        # 把账号主页锚点渲染成作品链接;来源归属由 source_url 承担。
+        assert post["post_url"] is None
         assert post["source_url"] == PROFILE_URL
         assert post["published_at"] is None
         assert post["content_type"] == "other"

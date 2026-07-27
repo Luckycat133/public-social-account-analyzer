@@ -476,7 +476,10 @@ def validate_evidence(
                 raise EvidenceError(f"posts[{source_rank - 1}].post_url 对搜索索引必须为 null")
             dedupe_key = (title, published_at, metrics["likes"])
             post_id = _local_record_key(profile_url, title, source_rank)
-            post_url = profile_url
+            # search-card 没有真实作品 URL:post_url 必须保持 null,
+            # 否则下游渲染与统计会把账号主页锚点误当成作品链接。
+            # 来源归属由 record_source_url(profile_url) 保留。
+            post_url = None
             item_url_known = False
             platform_post_id_known = False
             local_record_key = True
