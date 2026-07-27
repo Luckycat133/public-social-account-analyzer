@@ -83,11 +83,14 @@ skill/evals/
 
 ```
 docs/
-├── STRUCTURE.md
-├── 公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx
-├── 需求实现状态与抖音能力边界.md
-├── operations-trial-template.md        # AC-10 模板
-└── deployment-package-checklist.md     # 本文件
+├── architecture/
+│   └── STRUCTURE.md
+├── guides/
+│   ├── operations-trial-template.md        # AC-10 模板
+│   └── deployment-package-checklist.md     # 本文件
+└── prd/
+    ├── 公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx
+    └── 需求实现状态与抖音能力边界.md
 ```
 
 ---

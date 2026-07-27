@@ -39,19 +39,24 @@ public-social-account-analyzer/             # 项目根目录
 ├── USAGE.md                               # 详细使用指南与故障排查
 ├── CHANGELOG.md                           # 变更日志 (Keep a Changelog v1.1.0)
 ├── ROADMAP.md                             # 历史路线图（既有条目已完成；评论洞察待实施）
-├── TODO.md                                # 待办事项与开发路线图
-├── docs/需求实现状态与抖音能力边界.md        # PRD/验收映射与抖音全量能力边界
-├── 测试分析-问题整理与目录结构.md           # 架构分析与 Agent 观测日志
+├── AGENTS.md                              # 仓库贡献规范
 ├── pyproject.toml                         # Python 项目与 Pytest 配置
-├── docs/                                  # 架构设计与技术文档
-│   ├── STRUCTURE.md                        # 目录、模块职责与依赖关系
-│   ├── plans/                             # 重构与优化实施方案
-│   └── observations/                      # 历史观测日志与分析文档
+├── docs/                                  # 文档总目录（按 architecture/guides/prd 分类）
+│   ├── architecture/                     # 架构、模块与依赖
+│   │   └── STRUCTURE.md               # 目录、模块职责与依赖关系
+│   ├── guides/                          # 使用、部署、运营指南
+│   │   ├── operations-trial-template.md
+│   │   └── deployment-package-checklist.md
+│   ├── prd/                            # 产品需求与验收
+│   │   ├── 需求实现状态与抖音能力边界.md
+│   │   └── 公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx
+│   ├── observations/                    # Agent 行动路径观测与验收记录
+│   └── plans/                          # 进行中 / 待实施计划
 ├── tests/                                 # Pytest 自动化单元测试集
-├── workspace/                             # 任务运行产物输出目录
+├── workspace/                             # 任务运行产物输出目录（git 忽略）
 └── skill/                                 # AI Agent 纯净技能包 (Agent Skills 规范)
     ├── SKILL.md                           # Agent 技能指令与执行契约
-    ├── scripts/                           # Python 执行脚本 (collect/normalize/analyze/render)
+    ├── scripts/                           # Python 执行脚本
     │   ├── README.md                       # 脚本入口、模块边界与依赖说明
     │   └── collectors/                    # 平台适配器 (bilibili / douyin / weibo + 共享层)
     ├── references/                        # 领域数据模型与分析规则规范
@@ -60,7 +65,7 @@ public-social-account-analyzer/             # 项目根目录
         └── datasets/                      # source / validation_data / test_data
 ```
 
-完整目录结构、模块责任清单与依赖关系见 [docs/STRUCTURE.md](docs/STRUCTURE.md)。
+完整目录结构、模块责任清单与依赖关系见 [docs/architecture/STRUCTURE.md](docs/architecture/STRUCTURE.md)。
 
 ---
 
@@ -72,19 +77,25 @@ public-social-account-analyzer/             # 项目根目录
 | **抖音 (Douyin)** | 🟡 P0（实验性支持） | `skill/scripts/collectors/douyin.py` | 限量或有界 `--all` 公开采集、已知作品详情补全、临时浏览器 CDP；另有仅限同次 OAuth 凭据所绑定账号的官方 OpenAPI 全量入口与非穷尽 Web 索引证据 |
 | **微博 (Weibo)** | 🟡 P1 (条件支持) | `skill/scripts/collectors/weibo.py` | 需显式启用适配器；未启用时返回 `ADAPTER_UNAVAILABLE` |
 
+B站常规列表会在 limit 前按 BV 去重，避免 medialist 的 inclusive `oid` 页边界重复抬高数量；
+动态发现排在逐条标签补充之前。动态入口若受限，任务保留已验证的常规投稿并标为 `PARTIAL`，
+`task.json` 与报告通过 `BILIBILI_DYNAMIC_DISCOVERY` 及
+`regular_source/regular_observed_count/dynamic_status/dynamic_observed_count` 披露缺口。
+此时单条常规投稿仍可是 `SUCCESS`，但不能据此声称动态-only公开视频已完整覆盖。
+
 抖音浏览器降级默认自动尝试：当 SSR 缺失或作品列表结构无法识别时，依次使用公开的 CDP 网络响应和可见 DOM 卡片；已识别的空列表不会启动浏览器，而是返回 `NO_PUBLIC_CONTENT`。公开 `--all` 只在安全预算内尽量滚动；见到可信末页后停止滚动，并排空到一个无尾随 CDP 调用的静默边界。每个候选须具有精确 HTTP 200，顶层 `status_code` / `error_code` 若存在须为整数 0；owner、原始条目和分页事实逐项验证后原子合并成一个逻辑页，作品 ID 别名及可解析的官方直接作品 URL 也须一致。只有全部候选一致且观察到账号绑定的明确末页，才可标记 `is_exhaustive=true`。登录、验证、频控、HTTP/API 错误、歧义绑定、候选加载/JSON/结构/原始条目/分页冲突、超时或预算停止都保留为非穷尽结果。`--enrich-details` 只补列表中已有真实作品的缺失字段，不能发现新作品。
 
 如果直连被登录墙/验证/空响应阻断，Agent 环境有 Web 连接器时还可导入官方精选页或精确主页搜索索引；该数据始终标记 `PARTIAL`，不把本地 ID、账号主页或陈旧索引冒充真实单条作品。索引导入必须继承原任务日期范围；日期未知的搜索索引不能用于“最近 N 天”排名。导入器还可从同账号、已密封的直连提交合并较新的非空公开资料，并保留来源摘要与新旧证据边界。账号本人另可使用 `collect_douyin_authorized.py` 和官方 `video.list` 权限遍历自己的公开视频；入口同时要求 OAuth 返回的 access token 与 open_id，并用官方 userinfo 精确回证账号。它不是任意第三方账号的匿名接口。`--no-browser-fallback` 仅控制抖音是否启动系统浏览器；B站收到平台保护响应会立即停止当前任务，不重试、不轮换身份，也不转浏览器，详见 [USAGE.md](USAGE.md)。
 
 ## 需求实现状态
 
-PRD 的 FR-001～FR-015、AC-01～AC-10 逐项证据、未完成验收和“所有视频”可达边界见 [需求实现状态与抖音能力边界](docs/需求实现状态与抖音能力边界.md)。当前不能保证任意第三方抖音账号的全部历史作品：公开路径受页面可见性和平台保护约束，官方全量路径只适用于账号本人授权。
+PRD 的 FR-001～FR-015、AC-01～AC-10 逐项证据、未完成验收和“所有视频”可达边界见 [需求实现状态与抖音能力边界](docs/prd/需求实现状态与抖音能力边界.md)。当前不能保证任意第三方抖音账号的全部历史作品：公开路径受页面可见性和平台保护约束，官方全量路径只适用于账号本人授权。
 
 ### 验收辅助制品
 
 - PRD AC-03 / AC-06 人工验收工具：[`tests/manual_accuracy_check.py`](tests/manual_accuracy_check.py) — `prepare` 只生成绑定两份不可变提交的空白抽查表；必须由人工打开公开页面填写外部真值，再由 `verify` 分别核算字段准确率（阈值 ≥95%）和核心洞察证据覆盖。源数据与 CSV 的一致性只算流水线完整性，不能替代人工真值。
-- PRD AC-10 运营人员试用反馈结构化模板：[`docs/operations-trial-template.md`](docs/operations-trial-template.md) — 10 章节覆盖任务输入、产物清单、数据真实性核查、可用性评分、阻碍清单与提交归档流程；填写后 commit 到 `docs/operations-trial-records/` 即可计入 AC-10 验收。
-- dev → 部署打包与 drift 检测清单：[`docs/deployment-package-checklist.md`](docs/deployment-package-checklist.md) — 列出必须随部署版打包的 4 类内容、4 个部署位置、4 步 drift 检测与发布流程；新发布前必跑。
+- PRD AC-10 运营人员试用反馈结构化模板：[`docs/guides/operations-trial-template.md`](docs/guides/operations-trial-template.md) — 绑定两份不可变提交、外部人工真值、洞察证据、结构化耗时与使用反馈；只有真实记录和一轮由该反馈驱动且已合并的修改同时存在，AC-10 才通过。
+- dev → 部署打包与 drift 检测清单：[`docs/guides/deployment-package-checklist.md`](docs/guides/deployment-package-checklist.md) — 列出必须随部署版打包的 4 类内容、4 个部署位置、4 步 drift 检测与发布流程；新发布前必跑。
 
 ---
 
@@ -204,17 +215,7 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 
 ## 产物结构
 
-从仓库根执行完整流水线后，产物位于 `workspace/<platform>-<account>-<date>/`：
-
-- `source/profile.json` — 原始公开账号资料快照
-- `source/posts.jsonl` — 原始公开内容列表
-- `normalized-posts.csv` — 遵循统一数据模型的归一化 CSV 表格
-- `normalized-coverage.json` — 归一化阶段生成的字段覆盖率、去重和解析错误摘要
-- `collection-report.md` — 采集阶段生成的公开字段可见性与质量说明
-- `account-analysis-report.md` — 完整 Markdown 账号分析报告（含具体证据 URL）
-- `dashboard.html` — 可视化 HTML 仪表盘
-- `analysis.json` — 机器可读的统计指标与分类分析 JSON
-执行完成后会保留两个提交边界。
+从仓库根执行完整流程后会保留两个互相独立的 create-only 提交：一个保存采集事实，一个保存由该事实派生的分析。目录名由命令的 `--out` / `--output` 指定，已存在的路径不会被覆盖。
 
 采集工作区包含：
 

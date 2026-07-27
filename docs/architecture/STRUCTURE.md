@@ -13,44 +13,48 @@ public-social-account-analyzer/
 ├── CHANGELOG.md                           # 变更日志（Keep a Changelog v1.1.0）
 ├── ROADMAP.md                             # 历史路线图（既有条目已完成；评论洞察待实施）
 ├── pyproject.toml                         # Python 项目与 pytest 配置
-├── docs/                                  # 架构设计与技术文档
-│   ├── STRUCTURE.md                       # 本文件：目录结构与模块清单
-│   ├── plans/                             # 重构与优化实施方案
-│   ├── observations/                      # 历史观测日志与分析文档（含 README）
-│   └── superpowers/                       # 历史设计与实施计划
-├── tests/                                 # pytest 单元测试集（128 项）
-│   ├── conftest.py                        # 仅注入 skill/scripts/ 的测试导入配置
-│   ├── test_bilibili_parse.py             # B站字段映射与 WBI 签名回归
-│   ├── test_browser_backend.py            # 浏览器降级后端接线
-│   ├── test_collectors.py                 # 适配器路由与 stop_reason 语义
-│   ├── test_datetime.py                   # 时间解析
-│   ├── test_deduplication.py              # 去重
-│   ├── test_incremental.py                # 增量续采
-│   ├── test_metrics.py                    # 指标统计算法
-│   ├── test_normalize.py                  # 归一化
-│   ├── test_render_report.py              # 报告渲染
-│   ├── test_split_dataset.py               # 数据集划分与校验
-│   └── test_weibo.py                      # 微博适配器
+├── docs/                                  # 文档总目录（导航见 docs/README.md）
+│   ├── README.md                         # 文档地图与命名规范
+│   ├── architecture/                     # 架构、模块与依赖
+│   │   └── STRUCTURE.md               # 本文件：目录结构与模块清单
+│   ├── guides/                          # 使用、部署、运营指南
+│   ├── prd/                            # 产品需求与验收
+│   ├── observations/                    # Agent 行动路径观测与验收记录
+│   └── plans/                          # 进行中 / 待实施计划
+├── tests/                                 # pytest 回归与人工验收工具；数量以发布日志为准
+│   ├── conftest.py                        # 注入 skill/scripts/ 的测试导入配置
+│   ├── test_*.py                          # 采集、分析、报告、安全和工作区合同
+│   └── manual_accuracy_check.py           # AC-03 / AC-06 外部人工真值工具
 ├── workspace/                             # 任务运行产物输出目录（运行时生成）
 └── skill/                                 # AI Agent 纯净技能包（Agent Skills 规范）
     ├── SKILL.md                           # Agent 技能指令与执行契约
     ├── scripts/                           # Python 执行脚本
     │   ├── README.md                       # 脚本入口、模块边界与依赖说明
     │   ├── collect.py                     # 采集入口（FR-001~FR-009）
+    │   ├── collect_douyin_authorized.py   # 抖音账号本人 OpenAPI 入口
+    │   ├── import_index_snapshot.py       # 抖音公开索引证据导入
     │   ├── normalize.py                   # 归一化（FR-008）
-    │   ├── analyze.py                     # 确定性指标计算 + 分类槽位准备
+    │   ├── analyze.py                     # 确定性指标 + 两阶段模型输入校验
     │   ├── render_report.py               # Markdown + HTML 报告渲染
+    │   ├── run_pipeline.py                # 推荐的不可变分析编排入口
+    │   ├── immutable_workspace.py         # create-only 提交与核验协议
+    │   ├── execution_timing.py            # 结构化总耗时与阶段耗时
+    │   ├── csv_contract.py                # 规范 CSV 合同
+    │   ├── task_contract.py               # 任务状态与停止原因合同
     │   ├── split_dataset.py               # 评估数据集分层随机划分
     │   └── collectors/                    # 平台采集适配器子包
     │       ├── __init__.py                # 包标识（空）
     │       ├── base.py                    # BaseCollector 抽象基类
     │       ├── _constants.py              # 共享常量（时区 + stop_reason 枚举）
     │       ├── _utils.py                  # 共享工具函数（now_iso / parse_int / ts_to_iso / extract_hashtags）
-    │       ├── _bilibili_transport.py     # B站传输层（HTTP / WBI / Session / 异常）
     │       ├── bilibili.py                # B站业务层（BilibiliCollector + 字段构建）
     │       ├── douyin.py                  # 抖音适配器（DouyinCollector）
+    │       ├── douyin_openapi.py          # 抖音账号本人官方接口适配器
+    │       ├── _douyin_browser_transport.py # 抖音临时浏览器公开传输
+    │       ├── _douyin_detail_contract.py # 抖音作品详情身份合同
+    │       ├── url_policy.py              # 跨平台 URL 安全策略
     │       ├── weibo.py                   # 微博适配器（WeiboCollector，默认禁用）
-    │       └── browser_backend.py         # 通用 headless 浏览器降级后端
+    │       └── browser_backend.py         # 标准库 CDP 临时浏览器后端
     ├── references/                        # 领域数据模型与分析规则规范
     │   ├── analysis-rules.md              # 分析规则（§3 节奏 / §4 指标 / §5 分类 / §6 高低表现）
     │   ├── data-schema.md                 # 统一数据模型与字段表
@@ -82,13 +86,13 @@ public-social-account-analyzer/
 ```text
 ┌─────────────────────────────────────────────────────────┐
 │  编排层（entry scripts）                                  │
-│  collect.py · normalize.py · analyze.py · render_report.py │
+│  collect.py · run_pipeline.py · authorized/import entries │
 └────────────────────────┬────────────────────────────────┘
                          │ collect.py 加载具体 collectors；其余脚本消费任务产物
 ┌────────────────────────▼────────────────────────────────┐
 │  适配器层（collectors/）                                  │
-│  bilibili.py · douyin.py · weibo.py                     │
-│  _bilibili_transport.py · browser_backend.py             │
+│  bilibili.py · douyin.py · douyin_openapi.py · weibo.py │
+│  _douyin_browser_transport.py · browser_backend.py       │
 └────────────────────────┬────────────────────────────────┘
                          │ from ._constants / ._utils / .base
 ┌────────────────────────▼────────────────────────────────┐
@@ -107,8 +111,9 @@ public-social-account-analyzer/
 **依赖规则**：
 - 上层可依赖下层，下层不得反向依赖上层
 - 适配器层通过 `BaseCollector` 抽象基类实现多态；`collect.py` 负责显式加载具体适配器
-- `_bilibili_transport.py` 依赖 `_constants`、`_utils` 与 `browser_backend.py` 的错误类型；仅在启用浏览器降级时才创建浏览器会话或探测浏览器二进制
-- `bilibili.py` 依赖 `_bilibili_transport` 并 re-export 其符号，保持对外契约不变
+- `bilibili.py` 是 B站采集、HTTP/WBI 传输、错误映射与任务级断路器的单一实现；平台保护响应不会触发浏览器降级
+- 采集工作区与分析工作区分别提交；`run_pipeline.py` 只读核验前者，再创建后者
+- taxonomy 与 business-insight 输入由执行 Agent 在已提交目录外生成，脚本只负责严格校验、摘要绑定和封存
 
 ---
 
@@ -119,9 +124,14 @@ public-social-account-analyzer/
 | 模块 | 职责 | 关键符号 |
 |:---|:---|:---|
 | `collect.py` | 采集入口：根据 URL 路由到适配器，采集资料与内容列表/详情，支持增量续采与日期过滤；默认写入仓库根 `workspace/` | `run()` · `main()` · `_load_adapters()` · `_merge_incremental()` |
-| `normalize.py` | 归一化：各平台原始字段 → 统一数据模型，覆写规范化 `normalized-posts.csv` 并输出 `normalized-coverage.json`。确定性、无网络 | `normalize_post()` · `dedup_posts()` · `compute_metric_coverage()` |
-| `analyze.py` | 确定性指标计算 + 模型分类槽位准备：发布节奏、公开表现指标、高低表现分组。无 LLM、无网络 | `compute_cadence()` · `compute_metric_summary()` · `compute_high_low()` · `build_taxonomy_prompt()` |
-| `render_report.py` | 报告渲染：读取资料、规范化 CSV 和 `analysis.json`，仅生成 12 节 Markdown 报告与 HTML 仪表盘 | `render_dashboard()` · `build_metrics_dashboard()` · `build_strategy()` |
+| `collect_douyin_authorized.py` | 账号本人授权入口：同次 OAuth 的 token + open_id 身份回证与官方公开视频分页 | `run()` · `main()` |
+| `import_index_snapshot.py` | 将 Agent 已核验的公开索引证据导入为非穷尽、可审计采集提交 | `run()` · `main()` |
+| `run_pipeline.py` | 推荐分析入口：只读核验采集提交，在新目录完成归一化、分析、渲染、验证与提交 | `run_pipeline()` · `main()` |
+| `normalize.py` | 各平台原始字段 → 统一数据模型；内存 API 由流水线使用，legacy CLI 不修改已密封工作区 | `normalize_in_memory()` · `normalize_post()` · `dedup_posts()` |
+| `analyze.py` | 确定性指标、taxonomy 与 business-insight prompt/result 严格合同；无 LLM、无网络 | `analyze_in_memory()` · `build_taxonomy_prompt()` · `validate_business_insight_results()` |
+| `render_report.py` | 从已校验对象生成同合同的 Markdown 与 HTML 报告 | `render_in_memory()` · `build_metrics_dashboard()` · `build_strategy()` |
+| `immutable_workspace.py` | create-only 工作区、manifest SHA-256、`.complete` 提交与 identity-bound 读取 | `ImmutableWorkspace` · `VerifiedWorkspaceReader` |
+| `execution_timing.py` | 带时区起止时间、monotonic 总耗时和固定阶段累计 | `ExecutionTimer` |
 | `split_dataset.py` | 评估数据集分层随机划分（validation / test），固定种子保证可复现 | `stratified_split()` · `verify()` |
 
 ### 适配器层（skill/scripts/collectors/）
@@ -129,11 +139,12 @@ public-social-account-analyzer/
 | 模块 | 职责 | 关键符号 |
 |:---|:---|:---|
 | `base.py` | `BaseCollector` 抽象基类，声明统一接口：`supports` / `check_access` / `collect_profile` / `collect_post_list` / `collect_post_detail` / `collect_comments` | `BaseCollector` |
-| `bilibili.py` | B站业务层：`BilibiliCollector` + 字段构建函数（`_build_profile_raw` / `_build_post_raw_from_*`）。re-export 传输层符号保持对外契约 | `BilibiliCollector` · `_build_post_raw_from_view()` |
-| `_bilibili_transport.py` | B站传输层：常量（API/UA/WBI 表）、异常（`BilibiliError`/`_Retryable`）、WBI 签名（`enc_wbi`）、curl `Session`、动态卡解析 | `Session` · `BilibiliError` · `enc_wbi()` · `_stop_reason_for_code()` |
+| `bilibili.py` | B站适配与传输单一实现：公开资料/投稿/动态/合集、WBI、任务级断路器与部分结果保留 | `BilibiliCollector` · `Session` · `BilibiliError` · `enc_wbi()` |
 | `douyin.py` | 抖音适配器：直连解析页面内嵌 `RENDER_DATA`，无明确限制时可选浏览器传输降级；如实上抛风控 stop_reason | `DouyinCollector` · `DouyinError` |
+| `douyin_openapi.py` | 账号本人官方 userinfo / video.list 客户端与严格身份绑定 | `DouyinOpenAPIClient` |
 | `weibo.py` | 微博适配器：默认 `ENABLED=False`，启用后访问公开 AJAX 端点；未启用时抛 `ADAPTER_UNAVAILABLE` | `WeiboCollector` · `WeiboError` |
-| `browser_backend.py` | 通用 headless 浏览器降级后端：跨平台探测浏览器二进制，自带标准库 WebSocket 客户端，仅作传输层降级 | `BrowserSession` · `find_browser()` |
+| `_douyin_browser_transport.py` | 抖音公开列表/资料/详情的账号绑定、候选验证、限制枚举和有界滚动 | `collect_account_page()` · `collect_post_page()` |
+| `browser_backend.py` | 探测浏览器二进制并提供标准库 WebSocket/CDP 会话；每次使用隔离临时 profile | `BrowserSession` · `find_browser()` |
 
 ### 共享层（skill/scripts/collectors/_*）
 
@@ -148,7 +159,7 @@ public-social-account-analyzer/
 
 | 类别 | 规范 | 示例 |
 |:---|:---|:---|
-| 模块文件 | `snake_case.py`；私有模块以 `_` 前缀 | `bilibili.py` · `_constants.py` · `_bilibili_transport.py` |
+| 模块文件 | `snake_case.py`；私有模块以 `_` 前缀 | `bilibili.py` · `_constants.py` · `_utils.py` |
 | 类 | `PascalCase` | `BilibiliCollector` · `BaseCollector` · `BrowserSession` |
 | 函数/变量 | `snake_case`；私有以 `_` 前缀 | `collect_post_list()` · `_build_profile_raw()` |
 | 常量 | `UPPER_SNAKE_CASE`；stop_reason 枚举以 `STOP_` 前缀 | `BEIJING_TZ` · `STOP_LOGIN` · `MIXIN_KEY_ENC_TAB` |
@@ -159,27 +170,27 @@ public-social-account-analyzer/
 ## 采集流水线
 
 ```text
-collect.py（联网采集；默认仓库根 workspace/） ──→ source/profile.json + source/posts.jsonl + task.json + collection-report.md
-     │
-     ▼
-normalize.py ──→ 覆写为规范化 normalized-posts.csv + normalized-coverage.json
-     │
-     ▼
-analyze.py ──→ analysis.json（含 cadence / metrics / high_low / taxonomy_prompt）
-     │
-     ▼
-render_report.py ──→ account-analysis-report.md + dashboard.html（不写 analysis.json）
+collect.py / authorized / index importer
+     └─→ 不可变采集工作区（source/* + task + manifest + .complete）
+             │ 只读核验
+             ▼
+run_pipeline.py ─→ normalize ─→ deterministic analysis ─→ render ─→ validate
+             └─→ 独立不可变分析工作区（四类标准产物 + provenance + manifest + .complete）
+
+策略任务在同一个 collection 上依次创建：
+taxonomy draft → taxonomy final / business draft → business final。
+只有 final 同时封存 classification 与 business-insight JSON，才能声明完整策略分析。
 ```
 
-采集步骤访问公开平台页面，必要时可用浏览器作传输降级；其余主流水线步骤离线执行。`normalize.py`、`analyze.py` 和 `render_report.py` 不访问网络，也不在脚本内部调用 LLM。模型分类槽位由 `analyze.py` 的 `build_taxonomy_prompt()` 准备，由上层模型填充后回写 `analysis.json`。
+采集步骤访问公开平台页面，抖音在无明确限制且 SSR 不足时可用隔离临时浏览器作实验性传输降级；其余主流水线步骤离线执行。`normalize.py`、`analyze.py`、`render_report.py` 和 `run_pipeline.py` 不访问网络，也不在脚本内部调用 LLM。执行 Agent 在提交目录外填写 prompt 规定的严格 JSON，再由新一次流水线提交校验并封存。
 
 ---
 
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q  # 运行全部 128 项测试
-python tests/test_bilibili_parse.py  # 独立运行（不依赖 pytest）
+python3 -m pytest tests/ -q
+python3 -m pytest tests/test_douyin.py -q
 ```
 
-测试覆盖：适配器路由正则、WBI 签名、字段映射、stop_reason 语义、去重合并、增量续采、指标统计算法、归一化、报告渲染、时间解析。
+测试覆盖适配器路由、字段映射、限制断路器、去重/续采、指标、归一化、不可变提交、taxonomy/business 合同、报告安全、结构化耗时与人工验收工具。用例数与耗时以当次发布日志为准。

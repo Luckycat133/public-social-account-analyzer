@@ -95,7 +95,7 @@ python3 skill/scripts/render_report.py --input <workspace>
   或 CSRF token。
 - 当时的本地工作区被 `.gitignore` 排除，远端读者无法仅凭仓库重放其字节；当前离线 pytest、
   Python 编译、CLI/JSON 与差异检查汇总见
-  [需求实现状态与抖音能力边界](../需求实现状态与抖音能力边界.md#发布检查与剩余工作)。
+  [需求实现状态与抖音能力边界](../prd/需求实现状态与抖音能力边界.md#发布检查与剩余工作)。
 
 ## 能力定位
 

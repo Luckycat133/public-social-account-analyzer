@@ -72,4 +72,4 @@
 - [ ] 若要求恢复未提交/进程中断任务，设计独立检查点合同；当前 `--resume` 只从 manifest + `.complete` 已密封提交创建新任务，不恢复未密封目录。
 - [x] 本分支最终完整 `pytest`、Python 编译、三个 CLI help、JSON、`git diff --check` 与零额外运行时依赖检查均已通过。
 
-完整 FR/AC 映射见 [`docs/需求实现状态与抖音能力边界.md`](docs/需求实现状态与抖音能力边界.md)。
+完整 FR/AC 映射见 [`docs/prd/需求实现状态与抖音能力边界.md`](docs/prd/需求实现状态与抖音能力边界.md)。

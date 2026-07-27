@@ -15,8 +15,8 @@
 | 文件 | 内容 | 当前状态 |
 |---|---|---|
 | `agent-action-path-observations.md` | 多轮 Agent/subagent 行动路径记录及其时效性说明。 | 含 🟢/🟡/🔴 分项状态；阅读时以每条记录的标注为准。 |
-| `bilibili-collection-gap-analysis.md` | B站公开端点、降级和字段可见性观察。 | 🟡 SUPERSEDED：端点可用性与风控响应会变化，当前行为以采集器、测试和平台规范为准。 |
-| `bilibili-subagent-traces.md` | 早期并行 subagent 运行转录。 | 🔴 STALE：形成于可执行脚本落地前，仅保留过程证据。 |
-| `t2-running-path-analysis.md` | 一次中等粉丝量级 B站采集的路径分析。 | 🟡 SUPERSEDED：保留环境特定的失败/降级案例，不代表当前通用结果。 |
+| `douyin-browser-fallback-acceptance.md` / `douyin-sandbox-index-acceptance.md` | 抖音降级 / 索引降级的在线验收记录。 | 当前实现参考，结论以相应验收日期为准。 |
+
+> 历史文件 `bilibili-collection-gap-analysis.md`、`bilibili-subagent-traces.md`、`t2-running-path-analysis.md` 已于 2026-07-27 文档整理中移除（时效标记分别为 🟡SUPERSEDED / 🔴STALE / 🟡SUPERSEDED，结论已并入本目录保留文档或当前实现/测试）。
 
 新增文档应在开头写明观察日期、数据/运行来源、约束与时效性状态；不得把历史观察写成当前产品承诺或绕过平台限制的操作说明。
