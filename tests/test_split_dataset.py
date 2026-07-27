@@ -20,6 +20,57 @@ def _behavior(case_id: str):
     }
 
 
+def _p0_case(
+    case_id: str,
+    primary_p0_id: str,
+    *,
+    platform: str = "bilibili",
+    scenario_type: str = "positive",
+    scenario_group=None,
+):
+    return {
+        "id": case_id,
+        "name": f"case-{case_id}",
+        "primary_p0_id": primary_p0_id,
+        "p0_ids": [primary_p0_id],
+        "source_ref": "PRD §7/§16",
+        "platform": platform,
+        "scenario_type": scenario_type,
+        "scenario_group": scenario_group or case_id,
+        "verification_type": "automated",
+        "prompt": "执行可复核的 P0 验收场景",
+        "expected_output": "输出满足需求并保留证据",
+        "assertions": ["结果可由固定断言复核"],
+    }
+
+
+def _p0_catalog():
+    return {
+        "requirements": [
+            {
+                "id": "FR-001",
+                "title": "任务创建",
+                "kind": "functional",
+                "priority": "P0",
+                "source_ref": "PRD §7/§16",
+                "min_cases": 2,
+                "required_platforms": ["bilibili", "douyin"],
+                "required_scenario_types": ["positive", "boundary"],
+            },
+            {
+                "id": "AC-01",
+                "title": "两平台端到端",
+                "kind": "acceptance",
+                "priority": "P0",
+                "source_ref": "PRD §16 AC-01",
+                "min_cases": 1,
+                "required_platforms": ["cross_platform"],
+                "required_scenario_types": ["external_acceptance"],
+            },
+        ]
+    }
+
+
 def _complete_manifest_entries():
     return [
         {
@@ -135,8 +186,8 @@ def test_build_manifest_contains_governance_metadata():
     manifest = split_dataset.build_manifest(
         results=[], seed=42, test_ratio=0.30, max_distribution_deviation=0.0
     )
-    assert manifest["schema"].endswith("eval-dataset-manifest@2")
-    assert manifest["dataset_version"] == "1.0.0"
+    assert manifest["schema"].endswith("eval-dataset-manifest@3")
+    assert manifest["dataset_version"] == "1.1.0"
     assert manifest["paths"] == {
         "source": "source",
         "validation": "validation_data",
@@ -302,3 +353,131 @@ def test_verify_rejects_incomplete_or_invalid_manifest_entries(
         str(manifest_path),
     ) == 1
     assert expected_message in capsys.readouterr().err
+
+
+def test_validate_p0_coverage_rejects_missing_requirement_case():
+    rows = [
+        _p0_case("p0-fr001-positive", "FR-001"),
+        _p0_case(
+            "p0-fr001-boundary",
+            "FR-001",
+            platform="douyin",
+            scenario_type="boundary",
+        ),
+    ]
+
+    errors = split_dataset.validate_p0_coverage(_p0_catalog(), rows)
+
+    assert any("AC-01" in error and "缺少" in error for error in errors)
+
+
+def test_validate_p0_catalog_rejects_omitted_official_requirement():
+    catalog = {
+        "requirements": [
+            {
+                "id": requirement_id,
+                "title": "requirement",
+                "kind": "functional",
+                "priority": "P0",
+                "min_cases": 1,
+                "required_platforms": ["cross_platform"],
+                "required_scenario_types": ["positive"],
+            }
+            for requirement_id in sorted(split_dataset.EXPECTED_P0_IDS - {"FR-015"})
+        ]
+    }
+
+    errors = split_dataset.validate_p0_catalog(catalog)
+
+    assert any("FR-015" in error and "缺失" in error for error in errors)
+
+
+def test_validate_p0_coverage_rejects_missing_required_platform_and_scenario():
+    rows = [
+        _p0_case("p0-fr001-a", "FR-001"),
+        _p0_case("p0-fr001-b", "FR-001"),
+        _p0_case(
+            "p0-ac01",
+            "AC-01",
+            platform="cross_platform",
+            scenario_type="external_acceptance",
+        ),
+    ]
+
+    errors = split_dataset.validate_p0_coverage(_p0_catalog(), rows)
+
+    assert any("FR-001" in error and "douyin" in error for error in errors)
+    assert any("FR-001" in error and "boundary" in error for error in errors)
+
+
+def test_validate_partition_groups_rejects_semantic_leakage():
+    validation = [
+        _p0_case(
+            "p0-fr001-a", "FR-001", scenario_group="task-creation-defaults"
+        )
+    ]
+    test = [
+        _p0_case(
+            "p0-fr001-b",
+            "FR-001",
+            platform="douyin",
+            scenario_group="task-creation-defaults",
+        )
+    ]
+
+    errors = split_dataset.validate_partition_groups(
+        "p0_cases", validation, test
+    )
+
+    assert any("场景组交叉污染" in error for error in errors)
+
+
+def test_stratified_split_keeps_both_partitions_for_non_singleton_strata():
+    rows = [
+        {"id": "a-1", "kind": "a"},
+        {"id": "a-2", "kind": "a"},
+        {"id": "b-1", "kind": "b"},
+        {"id": "b-2", "kind": "b"},
+    ]
+
+    validation, test, detail = split_dataset.stratified_split(
+        rows, "kind", 0.30, 42
+    )
+
+    assert {row["kind"] for row in validation} == {"a", "b"}
+    assert {row["kind"] for row in test} == {"a", "b"}
+    assert detail == {
+        "a": {"total": 2, "test": 1, "validation": 1},
+        "b": {"total": 2, "test": 1, "validation": 1},
+    }
+
+
+def test_build_p0_coverage_report_distinguishes_external_acceptance():
+    catalog = _p0_catalog()
+    rows = [
+        _p0_case("p0-fr001-positive", "FR-001"),
+        _p0_case(
+            "p0-fr001-boundary",
+            "FR-001",
+            platform="douyin",
+            scenario_type="boundary",
+        ),
+        _p0_case(
+            "p0-ac01",
+            "AC-01",
+            platform="cross_platform",
+            scenario_type="external_acceptance",
+        ),
+    ]
+    rows[-1]["verification_type"] = "external_live"
+
+    report = split_dataset.build_p0_coverage_report(catalog, rows)
+
+    assert report["coverage"] == {
+        "required": 2,
+        "covered_by_cases": 2,
+        "dataset_coverage_rate": 1.0,
+        "external_acceptance_required": 1,
+    }
+    ac01 = next(item for item in report["requirements"] if item["id"] == "AC-01")
+    assert ac01["execution_gate"] == "external_evidence_required"

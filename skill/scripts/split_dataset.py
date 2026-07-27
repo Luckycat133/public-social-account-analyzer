@@ -52,8 +52,9 @@ from typing import Any, Dict, List, Tuple
 # 分层字段缺失时回退到 "_default" 单一层，脚本不会崩溃。
 DATASETS: Dict[str, str] = {
     "behavior_cases": "category",     # 行为用例按场景类别分层
+    "p0_cases": "scenario_type",      # PRD P0 用例按验证场景类型分层
     "trigger_should": "platform",     # 应触发按平台分层
-    "trigger_should_not": "reason",   # 不应触发按拒绝原因分层
+    "trigger_should_not": "category", # 不应触发按风险大类分层，避免单例分层
 }
 
 DATASET_SCHEMAS: Dict[str, Dict[str, type]] = {
@@ -67,6 +68,20 @@ DATASET_SCHEMAS: Dict[str, Dict[str, type]] = {
         "expected_output": str,
         "assertions": list,
     },
+    "p0_cases": {
+        "id": str,
+        "name": str,
+        "primary_p0_id": str,
+        "p0_ids": list,
+        "source_ref": str,
+        "platform": str,
+        "scenario_type": str,
+        "scenario_group": str,
+        "verification_type": str,
+        "prompt": str,
+        "expected_output": str,
+        "assertions": list,
+    },
     "trigger_should": {
         "id": str,
         "label": str,
@@ -76,12 +91,13 @@ DATASET_SCHEMAS: Dict[str, Dict[str, type]] = {
     "trigger_should_not": {
         "id": str,
         "label": str,
+        "category": str,
         "reason": str,
         "query": str,
     },
 }
 
-DATASET_VERSION = "1.0.0"
+DATASET_VERSION = "1.1.0"
 DEFAULT_TEST_RATIO = 0.30   # 留出（test）比例，对应「独立数据的 20-30%」标准区间
 # 分布一致性阈值：各层在 test 中的实际占比与目标 test_ratio 的最大允许偏差。
 # 分层样本较小时偏差天然偏大，这里给出提示而非硬失败（见 --strict）。
@@ -92,6 +108,15 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 TRIGGER_LABELS = {
     "trigger_should": "should_trigger",
     "trigger_should_not": "should_not_trigger",
+}
+EXPECTED_P0_IDS = {
+    "FR-001", "FR-002", "FR-003", "FR-004", "FR-005", "FR-006",
+    "FR-008", "FR-009", "FR-010", "FR-011", "FR-012", "FR-013",
+    "FR-015",
+    "NFR-001", "NFR-002", "NFR-003", "NFR-004", "NFR-005",
+    "NFR-006", "NFR-007",
+    "AC-01", "AC-02", "AC-03", "AC-04", "AC-05", "AC-06", "AC-07",
+    "AC-08", "AC-09", "AC-10",
 }
 
 
@@ -120,6 +145,18 @@ def read_jsonl(path: str) -> List[Dict[str, Any]]:
                 )
             rows.append(row)
     return rows
+
+
+def read_json_object(path: str) -> Dict[str, Any]:
+    """读取一个顶层为对象的 UTF-8 JSON 文件。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"[FATAL] 无法读取 {path}: {exc}")
+    if not isinstance(value, dict):
+        raise SystemExit(f"[FATAL] {path} 顶层必须是 JSON 对象")
+    return value
 
 
 def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
@@ -208,6 +245,149 @@ def validate_partition_ids(
     return errors
 
 
+def validate_partition_groups(
+    name: str,
+    validation_rows: List[Dict[str, Any]],
+    test_rows: List[Dict[str, Any]],
+) -> List[str]:
+    """阻止同一语义场景组同时出现在开发集和留出集。"""
+    if name != "p0_cases":
+        return []
+    validation_groups = {row["scenario_group"] for row in validation_rows}
+    test_groups = {row["scenario_group"] for row in test_rows}
+    overlap = sorted(validation_groups & test_groups)
+    if not overlap:
+        return []
+    return [f"{name} validation/test 场景组交叉污染: {', '.join(overlap)}"]
+
+
+def validate_p0_coverage(
+    catalog: Dict[str, Any], rows: List[Dict[str, Any]]
+) -> List[str]:
+    """按 PRD 目录检查每项 P0 的数量、平台和场景覆盖门槛。"""
+    requirements = catalog.get("requirements")
+    if not isinstance(requirements, list):
+        return ["P0 requirements 清单必须是数组"]
+
+    errors: List[str] = []
+    catalog_ids = {
+        item.get("id") for item in requirements if isinstance(item, dict)
+    }
+    for row in rows:
+        primary = row.get("primary_p0_id")
+        p0_ids = row.get("p0_ids")
+        if primary not in catalog_ids:
+            errors.append(f"{row.get('id')} primary_p0_id 未在目录中: {primary}")
+        if isinstance(p0_ids, list):
+            unknown = sorted(set(p0_ids) - catalog_ids)
+            if unknown:
+                errors.append(
+                    f"{row.get('id')} p0_ids 含未知编号: {', '.join(unknown)}"
+                )
+            if primary not in p0_ids:
+                errors.append(
+                    f"{row.get('id')} primary_p0_id 必须包含在 p0_ids 中"
+                )
+
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            errors.append("P0 requirement 必须是对象")
+            continue
+        requirement_id = requirement.get("id")
+        matched = [
+            row for row in rows if requirement_id in row.get("p0_ids", [])
+        ]
+        min_cases = requirement.get("min_cases", 1)
+        if len(matched) < min_cases:
+            errors.append(
+                f"{requirement_id} 缺少 P0 用例: 需要 {min_cases}，实际 {len(matched)}"
+            )
+        platforms = {row.get("platform") for row in matched}
+        for platform in requirement.get("required_platforms", []):
+            if platform not in platforms:
+                errors.append(f"{requirement_id} 缺少平台覆盖: {platform}")
+        scenario_types = {row.get("scenario_type") for row in matched}
+        for scenario_type in requirement.get("required_scenario_types", []):
+            if scenario_type not in scenario_types:
+                errors.append(f"{requirement_id} 缺少场景覆盖: {scenario_type}")
+    return errors
+
+
+def validate_p0_catalog(catalog: Dict[str, Any]) -> List[str]:
+    """校验目录精确覆盖 PRD V1.0 的全部 P0 编号。"""
+    requirements = catalog.get("requirements")
+    if not isinstance(requirements, list):
+        return ["P0 requirements 清单必须是数组"]
+    ids = [item.get("id") for item in requirements if isinstance(item, dict)]
+    actual = set(ids)
+    errors: List[str] = []
+    missing = sorted(EXPECTED_P0_IDS - actual)
+    extra = sorted(value for value in actual - EXPECTED_P0_IDS if isinstance(value, str))
+    if missing:
+        errors.append(f"P0 官方需求编号缺失: {', '.join(missing)}")
+    if extra:
+        errors.append(f"P0 目录包含非官方编号: {', '.join(extra)}")
+    if len(ids) != len(actual):
+        errors.append("P0 目录包含重复编号")
+    for item in requirements:
+        if not isinstance(item, dict):
+            continue
+        if item.get("priority") != "P0":
+            errors.append(f"{item.get('id')} priority 必须为 P0")
+    return errors
+
+
+def build_p0_coverage_report(
+    catalog: Dict[str, Any], rows: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """生成需求到用例的机器可读追踪矩阵，不冒充执行通过状态。"""
+    requirement_rows: List[Dict[str, Any]] = []
+    external_count = 0
+    for requirement in catalog["requirements"]:
+        requirement_id = requirement["id"]
+        cases = [row for row in rows if requirement_id in row["p0_ids"]]
+        verification_types = sorted(
+            {row["verification_type"] for row in cases}
+        )
+        external = any(value.startswith("external_") for value in verification_types)
+        if external:
+            external_count += 1
+        requirement_rows.append(
+            {
+                "id": requirement_id,
+                "title": requirement["title"],
+                "kind": requirement["kind"],
+                "source_ref": requirement["source_ref"],
+                "case_ids": [row["id"] for row in cases],
+                "platforms": sorted({row["platform"] for row in cases}),
+                "scenario_types": sorted(
+                    {row["scenario_type"] for row in cases}
+                ),
+                "verification_types": verification_types,
+                "execution_gate": (
+                    "external_evidence_required" if external else "runnable_offline"
+                ),
+            }
+        )
+    covered = sum(1 for item in requirement_rows if item["case_ids"])
+    required = len(requirement_rows)
+    return {
+        "schema": "public-social-account-analyzer/p0-coverage@1",
+        "dataset_version": DATASET_VERSION,
+        "coverage": {
+            "required": required,
+            "covered_by_cases": covered,
+            "dataset_coverage_rate": round(covered / required, 4) if required else 0.0,
+            "external_acceptance_required": external_count,
+        },
+        "status_semantics": {
+            "dataset_coverage": "存在可执行或可填写的验收用例，不代表运行通过",
+            "external_evidence_required": "必须由真实公开页面、人工真值或运营试用记录完成",
+        },
+        "requirements": requirement_rows,
+    }
+
+
 def build_manifest(
     results: List[Dict[str, Any]],
     seed: int,
@@ -216,7 +396,7 @@ def build_manifest(
 ) -> Dict[str, Any]:
     """构建带治理元数据的数据集快照清单。"""
     return {
-        "schema": "public-social-account-analyzer/eval-dataset-manifest@2",
+        "schema": "public-social-account-analyzer/eval-dataset-manifest@3",
         "dataset_version": DATASET_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "generated_by": "skill/scripts/split_dataset.py",
@@ -238,6 +418,8 @@ def build_manifest(
             "unique_id",
             "partition_disjointness",
             "source_coverage",
+            "scenario_group_disjointness",
+            "p0_requirement_coverage",
             "record_counts",
             "sha256",
         ],
@@ -285,10 +467,14 @@ def stratified_split(
     remainders: Dict[str, float] = {}
     for key, items in buckets.items():
         quota = len(items) * test_ratio
-        floors[key] = int(math.floor(quota))
+        floor = int(math.floor(quota))
+        if len(items) >= 2:
+            floor = max(1, min(floor, len(items) - 1))
+        floors[key] = floor
         remainders[key] = quota - floors[key]
 
     assigned = sum(floors.values())
+    global_target = max(global_target, assigned)
     remaining = global_target - assigned
     # 余数从大到小分配剩余名额；同余数按层名排序，确保确定性
     order = sorted(buckets.keys(), key=lambda k: (-remainders[k], k))
@@ -361,9 +547,17 @@ def process_one(
 
     rows = read_jsonl(src_path)
     schema_errors = validate_dataset_rows(name, rows, src_path)
+    if name == "p0_cases":
+        catalog_path = os.path.join(os.path.dirname(source_dir), "p0_requirements.json")
+        catalog = read_json_object(catalog_path)
+        schema_errors.extend(validate_p0_catalog(catalog))
+        schema_errors.extend(validate_p0_coverage(catalog, rows))
     if schema_errors:
         raise SystemExit("[FATAL] " + "\n[FATAL] ".join(schema_errors))
     validation, test, detail = stratified_split(rows, stratify_field, test_ratio, seed)
+    group_errors = validate_partition_groups(name, validation, test)
+    if group_errors:
+        raise SystemExit("[FATAL] " + "\n[FATAL] ".join(group_errors))
     creport, max_dev = consistency_report(detail, test_ratio)
 
     eprint(f"  · {name}.jsonl  共 {len(rows)} 条 → "
@@ -445,6 +639,35 @@ def verify(source_dir: str, val_dir: str, test_dir: str, manifest_path: str) -> 
         print(json.dumps({"verify": "FAIL"}, ensure_ascii=False, indent=2))
         return 1
 
+    governance = manifest.get("p0_governance")
+    governance_errors: List[str] = []
+    if not isinstance(governance, dict):
+        governance_errors.append("manifest 缺少 p0_governance")
+    else:
+        root = os.path.dirname(source_dir)
+        for path_field, hash_field in (
+            ("requirements_path", "requirements_sha256"),
+            ("coverage_path", "coverage_sha256"),
+        ):
+            relative_path = governance.get(path_field)
+            expected_hash = governance.get(hash_field)
+            if not isinstance(relative_path, str) or not relative_path:
+                governance_errors.append(f"p0_governance {path_field} 无效")
+                continue
+            if not isinstance(expected_hash, str) or not _SHA256_RE.fullmatch(expected_hash):
+                governance_errors.append(f"p0_governance {hash_field} 无效")
+                continue
+            full_path = os.path.join(root, relative_path)
+            if not os.path.exists(full_path):
+                governance_errors.append(f"P0 治理文件缺失: {full_path}")
+            elif sha256_of_file(full_path) != expected_hash.lower():
+                governance_errors.append(f"P0 治理文件校验和不匹配: {full_path}")
+    if governance_errors:
+        for error in governance_errors:
+            eprint(f"[INVALID] {error}")
+        print(json.dumps({"verify": "FAIL"}, ensure_ascii=False, indent=2))
+        return 1
+
     ok = True
     for ds in datasets:
         name = ds["dataset"]
@@ -474,6 +697,24 @@ def verify(source_dir: str, val_dir: str, test_dir: str, manifest_path: str) -> 
             integrity_errors.extend(
                 validate_partition_ids(name, source_rows, validation_rows, test_rows)
             )
+            integrity_errors.extend(
+                validate_partition_groups(name, validation_rows, test_rows)
+            )
+            if name == "p0_cases":
+                catalog_path = os.path.join(
+                    os.path.dirname(source_dir), "p0_requirements.json"
+                )
+                if not os.path.exists(catalog_path):
+                    integrity_errors.append(
+                        f"{name} 缺少 P0 目录: {catalog_path}"
+                    )
+                else:
+                    integrity_errors.extend(
+                        validate_p0_catalog(read_json_object(catalog_path))
+                    )
+                    integrity_errors.extend(
+                        validate_p0_coverage(read_json_object(catalog_path), source_rows)
+                    )
 
         expected_counts = {
             "total": len(source_rows),
@@ -575,6 +816,25 @@ def main() -> int:
     manifest = build_manifest(results, args.seed, args.test_ratio, max_dev_all)
 
     if not args.dry_run:
+        catalog_path = os.path.join(root, "p0_requirements.json")
+        coverage_path = os.path.join(root, "p0_coverage.json")
+        catalog = read_json_object(catalog_path)
+        p0_rows = read_jsonl(os.path.join(source_dir, "p0_cases.jsonl"))
+        with open(coverage_path, "w", encoding="utf-8") as f:
+            json.dump(
+                build_p0_coverage_report(catalog, p0_rows),
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+            f.write("\n")
+        os.chmod(coverage_path, FILE_MODE)
+        manifest["p0_governance"] = {
+            "requirements_path": "p0_requirements.json",
+            "requirements_sha256": sha256_of_file(catalog_path),
+            "coverage_path": "p0_coverage.json",
+            "coverage_sha256": sha256_of_file(coverage_path),
+        }
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
             f.write("\n")
