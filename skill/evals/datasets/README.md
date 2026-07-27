@@ -114,7 +114,16 @@ skill/evals/datasets/
 | `reason` | string | 分层字段和拒绝原因 |
 | `query` | string | 不应触发本 Skill 的用户请求 |
 
-所有必需字符串必须非空，`assertions` 必须是非空字符串数组。禁止把密码、Cookie、令牌、私有后台指标或个人敏感信息写入任何数据文件。
+## 主数据池维护规则
+
+`source/` 是评估数据的唯一事实来源（single source of truth）。维护者只在 `source/` 目录新增或修改评估记录，再通过 `skill/scripts/split_dataset.py` 生成 `validation_data/` 和 `test_data/`。
+
+1. 每行必须是 UTF-8 JSON 对象，字符串字段不得为空，`assertions` 必须是非空字符串数组。
+2. 每个文件内 `id` 必须唯一且发布后保持稳定。
+3. 新场景必须能追溯到明确的产品、技能或合规要求；每个官方 P0 编号必须存在于 `p0_requirements.json`。
+4. 禁止复制记录以调整比例；关键稀有类别应新增独立场景。
+5. 禁止把密码、Cookie、令牌、私有后台指标或个人敏感信息写入任何数据文件。
+6. 禁止直接修补 derived partitions；修改后必须重新运行划分和验证。
 
 ## 划分策略
 

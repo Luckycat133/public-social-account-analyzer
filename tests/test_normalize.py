@@ -1,14 +1,17 @@
-"""CASE-001（null 与 0）、CASE-005（中文数字单位）、CASE-011（字段覆盖率）。
+"""CASE-001（null 与 0）、CASE-002（同平台去重）、CASE-003（跨平台保留）、CASE-004（ISO 时间）、CASE-005（中文数字单位）、CASE-011（字段覆盖率）。
 
 全部离线、确定性，直接调用 normalize 纯函数：
 - parse_metric：页面显示 0 → 0（visible）；页面未显示 → None（hidden）。
 - parse_metric：中文单位 万/亿 → 整数换算。
+- parse_time：多种时间格式统一为带时区的 datetime。
+- dedup_posts：按 (platform, post_id) 唯一键去重。
 - compute_metric_coverage：各指标在有效样本中非 null 比例。
 """
 import csv
 import copy
 import io
 import json
+from datetime import datetime, timezone, timedelta
 
 import pytest
 
@@ -381,3 +384,145 @@ def test_invalid_field_visibility_is_replaced_by_derived_value_with_warning():
     warning = result.coverage["warnings"][0]
     assert warning["warning_code"] == "FIELD_VISIBILITY_INVALID"
     assert warning["field"] == "field_visibility.views"
+
+
+# ---------------------------------------------------------------------------
+# CASE-002：同平台同 post_id 去重与 CASE-003：跨平台相同 post_id 保留
+# ---------------------------------------------------------------------------
+def test_same_platform_same_post_id_dedup():
+    raw = [
+        {"platform": "bilibili", "post_id": "BV123", "title": "first"},
+        {"platform": "bilibili", "post_id": "BV123", "title": "dup"},
+        {"platform": "bilibili", "post_id": "BV456"},
+    ]
+    kept, dup = normalize.dedup_posts(raw)
+    assert len(kept) == 2
+    assert dup == 1
+    assert kept[0]["title"] == "first"
+    ids = [(p["platform"], p["post_id"]) for p in kept]
+    assert ids == [("bilibili", "BV123"), ("bilibili", "BV456")]
+
+
+def test_cross_platform_same_post_id_kept():
+    raw = [
+        {"platform": "bilibili", "post_id": "123"},
+        {"platform": "douyin", "post_id": "123"},
+    ]
+    kept, dup = normalize.dedup_posts(raw)
+    assert len(kept) == 2
+    assert dup == 0
+    platforms = sorted(p["platform"] for p in kept)
+    assert platforms == ["bilibili", "douyin"]
+
+
+def test_no_duplicate_when_unique():
+    raw = [
+        {"platform": "bilibili", "post_id": "BV1"},
+        {"platform": "bilibili", "post_id": "BV2"},
+        {"platform": "douyin", "post_id": "DV1"},
+    ]
+    kept, dup = normalize.dedup_posts(raw)
+    assert len(kept) == 3
+    assert dup == 0
+
+
+def test_missing_post_id_not_collapsed():
+    raw = [
+        {"platform": "bilibili"},
+        {"platform": "bilibili"},
+    ]
+    kept, dup = normalize.dedup_posts(raw)
+    assert len(kept) == 2
+    assert dup == 0
+
+
+# ---------------------------------------------------------------------------
+# CASE-004：ISO 时间转换
+# ---------------------------------------------------------------------------
+def test_naive_iso_gets_plus08():
+    dt = normalize.parse_time("2026-07-23T09:00:00")
+    assert dt is not None
+    assert dt.tzinfo is not None
+    assert dt.utcoffset() == timezone(timedelta(hours=8)).utcoffset(None)
+    assert dt.isoformat().endswith("+08:00")
+
+
+def test_iso_with_explicit_offset_kept():
+    dt = normalize.parse_time("2026-07-23T09:00:00+00:00")
+    assert dt is not None
+    assert dt.utcoffset() == timezone.utc.utcoffset(None)
+    assert dt.isoformat().endswith("+00:00")
+
+
+def test_iso_with_z_suffix_normalized():
+    dt = normalize.parse_time("2026-07-23T09:00:00Z")
+    assert dt is not None
+    assert dt.utcoffset() == timezone.utc.utcoffset(None)
+
+
+def test_yyyymmdd_hhmmss_format():
+    dt = normalize.parse_time("2026-07-23 09:00:00")
+    assert dt is not None
+    assert dt.year == 2026 and dt.month == 7 and dt.day == 23
+    assert dt.hour == 9 and dt.minute == 0 and dt.second == 0
+    assert dt.isoformat().endswith("+08:00")
+
+
+def test_yyyymmdd_only_format():
+    dt = normalize.parse_time("2026-07-23")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2026, 7, 23)
+    assert dt.isoformat().endswith("+08:00")
+
+
+def test_chinese_date_format():
+    dt = normalize.parse_time("2026年7月23日")
+    assert dt is not None
+    assert (dt.year, dt.month, dt.day) == (2026, 7, 23)
+    assert dt.isoformat().endswith("+08:00")
+
+
+def test_md_date_uses_current_year():
+    dt = normalize.parse_time("7月23日")
+    assert dt is not None
+    assert (dt.month, dt.day) == (7, 23)
+    assert dt.year == datetime.now().year
+    assert dt.isoformat().endswith("+08:00")
+
+
+def test_unparseable_returns_none():
+    assert normalize.parse_time("not-a-date") is None
+    assert normalize.parse_time("") is None
+    assert normalize.parse_time(None) is None
+    assert normalize.parse_time("刚刚") is None
+
+
+def test_unix_timestamp_converted():
+    dt = normalize.parse_time(1784602500)
+    assert dt is not None
+    assert dt.isoformat().endswith("+08:00")
+
+
+def test_reversed_collection_range_fails_before_workspace_creation(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class DateAdapter:
+        platform = "douyin"
+
+        def supports(self, url):
+            return True
+
+    out = tmp_path / "must-not-exist"
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [DateAdapter()])
+
+    rc = collect.run(
+        "https://www.douyin.com/user/example",
+        out_dir=str(out),
+        date_from="2026-07-25",
+        date_to="2026-07-24",
+    )
+
+    assert rc == 2
+    assert not out.exists()
