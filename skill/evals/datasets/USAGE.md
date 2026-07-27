@@ -11,6 +11,8 @@ source:     skill/evals/datasets/source
 validation: skill/evals/datasets/validation_data
 test:       skill/evals/datasets/test_data
 manifest:   skill/evals/datasets/manifest.json
+P0目录:     skill/evals/datasets/p0_requirements.json
+P0矩阵:     skill/evals/datasets/p0_coverage.json
 ```
 
 `config.example.json` 是供应用、CI 或外部评估器复制的路径映射示例；当前 Python 脚本通过 `--datasets-root`、`--test-ratio` 和 `--seed` 接收参数，不自动读取该配置文件。
@@ -41,8 +43,9 @@ python3 skill/scripts/split_dataset.py --dry-run --test-ratio 0.30 --seed 42
 脚本按以下字段分层：
 
 - `behavior_cases`：`category`；
+- `p0_cases`：`scenario_type`；
 - `trigger_should`：`platform`；
-- `trigger_should_not`：`reason`。
+- `trigger_should_not`：`category`（细粒度原因仍保留在 `reason`）。
 
 固定 seed 保证相同输入产生相同 ID 分配。不要使用未记录的临时 seed 生成正式快照。
 
@@ -62,7 +65,7 @@ python3 skill/scripts/split_dataset.py --dry-run --test-ratio 0.30 --seed 42
 python3 skill/scripts/split_dataset.py --dry-run --strict
 ```
 
-当前数据包含单样本 strata，严格模式可能因自然比例偏差返回 1。应结合 strata 数量判断，不得通过泄漏或复制记录消除告警。
+正式快照要求严格模式退出码为0。脚本会尽量保证样本数不少于2的分层同时出现在 validation 和 test；不得通过复制记录消除告警。
 
 ### 2.5 生成正式快照
 
@@ -78,7 +81,17 @@ python3 skill/scripts/split_dataset.py --test-ratio 0.30 --seed 42
 python3 skill/scripts/split_dataset.py --verify
 ```
 
-成功标准：退出码为 0，stdout 包含 `"verify": "PASS"`。任何 schema、重复 ID、交叉污染、覆盖、数量或 checksum 错误都必须在使用数据前修复。
+成功标准：退出码为 0，stdout 包含 `"verify": "PASS"`。任何 schema、重复 ID、场景组交叉污染、P0覆盖、数量或 checksum 错误都必须在使用数据前修复。
+
+### 2.7 解读 P0 覆盖
+
+`p0_coverage.json` 将 PRD 的13项功能需求、7项非功能需求和10项验收标准映射到测试用例。`dataset_coverage_rate=1.0` 只说明测试定义完整：
+
+- `runnable_offline` 可由自动化测试或 Agent 基准执行；
+- `external_evidence_required` 必须使用真实公开账号、人工页面真值或真实运营人员反馈；
+- 外部记录未完成时必须报告 `PENDING/INCONCLUSIVE`，不能用合成夹具标记通过。
+
+有 Skill/无 Skill 模型基准必须对同一 prompt 同时启动，使用干净上下文，保存输出、逐项评分、耗时和 token；至少重复3次后报告均值、标准差和差值。
 
 ## 3. 数据使用规范
 
@@ -150,7 +163,8 @@ find skill/evals/datasets -maxdepth 2 -printf '%M %p\n'
 3. 使用记录的 seed 与比例生成正式划分。
 4. 运行 `--verify`。
 5. 运行 `python3 -m pytest tests/test_split_dataset.py -q`。
-6. 更新 `manifest.json` 中的数据版本（如需要）。
-7. 更新 `skill/evals/datasets/CHANGELOG.md`。
-8. 应用并验证本地权限。
-9. 复核 `git diff`，确认 test/validation 仅包含可解释的确定性变化。
+6. 运行 `python3 skill/scripts/split_dataset.py --dry-run --strict`。
+7. 检查 `p0_coverage.json` 中 required 与 covered_by_cases 相等。
+8. 更新 `skill/evals/datasets/CHANGELOG.md`。
+9. 应用并验证本地权限。
+10. 复核 `git diff`，确认 test/validation 仅包含可解释的确定性变化。

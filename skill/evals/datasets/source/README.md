@@ -9,8 +9,9 @@
 ## 文件与用途
 
 - `behavior_cases.jsonl`：Agent 行为、合规、边界与输出契约场景；按 `category` 分层。
+- `p0_cases.jsonl`：PRD P0 功能、非功能和验收用例；按 `scenario_type` 分层，并由 `scenario_group` 防止语义泄漏。
 - `trigger_should.jsonl`：应触发 Skill 的正例；按 `platform` 分层。
-- `trigger_should_not.jsonl`：不应触发 Skill 的负例；按 `reason` 分层。
+- `trigger_should_not.jsonl`：不应触发 Skill 的负例；保留细粒度 `reason`，按粗粒度 `category` 分层。
 
 ## 维护规则
 
@@ -21,6 +22,7 @@
 5. 禁止复制记录以调整比例；关键稀有类别应新增独立场景。
 6. 禁止凭证、Cookie、令牌、私有指标和个人敏感信息。
 7. 禁止直接修补 derived partitions；修改后必须重新运行划分和验证。
+8. 每个官方 P0 编号必须存在于 `p0_requirements.json`，并有符合目录门槛的用例。
 
 ## 生成与校验
 

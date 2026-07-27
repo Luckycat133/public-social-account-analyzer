@@ -5,6 +5,26 @@ All notable changes to the evaluation dataset are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and dataset versions use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-27
+
+### Added
+
+- Added a machine-readable catalog for all 30 PRD V1.0 P0 requirements: 13 functional requirements, 7 non-functional requirements, and 10 acceptance criteria.
+- Added 30 traceable P0 cases with source references, platform scope, scenario type, verification mode, objective assertions, and semantic leakage groups.
+- Added a generated P0 coverage report that separates dataset coverage from external evidence gates.
+- Added checksum governance for the P0 catalog and coverage report.
+
+### Changed
+
+- Added scenario-group leakage and strict P0 coverage validation.
+- Stratified P0 cases by scenario type and negative triggers by coarse risk category.
+- Preserved validation and test examples for every non-singleton stratum where mathematically possible.
+- Expanded output-contract and conditional Weibo trigger samples so strict distribution validation passes.
+
+### Security
+
+- Added explicit P0 cases for credential rejection, private-data exclusion, no-login behavior, and anti-bypass compliance.
+
 ## [1.0.0] - 2026-07-24
 
 ### Added

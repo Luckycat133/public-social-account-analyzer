@@ -5,7 +5,9 @@
     "source": "skill/evals/datasets/source",
     "validation": "skill/evals/datasets/validation_data",
     "test": "skill/evals/datasets/test_data",
-    "manifest": "skill/evals/datasets/manifest.json"
+    "manifest": "skill/evals/datasets/manifest.json",
+    "p0_requirements": "skill/evals/datasets/p0_requirements.json",
+    "p0_coverage": "skill/evals/datasets/p0_coverage.json"
   },
   "split": {
     "method": "stratified_random_largest_remainder",
@@ -13,8 +15,9 @@
     "test_ratio": 0.3,
     "stratify_fields": {
       "behavior_cases": "category",
+      "p0_cases": "scenario_type",
       "trigger_should": "platform",
-      "trigger_should_not": "reason"
+      "trigger_should_not": "category"
     }
   },
   "model_development_guidance": {

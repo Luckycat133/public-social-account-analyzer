@@ -1,6 +1,6 @@
 # 公开社交媒体账号分析 Skill 评估数据集
 
-![Dataset Version](https://img.shields.io/badge/dataset-v1.0.0-blue)
+![Dataset Version](https://img.shields.io/badge/dataset-v1.1.0-blue)
 ![Format](https://img.shields.io/badge/format-JSONL-green)
 ![Split](https://img.shields.io/badge/split-stratified%20seed%2042-orange)
 
@@ -39,9 +39,12 @@ skill/evals/datasets/
 ├── config.example.json               # 数据路径与划分参数示例
 ├── CHANGELOG.md                      # 数据版本更新历史
 ├── manifest.json                     # 版本、策略、分布、数量与 SHA-256
+├── p0_requirements.json              # PRD V1.0 的30项P0官方需求目录
+├── p0_coverage.json                  # 需求到用例的机器可读追踪矩阵
 ├── source/
 │   ├── README.md                     # 主数据池维护规则
 │   ├── behavior_cases.jsonl
+│   ├── p0_cases.jsonl
 │   ├── trigger_should.jsonl
 │   └── trigger_should_not.jsonl
 ├── validation_data/
@@ -78,6 +81,21 @@ skill/evals/datasets/
 | `expected_output` | string | 预期行为与结果摘要 |
 | `assertions` | string[] | 必须逐项满足的验收断言 |
 
+### `p0_cases.jsonl`
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `primary_p0_id` | string | 用例主要验证的 FR、NFR 或 AC 编号 |
+| `p0_ids` | string[] | 用例同时覆盖的全部 P0 编号 |
+| `source_ref` | string | PRD 中的来源章节和编号 |
+| `platform` | string | 平台或 `cross_platform` 边界类别 |
+| `scenario_type` | string | 正向、边界、失败、合同或外部验收场景 |
+| `scenario_group` | string | 近重复样本的防泄漏分组键 |
+| `verification_type` | string | 自动化、Agent、在线或人工验收方式 |
+| `prompt` | string | 可执行的测试任务 |
+| `expected_output` | string | 预期行为与产物摘要 |
+| `assertions` | string[] | 可客观复核的逐项断言 |
+
 ### `trigger_should.jsonl`
 
 | 字段 | 类型 | 含义 |
@@ -108,7 +126,7 @@ skill/evals/datasets/
 - 随机方法：分层伪随机划分；
 - 配额方法：最大余数法；
 - 固定种子：`42`；
-- 分层字段：`behavior_cases.category`、`trigger_should.platform`、`trigger_should_not.reason`。
+- 分层字段：`behavior_cases.category`、`p0_cases.scenario_type`、`trigger_should.platform`、`trigger_should_not.category`。
 
 对于通用模型开发流程，建议从训练数据中留出 15–20% 作为验证集，并从独立数据中保留 20–30% 作为测试集。这两个建议使用不同分母；本仓库当前 70/30 是小规模 Agent 评估池的开发/留出划分，不应解释为训练数据三分法。
 
@@ -125,8 +143,13 @@ skill/evals/datasets/
 5. validation 与 test 的并集是否完整覆盖 source；
 6. manifest 记录数量是否与文件一致；
 7. source、validation、test 的 SHA-256 是否匹配。
+8. PRD 30项 P0 是否全部有用例，且满足平台和场景门槛；
+9. 同一 `scenario_group` 是否跨入 validation 和 test；
+10. P0需求目录、追踪矩阵及其 SHA-256 是否一致。
 
-分布偏差是小样本诊断指标，不等同于数据泄漏。使用 `--strict` 时，偏差超过 `0.20` 会返回非零退出码；当前存在单样本 strata，因此严格模式适合质量评审，不作为默认发布阻断条件。
+分布偏差是小样本诊断指标，不等同于数据泄漏。使用 `--strict` 时，偏差超过 `0.20` 会返回非零退出码。正式发布必须同时通过普通验证和严格分布检查。
+
+`p0_coverage.json` 的 100% 表示“每项需求均有测试定义”，不表示所有测试已经运行通过。`external_evidence_required` 项必须依靠真实公开页面、人工真值或运营试用证据。
 
 ## 安全与权限
 
