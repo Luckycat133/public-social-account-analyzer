@@ -119,8 +119,11 @@ def _http_get_text(url: str) -> str:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        # 401/403/302/405 → 登录墙或验证码，立即停止
-        if e.code in (401, 403, 302, 405):
+        # 401/403 → 登录墙或验证码，立即停止。302/405 are normal redirect
+        # responses (weibo.com/<name> → /u/<uid>; urllib follows 30x by
+        # default) and must not be misclassified as LOGIN_REQUIRED — that
+        # would block every name-based URL on the first redirect.
+        if e.code in (401, 403):
             raise WeiboError(LOGIN_REQUIRED, f"微博要求登录/验证码 (HTTP {e.code}): {url}")
         raise WeiboError(ACCESS_RESTRICTED, f"微博访问受限 (HTTP {e.code}): {url}")
     except urllib.error.URLError as e:

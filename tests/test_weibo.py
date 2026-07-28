@@ -164,3 +164,73 @@ def test_disabled_still_adapter_unavailable(monkeypatch):
     with pytest.raises(RuntimeError) as exc:
         c.collect_profile("https://weibo.com/u/123456")
     assert ADAPTER_UNAVAILABLE in str(exc.value)
+
+
+def test_weibo_does_not_treat_302_as_login_required():
+    """C3: a 302 is a normal HTTP redirect. urllib follows 30x by default, so
+    HTTPError 302 only fires when the redirect lands on a non-HTTP scheme
+    or a chain. It must not be classified as LOGIN_REQUIRED, which would
+    block every name-based account URL on the first redirect.
+
+    The docstring on the weibo collector now claims 401/403 are the only
+    login-wall triggers; this test pins that contract.
+    """
+    import urllib.error
+
+    from collectors.weibo import WeiboError, _http_get_text
+
+    class _Boom:
+        def __init__(self, code):
+            self.code = code
+
+    request = _Boom(302)
+
+    def fake_urlopen(_req, timeout=None):
+        raise urllib.error.HTTPError(
+            "https://weibo.com/jack",
+            302,
+            "Found",
+            None,
+            None,
+        )
+
+    import collectors.weibo as weibo_mod
+    original = weibo_mod.urllib.request.urlopen
+    weibo_mod.urllib.request.urlopen = fake_urlopen
+    try:
+        with pytest.raises(WeiboError) as exc_info:
+            _http_get_text("https://weibo.com/jack")
+    finally:
+        weibo_mod.urllib.request.urlopen = original
+
+    # 302 must NOT be LOGIN_REQUIRED — the redirect target is unknown,
+    # so ACCESS_RESTRICTED is the conservative fallback.
+    assert exc_info.value.stop_reason != "LOGIN_REQUIRED"
+
+
+def test_weibo_401_still_triggers_login_required():
+    """Pinned positive control: 401 still maps to LOGIN_REQUIRED after
+    the 302/405 removal."""
+    import urllib.error
+
+    from collectors.weibo import WeiboError, _http_get_text
+
+    def fake_urlopen(_req, timeout=None):
+        raise urllib.error.HTTPError(
+            "https://weibo.com/u/123456",
+            401,
+            "Unauthorized",
+            None,
+            None,
+        )
+
+    import collectors.weibo as weibo_mod
+    original = weibo_mod.urllib.request.urlopen
+    weibo_mod.urllib.request.urlopen = fake_urlopen
+    try:
+        with pytest.raises(WeiboError) as exc_info:
+            _http_get_text("https://weibo.com/u/123456")
+    finally:
+        weibo_mod.urllib.request.urlopen = original
+
+    assert exc_info.value.stop_reason == "LOGIN_REQUIRED"
