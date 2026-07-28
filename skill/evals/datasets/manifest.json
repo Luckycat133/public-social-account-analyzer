@@ -1,7 +1,7 @@
 {
   "schema": "public-social-account-analyzer/eval-dataset-manifest@3",
-  "dataset_version": "1.1.0",
-  "generated_at": "2026-07-27T09:37:39+00:00",
+  "dataset_version": "0.2.0",
+  "generated_at": "2026-07-28T09:53:42+00:00",
   "generated_by": "skill/scripts/split_dataset.py",
   "paths": {
     "source": "source",
@@ -227,6 +227,6 @@
     "requirements_path": "p0_requirements.json",
     "requirements_sha256": "44a1a8f2469b02ebec5be1bea02457415fa17209f0881643ec512dcc291b73bf",
     "coverage_path": "p0_coverage.json",
-    "coverage_sha256": "43d58a0b7194cde06f6e2e0eca9f3b2641cd6579ad48058e5c550dff3dd7d5ec"
+    "coverage_sha256": "58d66fb2b1ba014c4849d23690e68e703c9514bd1b114c4a73640c4b43804f21"
   }
 }

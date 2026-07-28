@@ -1,6 +1,6 @@
 # 公开社交媒体账号分析 Skill 评估数据集
 
-![Dataset Version](https://img.shields.io/badge/dataset-v1.1.0-blue)
+![Dataset Version](https://img.shields.io/badge/dataset-v0.2.0-blue)
 ![Format](https://img.shields.io/badge/format-JSONL-green)
 ![Split](https://img.shields.io/badge/split-stratified%20seed%2042-orange)
 

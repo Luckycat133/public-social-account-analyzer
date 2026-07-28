@@ -97,7 +97,7 @@ DATASET_SCHEMAS: Dict[str, Dict[str, type]] = {
     },
 }
 
-DATASET_VERSION = "1.1.0"
+DATASET_VERSION = "0.2.0"
 DEFAULT_TEST_RATIO = 0.30   # 留出（test）比例，对应「独立数据的 20-30%」标准区间
 # 分布一致性阈值：各层在 test 中的实际占比与目标 test_ratio 的最大允许偏差。
 # 分层样本较小时偏差天然偏大，这里给出提示而非硬失败（见 --strict）。

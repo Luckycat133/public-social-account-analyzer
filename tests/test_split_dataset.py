@@ -187,7 +187,7 @@ def test_build_manifest_contains_governance_metadata():
         results=[], seed=42, test_ratio=0.30, max_distribution_deviation=0.0
     )
     assert manifest["schema"].endswith("eval-dataset-manifest@3")
-    assert manifest["dataset_version"] == "1.1.0"
+    assert manifest["dataset_version"] == "0.2.0"
     assert manifest["paths"] == {
         "source": "source",
         "validation": "validation_data",
