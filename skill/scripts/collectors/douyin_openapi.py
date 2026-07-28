@@ -17,7 +17,7 @@ from typing import Any, Callable
 from .url_policy import canonical_item_url, sanitize_routing_url
 
 
-_PROFILE_URL = "https://open.douyin.com/oauth/userinfo/"
+_PROFILE_ENDPOINT = "https://open.douyin.com/oauth/userinfo/"
 _VIDEO_LIST_URL = "https://open.douyin.com/video/list/"
 _BEIJING = timezone(timedelta(hours=8))
 _NUMERIC_ID = re.compile(r"^[0-9]+$")
@@ -329,7 +329,7 @@ class DouyinOpenAPIClient:
     @staticmethod
     def _is_fixed_endpoint(method: str, url: str) -> bool:
         if method == "POST":
-            return url == _PROFILE_URL
+            return url == _PROFILE_ENDPOINT
         if method != "GET":
             return False
         parse_failed = False
@@ -406,7 +406,7 @@ class DouyinOpenAPIClient:
         return payload
 
     def collect_profile(self) -> dict[str, Any]:
-        payload = self._request("POST", _PROFILE_URL)
+        payload = self._request("POST", _PROFILE_ENDPOINT)
         data = payload.get("data")
         if not isinstance(data, dict):
             raise DouyinOpenAPIError(

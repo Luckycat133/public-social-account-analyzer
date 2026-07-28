@@ -952,6 +952,29 @@ def test_orchestration_rejects_foreign_profile_before_video_pages(
     assert "stage=collect_video_pages" not in report
 
 
+def test_profile_failure_artifacts_do_not_expose_oauth_endpoint(
+    monkeypatch, tmp_path
+):
+    """A failed profile request cannot substitute an OAuth route for a profile."""
+    out_dir = tmp_path / "authorized-profile-failure"
+    foreign_client = _ForeignAuthorizedClient()
+    monkeypatch.setattr(
+        authorized,
+        "DouyinOpenAPIClient",
+        lambda *args, **kwargs: foreign_client,
+    )
+
+    assert run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ=AUTHORIZED_ENV,
+    ) == 3
+
+    task = json.loads((out_dir / "task.json").read_text(encoding="utf-8"))
+    assert task["profile_url"] is None
+    assert "open.douyin.com/oauth/userinfo" not in _artifact_text(out_dir)
+
+
 def test_authorized_entry_builds_client_from_both_environment_credentials(
     monkeypatch, tmp_path
 ):
@@ -1237,6 +1260,48 @@ def test_all_writes_standard_completed_artifacts_without_token(tmp_path, capsys)
     assert post["is_repost"] is None
     assert TOKEN not in _artifact_text(out_dir)
     assert TOKEN not in captured.out + captured.err
+
+
+def test_report_has_openapi_disclaimer(tmp_path):
+    out_dir = tmp_path / "authorized-disclaimer"
+
+    assert run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ=AUTHORIZED_ENV,
+        transport=_completed_transport(),
+    ) == 0
+
+    report = (out_dir / "collection-report.md").read_text(encoding="utf-8")
+    assert (
+        "> 本报告基于账号本人授权 OpenAPI 返回的公开来源证据，"
+        "不代表账号后台真实曝光、触达、完播或转化数据。"
+    ) in report
+
+
+def test_execution_timing_present(tmp_path):
+    out_dir = tmp_path / "authorized-timing"
+
+    assert run(
+        out_dir=str(out_dir),
+        collect_all=True,
+        environ=AUTHORIZED_ENV,
+        transport=_completed_transport(),
+    ) == 0
+
+    task = json.loads((out_dir / "task.json").read_text(encoding="utf-8"))
+    assert isinstance(task["started_at"], str)
+    assert isinstance(task["ended_at"], str)
+    assert isinstance(task["duration_ms"], int)
+    assert task["duration_ms"] >= 0
+    assert set(task["phase_durations_ms"]) == {
+        "collect_profile",
+        "collect_video_pages",
+    }
+    assert all(
+        isinstance(duration_ms, int) and duration_ms >= 0
+        for duration_ms in task["phase_durations_ms"].values()
+    )
 
 
 def test_official_opaque_share_is_committed_as_non_item_source(tmp_path):

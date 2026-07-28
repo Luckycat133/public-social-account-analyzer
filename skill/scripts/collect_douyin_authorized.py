@@ -27,15 +27,16 @@ from immutable_workspace import (
     verify_committed_workspace,
 )
 from task_contract import (
+    AUTHORIZED_DISCLAIMER,
     TaskContractError,
     new_task_id,
     validate_analysis_goal,
 )
 from csv_contract import serialize_csv_row
+from execution_timing import ExecutionTimer
 
 
 _BEIJING = timezone(timedelta(hours=8))
-_PROFILE_ENDPOINT = "https://open.douyin.com/oauth/userinfo/"
 _TOKEN_ENV = "DOUYIN_OPENAPI_ACCESS_TOKEN"
 _OPEN_ID_ENV = "DOUYIN_OPENAPI_OPEN_ID"
 _INDETERMINATE_EXIT_CODE = 4
@@ -97,6 +98,7 @@ def _serialize_artifacts(
     analysis_goal: str | None,
     diagnostic_code: str | None = None,
     diagnostic_stage: str = "collect_video_pages",
+    execution_timing: Mapping[str, object],
 ) -> None:
     with reservation.open_text("source/profile.json") as handle:
         json.dump(profile, handle, ensure_ascii=False, indent=2)
@@ -109,7 +111,7 @@ def _serialize_artifacts(
     task = {
         "task_id": task_id,
         "platform": "douyin",
-        "profile_url": profile.get("profile_url") or _PROFILE_ENDPOINT,
+        "profile_url": profile.get("profile_url"),
         "requested_limit": requested_limit,
         "date_from": None,
         "date_to": None,
@@ -125,6 +127,7 @@ def _serialize_artifacts(
         "collection_source": "douyin_openapi_token_owner",
         "collection_coverage": coverage,
     }
+    task.update(execution_timing)
     if diagnostic_code:
         task["diagnostic_code"] = diagnostic_code
     with reservation.open_text("task.json") as handle:
@@ -132,6 +135,8 @@ def _serialize_artifacts(
 
     lines = [
         "# 采集质量报告",
+        "",
+        f"> {AUTHORIZED_DISCLAIMER}",
         "",
         "- 平台: douyin",
         "- 采集来源: douyin_openapi_token_owner",
@@ -215,6 +220,7 @@ def _run_reserved_collection(
     task_id: str,
     analysis_goal: str | None,
 ) -> int:
+    execution_timer = ExecutionTimer(wall_timezone=_BEIJING)
     profile: dict[str, Any] = {}
     posts: list[dict[str, Any]] = []
     coverage: dict[str, Any] = {
@@ -229,7 +235,8 @@ def _run_reserved_collection(
     }
 
     try:
-        candidate_profile = api.collect_profile()
+        with execution_timer.phase("collect_profile"):
+            candidate_profile = api.collect_profile()
         account_id = (
             candidate_profile.get("account_id")
             if isinstance(candidate_profile, dict)
@@ -258,15 +265,17 @@ def _run_reserved_collection(
             analysis_goal=analysis_goal,
             diagnostic_code=exc.error_code,
             diagnostic_stage="collect_profile",
+            execution_timing=execution_timer.snapshot(),
         )
         print("[FAILED] 授权账号资料请求失败", file=sys.stderr)
         return 3
 
     try:
-        posts, coverage = api.collect_video_pages(
-            limit=None if collect_all else limit,
-            page_size=page_size,
-        )
+        with execution_timer.phase("collect_video_pages"):
+            posts, coverage = api.collect_video_pages(
+                limit=None if collect_all else limit,
+                page_size=page_size,
+            )
         if collect_all:
             complete = coverage.get("is_exhaustive") is True
         else:
@@ -304,6 +313,7 @@ def _run_reserved_collection(
         task_id=task_id,
         analysis_goal=analysis_goal,
         diagnostic_code=diagnostic_code,
+        execution_timing=execution_timer.snapshot(),
     )
     print(
         f"[OK] 平台=douyin 授权账号内容条数={len(posts)} "
