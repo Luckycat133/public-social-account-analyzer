@@ -422,6 +422,14 @@ class DouyinOpenAPIClient:
             raise DouyinOpenAPIError(
                 "INVALID_RESPONSE", "Douyin OpenAPI profile is missing account name"
             )
+        sec_uid = data.get("sec_uid")
+        if not isinstance(sec_uid, str) or not sec_uid.strip():
+            raise DouyinOpenAPIError(
+                "INVALID_RESPONSE", "Douyin OpenAPI profile is missing sec_uid"
+            )
+        # Public profile URL contract: only the public web URL is allowed into
+        # task.json / reports. The OAuth endpoint must never be persisted.
+        profile_url = f"https://www.douyin.com/user/{sec_uid}"
         followers = _safe_int(data.get("follower_count"))
         post_count = _safe_int(data.get("video_count"))
         verified = data.get("is_verified")
@@ -431,7 +439,7 @@ class DouyinOpenAPIClient:
             "platform": "douyin",
             "account_id": open_id,
             "account_name": account_name,
-            "profile_url": _PROFILE_URL,
+            "profile_url": profile_url,
             "bio": data.get("description") if isinstance(data.get("description"), str) else None,
             "verified": verified,
             "followers": followers,

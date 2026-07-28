@@ -32,17 +32,20 @@ class _CredentialSubclass(str):
     pass
 
 
-def _profile_response():
-    return {
-        "err_no": 0,
-        "data": {
-            "open_id": OPEN_ID,
-            "union_id": "owner-union-id",
-            "nickname": "授权账号",
-            "description": "公开简介",
-            "avatar": "https://example.test/avatar.png",
-        },
+SEC_UID = "owner-public-sec-uid"
+
+
+def _profile_response(**overrides):
+    data = {
+        "open_id": OPEN_ID,
+        "sec_uid": SEC_UID,
+        "union_id": "owner-union-id",
+        "nickname": "授权账号",
+        "description": "公开简介",
+        "avatar": "https://example.test/avatar.png",
     }
+    data.update(overrides)
+    return {"err_no": 0, "data": data}
 
 
 def _video(video_id, *, title, create_time, is_top, play_count):
@@ -105,6 +108,55 @@ def test_profile_uses_fixed_official_endpoint_and_form_credentials():
     assert profile["platform_metrics"]["union_id"] == "owner-union-id"
     assert TOKEN not in transport.requests[0]["url"]
     assert TOKEN not in json.dumps(profile, ensure_ascii=False)
+
+
+def test_collect_profile_uses_sec_uid_for_public_profile_url():
+    """profile_url must be the public web URL, never the OAuth endpoint.
+
+    Regression for code-review D-1: collect_profile() previously returned
+    ``profile_url = _PROFILE_URL`` (the OAuth userinfo endpoint), which was
+    then written verbatim into task.json and surfaced in the report as the
+    account's "主页". The OAuth endpoint must never appear in any persisted
+    artifact.
+    """
+    transport = FakeTransport([_profile_response()])
+
+    profile = DouyinOpenAPIClient(
+        TOKEN, OPEN_ID, transport=transport
+    ).collect_profile()
+
+    assert profile["profile_url"] == f"https://www.douyin.com/user/{SEC_UID}"
+    assert "open.douyin.com/oauth" not in profile["profile_url"]
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["sec_uid", None, "", "   "],
+    ids=["absent-key", "null-value", "empty-string", "whitespace-only"],
+)
+def test_collect_profile_rejects_missing_or_empty_sec_uid(missing_field):
+    """A response without a usable sec_uid must raise INVALID_RESPONSE.
+
+    The public profile URL is synthetic and depends on sec_uid; if the field
+    is missing, blank, or whitespace-only, the client cannot produce a valid
+    public URL and must fail loudly rather than fall back to the OAuth
+    endpoint.
+    """
+    if missing_field is None:
+        response = _profile_response()
+        del response["data"]["sec_uid"]
+    elif missing_field == "sec_uid":
+        response = _profile_response()
+        response["data"].pop("sec_uid", None)
+    else:
+        response = _profile_response(sec_uid=missing_field)
+    transport = FakeTransport([response])
+
+    with pytest.raises(DouyinOpenAPIError) as exc_info:
+        DouyinOpenAPIClient(TOKEN, OPEN_ID, transport=transport).collect_profile()
+
+    assert exc_info.value.error_code == "INVALID_RESPONSE"
+    assert "sec_uid" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -810,7 +862,7 @@ class _CompletedAuthorizedClient:
         return {
             "platform": "douyin",
             "account_id": OPEN_ID,
-            "profile_url": "https://open.douyin.com/oauth/userinfo/",
+            "profile_url": f"https://www.douyin.com/user/{SEC_UID}",
             "field_visibility": {},
         }
 
@@ -842,7 +894,7 @@ class _ForeignAuthorizedClient(_CompletedAuthorizedClient):
         return {
             "platform": "douyin",
             "account_id": "foreign-open-id",
-            "profile_url": "https://open.douyin.com/oauth/userinfo/",
+            "profile_url": "https://www.douyin.com/user/foreign-sec-uid",
             "field_visibility": {},
         }
 

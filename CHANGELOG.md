@@ -102,6 +102,7 @@
 - 安全：Windows 读取器通过持有的目录句柄重新枚举精确清单，且 HTML 模板替换采用单次遍历，使公开文本无法被重新解释为模板语法。
 - 安全：回退机制不重放签名，也不绕过登录、验证码、滑块、限流或其他访问保护。它不持久化 cookie、请求头、签名 URL、响应体或媒体。
 - 安全：网络索引导入器拒绝非 Douyin/仿冒主机、凭证、端口、查询字符串、作者不匹配、ID/URL 不匹配，以及非整数指标；持久化证据采用字段白名单。
+- 安全：(collect-douyin-auth) `task.json` 写入的 `profile_url` 现从 userinfo 响应中的 `sec_uid` 合成 `https://www.douyin.com/user/<sec_uid>`，不再泄露 OAuth `userinfo` 端点；缺失或空白的 `sec_uid` 抛 `INVALID_RESPONSE`（D-1）。
 
 ## [1.0.0] - 2026-07-24
 
