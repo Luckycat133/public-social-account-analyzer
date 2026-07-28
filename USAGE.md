@@ -92,7 +92,8 @@ python3 skill/scripts/run_pipeline.py \
 - `--with-llm-tax`：生成 `taxonomy-prompt.md`、`taxonomy-input.jsonl` 与 `taxonomy-result-template.json`，但不调用模型；没有分类结果时分析保持 `PARTIAL`。
 - `--classification-results PATH`：读取严格 JSON 数组。每个有效父作品必须且只能出现一次，
   `post_id` 必须匹配分析样本，分类枚举、布尔值、标签数组和 0–1 置信度均须合法。校验成功后
-  原始字节写入 `source/classification-results.json`；路径本身不会写入产物。
+  原始字节写入 `source/classification-results.json`；路径本身不会写入产物。使用该参数时必须
+  同时传入 `--with-llm-tax`，确保 taxonomy prompt、输入与结果模板在同一分析提交中共现。
 - `--with-business-insights`：要求第二阶段业务洞察；未提供结果时生成简短 prompt、`business-context.json`、`business-evidence-catalog.jsonl` 与 `business-result-template.json` 并保持 `PARTIAL`。
 - `--business-insight-results PATH`：读取严格 JSON 对象。结果必须绑定 collection commit 与 taxonomy 原始字节 SHA-256，并具有固定 5 项定位、6 项高低表现公开文案模式，以及模板冻结的 3–8 个选题、2–5 个内容模式和 2–4 个实验。
 - `--with-comment-insights`：存在有效公开评论时生成 `comment-insights-prompt.md`；未提供结果时保持 `PARTIAL`，并记录 `PENDING_COMMENT_INSIGHTS`。

@@ -42,9 +42,12 @@ skill/
 │   ├── run_pipeline.py                # 一体化流水线（创建独立分析工作区）
 │   ├── collect_douyin_authorized.py   # 抖音官方 OpenAPI 路径
 │   ├── import_index_snapshot.py       # Web 索引证据导入
+│   ├── resolve_profile_url.py          # 账号主页 URL 解析与校验
+│   ├── validate_model_results.py       # 外部模型分类结果校验
 │   ├── split_dataset.py               # 数据集分层随机划分
 │   ├── csv_contract.py                # CSV 字段契约
 │   ├── execution_timing.py            # 结构化起止时间与分阶段耗时
+│   ├── field_coverage.py               # 字段覆盖率与缺失统计
 │   ├── immutable_workspace.py         # 不可变工作区协议
 │   ├── task_contract.py               # task_status / stop_reason 枚举
 │   └── collectors/                    # 平台适配器子包
@@ -90,9 +93,12 @@ skill/evals/
 ├── cases.md
 ├── evals.json
 └── datasets/
+    ├── CHANGELOG.md
     ├── README.md
     ├── USAGE.md
     ├── config.example.json
+    ├── p0_requirements.json
+    ├── p0_coverage.json
     ├── source/
     ├── test_data/
     ├── validation_data/
@@ -198,11 +204,11 @@ drift 任意一条失败 → 阻塞发布。
 
 ## 4. 版本发布流程（建议）
 
-1. dev 版本打 tag：`git tag v1.x.y`
+1. dev 版本按 `pyproject.toml` 打 tag，例如当前 pre-1.0 版本使用 `git tag v0.5.0`
 2. 在 dev `skill/SKILL.md` 顶部 frontmatter 注明版本（如项目采用该字段）
 3. 用第 3 节的 drift 检测全绿
 4. 更新 `CHANGELOG.md`（Keep a Changelog v1.1.0）
-5. 仅当选择"独立打包"时，打包 §1 列出的全部内容为 `public-social-account-analyzer-v1.x.y.zip`
+5. 仅当选择“独立打包”时，按实际版本打包 §1 内容，例如 `public-social-account-analyzer-v0.5.0.zip`
 6. 否则保持软链接，本节不适用
 
 ---

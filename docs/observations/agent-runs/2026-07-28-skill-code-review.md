@@ -2,6 +2,8 @@
 
 Scope: every Python file under `skill/scripts/` (26 files, ~26k LOC). Five parallel reviewers covered: core infrastructure, entry points, collector adapters, analysis/rendering, and test coverage. Tests cross-referenced against source modules.
 
+> **Resolution status (2026-07-28, v0.5.0):** 本报告记录的是修复前基线。计划内发现已完成实现、直接回归和全量回归；下文的缺陷数、测试数与“未修复”措辞仅用于保留审查历史，不代表当前版本状态。剩余 OpenAPI 真实凭据验收与 AC-10 运营试用属于外部验收，不由离线代码测试代填。
+
 ## 1. Top-line summary
 
 - **2 blocking bugs** (one in CLAUDE.md §5.6 single-source-of-truth enums, one broken entry path)

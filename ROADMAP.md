@@ -1,6 +1,6 @@
 # 开发路线图与待办事项 (Roadmap & Backlog)
 
-> **状态（2026-07-27）**：工程功能已实现并验证；剩余项主要是平台登录/授权与真人验收。
+> **状态（2026-07-28，v0.5.0）**：计划内工程功能已实现并通过回归；剩余项是账号本人 OpenAPI 真实凭据验收与 AC-10 真人运营试用。
 > 状态标记与 [`docs/observations/README.md`](docs/observations/README.md) 一致：🟢 VALID 已实现并验证 / 🟡 SUPERSEDED 被后续实现覆盖 / 🔴 STALE 依赖已变化。
 
 本文档记录项目的近远期规划与待办功能项。

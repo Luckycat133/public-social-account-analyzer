@@ -1,5 +1,8 @@
 # 公开社交媒体账号内容分析器 (Public Social Account Analyzer)
 
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](pyproject.toml)
+
 > 基于 Python 3.9+ 与 Agent Skills 规范实现的公开社交账号分析系统。支持 B站（Bilibili）、抖音（Douyin）公开主页数据的合规采集、指标归一化、中位数/分位数分析与多格式报告生成。
 
 ---
@@ -7,6 +10,7 @@
 ## 目录
 
 - [背景与设计理念](#背景与设计理念)
+- [版本状态](#版本状态)
 - [项目架构](#项目架构)
 - [支持平台与成熟度](#支持平台与成熟度)
 - [需求实现状态](#需求实现状态)
@@ -26,8 +30,18 @@
 在社交媒体内容分析场景中，传统的分析方法往往面临数据口径不一致、过度依赖后台私有数据或包含主观推测等问题。本项目旨在提供一套**确定性、合规且可复核**的账号内容分析工具。
 
 系统采用**分层架构设计**：
+
 - **仓库根目录（开发者视角）**：包含完整源代码、自动化测试集与遵循 Standard Readme 规范的工程文档。
 - **`skill/` 子目录（AI Agent 视角）**：符合 [Agent Skills 规范](https://agentskills.io) 的纯净技能包，供 Anthropic Claude、Google Antigravity 或 WorkBuddy 等 AI Agent 无缝接入使用。
+
+---
+
+## 版本状态
+
+- 当前项目版本：`0.5.0`（pre-1.0；每个次版本表示一个可验收能力里程碑）。
+- 当前评测数据集版本：`0.2.0`，与项目版本独立演进。
+- `0.1.0` 至 `0.5.0` 的版本日期、功能边界和安全修复见 [CHANGELOG.md](CHANGELOG.md)。
+- 工程合同已完成自动化验证；账号本人 OpenAPI 真实凭据验收和 AC-10 运营试用仍属于外部验收项。
 
 ---
 
@@ -165,6 +179,7 @@ python3 skill/scripts/run_pipeline.py \
 python3 skill/scripts/run_pipeline.py \
   --input workspace/bilibili-123456-collection \
   --output workspace/bilibili-123456-business-draft \
+  --with-llm-tax \
   --classification-results /path/to/taxonomy-results.json \
   --with-business-insights
 
@@ -174,6 +189,7 @@ python3 skill/scripts/run_pipeline.py \
 python3 skill/scripts/run_pipeline.py \
   --input workspace/bilibili-123456-collection \
   --output workspace/bilibili-123456-final \
+  --with-llm-tax \
   --classification-results /path/to/taxonomy-results.json \
   --with-business-insights \
   --business-insight-results /path/to/business-insight-results.json
