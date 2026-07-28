@@ -242,7 +242,10 @@ def _profile_freshness_baseline(evidence: dict[str, Any]) -> datetime:
     profile is current. A date-only crawl timestamp has day precision, so its
     conservative upper bound is the end of that calendar day.
     """
-    baseline = datetime.fromisoformat(evidence["observed_at"])
+    observed = evidence.get("observed_at")
+    if not isinstance(observed, str) or not observed:
+        raise EvidenceError("observed_at is required for profile freshness baseline")
+    baseline = datetime.fromisoformat(observed)
     snapshot = evidence.get("snapshot_crawled_at")
     if snapshot is not None:
         snapshot_time = datetime.fromisoformat(snapshot)

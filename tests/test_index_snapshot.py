@@ -1128,3 +1128,33 @@ def test_search_index_runs_through_immutable_analysis_pipeline(tmp_path):
         assert "非穷尽索引样本" in rendered
     assert report.count(PROFILE_URL) >= 1
     assert "idx-" not in report.split("## 12. 来源链接", 1)[-1]
+
+
+def test_profile_freshness_baseline_requires_observed_at():
+    """I-4: _profile_freshness_baseline must raise EvidenceError, not KeyError,
+    when the evidence dict is missing observed_at. The function is called
+    from the profile-overlay path; if an internal caller passes an
+    incomplete evidence dict, the failure must surface as the documented
+    EvidenceError type, not an unhandled KeyError.
+    """
+    from import_index_snapshot import _profile_freshness_baseline, EvidenceError
+
+    with pytest.raises(EvidenceError, match="observed_at"):
+        _profile_freshness_baseline({})
+
+    with pytest.raises(EvidenceError, match="observed_at"):
+        _profile_freshness_baseline({"observed_at": None})
+
+    with pytest.raises(EvidenceError, match="observed_at"):
+        _profile_freshness_baseline({"observed_at": ""})
+
+
+def test_profile_freshness_baseline_happy_path():
+    """Sanity: the documented happy path still works after the defensive check."""
+    from import_index_snapshot import _profile_freshness_baseline
+
+    baseline = _profile_freshness_baseline(
+        {"observed_at": "2026-07-01T12:00:00+08:00"}
+    )
+    assert baseline.tzinfo is not None
+    assert baseline == datetime.fromisoformat("2026-07-01T12:00:00+08:00")
