@@ -99,9 +99,12 @@ _BEIJING = timezone(timedelta(hours=8))
 
 
 def _follow_bilibili_short_link(value: str) -> str:
+    # b23.tv does not honor HEAD (returns the short URL itself on 302/405),
+    # so use GET. urllib's default HTTPRedirectHandler follows the 302 to
+    # the public space.bilibili.com/<uid> page.
     request = urllib.request.Request(
         value,
-        method="HEAD",
+        method="GET",
         headers={"User-Agent": "Mozilla/5.0 public-profile-resolver"},
     )
     with urllib.request.urlopen(request, timeout=10) as response:

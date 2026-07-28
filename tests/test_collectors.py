@@ -25,6 +25,8 @@ from collectors.bilibili import (
 )
 from collectors.weibo import WeiboCollector, ADAPTER_UNAVAILABLE
 
+import collect  # noqa: E402  import after collector imports for sys.path resolution
+
 
 # ---------------------------------------------------------------------------
 # BilibiliCollector.supports 路由
@@ -1641,3 +1643,41 @@ def test_collect_tags_wired_into_full_flow(monkeypatch):
     assert "apiTagA" in tags and "apiTagB" in tags
     # 文本提取标签也保留
     assert "t1" in tags and "t2" in tags and "t3" in tags
+
+
+def test_follow_bilibili_short_link_uses_get_not_head(monkeypatch):
+    """Regression: b23.tv does not honor HEAD, so use GET to retrieve the
+    final URL after the redirect chain. urllib's default HTTPRedirectHandler
+    follows the 302 to the public space.bilibili.com/<uid> page.
+
+    C-2 in the 2026-07-28 code review.
+    """
+    captured = []
+
+    class _FakeResponse:
+        def __init__(self, url):
+            self._url = url
+
+        def geturl(self):
+            return self._url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        captured.append({"method": request.method, "url": request.full_url, "timeout": timeout})
+        return _FakeResponse("https://space.bilibili.com/514527835")
+
+    monkeypatch.setattr(collect.urllib.request, "urlopen", fake_urlopen)
+
+    resolved = collect._follow_bilibili_short_link("https://b23.tv/abcXYZ")
+
+    assert resolved == "https://space.bilibili.com/514527835"
+    assert captured == [{
+        "method": "GET",
+        "url": "https://b23.tv/abcXYZ",
+        "timeout": 10,
+    }]
