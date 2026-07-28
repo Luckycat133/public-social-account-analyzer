@@ -1506,3 +1506,30 @@ def test_limited_loop_below_requested_count_is_partial(tmp_path):
     assert task["task_status"] == "PARTIAL"
     assert task["stop_reason"] == "PARSER_FAILED"
     assert task["collected_count"] == 1
+
+
+def test_authorized_rejects_analysis_goal_containing_open_id(tmp_path, capsys):
+    """D-2: Per CLAUDE.md §5.7, both access_token AND open_id are secrets
+    that must never reach artifacts. A caller (or attacker) with control
+    of the analysis_goal argument could otherwise smuggle open_id into
+    task.json and the analysis report.
+    """
+    out_dir = tmp_path / "authorized-open-id-goal"
+    transport = FakeTransport([
+        _profile_response(),
+        _page([], cursor=0, has_more=0),
+    ])
+
+    rc = run(
+        out_dir=str(out_dir),
+        analysis_goal=f"分析授权账号 {OPEN_ID}",
+        environ=AUTHORIZED_ENV,
+        transport=transport,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert not out_dir.exists()
+    assert transport.requests == []
+    assert OPEN_ID not in captured.out + captured.err
+    assert TOKEN not in captured.out + captured.err

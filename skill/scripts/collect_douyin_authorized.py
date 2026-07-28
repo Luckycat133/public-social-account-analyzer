@@ -379,9 +379,15 @@ def run(
     if not _valid_credential(open_id):
         print(f"[FAILED] 缺少环境变量 {_OPEN_ID_ENV}", file=sys.stderr)
         return 2
-    if analysis_goal is not None and access_token in analysis_goal:
-        print("[FAILED] analysis_goal 不得包含访问令牌", file=sys.stderr)
-        return 2
+    if analysis_goal is not None:
+        # Per CLAUDE.md §5.7, both access_token AND open_id are secrets that
+        # must never reach artifacts. Either can be smuggled in via
+        # analysis_goal (which is later written into task.json and the
+        # analysis report).
+        for secret_name, secret_value in (("访问令牌", access_token), ("open_id", open_id)):
+            if secret_value and secret_value in analysis_goal:
+                print(f"[FAILED] analysis_goal 不得包含{secret_name}", file=sys.stderr)
+                return 2
 
     task_id = new_task_id("douyin")
     api = DouyinOpenAPIClient(access_token, open_id, transport=transport)
