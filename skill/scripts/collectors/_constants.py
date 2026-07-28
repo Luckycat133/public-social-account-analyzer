@@ -2,8 +2,10 @@
 
 import math
 import re
+from datetime import timedelta, timezone
 
 
+BEIJING_TZ = timezone(timedelta(hours=8))
 PUBLIC_LIMIT_DEFAULT = 30
 PUBLIC_LIMIT_MAX = 100
 

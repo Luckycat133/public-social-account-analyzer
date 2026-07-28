@@ -25,6 +25,7 @@
 - 新增支持时区的起止时间戳、单调递增的总耗时，以及固定的阶段计时，应用于采集与分析任务产物。
 
 ### Changed
+- 采集器统一使用共享的北京时间、宽松数字与秒/毫秒时间戳工具；微博带偏移发布时间会规范到 UTC+8，非有限数字与布尔时间戳保持未知。
 - 已授权 Douyin 的采集报告现使用统一的 OpenAPI 专用免责声明；Bilibili 空作品降级为 `PARTIAL`，medialist 页预算随请求上限推导，动态转发与空页终止保持三态和有界语义。
 - 默认任务目录对所有平台账号标识统一使用短 SHA-256 键，不再在 Bilibili 路径中暴露数字 UID。
 - 业务模板不再要求模型手抄 `post_id/source_field/excerpt`；supported pattern 的 `limitation` 明确使用 JSON `null`。分类形式新增 `animation` 与 `gameplay`，并加强创作者身份误作受众、观察相关性误写为因果的语义门控。

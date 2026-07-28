@@ -159,6 +159,10 @@ def test_collect_profile_rejects_missing_or_empty_sec_uid(missing_field):
     assert "sec_uid" in str(exc_info.value)
 
 
+def test_safe_int_none_returns_none():
+    assert openapi._safe_int(None) is None
+
+
 @pytest.mark.parametrize(
     ("access_token", "open_id", "error_code"),
     [

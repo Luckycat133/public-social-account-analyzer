@@ -32,11 +32,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from typing import Any
 
 
 from ._constants import (
+    BEIJING_TZ,
     DOUYIN_BROWSER_VISIBLE_RESTRICTION_MARKER_VALUES,
     DOUYIN_BROWSER_VISIBLE_RESTRICTION_SOURCE,
     DOUYIN_PAGE_STATE_PATTERNS,
@@ -58,6 +59,9 @@ from ._constants import (
     validate_public_all_budgets,
     validate_public_limit,
 )
+from ._utils import now_iso as _now_iso
+from ._utils import parse_int as _int
+from ._utils import ts_to_iso as _ts_to_iso
 from .base import BaseCollector
 from .browser_backend import BrowserError
 from ._douyin_detail_contract import (
@@ -70,9 +74,6 @@ from .url_policy import (
     sanitize_routing_url,
 )
 
-
-# 抖音公开接口 / 主页均使用北京时间（+08:00）
-_BEIJING = timezone(timedelta(hours=8))
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -104,47 +105,6 @@ class DouyinError(Exception):
         self.raw = raw
         self.partial_posts = list(partial_posts or [])
         self.diagnostic_code = diagnostic_code
-
-
-# --------------------------------------------------------------------------
-# 工具函数
-# --------------------------------------------------------------------------
-def _now_iso() -> str:
-    """当前北京时间 ISO 8601。"""
-    return datetime.now(_BEIJING).isoformat()
-
-
-def _ts_to_iso(ts: Any) -> str | None:
-    """Unix 秒 → 北京时间 ISO 8601；失败返回 None。"""
-    if not ts or isinstance(ts, bool):
-        return None
-    try:
-        return datetime.fromtimestamp(int(ts), tz=_BEIJING).isoformat()
-    except (ValueError, OverflowError, OSError, TypeError):
-        return None
-
-
-def _int(v: Any) -> int | None:
-    """宽松数字解析：支持 '1.2万' / '3.4亿' / 纯数字；失败返回 None。"""
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
-        return int(v) if math.isfinite(v) else None
-    s = str(v).strip()
-    if not s:
-        return None
-    mult = 1
-    if "亿" in s:
-        mult = 100_000_000
-    if "万" in s:
-        mult = 10_000
-    s = s.replace("亿", "").replace("万", "").replace(",", "").replace("+", "").strip()
-    try:
-        return int(float(s) * mult)
-    except (OverflowError, ValueError):
-        return None
 
 
 def _public_boolean(source: dict[str, Any], *keys: str) -> bool | None:
@@ -567,7 +527,7 @@ class DouyinCollector(BaseCollector):
                         "sec_uid": bound_sec_uid,
                         "unique_id": ui.get("unique_id"),
                     },
-                    "collected_at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
+                    "collected_at": _now_iso(),
                     "field_visibility": {
                         "account_name": "visible" if ui.get("nickname") else "hidden",
                         "bio": "visible" if ui.get("signature") else "hidden",
@@ -1807,7 +1767,7 @@ class DouyinCollector(BaseCollector):
         except (ValueError, TypeError):
             return None
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=_BEIJING)
+            parsed = parsed.replace(tzinfo=BEIJING_TZ)
         return parsed
 
     @staticmethod

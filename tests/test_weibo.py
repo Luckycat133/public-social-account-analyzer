@@ -102,6 +102,12 @@ def test_enabled_collect_post_detail_parses(enabled, monkeypatch):
     assert post["is_promoted"] is None
 
 
+def test_weibo_time_normalized_to_beijing():
+    assert weibo._parse_weibo_time(
+        "Wed Oct 10 20:40:00 +0000 2012"
+    ) == "2012-10-11T04:40:00+08:00"
+
+
 def test_weibo_boolean_evidence_parses_explicit_zero_without_truthiness():
     raw = weibo._build_post_raw(
         {

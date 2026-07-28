@@ -25,10 +25,12 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
-from ._constants import PUBLIC_LIMIT_DEFAULT, validate_public_limit
+from ._constants import BEIJING_TZ, PUBLIC_LIMIT_DEFAULT, validate_public_limit
+from ._utils import now_iso as _now_iso
+from ._utils import parse_int as _int
 from .base import BaseCollector  # 适配 scripts/collectors 作为 sys.path 入口
 from .url_policy import canonical_item_url, canonical_profile_url
 
@@ -57,9 +59,6 @@ _HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-# 北京时间为微博默认时区
-_BEIJING = timezone(timedelta(hours=8))
-
 # URL 路由正则
 _RE_UID = re.compile(r"^https?://weibo\.com/u/(\d+)(?:[/?].*)?$", re.IGNORECASE)
 _RE_NAME = re.compile(r"^https?://weibo\.com/([A-Za-z0-9_\-]+)", re.IGNORECASE)
@@ -70,19 +69,6 @@ _RESERVED_SEGMENTS = frozenset({
     "help", "about", "m", "p", "s", "wbprofile", "compose", "api", "comments",
     "attitude", "i", "fav", "tv",
 })
-
-
-def _now_iso() -> str:
-    return datetime.now(_BEIJING).isoformat()
-
-
-def _int(v: Any) -> int | None:
-    if v is None:
-        return None
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
 
 
 def _optional_public_bool(mapping: dict, key: str) -> bool | None:
@@ -165,7 +151,7 @@ def _parse_weibo_time(s: Any) -> str | None:
     if not s or not isinstance(s, str):
         return None
     s = s.strip()
-    now = datetime.now(_BEIJING)
+    now = datetime.now(BEIJING_TZ)
     m = re.match(r"^(\d+)\s*分钟前$", s)
     if m:
         return (now - timedelta(minutes=int(m.group(1)))).isoformat()
@@ -198,7 +184,9 @@ def _parse_weibo_time(s: Any) -> str | None:
             month=int(m.group(1)), day=int(m.group(2)),
             hour=0, minute=0, second=0, microsecond=0).isoformat()
     try:
-        return datetime.strptime(s, "%a %b %d %H:%M:%S %z %Y").isoformat()
+        return datetime.strptime(
+            s, "%a %b %d %H:%M:%S %z %Y"
+        ).astimezone(BEIJING_TZ).isoformat()
     except ValueError:
         return None
 

@@ -27,11 +27,13 @@ import re
 import subprocess
 import time
 import urllib.parse
-from datetime import datetime, timezone, timedelta
 from functools import reduce
 from typing import Any
 
 from ._constants import PUBLIC_LIMIT_DEFAULT, validate_public_limit
+from ._utils import now_iso as _now_iso
+from ._utils import parse_int as _int
+from ._utils import ts_to_iso as _to_iso
 from .base import BaseCollector
 from .url_policy import canonical_item_url
 
@@ -732,47 +734,6 @@ class Session:
                 break
             offset = new_offset
         return out[:limit]
-
-
-# --------------------------------------------------------------------------
-# 工具函数
-# --------------------------------------------------------------------------
-# B站公开时间戳均为北京时间 (UTC+8)
-_BEIJING = timezone(timedelta(hours=8))
-
-
-def _now_iso() -> str:
-    return datetime.now(_BEIJING).isoformat()
-
-
-def _int(v: Any) -> int | None:
-    if v is None:
-        return None
-    s = str(v).strip()
-    if not s:
-        return None
-    mult = 1
-    if "亿" in s:
-        mult = 100_000_000
-    if "万" in s:
-        mult = 10_000
-    s = s.replace("亿", "").replace("万", "").replace(",", "")
-    try:
-        return int(float(s) * mult)
-    except ValueError:
-        return None
-
-
-def _to_iso(ts: Any) -> str | None:
-    if not ts:
-        return None
-    try:
-        val = int(ts)
-        if val > 10000000000:
-            val //= 1000
-        return datetime.fromtimestamp(val, tz=_BEIJING).isoformat()
-    except (ValueError, OverflowError, OSError):
-        return None
 
 
 def _date_matches(

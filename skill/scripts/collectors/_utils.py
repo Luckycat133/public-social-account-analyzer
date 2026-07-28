@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from typing import Any
@@ -33,7 +34,7 @@ def parse_int(v: Any) -> int | None:
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
-        return int(v)
+        return int(v) if math.isfinite(v) else None
     s = str(v).strip()
     if not s:
         return None
@@ -42,10 +43,16 @@ def parse_int(v: Any) -> int | None:
         mult = 100_000_000
     if "万" in s:
         mult = 10_000
-    s = s.replace("亿", "").replace("万", "").replace(",", "").replace("+", "").strip()
+    s = (
+        s.replace("亿", "")
+        .replace("万", "")
+        .replace(",", "")
+        .replace("+", "")
+        .strip()
+    )
     try:
         return int(float(s) * mult)
-    except ValueError:
+    except (OverflowError, ValueError):
         return None
 
 
@@ -54,7 +61,7 @@ def ts_to_iso(ts: Any) -> str | None:
 
     自动处理毫秒时间戳（>10000000000 时除以 1000）。
     """
-    if not ts:
+    if not ts or isinstance(ts, bool):
         return None
     try:
         val = int(ts)

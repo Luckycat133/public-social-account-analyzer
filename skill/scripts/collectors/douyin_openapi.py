@@ -11,15 +11,15 @@ import json
 import re
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Callable
 
 from .url_policy import canonical_item_url, sanitize_routing_url
+from ._utils import BEIJING_TZ, now_iso
 
 
 _PROFILE_ENDPOINT = "https://open.douyin.com/oauth/userinfo/"
 _VIDEO_LIST_URL = "https://open.douyin.com/video/list/"
-_BEIJING = timezone(timedelta(hours=8))
 _NUMERIC_ID = re.compile(r"^[0-9]+$")
 _HASHTAG = re.compile(r"#([^#\s]+)")
 _MEDIA_TYPES = {2: "video", 4: "image_text"}
@@ -252,7 +252,7 @@ def _map_video(item: Any) -> dict[str, Any]:
     if isinstance(create_time, int) and not isinstance(create_time, bool):
         timestamp_invalid = False
         try:
-            published_at = datetime.fromtimestamp(create_time, _BEIJING).isoformat()
+            published_at = datetime.fromtimestamp(create_time, BEIJING_TZ).isoformat()
         except (OverflowError, OSError, ValueError):
             timestamp_invalid = True
         if timestamp_invalid:
@@ -272,7 +272,7 @@ def _map_video(item: Any) -> dict[str, Any]:
     if not isinstance(statistics, dict):
         statistics = {}
     media_type, content_type = _recognized_media_type(item.get("media_type"))
-    now = datetime.now(_BEIJING).isoformat()
+    now = now_iso()
     return {
         "platform": "douyin",
         "post_id": video_id,
@@ -450,7 +450,7 @@ class DouyinOpenAPIClient:
                 "avatar": data.get("avatar") if isinstance(data.get("avatar"), str) else None,
                 "authorization_source": "douyin_openapi_token_owner",
             },
-            "collected_at": datetime.now(_BEIJING).isoformat(),
+            "collected_at": now_iso(),
             "field_visibility": {
                 "bio": "visible" if isinstance(data.get("description"), str) else "hidden",
                 "verified": "visible" if verified is not None else "hidden",
