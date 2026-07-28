@@ -26,6 +26,123 @@ ACCOUNT_URL = "https://www.douyin.com/user/example"
 ACCOUNT_AWEME = {**AWEME, "author": {"sec_uid": "example"}}
 
 
+def _raise_http_error(status):
+    import urllib.error
+
+    def fail(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            ACCOUNT_URL,
+            status,
+            "controlled response",
+            None,
+            None,
+        )
+
+    return fail
+
+
+def test_401_maps_to_login(monkeypatch):
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    monkeypatch.setattr(
+        "collectors.douyin.urllib.request.urlopen", _raise_http_error(401)
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        DouyinCollector()._fetch(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == "LOGIN_REQUIRED"
+
+
+def test_403_maps_to_access_restricted(monkeypatch):
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    monkeypatch.setattr(
+        "collectors.douyin.urllib.request.urlopen", _raise_http_error(403)
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        DouyinCollector()._fetch(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
+
+
+def test_404_maps_to_account_unavailable(monkeypatch):
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    monkeypatch.setattr(
+        "collectors.douyin.urllib.request.urlopen", _raise_http_error(404)
+    )
+
+    with pytest.raises(DouyinError) as exc_info:
+        DouyinCollector()._fetch(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_ACCOUNT_UNAVAILABLE
+
+
+def test_proxy_credential_not_in_error(monkeypatch):
+    import urllib.error
+
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    secret = "proxy-user:proxy-password"
+
+    def fail(*_args, **_kwargs):
+        raise urllib.error.URLError(f"proxy authentication failed for {secret}")
+
+    monkeypatch.setattr("collectors.douyin.urllib.request.urlopen", fail)
+
+    with pytest.raises(DouyinError) as exc_info:
+        DouyinCollector()._fetch(ACCOUNT_URL)
+
+    assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert str(exc_info.value) == "网络层错误，未保留远端原因文本"
+    assert secret not in str(exc_info.value)
+
+
+def test_browser_error_type_check():
+    from collectors.browser_backend import BrowserError
+    from collectors.douyin import DouyinCollector, DouyinError
+
+    unavailable = DouyinCollector(
+        browser_collect=lambda **_request: (_ for _ in ()).throw(
+            BrowserError(
+                "message wording is irrelevant",
+                diagnostic_code="BROWSER_UNAVAILABLE",
+            )
+        )
+    )
+    with pytest.raises(DouyinError) as unavailable_error:
+        unavailable._request_browser_result(ACCOUNT_URL, 30, None)
+
+    misleading_generic = DouyinCollector(
+        browser_collect=lambda **_request: (_ for _ in ()).throw(
+            RuntimeError("未找到可用的浏览器")
+        )
+    )
+    with pytest.raises(DouyinError) as transport_error:
+        misleading_generic._request_browser_result(ACCOUNT_URL, 30, None)
+
+    assert unavailable_error.value.diagnostic_code == "BROWSER_UNAVAILABLE"
+    assert transport_error.value.diagnostic_code == "BROWSER_TRANSPORT_FAILED"
+
+
+def test_partial_gate_no_browser_required():
+    from collectors.douyin import DouyinCollector
+
+    post = DouyinCollector._build_post_raw(
+        ACCOUNT_URL,
+        {
+            "aweme_id": "7001",
+            "desc": "只有列表文案",
+            "share_url": "https://www.douyin.com/video/7001",
+        },
+        source="list",
+    )
+
+    assert post["collection_status"] == "PARTIAL"
+
+
 def test_douyin_supports_canonicalizable_profile_and_rejects_authority_data():
     from collectors.douyin import DouyinCollector
 

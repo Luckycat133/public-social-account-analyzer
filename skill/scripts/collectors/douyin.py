@@ -59,6 +59,7 @@ from ._constants import (
     validate_public_limit,
 )
 from .base import BaseCollector
+from .browser_backend import BrowserError
 from ._douyin_detail_contract import (
     MISSING_P0_DETAIL,
     missing_detail_fields,
@@ -450,10 +451,10 @@ class DouyinCollector(BaseCollector):
                     STOP_ACCOUNT_UNAVAILABLE, f"HTTP {e.code} 账号/页面不存在: {url}"
                 )
             raise DouyinError(STOP_ACCESS_RESTRICTED, f"HTTP {e.code}: {url}")
-        except urllib.error.URLError as e:
+        except urllib.error.URLError:
             # 网络层错误（DNS/连接被拒等），按访问受限如实上抛，不重试绕过。
             raise DouyinError(
-                STOP_ACCESS_RESTRICTED, f"网络错误: {e.reason} ({url})"
+                STOP_ACCESS_RESTRICTED, "网络层错误，未保留远端原因文本"
             )
 
     # -- 访问检查（不绕过） -------------------------------------------------
@@ -705,7 +706,8 @@ class DouyinCollector(BaseCollector):
         except Exception as exc:
             code = (
                 "BROWSER_UNAVAILABLE"
-                if "未找到可用的浏览器" in str(exc)
+                if isinstance(exc, BrowserError)
+                and exc.diagnostic_code == "BROWSER_UNAVAILABLE"
                 else "BROWSER_TRANSPORT_FAILED"
             )
             raise DouyinError(
@@ -1733,7 +1735,7 @@ class DouyinCollector(BaseCollector):
         )
         collection_status = (
             "PARTIAL"
-            if browser_source and p0_missing_fields
+            if p0_missing_fields
             else "SUCCESS"
         )
         return {

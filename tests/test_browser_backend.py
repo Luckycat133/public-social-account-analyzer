@@ -129,6 +129,25 @@ def test_session_start_no_binary_raises():
         assert "未找到" in str(e) or "浏览器" in str(e)
 
 
+def test_diagnostic_code(monkeypatch, tmp_path):
+    missing = BrowserSession(browser_bin="/nonexistent/browser")
+    with pytest.raises(BrowserError) as unavailable_error:
+        missing.start()
+
+    browser = tmp_path / "browser"
+    browser.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(
+        "collectors.browser_backend.subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+    failed = BrowserSession(browser_bin=str(browser))
+    with pytest.raises(BrowserError) as transport_error:
+        failed.start()
+
+    assert unavailable_error.value.diagnostic_code == "BROWSER_UNAVAILABLE"
+    assert transport_error.value.diagnostic_code == "BROWSER_TRANSPORT_FAILED"
+
+
 def test_session_rejects_user_data_dir_override(tmp_path):
     with pytest.raises(TypeError):
         BrowserSession(port=9222, user_data_dir=str(tmp_path))

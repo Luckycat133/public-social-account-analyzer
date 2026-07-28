@@ -337,7 +337,8 @@ class BrowserSession:
             if not bin_path or not os.path.exists(bin_path):
                 raise BrowserError(
                     "未找到可用的浏览器二进制；请安装 Chrome/Chromium/Edge，"
-                    "或通过 BROWSER_BIN 环境变量指定路径。"
+                    "或通过 BROWSER_BIN 环境变量指定路径。",
+                    diagnostic_code="BROWSER_UNAVAILABLE",
                 )
             if self._user_data_dir is None:
                 self._user_data_dir = tempfile.mkdtemp(prefix="psaa-cdp-")
@@ -362,7 +363,10 @@ class BrowserSession:
                 self.close()
             except Exception:
                 pass
-            raise BrowserError(f"启动浏览器失败: {e}")
+            raise BrowserError(
+                f"启动浏览器失败: {e}",
+                diagnostic_code="BROWSER_TRANSPORT_FAILED",
+            )
         except Exception:
             try:
                 self.close()
