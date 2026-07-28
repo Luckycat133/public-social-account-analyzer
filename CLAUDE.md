@@ -4,6 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
+## Table of contents
+
+- [1. Project shape](#1-project-shape)
+- [2. Build, test, and common commands](#2-build-test-and-common-commands)
+- [3. Pipeline architecture (the big picture)](#3-pipeline-architecture-the-big-picture)
+- [4. Key modules and contracts](#4-key-modules-and-contracts)
+- [5. Compliance boundaries (always enforce)](#5-compliance-boundaries-always-enforce)
+- [6. Deployment + drift detection](#6-deployment--drift-detection)
+- [7. Acceptance evidence (PRD AC-01…AC-10)](#7-acceptance-evidence-prd-ac-01ac-10)
+- [8. Coding conventions](#8-coding-conventions)
+- [9. Commit conventions](#9-commit-conventions)
+- [10. Useful pointers](#10-useful-pointers)
+
 ## 1. Project shape
 
 Public social-account content analyzer. Two-tier layout:
@@ -45,7 +58,7 @@ There is no compile step, no formatter, no linter. Match existing 4-space indent
 
 ## 3. Pipeline architecture (the big picture)
 
-```
+```text
                 ┌────────────────────────────────────────────────────────┐
                 │  collect.py / collect_douyin_authorized.py /           │
                 │  import_index_snapshot.py                              │
@@ -99,10 +112,10 @@ Key invariants:
 | `skill/scripts/task_contract.py` | Single source of truth for `TASK_STATUSES`, `STOP_REASONS`, `LABEL_MISSING="null"`, `LABEL_UNKNOWN="INVALID"`, `ANALYZABLE_TASK_STATUSES`, `safe_*_label`, `validate_analysis_goal`, `new_task_id`. **Always import from here; do not redeclare.** |
 | `skill/scripts/collectors/base.py` | `BaseCollector` ABC: `supports`, `check_access`, `collect_profile`, `collect_post_list`, `collect_post_detail`, `collect_comments`, `get_collection_coverage`, `normalize_profile`, `normalize_post`. `_canon_status_with_source` makes missing/invalid `collection_status` → `PARTIAL` (never invented success). |
 | `skill/scripts/collectors/_constants.py` | `STOP_*` single-string constants used by adapters. |
-| `skill/scripts/collectors/bilibili.py` | B站 adapter: 3-tier endpoint fallback (`medialist` → `arc/wbi` → `search/type`); platform-protection response aborts the task. |
-| `skill/scripts/collectors/douyin.py` | 抖音 public adapter: SSR variants + `--all` bounded scrolling + optional browser fallback. |
-| `skill/scripts/collectors/douyin_openapi.py` | 抖音 OpenAPI adapter (post-OAuth). |
-| `skill/scripts/collectors/weibo.py` | weibo adapter, env-gated (`WEIBO_COLLECTOR_ENABLED`). |
+| `skill/scripts/collectors/bilibili.py` | Bilibili adapter: 3-tier endpoint fallback (`medialist` → `arc/wbi` → `search/type`); platform-protection response aborts the task. |
+| `skill/scripts/collectors/douyin.py` | Douyin public adapter: SSR variants + `--all` bounded scrolling + optional browser fallback. |
+| `skill/scripts/collectors/douyin_openapi.py` | Douyin OpenAPI adapter (post-OAuth). |
+| `skill/scripts/collectors/weibo.py` | Weibo adapter, env-gated (`WEIBO_COLLECTOR_ENABLED`). |
 | `skill/scripts/collectors/browser_backend.py` | Headless browser transport — only used by fallback path; never persists cookies/headers/bodies. |
 | `skill/scripts/collectors/url_policy.py` | URL allowlist / canonicalization. |
 | `skill/scripts/collectors/_douyin_browser_transport.py` / `_douyin_detail_contract.py` | Internal helpers for browser fallback and detail contract. |
@@ -128,8 +141,8 @@ Non-negotiable; listed in `SKILL.md`, `README.md`, and `docs/prd/需求实现状
 5. **Pinned / repost / promoted** are tri-state: `true` / `false` / `null` based on explicit evidence.
 6. **Single source of truth for enums.** `TASK_STATUSES`, `STOP_REASONS`, `LABEL_MISSING`, `LABEL_UNKNOWN` live in `task_contract.py`. Use `safe_*_label` for messages; bare "null" / "INVALID" must never be treated as a real enum value downstream.
 7. **Tokens never leave the runtime.** OpenAPI access token + `open_id` come from env, never URL/log/artifact. userinfo uses form-encoded body; `video.list` uses JSON `Content-Type` + `access-token` header. userinfo must echo the exact `open_id`.
-8. **抖音 `--all` is bounded.** Budgets (`--max-items`, `--max-seconds`, `--max-scrolls`) and per-candidate owner+item+alias+pagination audits are mandatory. `is_exhaustive=true` only when all candidates agree + a verified terminal page is observed. Any protection stop → `is_exhaustive=false`.
-9. **抖音 browser fallback is experimental.** Triggered only when SSR is missing or unrecognized. Empty list → `NO_PUBLIC_CONTENT` (no browser). Visible protection page → fixed `restriction_source` + `restriction_marker` enum only — no raw page text persisted. `SOCIAL_BROWSER_FALLBACK=0` / `--no-browser-fallback` disables it. Never forges signatures, replays cookies, or bypasses challenge pages.
+8. **Douyin `--all` is bounded.** Budgets (`--max-items`, `--max-seconds`, `--max-scrolls`) and per-candidate owner+item+alias+pagination audits are mandatory. `is_exhaustive=true` only when all candidates agree + a verified terminal page is observed. Any protection stop → `is_exhaustive=false`.
+9. **Douyin browser fallback is experimental.** Triggered only when SSR is missing or unrecognized. Empty list → `NO_PUBLIC_CONTENT` (no browser). Visible protection page → fixed `restriction_source` + `restriction_marker` enum only — no raw page text persisted. `SOCIAL_BROWSER_FALLBACK=0` / `--no-browser-fallback` disables it. Never forges signatures, replays cookies, or bypasses challenge pages.
 10. **Reports must include the disclaimer** "公开页面快照，不代表账号后台真实曝光和转化" for anonymous sources; OpenAPI source uses a dedicated disclaimer instead of the anonymous one.
 
 ---
@@ -138,7 +151,7 @@ Non-negotiable; listed in `SKILL.md`, `README.md`, and `docs/prd/需求实现状
 
 Three known deployment surfaces:
 
-```
+```text
 ~/.agents/skills/public-social-account-analyzer  →  dev skill/   (symlink, P0)
 ~/.claude/skills/public-social-account-analyzer  →  ~/.agents/... (symlink, P0)
 ~/.workbuddy/skills/public-social-account-analyzer  (real dir snapshot, P1)
@@ -179,7 +192,7 @@ Do not mark any AC PASS with placeholder evidence or duplicate IDs.
 
 History uses Conventional Commits with scopes:
 
-```
+```text
 feat(analysis): ...
 fix(douyin): ...
 docs: ...
@@ -189,7 +202,7 @@ chore: ...
 ```
 
 - Keep commits focused; never bundle a behavior change with unrelated refactors.
-- Update `CHANGELOG.md` (Keep a Changelog 1.1.0) under both `### Added` / `### Changed` / `### Fixed` / `### Security` simultaneously — entries go in `[Unreleased]` until release.
+- Update `CHANGELOG.md` (Keep a Changelog v1.1.0) under both `### Added` / `### Changed` / `### Fixed` / `### Security` simultaneously — entries go in `[Unreleased]` until release.
 - Bump by behavior, not by line count. Run the drift checklist before tagging.
 - Never commit OAuth tokens, signed URLs, raw private data, or generated `workspace/` payloads.
 

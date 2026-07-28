@@ -7,10 +7,17 @@ import re
 import secrets
 import unicodedata
 from datetime import datetime, timezone
+from typing import Callable
 from urllib.parse import urlsplit
 
 
 MAX_ANALYSIS_GOAL_LENGTH = 500
+_BILIBILI_PROFILE_RE = re.compile(
+    r"https://space\.bilibili\.com/([1-9][0-9]*)(?:[/?#].*)?\Z"
+)
+_BILIBILI_SHORT_RE = re.compile(
+    r"https://b23\.tv/[A-Za-z0-9_-]+(?:[/?#].*)?\Z"
+)
 
 
 # Task status 枚举的单一来源。run_pipeline / collect / analyze 等模块必须从这里导入，
@@ -86,6 +93,30 @@ def safe_task_status_label(value: object) -> LabelLiteral:
 
 class TaskContractError(ValueError):
     """A task field is malformed and must be rejected before side effects."""
+
+
+def resolve_profile_url(
+    value: str, *, redirect_resolver: Callable[[str], str]
+) -> str:
+    """Resolve an allowlisted Bilibili short link to one canonical profile."""
+    if not isinstance(value, str):
+        raise ValueError("URL is not a supported public profile")
+    candidate = value.strip()
+    direct = _BILIBILI_PROFILE_RE.fullmatch(candidate)
+    if direct is not None:
+        return f"https://space.bilibili.com/{direct.group(1)}"
+    if _BILIBILI_SHORT_RE.fullmatch(candidate) is None:
+        raise ValueError("URL is not a supported public profile")
+    resolved = redirect_resolver(candidate)
+    if not isinstance(resolved, str):
+        raise ValueError("URL is not a supported public profile")
+    target = _BILIBILI_PROFILE_RE.fullmatch(resolved.strip())
+    if target is None:
+        raise ValueError("URL is not a supported public profile")
+    parsed = urlsplit(resolved.strip())
+    if parsed.scheme != "https" or parsed.netloc != "space.bilibili.com":
+        raise ValueError("URL is not a supported public profile")
+    return f"https://space.bilibili.com/{target.group(1)}"
 
 
 def validate_analysis_goal(value: object) -> str | None:

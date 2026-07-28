@@ -158,7 +158,7 @@ def test_comment_analysis_not_requested_has_stable_complete_contract():
         },
         "representative_comments": [],
         "semantic": {
-            "status": "pending-model",
+            "status": "not-applicable",
             "model_version": None,
             "insights": None,
         },
@@ -201,7 +201,7 @@ def test_comment_analysis_distinguishes_empty_from_unavailable():
         "VERIFICATION_REQUIRED"
     )
     assert unavailable["semantic"] == empty["semantic"] == {
-        "status": "pending-model",
+        "status": "not-applicable",
         "model_version": None,
         "insights": None,
     }
@@ -612,7 +612,7 @@ def test_comment_semantics_never_generate_deterministic_insights():
     )
 
     assert result["semantic"] == {
-        "status": "pending-model",
+        "status": "not-requested",
         "model_version": None,
         "insights": None,
     }

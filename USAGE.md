@@ -30,8 +30,15 @@
 
 根据 URL 识别目标平台，检查可访问性并采集账号资料与最近投稿列表。
 
+B站规范主页可直接使用；`collect.py` 会自动解析 `b23.tv` 短链，也可先运行以下命令核验。解析器只接受最终跳转到
+`https://space.bilibili.com/<数字UID>` 的结果，不会接受作品页或站外跳转：
+
 ```bash
-python skill/scripts/collect.py <URL> [OPTIONS]
+python3 skill/scripts/resolve_profile_url.py "<B站主页或 b23.tv 短链>"
+```
+
+```bash
+python3 skill/scripts/collect.py <URL> [OPTIONS]
 ```
 
 #### 位置参数：
@@ -39,7 +46,7 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 
 #### 可选选项：
 - `--limit INT`：最大采集条数。默认值：`30`，上限：`100`。
-- `--out PATH`：指定输出目录路径。默认自动生成为仓库根 `workspace/<platform>-<account>-<date>/`（从仓库根执行命令）。
+- `--out PATH`：指定输出目录路径。默认自动生成为仓库根 `workspace/<platform>-<account>-<date>/`（从仓库根执行命令）。显式路径必须尚不存在；只选择路径，不要提前 `mkdir`，失败重试时使用新后缀，不删除旧目录。
 - `--all`：仅用于抖音公开主页；在有界临时浏览器会话中尽量观察到可信列表末页，不能与显式 `--limit` 联用。
 - `--max-items / --max-seconds / --max-scrolls`：公开 `--all` 的安全预算。默认 `10000 / 1800 / 2000`，硬上限 `50000 / 14400 / 20000`；只能与 `--all` 联用。
 - `--analysis-goal STRING`：可选分析目的，最多 500 字符且不允许控制字符。
@@ -67,7 +74,7 @@ python skill/scripts/collect.py <URL> [OPTIONS]
 分析目录，逐文件 create-only 写入并提交。
 
 ```bash
-python skill/scripts/run_pipeline.py \
+python3 skill/scripts/run_pipeline.py \
   --input <COLLECTION_WORKSPACE> \
   --output <NEW_ANALYSIS_WORKSPACE> \
   [--with-llm-tax] [--classification-results <JSON_FILE>] \
@@ -82,19 +89,23 @@ python skill/scripts/run_pipeline.py \
 
 #### 可选参数：
 
-- `--with-llm-tax`：生成 `taxonomy-prompt.md`，但不调用模型；没有分类结果时分析保持 `PARTIAL`。
+- `--with-llm-tax`：生成 `taxonomy-prompt.md`、`taxonomy-input.jsonl` 与 `taxonomy-result-template.json`，但不调用模型；没有分类结果时分析保持 `PARTIAL`。
 - `--classification-results PATH`：读取严格 JSON 数组。每个有效父作品必须且只能出现一次，
   `post_id` 必须匹配分析样本，分类枚举、布尔值、标签数组和 0–1 置信度均须合法。校验成功后
   原始字节写入 `source/classification-results.json`；路径本身不会写入产物。
-- `--with-business-insights`：要求第二阶段业务洞察；未提供结果时生成 `business-insights-prompt.md` 并保持 `PARTIAL`。
-- `--business-insight-results PATH`：读取严格 JSON 对象。结果必须绑定 collection commit 与 taxonomy 原始字节 SHA-256，并具有固定 5 项定位、6 项高低表现公开文案模式、10 个选题、5 个内容模式和 4 个实验。校验成功后原始字节写入 `source/business-insight-results.json`。
+- `--with-business-insights`：要求第二阶段业务洞察；未提供结果时生成简短 prompt、`business-context.json`、`business-evidence-catalog.jsonl` 与 `business-result-template.json` 并保持 `PARTIAL`。
+- `--business-insight-results PATH`：读取严格 JSON 对象。结果必须绑定 collection commit 与 taxonomy 原始字节 SHA-256，并具有固定 5 项定位、6 项高低表现公开文案模式，以及模板冻结的 3–8 个选题、2–5 个内容模式和 2–4 个实验。
 - `--with-comment-insights`：存在有效公开评论时生成 `comment-insights-prompt.md`；未提供结果时保持 `PARTIAL`，并记录 `PENDING_COMMENT_INSIGHTS`。
 - `--comment-insight-results PATH`：读取严格 JSON 对象。结果必须绑定评论源 SHA-256 与规范语义输入 SHA-256，固定覆盖高频问题、争议、需求、顾虑和后续选题线索，且每项证据精确匹配父作品、评论 ID、1 基源行号和原文摘录。校验成功后原始字节写入 `source/comment-insight-results.json`。
+- `--validate-only`：复用正式归一化与分析契约校验外部模型结果，不需要 `--output`，不渲染报告也不创建分析工作区；不能与 `--output` 同时使用。
+
+业务模板的 `evidence` 只填写 `business-evidence-catalog.jsonl` 中的 `evidence_id`；脚本会解析精确的 `post_id`、`source_field` 与 `excerpt`。performance pattern 只能选择 `business-context.json.performance_evidence_options` 对应槽位列出的 ID。`observability="supported"` 时 `limitation` 必须填写 JSON `null`（不加引号）；不可从互动量自动推断 `funnel_stage`。
 
 前五个阶段（采集核验、归一化、分析、渲染、输出验证）失败时不会创建输出路径。预留之后
 发生序列化或提交失败时可保留无有效 `.complete` 的目录，但流水线不会删除、覆盖或发布它。
 分类或洞察文件缺失、JSON 非法、重复键、记录不完整、摘要/父作品/评论证据不匹配或枚举越界同样在预留前失败。
 分析 `task.json` 记录总耗时与 `collection_input`、`normalization`、`analysis`、`render`、`validation` 分阶段耗时；`pipeline-report.md` 同步记录总耗时。
+每个分析提交还必须包含 `delivery-summary.json` 与 `final-response.md`；后者的数据质量数字直接来自 final `analysis.json`，Agent 最终答复不得重新汇总或凭记忆改写。
 
 ### 3. Legacy 分阶段脚本
 
@@ -106,7 +117,7 @@ python skill/scripts/run_pipeline.py \
 读取原始 JSON 节点，校验去重，并映射至统一数据模型（Schema 见 `skill/references/data-schema.md`）。
 
 ```bash
-python skill/scripts/normalize.py --input <WORKSPACE_DIR>
+python3 skill/scripts/normalize.py --input <WORKSPACE_DIR>
 ```
 
 #### 必备参数：
@@ -119,7 +130,7 @@ python skill/scripts/normalize.py --input <WORKSPACE_DIR>
 使用确定性算法计算互动中位数、四分位距、发布节奏，并提取高低表现内容差异。
 
 ```bash
-python skill/scripts/analyze.py --input <WORKSPACE_DIR> --platform <PLATFORM> [OPTIONS]
+python3 skill/scripts/analyze.py --input <WORKSPACE_DIR> --platform <PLATFORM> [OPTIONS]
 ```
 
 #### 必备参数：
@@ -143,7 +154,7 @@ python skill/scripts/analyze.py --input <WORKSPACE_DIR> --platform <PLATFORM> [O
 渲染生成 Markdown 报告、HTML 动态仪表盘及标准化分析数据。
 
 ```bash
-python skill/scripts/render_report.py --input <WORKSPACE_DIR>
+python3 skill/scripts/render_report.py --input <WORKSPACE_DIR>
 ```
 
 ---
@@ -170,13 +181,13 @@ python skill/scripts/render_report.py --input <WORKSPACE_DIR>
 
 ```bash
 # 1. 采集前 50 条公开投稿
-python skill/scripts/collect.py "https://space.bilibili.com/123456" --limit 50
+python3 skill/scripts/collect.py "https://space.bilibili.com/123456" --limit 50
 
 # 从仓库根执行时，假设生成的输出目录为 workspace/bilibili-123456-20260724
 # 假设采集输出为 workspace/bilibili-123456-collection
 
 # 2. 在新目录完成归一化、分析、渲染与提交
-python skill/scripts/run_pipeline.py \
+python3 skill/scripts/run_pipeline.py \
   --input workspace/bilibili-123456-collection \
   --output workspace/bilibili-123456-analysis
 ```
@@ -188,19 +199,19 @@ python skill/scripts/run_pipeline.py \
 以下命令默认在 SSR 缺失或作品列表结构无法识别时自动尝试浏览器降级：
 
 ```bash
-python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30
+python3 skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30
 ```
 
 仅使用 HTTP/SSR 快速路径：
 
 ```bash
-python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30 --no-browser-fallback
+python3 skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30 --no-browser-fallback
 ```
 
 通过环境变量禁用默认降级：
 
 ```bash
-SOCIAL_BROWSER_FALLBACK=0 python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30
+SOCIAL_BROWSER_FALLBACK=0 python3 skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" --limit 30
 ```
 
 设置 `SOCIAL_BROWSER_FALLBACK=1` 可显式保持默认启用状态。命令行开关优先于环境变量。
@@ -209,7 +220,7 @@ SOCIAL_BROWSER_FALLBACK=0 python skill/scripts/collect.py "https://www.douyin.co
 搜索/打开连接器，可按 `skill/references/douyin-index-evidence.md` 整理公开证据，然后执行：
 
 ```bash
-python skill/scripts/import_index_snapshot.py \
+python3 skill/scripts/import_index_snapshot.py \
   --evidence /path/to/douyin-evidence.json \
   --out workspace/douyin-index-<account>-<date> \
   --limit 30 \
@@ -217,7 +228,7 @@ python skill/scripts/import_index_snapshot.py \
   --date-to 2026-07-27 \
   --analysis-goal "分析最近90天高表现内容的共同点" \
   --profile-from-collection workspace/douyin-direct-failed
-python skill/scripts/run_pipeline.py \
+python3 skill/scripts/run_pipeline.py \
   --input workspace/douyin-index-<account>-<date> \
   --output workspace/douyin-index-<account>-analysis
 ```
@@ -240,11 +251,12 @@ python skill/scripts/run_pipeline.py \
 当用户要求内容策略、高低表现共同点或分类分布，并且存在有效样本时，Agent Skill 不把任何
 `pending-model` draft 当作最终交付：
 
-1. `--with-llm-tax` 创建 taxonomy draft；Agent 在提交目录外生成覆盖全部父作品的分类 JSON。
-2. 从同一个 collection 传 `--classification-results ... --with-business-insights` 创建 business draft；Agent 根据绑定分类摘要的 prompt 在目录外生成业务洞察 JSON。
-3. 从同一个 collection 同时传两份结果创建 final。只有 `classification_status=completed`、`business_insight_status=completed` 且 manifest 封存两份原始结果，才可声称完整策略分析完成。
+1. `--with-llm-tax` 创建 taxonomy draft；Agent 从完整预填模板开始，在提交目录外生成覆盖全部父作品的分类 JSON，不手抄确定字段。
+2. 从同一个 collection 传 `--classification-results ... --with-business-insights` 创建 business draft；Agent 从 evidence catalog 选择 `evidence_id`，不手抄原文三元组，并在目录外生成业务洞察 JSON。
+3. 两份结果先通过 collection-aware 批量预检，再用 `--validate-only` 运行正式契约；随后从同一个 collection 同时传两份结果创建 final。只有 `classification_status=completed`、`business_insight_status=completed` 且 manifest 封存两份原始结果，才可声称完整策略分析完成。
+4. 交付前先读 final 的 `final-response.md` 与 `delivery-summary.json`，保留其中状态和数字；按 views 排序称触达组，按播放分母比率排序称互动效率组，单篇异常值不冒充共同点。
 
-业务证据只能引用 prompt 中的父 `post_id`、源字段和精确摘录；URL、指标、排名与采集时间由脚本补齐。标题模式只引用标题；公开文案“开头”限前 120 字；没有公开字幕/转写时不得把文案结构说成真实视频结构，不可观察项会使 final 变为 `PARTIAL_BUSINESS_INSIGHTS`。
+业务证据只能提交 catalog 中的 `evidence_id`；父 `post_id`、源字段、精确摘录、URL 与采集时间由脚本补齐。标题模式只引用标题；公开文案“开头”限前 120 字；没有公开字幕/转写时不得把文案结构说成真实视频结构，不可观察项会使 final 变为 `PARTIAL_BUSINESS_INSIGHTS`。
 
 ### AC-03 / AC-06 外部人工真值
 
@@ -270,7 +282,7 @@ python3 tests/manual_accuracy_check.py verify \
 ### 示例 3：抖音公开 `--all` 与详情补全
 
 ```bash
-python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" \
+python3 skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" \
   --all \
   --max-items 10000 \
   --max-seconds 1800 \
@@ -293,7 +305,7 @@ python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" \
 read -r DOUYIN_OPENAPI_OPEN_ID
 read -r -s DOUYIN_OPENAPI_ACCESS_TOKEN
 export DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
-python skill/scripts/collect_douyin_authorized.py \
+python3 skill/scripts/collect_douyin_authorized.py \
   --all \
   --out workspace/douyin-authorized-all \
   --analysis-goal "分析本人账号全部公开视频"
@@ -321,7 +333,7 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 `--comments` 默认关闭；开启后，每篇最多采样 20 条无需登录即可查看的公开评论。采集工作区
 可包含 `source/comments.jsonl`，`task.json.comment_collection` 分开记录尝试、取得、明确空结果、
 失败和平台保护停止。分析流水线严格校验每条评论的父作品 ID/规范 URL、字段、时间和上限，
-并输出四种确定性状态：
+并输出五种确定性状态：
 
 - `not_requested`：未请求评论；
 - `empty`：所有合格父作品均已尝试、明确为空、无失败且未中止；

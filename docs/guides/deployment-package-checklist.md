@@ -1,9 +1,29 @@
 # Dev → 部署打包清单
 
-> 防止 dev 版本与部署版本 drift。本清单回答：
-> "我刚改了 dev `skill/`，需要把哪些内容打包/同步到部署位置（如 `~/.agents/skills/public-social-account-analyzer`、`.workbuddy/skills/public-social-account-analyzer`）才不会出现 3 天 drift？"
+> 本清单用于防止 dev 版本与部署版本之间出现漂移（drift）。它回答一个问题：「我刚改了 dev `skill/`，需要把哪些内容打包 / 同步到部署位置（如 `~/.agents/skills/public-social-account-analyzer`、`.workbuddy/skills/public-social-account-analyzer`）才不会出现 3 天 drift？」
 
----
+## 目录
+
+- [目标](#目标)
+- [前置条件](#前置条件)
+- [1. 必须随 dev 版本一并打包的内容](#1-必须随-dev-版本一并打包的内容)
+- [2. 已知部署位置与同步策略](#2-已知部署位置与同步策略)
+- [3. drift 检测](#3-drift-检测)
+- [4. 版本发布流程（建议）](#4-版本发布流程建议)
+- [5. 历史教训](#5-历史教训)
+- [6. 维护说明](#6-维护说明)
+- [7. 合规 vs legacy 产物族判别](#7-合规-vs-legacy-产物族判别)
+- [排障](#排障)
+
+## 目标
+
+确保部署端运行的技能包与 dev `skill/` 在脚本、测试、评估与文档上保持一致，避免「dev 已改、部署未更」导致的功能缺失、CLI 标志缺失或验收无法在部署端复现。
+
+## 前置条件
+
+- 本地 dev `skill/` 已就绪，且通过 `python3 -m pytest tests/ -q` 回归。
+- 已知目标部署路径（软链接或真实目录），见 §2。
+- 具备建立软链接（`ln -sfn`）或独立打包（`zip`）的权限与工具。
 
 ## 1. 必须随 dev 版本一并打包的内容
 
@@ -11,7 +31,7 @@
 
 ### 1.1 脚本层（运行时必需）
 
-```
+```text
 skill/
 ├── SKILL.md                           # Agent 入口指令
 ├── scripts/
@@ -54,7 +74,7 @@ skill/
 
 ### 1.2 自动化测试（验收必需）
 
-```
+```text
 tests/
 ├── conftest.py
 ├── test_*.py                          # 完整自动化回归；数量以发布日志为准
@@ -65,7 +85,7 @@ tests/
 
 ### 1.3 评估与数据集（验收支撑）
 
-```
+```text
 skill/evals/
 ├── cases.md
 ├── evals.json
@@ -81,7 +101,7 @@ skill/evals/
 
 ### 1.4 文档（用户与 AI 必需）
 
-```
+```text
 docs/
 ├── architecture/
 │   └── STRUCTURE.md
@@ -181,7 +201,7 @@ drift 任意一条失败 → 阻塞发布。
 1. dev 版本打 tag：`git tag v1.x.y`
 2. 在 dev `skill/SKILL.md` 顶部 frontmatter 注明版本（如项目采用该字段）
 3. 用第 3 节的 drift 检测全绿
-4. 更新 `CHANGELOG.md`（Keep a Changelog 1.1.0）
+4. 更新 `CHANGELOG.md`（Keep a Changelog v1.1.0）
 5. 仅当选择"独立打包"时，打包 §1 列出的全部内容为 `public-social-account-analyzer-v1.x.y.zip`
 6. 否则保持软链接，本节不适用
 
@@ -234,3 +254,14 @@ drift 任意一条失败 → 阻塞发布。
 - **C. 删除**：会丢失内容采样证据，建议先用 B。
 
 任何变更需 PR 评审至少 1 名 maintainer；选 C 时保留 30 天 git 历史可追溯。
+
+---
+
+## 排障
+
+drift 检测（§3）任一条失败时，按以下顺序处置，全部恢复为 OK / 0 failed 后才可发布：
+
+- **路径链不完整**：确认软链接目标存在；若 dev `skill/` 已移动，重新执行 §2.1 的 `ln -sfn` 命令重建软链接。
+- **关键模块 MISS**：若 dev `skill/` 已包含该模块，重建软链接或重新打包；若 dev 端也缺失，先补齐实现再发布，不得带缺模块发布。
+- **CLI 标志缺失**：说明部署版 `collect.py` / `run_pipeline.py` 与 dev 版不一致，以 dev 版为准重新同步后再跑 §3 第 3、4 步。
+- **测试有 failed**：定位失败用例并修复，重新跑 `python3 -m pytest tests/ -q` 至 0 failed；禁止在测试未全绿时发布。

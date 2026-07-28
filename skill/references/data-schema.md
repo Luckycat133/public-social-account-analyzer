@@ -52,7 +52,12 @@ workspace/<platform>-<account>-analysis/
   task.json                  # 派生任务状态与 phase_results
   pipeline-report.md         # 流水线阶段摘要
   taxonomy-prompt.md         # 可选；请求分类提示时生成
+  taxonomy-input.jsonl       # 可选；逐条不可信公开内容输入
+  taxonomy-result-template.json # 可选；预填严格分类结果壳
   business-insights-prompt.md # 可选；分类完成后请求业务洞察时生成
+  business-context.json      # 可选；摘要绑定与高低组上下文
+  business-evidence-catalog.jsonl # 可选；逐字可复制证据目录
+  business-result-template.json # 可选；证据规模驱动的严格结果壳
   comment-insights-prompt.md # 可选；存在有效评论且请求评论语义时生成
   manifest.json              # 分析产物的确定性清单
   .complete                  # 分析工作区的独立提交点
@@ -663,7 +668,7 @@ selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
 ```json
 {
   "schema_version": 1,
-  "status": "not_requested | empty | unavailable | collected_pending_model",
+  "status": "not_requested | empty | unavailable | collected_pending_model | collected_analyzed",
   "requested": false,
   "sampled_comment_count": 0,
   "eligible_parent_posts": 0,
@@ -704,6 +709,8 @@ selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
 - `include_comments=false` 且不存在评论文件/账本时为 `not_requested`；此时若
   `source/comments.jsonl` 存在或账本非空，分析在创建任何输出前失败。
 - 至少一条有效评论时为 `collected_pending_model`，即使同时存在评论级失败。
+- 已请求、至少一条有效评论且严格评论洞察结果 `semantic.status == "completed"` 时，状态升级为
+  `collected_analyzed`。
 - 已请求、评论文件明确为空、所有可分析父作品都已尝试且明确空结果、`failures=0`、
   `stop_reason=null` 时才为 `empty`。
 - 其他零评论证据均为 `unavailable`，包括文件缺失、保护中止、失败或覆盖不完整；不得把
@@ -734,14 +741,14 @@ selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
 复制八个已核验字段，并增加固定 `source_artifact=source/comments.jsonl` 与 `source_line`。
 评论字段覆盖率按全部有效评论行计算，零评论时各字段 `rate=null`。
 
-`semantic` 在确定性阶段为 `pending-model` / `model_version=null` / `insights=null`。传入
+`semantic` 在存在可用评论但未请求模型时为 `not-requested`；评论未请求、为空或不可用时为 `not-applicable`；已请求且有可用评论但尚无结果时才为 `pending-model`。传入
 `--with-comment-insights` 后，流水线生成 `comment-insights-prompt.md`；严格结果必须绑定
 `source/comments.jsonl` SHA-256 与规范语义输入 SHA-256，原字节封存为
 `source/comment-insight-results.json`。五类数组固定为 `frequent_questions`、
 `controversies`、`needs`、`concerns`、`follow_up_topics`。每条证据必须精确引用已核验的
 `parent_post_id`、`comment_id`、1 基 `source_line` 与原文子串 `excerpt`；脚本补齐规范
 `parent_post_url` 和 `source_artifact=source/comments.jsonl`。高频问题至少绑定两条不同评论。
-模型不得注入 URL、额外字段或不存在的摘录。无结果时保持 `pending-model`；完整结果为
+模型不得注入 URL、额外字段或不存在的摘录。已请求且存在可用评论但无结果时保持 `pending-model`；完整结果为
 `completed` 并参与全局完成门。Markdown 与 HTML 同步展示五类洞察及逐评论证据。
 
 ### 7.3 FR-011 / FR-012 确定性结构化聚合
@@ -890,7 +897,7 @@ boolean。样本不足时 groups/features 为空且状态为 `insufficient-sampl
 
 ### 9.5 format（内容形式，模型分类，有限枚举）
 
-`talking_head` / `tutorial` / `commentary` / `interview` / `vlog` / `news` / `review` / `compilation` / `image_text` / `live_clip` / `other`
+`talking_head` / `tutorial` / `commentary` / `interview` / `vlog` / `news` / `review` / `compilation` / `animation` / `gameplay` / `image_text` / `live_clip` / `other`
 
 ### 9.6 funnel_stage（内容目的 / 漏斗阶段，模型分类）
 

@@ -14,7 +14,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from analyze import AnalysisResult, analyze_in_memory
+from analyze import (
+    AnalysisResult,
+    analyze_in_memory,
+    build_business_context,
+    build_business_evidence_catalog,
+    build_business_result_template,
+    build_taxonomy_input,
+    build_taxonomy_result_template,
+)
 from execution_timing import ExecutionTimer
 from immutable_workspace import (
     ANALYSIS_ARTIFACTS,
@@ -85,6 +93,14 @@ def _json_object(payload: bytes, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PipelineError(f"{label} must be a JSON object")
     return value
+
+
+def _jsonl_bytes(records: list[dict[str, Any]]) -> bytes:
+    return "".join(
+        json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        + "\n"
+        for record in records
+    ).encode("utf-8")
 
 
 def _classification_json(payload: bytes) -> list[dict[str, Any]]:
@@ -343,6 +359,7 @@ def _validate_output_payloads(
         "normalized-coverage.json",
         "analysis.json",
         "task.json",
+        "delivery-summary.json",
     ):
         _json_object(artifacts[relative], relative)
     _validate_jsonl(artifacts["source/posts.jsonl"], "source/posts.jsonl")
@@ -378,6 +395,7 @@ def _validate_output_payloads(
         "account-analysis-report.md",
         "dashboard.html",
         "pipeline-report.md",
+        "final-response.md",
     ):
         try:
             text = artifacts[relative].decode("utf-8")
@@ -414,6 +432,123 @@ def _pipeline_report(
     return "\n".join(lines) + "\n"
 
 
+def _delivery_summary(
+    analysis: dict[str, Any], *, task_status: str
+) -> dict[str, Any]:
+    meta = analysis.get("meta") or {}
+    sample = analysis.get("sample_boundary") or {}
+    comments = analysis.get("comment_analysis") or {}
+    status_counts = sample.get("status_counts") or {}
+    stop_reason = meta.get("stop_reason")
+    restriction_scope = None
+    if stop_reason is not None:
+        diagnostic = meta.get("diagnostic_code") or "task_level"
+        restriction_scope = (
+            f"{diagnostic}; item_level_restricted="
+            f"{status_counts.get('RESTRICTED', 0)}"
+        )
+    main_metric = (analysis.get("performance_meta") or {}).get("main_metric")
+    small_denominator_warning = None
+    if main_metric in {
+        "view_based_engagement_rate",
+        "deep_approval_rate",
+        "community_discussion_rate",
+    }:
+        small_denominator_warning = (
+            "比率排序受播放分母影响；低播放高比率只能称为互动效率样本，"
+            "不能直接称为高触达或爆款。"
+        )
+    return {
+        "schema_version": 1,
+        "task_status": task_status,
+        "stop_reason": stop_reason,
+        "restriction_scope": restriction_scope,
+        "sample": {
+            "requested": sample.get("requested"),
+            "collected": sample.get("collected"),
+            "valid": sample.get("valid"),
+            "excluded_flagged": sample.get("excluded_flagged"),
+            "status_counts": {
+                key: status_counts.get(key, 0)
+                for key in (
+                    "SUCCESS",
+                    "PARTIAL",
+                    "FAILED",
+                    "DELETED",
+                    "RESTRICTED",
+                )
+            },
+        },
+        "field_coverage": sample.get("field_coverage") or {},
+        "classification": {
+            "status": analysis.get("classification_status"),
+            "coverage_rate": (
+                analysis.get("classification_coverage") or {}
+            ).get("rate"),
+        },
+        "business_insights": {
+            "status": analysis.get("business_insight_status")
+        },
+        "comments": {
+            "collection_status": comments.get("status"),
+            "sampled_count": comments.get("sampled_comment_count", 0),
+            "insight_required": analysis.get("comment_insight_required"),
+            "insight_status": analysis.get("comment_insight_status"),
+        },
+        "performance": {
+            "main_metric": main_metric,
+            "label": f"按 {main_metric} 排序的样本内相对表现",
+            "small_denominator_warning": small_denominator_warning,
+            "axes": {
+                "reach": {
+                    "status": ((analysis.get("performance_axes") or {}).get("reach") or {}).get("status"),
+                    "measured_count": ((analysis.get("performance_axes") or {}).get("reach") or {}).get("measured_count"),
+                },
+                "engagement_efficiency": {
+                    "status": ((analysis.get("performance_axes") or {}).get("engagement_efficiency") or {}).get("status"),
+                    "measured_count": ((analysis.get("performance_axes") or {}).get("engagement_efficiency") or {}).get("measured_count"),
+                    "denominator_floor": ((analysis.get("performance_axes") or {}).get("engagement_efficiency") or {}).get("denominator_floor"),
+                    "excluded_small_denominator_count": ((analysis.get("performance_axes") or {}).get("engagement_efficiency") or {}).get("excluded_small_denominator_count"),
+                },
+            },
+        },
+    }
+
+
+def _final_response(summary: dict[str, Any]) -> str:
+    sample = summary["sample"]
+    counts = sample["status_counts"]
+    coverage = summary["field_coverage"]
+    coverage_text = " / ".join(
+        f"{name} {value * 100:.1f}%" if isinstance(value, (int, float)) else f"{name} —"
+        for name, value in coverage.items()
+    )
+    lines = [
+        "## 数据质量摘要",
+        "",
+        f"- task_status: {summary['task_status']}",
+        f"- stop_reason: {summary['stop_reason'] or 'none'}",
+        f"- requested / collected / valid: {sample['requested']} / {sample['collected']} / {sample['valid']}",
+        "- "
+        + " / ".join(f"{key} {counts[key]}" for key in counts),
+        f"- excluded_flagged: {sample['excluded_flagged']}",
+        f"- field_coverage: {coverage_text or 'none'}",
+        f"- restriction_scope: {summary['restriction_scope'] or 'none'}",
+        "",
+        "## 分析结论交付规则",
+        "",
+        "以上数字由 final analysis.json 确定性生成；不得重新计算或凭记忆改写上述数字。",
+        "结论必须沿用报告的主指标名称，并把比率高组称为互动效率样本，而非自动称为高触达或爆款。",
+        "自然语言结论只引用 final 报告和已封存 evidence；单个作品只能称为个案，不能冒充共同点。",
+    ]
+    warning = (summary.get("performance") or {}).get(
+        "small_denominator_warning"
+    )
+    if warning:
+        lines.extend(["", f"> {warning}"])
+    return "\n".join(lines) + "\n"
+
+
 def _load_default_template() -> str:
     path = Path(__file__).resolve().parent.parent / "assets" / "report-template.html"
     try:
@@ -423,6 +558,93 @@ def _load_default_template() -> str:
     if not template:
         raise PipelineError("report template is empty")
     return template
+
+
+def validate_pipeline_inputs(
+    collection_dir: str,
+    *,
+    classification_results_path: str | None = None,
+    business_insight_results_path: str | None = None,
+    comment_insight_results_path: str | None = None,
+) -> AnalysisResult:
+    """Run authoritative normalization and model-result validation without output."""
+    classification_payload: bytes | None = None
+    classification_results: list[dict[str, Any]] | None = None
+    if classification_results_path is not None:
+        classification_payload, classification_results = (
+            _read_classification_results(classification_results_path)
+        )
+    classification_digest = (
+        hashlib.sha256(classification_payload).hexdigest()
+        if classification_payload is not None
+        else None
+    )
+    business_results = (
+        _read_business_insight_results(business_insight_results_path)[1]
+        if business_insight_results_path is not None
+        else None
+    )
+    comment_payload: bytes | None = None
+    comment_results: dict[str, Any] | None = None
+    if comment_insight_results_path is not None:
+        comment_payload, comment_results = _read_comment_insight_results(
+            comment_insight_results_path
+        )
+    comment_digest = (
+        hashlib.sha256(comment_payload).hexdigest()
+        if comment_payload is not None
+        else None
+    )
+    try:
+        reader_context = VerifiedWorkspaceReader.open(
+            collection_dir, allowed_artifacts=COLLECTION_ARTIFACTS
+        )
+    except WorkspaceError as exc:
+        raise PipelineError(f"collection verification failed: {exc}") from exc
+
+    with reader_context as reader:
+        manifested = {
+            item["path"] for item in reader.manifest.get("artifacts", [])
+        }
+        missing = COLLECTION_REQUIRED_ARTIFACTS - manifested
+        if missing:
+            raise PipelineError(
+                "collection is missing required input: " + ", ".join(sorted(missing))
+            )
+        profile_artifact = reader.read("source/profile.json")
+        posts_artifact = reader.read("source/posts.jsonl")
+        task_artifact = reader.read("task.json")
+        assert profile_artifact.payload is not None
+        assert posts_artifact.payload is not None
+        assert task_artifact.payload is not None
+        profile = _json_object(profile_artifact.payload, "source/profile.json")
+        task = _json_object(task_artifact.payload, "task.json")
+        normalization = _phase(
+            "NORMALIZE", normalize_in_memory, profile, posts_artifact.payload
+        )
+        if normalization.coverage.get("valid_count", 0) < 1:
+            raise PipelineError("NORMALIZE failed: no analyzable rows")
+        comments_payload = None
+        if "source/comments.jsonl" in manifested:
+            comments_payload = reader.read("source/comments.jsonl").payload
+        result = _phase(
+            "VALIDATE_MODEL_RESULTS",
+            analyze_in_memory,
+            profile,
+            normalization.rows,
+            task,
+            classification_results=classification_results,
+            business_insight_results=business_results,
+            with_business_insights=business_results is not None,
+            collection_commit_sha256=reader.source_digest,
+            classification_results_sha256=classification_digest,
+            comment_insight_results=comment_results,
+            with_comment_insights=comment_results is not None,
+            comment_insight_results_sha256=comment_digest,
+            comments_payload=comments_payload,
+        )
+        reader.verify_unchanged()
+        return result
 
 
 def run_pipeline(
@@ -685,6 +907,12 @@ def run_pipeline(
             artifacts["taxonomy-prompt.md"] = analysis.taxonomy_prompt.encode(
                 "utf-8"
             )
+            artifacts["taxonomy-input.jsonl"] = _jsonl_bytes(
+                build_taxonomy_input(analysis.analysis["posts"])
+            )
+            artifacts["taxonomy-result-template.json"] = _json_bytes(
+                build_taxonomy_result_template(analysis.analysis["posts"])
+            )
         if classification_payload is not None:
             artifacts["source/classification-results.json"] = (
                 classification_payload
@@ -693,6 +921,42 @@ def run_pipeline(
             artifacts["business-insights-prompt.md"] = (
                 analysis.business_insights_prompt.encode("utf-8")
             )
+            artifacts["business-evidence-catalog.jsonl"] = _jsonl_bytes(
+                build_business_evidence_catalog(
+                    analysis.analysis["posts"],
+                    analysis.analysis["high_performance"],
+                    analysis.analysis["low_performance"],
+                )
+            )
+            artifacts["business-result-template.json"] = _json_bytes(
+                build_business_result_template(
+                    analysis.analysis["posts"],
+                    analysis.analysis["high_performance"],
+                    analysis.analysis["low_performance"],
+                    reader.source_digest,
+                    classification_results_sha256,
+                )
+            )
+            business_context = build_business_context(
+                analysis.analysis["posts"],
+                analysis.analysis["high_performance"],
+                analysis.analysis["low_performance"],
+            )
+            business_context.update({
+                "account_name": profile.get("account_name"),
+                "collection_commit_sha256": reader.source_digest,
+                "classification_results_sha256": classification_results_sha256,
+                "performance_meta": analysis.analysis["performance_meta"],
+                "high_post_ids": [
+                    item["post_id"]
+                    for item in analysis.analysis["high_performance"]
+                ] if isinstance(analysis.analysis["high_performance"], list) else [],
+                "low_post_ids": [
+                    item["post_id"]
+                    for item in analysis.analysis["low_performance"]
+                ] if isinstance(analysis.analysis["low_performance"], list) else [],
+            })
+            artifacts["business-context.json"] = _json_bytes(business_context)
         if business_insight_payload is not None:
             artifacts["source/business-insight-results.json"] = (
                 business_insight_payload
@@ -705,6 +969,13 @@ def run_pipeline(
             artifacts["source/comment-insight-results.json"] = (
                 comment_insight_payload
             )
+        delivery_summary = _delivery_summary(
+            analysis.analysis, task_status=task_status
+        )
+        artifacts["delivery-summary.json"] = _json_bytes(delivery_summary)
+        artifacts["final-response.md"] = _final_response(delivery_summary).encode(
+            "utf-8"
+        )
 
         expected_artifacts = ANALYSIS_REQUIRED_ARTIFACTS | frozenset(
             relative
@@ -762,7 +1033,12 @@ def main(argv: list[str] | None = None) -> int:
         description="从已提交采集工作区创建独立、不可变的分析工作区"
     )
     parser.add_argument("--input", required=True, help="已提交的采集工作区")
-    parser.add_argument("--output", required=True, help="不存在的分析输出目录")
+    parser.add_argument("--output", help="不存在的分析输出目录")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="只验证模型结果，不渲染或创建分析工作区",
+    )
     parser.add_argument("--template", default=None, help="可选 HTML 模板")
     parser.add_argument(
         "--with-llm-tax",
@@ -796,6 +1072,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        if args.validate_only:
+            if args.output is not None:
+                parser.error("--validate-only cannot be combined with --output")
+            validate_pipeline_inputs(
+                args.input,
+                classification_results_path=args.classification_results,
+                business_insight_results_path=args.business_insight_results,
+                comment_insight_results_path=args.comment_insight_results,
+            )
+            print("model results valid; no analysis workspace created")
+            return 0
+        if args.output is None:
+            parser.error("--output is required unless --validate-only is used")
         template = (
             Path(args.template).read_text(encoding="utf-8")
             if args.template

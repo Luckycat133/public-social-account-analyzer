@@ -39,6 +39,7 @@ public-social-account-analyzer/             # 项目根目录
 ├── USAGE.md                               # 详细使用指南与故障排查
 ├── CHANGELOG.md                           # 变更日志 (Keep a Changelog v1.1.0)
 ├── ROADMAP.md                             # 历史路线图与剩余外部验收
+├── TESTING.md                             # 分层测试与模型结果验证方法
 ├── AGENTS.md                              # 仓库贡献规范
 ├── pyproject.toml                         # Python 项目与 Pytest 配置
 ├── docs/                                  # 文档总目录（按 architecture/guides/prd 分类）
@@ -51,9 +52,11 @@ public-social-account-analyzer/             # 项目根目录
 │   │   ├── 需求实现状态与抖音能力边界.md
 │   │   └── 公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx
 │   ├── observations/                    # Agent 行动路径观测与验收记录
+│   │   └── agent-runs/                  # 用于 Skill 复盘的原始 JSONL 轨迹
 │   └── plans/                          # 进行中 / 待实施计划
 ├── tests/                                 # Pytest 自动化单元测试集
-├── workspace/                             # 任务运行产物输出目录（git 忽略）
+├── tools/                                 # 开发辅助工具（demo / skill_eval）
+├── workspace/                             # 运行时按需生成，git 忽略且不入库
 └── skill/                                 # AI Agent 纯净技能包 (Agent Skills 规范)
     ├── SKILL.md                           # Agent 技能指令与执行契约
     ├── scripts/                           # Python 执行脚本
@@ -143,40 +146,45 @@ pip install -e ".[dev]"
 系统先提交只读采集快照，再从同一个 collection 创建互不修改的分析提交。仅需确定性指标时，一次 `run_pipeline.py` 即可；需要内容策略时，执行 taxonomy 与 business-insight 两阶段模型协作：
 
 ```bash
-# 步骤 1：采集公开账号数据（以 B站 为例）
-python skill/scripts/collect.py "https://space.bilibili.com/123456" \
+# 步骤 0：规范 URL；b23.tv 只允许跳转到 HTTPS 数字 UID 空间主页
+python3 skill/scripts/resolve_profile_url.py "https://b23.tv/example"
+
+# 步骤 1：选择尚不存在的输出路径后直接采集，不要预先 mkdir
+python3 skill/scripts/collect.py "https://space.bilibili.com/123456" \
   --limit 30 --out workspace/bilibili-123456-collection
 
 # 步骤 2：先生成 taxonomy prompt；脚本不自行调用模型
-python skill/scripts/run_pipeline.py \
+python3 skill/scripts/run_pipeline.py \
   --input workspace/bilibili-123456-collection \
   --output workspace/bilibili-123456-taxonomy-draft \
   --with-llm-tax
 
-# 步骤 3：Agent 在所有已提交目录外填写 taxonomy-results.json。
+# 步骤 3：Agent 把 prompt 中的完整预填数组复制到提交目录外，只编辑语义槽位。
 
 # 步骤 4：绑定分类原始字节，生成业务洞察 prompt
-python skill/scripts/run_pipeline.py \
+python3 skill/scripts/run_pipeline.py \
   --input workspace/bilibili-123456-collection \
   --output workspace/bilibili-123456-business-draft \
   --classification-results /path/to/taxonomy-results.json \
   --with-business-insights
 
-# 步骤 5：Agent 在所有已提交目录外填写 business-insight-results.json。
+# 步骤 5：Agent 从 prompt 的 evidence catalog 逐字复制证据，在提交目录外填写结果。
 
 # 步骤 6：从同一个 collection 创建最终分析提交
-python skill/scripts/run_pipeline.py \
+python3 skill/scripts/run_pipeline.py \
   --input workspace/bilibili-123456-collection \
   --output workspace/bilibili-123456-final \
   --classification-results /path/to/taxonomy-results.json \
   --with-business-insights \
   --business-insight-results /path/to/business-insight-results.json
+
+# 步骤 7：先读取 final-response.md / delivery-summary.json，再交付用户答复
 ```
 
 只需要确定性指标与报告时可使用：
 
 ```bash
-python skill/scripts/run_pipeline.py \
+python3 skill/scripts/run_pipeline.py \
   --input workspace/bilibili-123456-collection \
   --output workspace/bilibili-123456-analysis
 ```
@@ -185,14 +193,14 @@ python skill/scripts/run_pipeline.py \
 
 请求评论洞察时，采集阶段须显式增加 `--comments`。先以 `--with-comment-insights` 创建 draft，由执行 Agent 在已提交目录外填写 `comment-insight-results.json`，再从同一个 collection 传入 `--comment-insight-results` 创建 final。五类语义结果必须逐项绑定父作品、评论 ID、`source/comments.jsonl` 行号和原文摘录；没有严格结果时保持 `PARTIAL`，确定性脚本不会用关键词代替语义判断。
 
-完整分类通过后，分析会确定性生成主题×形式全矩阵、主题/形式主指标覆盖与中位数，以及高低组结构化特征。严格业务洞察结果另包含账号定位五维、6 个高低表现文案模式、10 个选题、5 个内容模式和 4 个实验；模型只能提交源字段摘录，脚本从冻结父作品补齐并校验 URL、采集时间、分组和摘要绑定。公开样本无法观察真实视频开头/结构时必须降级为 `PARTIAL_BUSINESS_INSIGHTS`，不得从标题或文案猜测视频内容。
+完整分类通过后，分析会确定性生成主题×形式全矩阵、主题/形式主指标覆盖与中位数、触达与互动效率双轴表现，以及高低组结构化特征。严格业务洞察结果另包含账号定位五维、6 个高低表现文案模式，以及按证据规模生成的 3–8 个选题、2–5 个内容模式和 2–4 个实验；模型只能提交源字段摘录，脚本从冻结父作品补齐并校验 URL、采集时间、分组和摘要绑定。
 
 Agent Skill 收到“内容策略、选题分布、高低表现共同点”等目标时，会把分类与业务洞察都作为最终交付前置。final 必须同时为 `classification_status=completed`、`business_insight_status=completed`，并在 manifest 中封存两份模型输入原始字节；否则保持 `PARTIAL`，不会把 draft 冒充完整策略分析。
 
 抖音公开账号的有界尽力全量与详情补全：
 
 ```bash
-python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" \
+python3 skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" \
   --all --enrich-details --out workspace/douyin-public-all
 ```
 
@@ -203,7 +211,7 @@ python skill/scripts/collect.py "https://www.douyin.com/user/<sec_uid>" \
 read -r DOUYIN_OPENAPI_OPEN_ID
 read -r -s DOUYIN_OPENAPI_ACCESS_TOKEN
 export DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
-python skill/scripts/collect_douyin_authorized.py \
+python3 skill/scripts/collect_douyin_authorized.py \
   --all --out workspace/douyin-authorized-all
 unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 ```
@@ -238,12 +246,15 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 - `source/classification-results.json` — 可选；已严格核验并按原字节封存的完整语义分类输入
 - `source/business-insight-results.json` — 可选；绑定 collection digest 与分类原始字节摘要、经严格校验后按原字节封存的业务洞察输入
 - `source/comment-insight-results.json` — 可选；绑定评论源与规范语义输入摘要、经严格校验后按原字节封存的评论洞察输入
-- `taxonomy-prompt.md` / `business-insights-prompt.md` / `comment-insights-prompt.md` — 可选 draft 提示；只在对应模型结果尚待填写时生成
+- `taxonomy-prompt.md` / `taxonomy-input.jsonl` / `taxonomy-result-template.json` — 可选分类 draft 工件
+- `business-insights-prompt.md` / `business-context.json` / `business-evidence-catalog.jsonl` / `business-result-template.json` — 可选业务洞察 draft 工件
+- `comment-insights-prompt.md` — 可选评论语义 draft 提示
 - `source/comments.jsonl` — 可选；从同一采集提交逐字节复制的评论证据
 - `normalized-posts.csv` / `normalized-coverage.json` — 从 `source/posts.jsonl` 重新生成的归一化结果
 - `account-analysis-report.md` — 完整 Markdown 账号分析报告（含分类覆盖与矩阵、分类维度表现、高低组结构化特征、完整证据与核心洞察来源）
 - `dashboard.html` — 与 Markdown 同口径的可视化 HTML 仪表盘
 - `analysis.json` — 机器可读的统计指标、分类生命周期/矩阵、结构化高低特征、严格业务洞察、评论证据与可选严格评论语义洞察 JSON
+- `delivery-summary.json` / `final-response.md` — 必需；从 final 确定性生成的数据质量交付摘要，区分任务级限制与作品级状态，并约束 Agent 不得凭记忆重算数字
 - `task.json` / `pipeline-report.md` — 派生任务状态、各阶段结果，以及 `started_at`、`ended_at`、`duration_ms`、`phase_durations_ms`
 - `manifest.json` / `.complete` — 分析产物的独立、create-only 提交
 
@@ -253,6 +264,8 @@ unset DOUYIN_OPENAPI_OPEN_ID DOUYIN_OPENAPI_ACCESS_TOKEN
 ---
 
 ## 自动化测试
+
+完整的分层测试、模型结果批量校验与在线烟雾测试步骤见 [TESTING.md](TESTING.md)。
 
 运行 Pytest 单元测试集：
 

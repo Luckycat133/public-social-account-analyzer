@@ -2,7 +2,19 @@
 
 本文档说明 `public-social-account-analyzer` 的目录组织、各模块职责与依赖关系。优化目标：分层清晰、无循环依赖、命名规范一致、便于维护与扩展。
 
----
+## 目录
+
+- [目录树](#目录树)
+- [分层架构](#分层架构)
+- [模块清单](#模块清单)
+  - [编排层](#编排层)
+  - [适配器层](#适配器层)
+  - [共享层](#共享层)
+- [命名规范](#命名规范)
+- [采集流水线](#采集流水线)
+- [边界与约束](#边界与约束)
+- [测试](#测试)
+- [参见](#参见)
 
 ## 目录树
 
@@ -13,6 +25,7 @@ public-social-account-analyzer/
 ├── CHANGELOG.md                           # 变更日志（Keep a Changelog v1.1.0）
 ├── ROADMAP.md                             # 历史路线图与当前能力状态
 ├── pyproject.toml                         # Python 项目与 pytest 配置
+├── TESTING.md                             # 分层测试与发布前验证方法
 ├── docs/                                  # 文档总目录（导航见 docs/README.md）
 │   ├── README.md                         # 文档地图与命名规范
 │   ├── architecture/                     # 架构、模块与依赖
@@ -20,12 +33,16 @@ public-social-account-analyzer/
 │   ├── guides/                          # 使用、部署、运营指南
 │   ├── prd/                            # 产品需求与验收
 │   ├── observations/                    # Agent 行动路径观测与验收记录
+│   │   └── agent-runs/                  # Skill 对照复盘的原始 JSONL 轨迹
 │   └── plans/                          # 设计与实施记录
 ├── tests/                                 # pytest 回归与人工验收工具；数量以发布日志为准
 │   ├── conftest.py                        # 注入 skill/scripts/ 的测试导入配置
 │   ├── test_*.py                          # 采集、分析、报告、安全和工作区合同
 │   └── manual_accuracy_check.py           # AC-03 / AC-06 外部人工真值工具
-├── workspace/                             # 任务运行产物输出目录（运行时生成）
+├── tools/                                 # 开发辅助工具
+│   ├── demo/                              # 冻结报告的本地 Ollama 演示 runner
+│   └── skill_eval/                        # Skill 评估聚合工具
+├── workspace/                             # 任务执行时按需生成，不属于源码
 └── skill/                                 # AI Agent 纯净技能包（Agent Skills 规范）
     ├── SKILL.md                           # Agent 技能指令与执行契约
     ├── scripts/                           # Python 执行脚本
@@ -34,7 +51,7 @@ public-social-account-analyzer/
     │   ├── collect_douyin_authorized.py   # 抖音账号本人 OpenAPI 入口
     │   ├── import_index_snapshot.py       # 抖音公开索引证据导入
     │   ├── normalize.py                   # 归一化（FR-008）
-    │   ├── analyze.py                     # 确定性指标 + 两阶段模型输入校验
+    │   ├── analyze.py                      # 确定性指标 + 两阶段模型输入校验
     │   ├── render_report.py               # Markdown + HTML 报告渲染
     │   ├── run_pipeline.py                # 推荐的不可变分析编排入口
     │   ├── immutable_workspace.py         # create-only 提交与核验协议
@@ -77,8 +94,6 @@ public-social-account-analyzer/
             └── manifest.json              # 校验和与划分清单
 ```
 
----
-
 ## 分层架构
 
 系统按职责分为四层，代码依赖保持单向，**无循环依赖**：
@@ -114,8 +129,6 @@ public-social-account-analyzer/
 - `bilibili.py` 是 B站采集、HTTP/WBI 传输、错误映射与任务级断路器的单一实现；平台保护响应不会触发浏览器降级
 - 采集工作区与分析工作区分别提交；`run_pipeline.py` 只读核验前者，再创建后者
 - taxonomy、business-insight 与 comment-insight 输入由执行 Agent 在已提交目录外生成，脚本只负责严格校验、摘要绑定和封存
-
----
 
 ## 模块清单
 
@@ -153,8 +166,6 @@ public-social-account-analyzer/
 | `_constants.py` | 跨采集器共享常量：`BEIJING_TZ` 时区 + `STOP_*` stop_reason 枚举 + `KNOWN_STOP_REASONS` 集合 | `BEIJING_TZ` · `STOP_LOGIN` · `STOP_VERIFICATION` · `STOP_ACCESS_RESTRICTED` |
 | `_utils.py` | 跨采集器共享工具函数：`now_iso` / `parse_int`（支持「万/亿/+」后缀）/ `ts_to_iso` / `extract_hashtags` | `now_iso()` · `parse_int()` · `ts_to_iso()` · `extract_hashtags()` |
 
----
-
 ## 命名规范
 
 | 类别 | 规范 | 示例 |
@@ -163,9 +174,7 @@ public-social-account-analyzer/
 | 类 | `PascalCase` | `BilibiliCollector` · `BaseCollector` · `BrowserSession` |
 | 函数/变量 | `snake_case`；私有以 `_` 前缀 | `collect_post_list()` · `_build_profile_raw()` |
 | 常量 | `UPPER_SNAKE_CASE`；stop_reason 枚举以 `STOP_` 前缀 | `BEIJING_TZ` · `STOP_LOGIN` · `MIXIN_KEY_ENC_TAB` |
-| stop_reason 值 | `UPPER_SNAKE_CASE` 字符串，对齐 `references/exceptions.md §9.2` | `"LOGIN_REQUIRED"` · `"ACCESS_RESTRICTED"` |
-
----
+| stop_reason 值 | `UPPER_SNAKE_CASE` 字符串，对齐 [`references/exceptions.md`](../../skill/references/exceptions.md) §9.2 | `"LOGIN_REQUIRED"` · `"ACCESS_RESTRICTED"` |
 
 ## 采集流水线
 
@@ -182,7 +191,16 @@ run_pipeline.py ─→ normalize ─→ deterministic analysis ─→ render ─
 
 采集步骤访问公开平台页面，抖音在无明确限制且 SSR 不足时可用隔离临时浏览器作实验性传输降级；其余主流水线步骤离线执行。`normalize.py`、`analyze.py`、`render_report.py` 和 `run_pipeline.py` 不访问网络，也不在脚本内部调用 LLM。执行 Agent 在提交目录外填写 prompt 规定的严格 JSON，再由新一次流水线提交校验并封存。
 
----
+## 边界与约束
+
+下列边界由现有实现与合同保证，任何新增模块不得突破：
+
+- **双工作区隔离**：采集工作区与分析工作区分别提交；`run_pipeline.py` 只读核验采集提交，再创建独立的分析工作区，二者不混写。
+- **离线确定性分析**：`normalize.py`、`analyze.py`、`render_report.py` 与 `run_pipeline.py` 不访问网络，也不在脚本内部调用 LLM；确定性指标与分析离线执行。
+- **公开与本人授权隔离**：匿名公开路径只采集无需登录即可查看的内容；抖音本人授权路径使用同次 OAuth 的 `access_token` + `open_id`，不读取登录态 / Cookie，也不以登录态抓取冒充公开采集。
+- **浏览器降级仅实验性**：抖音公开浏览器传输（`_douyin_browser_transport.py`）为隔离临时 profile 的实验性降级，仅在 SSR 不足且无明确限制时启用；B站平台保护响应不会触发浏览器降级。
+- **LLM 内容在提交目录外生成**：taxonomy、business-insight 与 comment-insight 的语义输入由执行 Agent 在已提交目录外填写严格 JSON，脚本只负责校验、摘要绑定与封存，不生成语义结论。
+- **合规产物合约**：仅含 `.complete` 与 `manifest.json`（含 SHA-256）的提交视为已提交采集；legacy 产物（无 `.complete` / `manifest.json`）不可作为 `--resume` 输入。
 
 ## 测试
 
@@ -192,3 +210,11 @@ python3 -m pytest tests/test_douyin.py -q
 ```
 
 测试覆盖适配器路由、字段映射、限制断路器、去重/增量续采/密封 checkpoint、指标、归一化、不可变提交、taxonomy/business/comment 合同、报告安全、结构化耗时与人工验收工具。用例数与耗时以当次发布日志为准。
+
+## 参见
+
+- [`../README.md`](../README.md) — 文档地图与命名规范。
+- [`../prd/需求实现状态与抖音能力边界.md`](../prd/需求实现状态与抖音能力边界.md) — 当前实现审计与抖音能力边界。
+- [`../../skill/references/data-schema.md`](../../skill/references/data-schema.md) — 统一数据模型与字段表。
+- [`../../skill/references/exceptions.md`](../../skill/references/exceptions.md) — `stop_reason` 决策表与异常语义。
+- [`../../skill/references/analysis-rules.md`](../../skill/references/analysis-rules.md) — 分析规则（节奏 / 指标 / 分类 / 高低表现）。

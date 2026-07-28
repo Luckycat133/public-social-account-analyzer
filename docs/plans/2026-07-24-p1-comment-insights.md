@@ -1,12 +1,12 @@
 # P1 评论洞察：设计与实施记录
 
-> **状态**：✅ 已实施（2026-07-27）
+> **状态**：已实施（2026-07-27）
 >
 > **对应 PRD**：第 7 节 FR-007、第 10 节评论洞察、第 14 节评论不可见处理
 >
 > **当前规范**：[`skill/references/data-schema.md`](../../skill/references/data-schema.md) §3.3、§6.1、§7.2
 >
-> **使用入口**：[`USAGE.md`](../../USAGE.md)“评论证据与分析状态”
+> **使用入口**：[`USAGE.md`](../../USAGE.md)「评论证据与分析状态」
 
 本文档保留最初的设计背景和最终决策，不再作为待办清单。实现以当前 Skill、字段字典和回归测试为准。
 
@@ -33,7 +33,7 @@ collect.py
 - `--comments` 默认关闭，每个合格父作品最多请求 20 条公开评论。
 - 评论逐行写入 `source/comments.jsonl`，由编排层补齐并核验 `parent_post_id` 与规范父作品 URL。
 - `task.json.comment_collection` 分开记录尝试数、有效评论数、明确空结果、失败数、单帖上限和评论阶段停止原因。
-- 分析状态区分 `not_requested`、`empty`、`unavailable`、`collected_pending_model` 与 `collected_analyzed`。文件缺失、覆盖不完整或保护中止不得表述为“没有评论”。
+- 分析状态区分 `not_requested`、`empty`、`unavailable`、`collected_pending_model` 与 `collected_analyzed`。文件缺失、覆盖不完整或保护中止不得表述为「没有评论」。
 
 ### 确定性证据层
 
@@ -52,7 +52,7 @@ collect.py
 
 ## 主要设计修正
 
-初稿曾计划用关键词正则和文本滑窗直接生成“问题、争议、需求、顾虑”结论。实施时放弃该方案，因为它无法可靠表达语境，也容易把启发式命中误报为用户洞察。最终设计把确定性证据整理与语义判断分开：脚本负责验证和绑定，执行 Agent 负责语义结果，任何缺失或不完整结果均保持可见的 pending/partial 状态。
+初稿曾计划用关键词正则和文本滑窗直接生成「问题、争议、需求、顾虑」结论。实施时放弃该方案，因为它无法可靠表达语境，也容易把启发式命中误报为用户洞察。最终设计把确定性证据整理与语义判断分开：脚本负责验证和绑定，执行 Agent 负责语义结果，任何缺失或不完整结果均保持可见的 pending/partial 状态。
 
 ## 边界
 

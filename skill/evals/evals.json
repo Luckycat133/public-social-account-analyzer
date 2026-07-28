@@ -10,6 +10,7 @@
         "未指定数量时默认采集 30 条（不超过实际可得数量）",
         "最终用户答复在任何分析结论之前先完整展示数据质量摘要（成功/失败/受限数量与字段覆盖率）；仅报告文件内含摘要、答复中只提状态码不算通过",
         "四类输出文件（account-analysis-report.md、dashboard.html、normalized-posts.csv、analysis.json）均存在且可打开",
+        "分析提交同时生成 delivery-summary.json 与 final-response.md；最终答复的数据质量数字与 delivery-summary.json 逐项一致，未凭记忆重算",
         "每项核心洞察至少引用一个实际采集到的 post_url",
         "报告含'公开页面快照，不代表账号后台真实曝光和转化'免责声明",
         "条件式：采集样本中存在置顶内容时，置顶被单独标记且未混入近期发布节奏统计；样本无置顶时，报告如实记录置顶数量为 0，本断言按 N/A 计（不作为失败）。确定性验证使用 evals/datasets/fixtures/ 中含置顶样本的离线 fixture"
@@ -25,9 +26,13 @@
         "索引证据缺少可验证发布时间时，不把日期未知或陈旧卡片纳入最近90天排名，并明确该时间窗无法分析",
         "有效样本≥15条时：高表现和低表现内容各至少列出3条，均带 post_url",
         "有效样本≥15条且要求共同点时：执行 Agent 完成两阶段 taxonomy，最终 classification_status=completed 且 manifest 封存 source/classification-results.json",
+        "taxonomy 结果从 draft 的完整预填模板编辑，B站 hook_type/is_original/series_name 与有效父作品集合首次校验即通过，Agent 未通过阅读 analyze.py 或反复试错推导合同",
         "有效样本≥15条且分类完成时：Agent 的最终答复至少归纳一条可由高低组明细复核的高表现共同点，并明确样本量、非因果和仅适用于当前证据范围的限制",
+        "共同点至少绑定 3 个不同父作品；单篇高播放或低播放高比率只称个案，不写成需求已验证、爆款或普遍规律",
+        "按 views 的组称触达组，按播放分母比率的组称互动效率组；最终答复未用模糊的统一高表现掩盖排序口径",
         "classification_status=completed 时，最终报告不得再出现分类可能为 pending-model 的矛盾提示，并明确区分平台 content_type 与模型 format",
         "最终报告中的主题/形式计数与高低组结构化特征能够从 manifest 封存的 source/classification-results.json 和标准化作品逐项重算",
+        "最终答复中的主题/形式数量直接来自 final 产物，与 analysis.json 完全一致；没有重新汇总后产生数字漂移",
         "有效样本<15条时：报告标记 INSUFFICIENT_SAMPLE，不输出完整高低表现共同点归纳，且未用置顶/转载/失效内容凑数",
         "排行依据与分析目标一致，未只按点赞排序"
       ]

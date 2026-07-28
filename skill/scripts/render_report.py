@@ -1736,6 +1736,35 @@ def _append_performance_note(md: str, html: str, note: str | None) -> tuple[str,
     )
 
 
+def _performance_axes_block(analysis) -> tuple[str, str]:
+    axes = analysis.get("performance_axes") if isinstance(analysis, dict) else None
+    if not isinstance(axes, dict):
+        return "", ""
+    reach = axes.get("reach") or {}
+    efficiency = axes.get("engagement_efficiency") or {}
+    floor = efficiency.get("denominator_floor")
+    floor_label = "—" if floor is None else fmt_float(floor, 2)
+    md = (
+        "**双轴表现口径**\n\n"
+        f"- 触达轴：views；状态 {md_escape_text(reach.get('status') or 'unknown')}；"
+        f"实测 {reach.get('measured_count', 0)} 条。\n"
+        f"- 互动效率轴：view_based_engagement_rate；状态 "
+        f"{md_escape_text(efficiency.get('status') or 'unknown')}；"
+        f"仅纳入 views ≥ {floor_label} 的记录，排除小分母 "
+        f"{efficiency.get('excluded_small_denominator_count', 0)} 条。"
+    )
+    html = (
+        '<p class="note">双轴表现口径</p><ul class="tight">'
+        f"<li>触达轴：views；状态 {h_esc(reach.get('status') or 'unknown')}；"
+        f"实测 {reach.get('measured_count', 0)} 条。</li>"
+        f"<li>互动效率轴：view_based_engagement_rate；状态 "
+        f"{h_esc(efficiency.get('status') or 'unknown')}；仅纳入 views ≥ "
+        f"{h_esc(floor_label)} 的记录，排除小分母 "
+        f"{efficiency.get('excluded_small_denominator_count', 0)} 条。</li></ul>"
+    )
+    return md, html
+
+
 def build_high_performance(analysis) -> tuple[str, str]:
     main_metric, metric_label, metric_note = _performance_metric_context(analysis)
     platform, collection_source = _performance_provenance_context(analysis)
@@ -1757,6 +1786,8 @@ def build_high_performance(analysis) -> tuple[str, str]:
     md, html = _append_report_block(md, html, insight_md, insight_html)
     pattern_md, pattern_html = _business_patterns_block(analysis, "high")
     md, html = _append_report_block(md, html, pattern_md, pattern_html)
+    axes_md, axes_html = _performance_axes_block(analysis)
+    md, html = _append_report_block(md, html, axes_md, axes_html)
     # 高低表现雷达图：对比两组在各指标上的均值形态（仅作形态对比，不构成因果）
     radar = svg_high_low_radar(high, low, METRIC_FIELDS)
     if radar:

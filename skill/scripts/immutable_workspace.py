@@ -47,6 +47,8 @@ ANALYSIS_REQUIRED_ARTIFACTS = frozenset(
         "dashboard.html",
         "task.json",
         "pipeline-report.md",
+        "delivery-summary.json",
+        "final-response.md",
     }
 )
 ANALYSIS_OPTIONAL_ARTIFACTS = frozenset(
@@ -54,8 +56,13 @@ ANALYSIS_OPTIONAL_ARTIFACTS = frozenset(
         "source/comments.jsonl",
         "source/index-evidence.json",
         "taxonomy-prompt.md",
+        "taxonomy-input.jsonl",
+        "taxonomy-result-template.json",
         "source/classification-results.json",
         "business-insights-prompt.md",
+        "business-context.json",
+        "business-evidence-catalog.jsonl",
+        "business-result-template.json",
         "source/business-insight-results.json",
         "comment-insights-prompt.md",
         "source/comment-insight-results.json",

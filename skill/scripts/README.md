@@ -8,8 +8,10 @@
 |---|---|---|---|
 | `collect.py` | 根据账号主页 URL 选择适配器，采集公开资料和内容；支持日期过滤、增量续采、密封中断 checkpoint 与可选浏览器传输降级。未指定 `--out` 时写入仓库根 `workspace/`。 | 账号 URL、`--limit`、`--out`；可选 `--resume` 或 `--checkpoint-out` / `--resume-checkpoint` | `source/profile.json`、`source/posts.jsonl`、`task.json`、`collection-report.md`；checkpoint 模式另建只含列表证据的密封工作区 |
 | `run_pipeline.py` | 推荐的不可变分析入口；核验 collection 后在新目录完成归一化、分析、渲染、校验，以及 taxonomy、business-insight 和 comment-insight 模型结果回填。无网络、不直接调用 LLM。 | `--input <collection>`、`--output <analysis>`；可选三类 prompt/result 参数 | 报告、`analysis.json`、阶段 prompt、按原字节封存的模型输入、带总耗时/阶段耗时的 `task.json` |
+| `validate_model_results.py` | 一次汇总外部 taxonomy/business 结果中可检测的错误；传 `--collection` 后同时校验原文绑定、控制字符、表现组和 caption lead。 | `--analysis <draft>/analysis.json`、`--collection <collection>`、`--taxonomy` 或 `--business` | JSON 诊断；合法返回 0，非法返回 2 |
 | `normalize.py` | 将原始内容映射为统一数据模型，去重并计算字段覆盖率。无网络、无 LLM。 | `--input <任务目录>` | `normalized-posts.csv`、覆盖率 JSON |
 | `analyze.py` | Legacy 目录的确定性分析与 taxonomy 接口；新任务的完整业务洞察流程由 `run_pipeline.py` 编排。无网络、不直接调用 LLM。 | `--input <任务目录>`、可选 `--with-llm-tax` / `--llm-tax-results` | `analysis.json`、可选 `taxonomy-prompt.md` |
+| `resolve_profile_url.py` | 在创建工作区前规范化 B站主页；短链只允许跳转到 HTTPS 数字 UID 空间主页。 | `<canonical-or-b23-url>` | stdout 输出规范主页 URL |
 | `render_report.py` | 基于标准化数据和分析结果渲染 Markdown 报告与 HTML 仪表盘。无网络、无 LLM。 | `--input <任务目录>` | `account-analysis-report.md`、`dashboard.html` |
 | `split_dataset.py` | 对离线评估数据作固定种子的分层划分，或校验已有划分及清单。 | 可选 `--datasets-root`、`--dry-run`、`--verify` | `validation_data/`、`test_data/`、`manifest.json` |
 

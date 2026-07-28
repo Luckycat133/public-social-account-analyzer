@@ -28,6 +28,7 @@ import re
 import stat
 import sys
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone, timedelta
 
 # 让脚本可直接运行:把 scripts/collectors/ 与 scripts/ 都加入 sys.path,
@@ -86,6 +87,7 @@ from task_contract import (  # noqa: E402
     TaskContractError,
     account_output_key,
     new_task_id,
+    resolve_profile_url,
     validate_analysis_goal,
 )
 from csv_contract import deserialize_csv_row, serialize_csv_row  # noqa: E402
@@ -94,6 +96,27 @@ from normalize import dedup_posts, to_bool_flag  # noqa: E402
 
 # 北京时间为中国平台默认时区(见 references/data-schema.md §1)
 _BEIJING = timezone(timedelta(hours=8))
+
+
+def _follow_bilibili_short_link(value: str) -> str:
+    request = urllib.request.Request(
+        value,
+        method="HEAD",
+        headers={"User-Agent": "Mozilla/5.0 public-profile-resolver"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.geturl()
+
+
+def canonicalize_entry_url(value: str, redirect_resolver=None) -> str:
+    """Resolve Bilibili profile short links without widening platform routing."""
+    host = urllib.parse.urlsplit(value.strip()).hostname if isinstance(value, str) else None
+    if host == "b23.tv" or host == "space.bilibili.com":
+        return resolve_profile_url(
+            value,
+            redirect_resolver=redirect_resolver or _follow_bilibili_short_link,
+        )
+    return value
 
 # 任务级 stop_reason 取值,严格对齐 references/exceptions.md §9.2 / references/data-schema.md §9.2
 SR_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
@@ -1855,12 +1878,18 @@ def run(
     analysis_goal: str | None = None,
     checkpoint_out: str | None = None,
     resume_checkpoint: str | None = None,
+    redirect_resolver=None,
 ) -> int:
     execution_timer = ExecutionTimer(wall_timezone=_BEIJING)
     try:
         analysis_goal = validate_analysis_goal(analysis_goal)
     except TaskContractError:
         print("[FAILED] analysis_goal 参数无效", file=sys.stderr)
+        return 2
+    try:
+        url = canonicalize_entry_url(url, redirect_resolver)
+    except (ValueError, OSError):
+        print("[FAILED] B站短链未解析到受支持的公开账号主页", file=sys.stderr)
         return 2
     if resume and not out_dir:
         print("[FAILED] 增量续采(--resume)必须配合 --out 指定既有任务目录", file=sys.stderr)

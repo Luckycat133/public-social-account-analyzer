@@ -135,6 +135,19 @@ def _evidence(post_id: str, source_field: str, excerpt: str) -> dict:
     }
 
 
+def _replace_evidence_triples_with_ids(value):
+    if isinstance(value, list):
+        return [_replace_evidence_triples_with_ids(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if set(value) == {"post_id", "source_field", "excerpt"}:
+        return {"evidence_id": f"{value['post_id']}:{value['source_field']}"}
+    return {
+        key: _replace_evidence_triples_with_ids(item)
+        for key, item in value.items()
+    }
+
+
 def _group_evidence(post_ids: tuple[str, ...], source_field: str) -> list[dict]:
     if source_field == "title":
         return [_evidence(post_id, "title", f"作品 {post_id} 标题") for post_id in post_ids]
@@ -192,7 +205,7 @@ def _business_result(collection_digest: str, classification_digest: str) -> dict
                     _evidence(f"{index:02d}", "title", f"作品 {index:02d} 标题")
                 ],
             }
-            for index in range(1, 11)
+            for index in range(1, 9)
         ],
         "content_modes": [
             {
@@ -260,8 +273,9 @@ def test_draft_commits_taxonomy_and_business_insight_prompts(tmp_path):
     assert analysis_payload["business_insight_required"] is True
     assert (output / "taxonomy-prompt.md").is_file()
     prompt = (output / "business-insights-prompt.md").read_text(encoding="utf-8")
-    assert digest in prompt
-    assert "topic-10" in prompt
+    context = json.loads((output / "business-context.json").read_text(encoding="utf-8"))
+    assert context["collection_commit_sha256"] == digest
+    assert "business-result-template.json" in prompt
     manifest = workspace.verify_committed_workspace(
         str(output), allowed_artifacts=pipeline.ANALYSIS_ARTIFACTS
     )
@@ -295,15 +309,187 @@ def test_business_prompt_binds_classification_bytes_and_states_strict_schema(
     task = json.loads((output / "task.json").read_text(encoding="utf-8"))
     assert result.task_status == "PARTIAL"
     assert task["partial_reasons"] == ["PENDING_BUSINESS_INSIGHTS"]
-    assert collection_digest in prompt
-    assert classification_digest in prompt
-    assert '"schema_version": 1' in prompt
-    assert '"id": "high-opening"' in prompt
-    assert '"success_metric": "views"' in prompt
-    assert "format=tutorial" in prompt
+    context = json.loads((output / "business-context.json").read_text(encoding="utf-8"))
+    template = json.loads((output / "business-result-template.json").read_text(encoding="utf-8"))
+    assert context["collection_commit_sha256"] == collection_digest
+    assert context["classification_results_sha256"] == classification_digest
+    assert template["schema_version"] == 1
+    assert template["performance_patterns"][1]["id"] == "high-opening"
+    assert template["experiments"][0]["success_metric"] == "views"
+    assert "business-evidence-catalog.jsonl" in prompt
 
 
-def test_final_seals_business_result_and_renders_10_5_4_6_contract(tmp_path):
+def test_business_prompt_exposes_copy_safe_source_bound_evidence_catalog(tmp_path):
+    pipeline = _pipeline_module()
+    collection, _collection_digest = _collection(tmp_path)
+    classification_path = tmp_path / "taxonomy.json"
+    classification_path.write_bytes(_classification_payload())
+    output = tmp_path / "business-draft"
+
+    pipeline.run_pipeline(
+        str(collection),
+        str(output),
+        template_text=_minimal_template(),
+        classification_results_path=str(classification_path),
+        with_business_insights=True,
+    )
+
+    catalog = (output / "business-evidence-catalog.jsonl").read_text(
+        encoding="utf-8"
+    )
+    catalog_line = next(
+        line
+        for line in catalog.splitlines()
+        if '"evidence_id":"15:title"' in line
+    )
+    assert json.loads(catalog_line) == {
+        "evidence_id": "15:title",
+        "post_id": "15",
+        "performance_group": "high",
+        "source_field": "title",
+        "excerpt": "作品 15 标题",
+    }
+
+
+def test_validate_only_accepts_model_results_without_creating_workspace(
+    tmp_path, capsys
+):
+    pipeline = _pipeline_module()
+    collection, collection_digest = _collection(tmp_path)
+    classification_payload = _classification_payload()
+    classification_path = tmp_path / "taxonomy.json"
+    classification_path.write_bytes(classification_payload)
+    business_path = tmp_path / "business.json"
+    business_path.write_text(
+        json.dumps(
+            _replace_evidence_triples_with_ids(
+                _business_result(
+                    collection_digest,
+                    hashlib.sha256(classification_payload).hexdigest(),
+                )
+            ),
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = pipeline.main([
+        "--validate-only",
+        "--input", str(collection),
+        "--classification-results", str(classification_path),
+        "--business-insight-results", str(business_path),
+    ])
+
+    assert exit_code == 0
+    assert "model results valid" in capsys.readouterr().out
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "collection", "taxonomy.json", "business.json",
+    }
+
+
+def test_final_pipeline_writes_deterministic_delivery_handoff(tmp_path):
+    pipeline = _pipeline_module()
+    collection, collection_digest = _collection(tmp_path)
+    classification_payload = _classification_payload()
+    classification_path = tmp_path / "taxonomy.json"
+    classification_path.write_bytes(classification_payload)
+    classification_digest = hashlib.sha256(classification_payload).hexdigest()
+    business_path = tmp_path / "business.json"
+    business_path.write_text(
+        json.dumps(
+            _business_result(collection_digest, classification_digest),
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "final"
+
+    pipeline.run_pipeline(
+        str(collection),
+        str(output),
+        template_text=_minimal_template(),
+        classification_results_path=str(classification_path),
+        with_business_insights=True,
+        business_insight_results_path=str(business_path),
+    )
+
+    handoff = json.loads(
+        (output / "delivery-summary.json").read_text(encoding="utf-8")
+    )
+    assert handoff == {
+        "schema_version": 1,
+        "task_status": "COMPLETED",
+        "stop_reason": None,
+        "restriction_scope": None,
+        "sample": {
+            "requested": 15,
+            "collected": 15,
+            "valid": 15,
+            "excluded_flagged": 0,
+            "status_counts": {
+                "SUCCESS": 15,
+                "PARTIAL": 0,
+                "FAILED": 0,
+                "DELETED": 0,
+                "RESTRICTED": 0,
+            },
+        },
+        "field_coverage": {
+            "views": 1.0,
+            "likes": 1.0,
+            "comments": 1.0,
+            "favorites": 1.0,
+            "shares": 1.0,
+            "coins": 0.0,
+            "danmaku": 0.0,
+        },
+        "classification": {"status": "completed", "coverage_rate": 1.0},
+        "business_insights": {"status": "completed"},
+        "comments": {
+            "collection_status": "not_requested",
+            "sampled_count": 0,
+            "insight_required": False,
+                "insight_status": "not-applicable",
+        },
+            "performance": {
+                "main_metric": "views",
+                "label": "按 views 排序的样本内相对表现",
+                "small_denominator_warning": None,
+                "axes": {
+                    "reach": {"status": "ok", "measured_count": 15},
+                    "engagement_efficiency": {
+                        "status": "INSUFFICIENT_SAMPLE",
+                        "measured_count": 11,
+                        "denominator_floor": 104.5,
+                        "excluded_small_denominator_count": 4,
+                    },
+                },
+            },
+    }
+    final_response = (output / "final-response.md").read_text(encoding="utf-8")
+    assert final_response.startswith("## 数据质量摘要\n")
+    assert "SUCCESS 15 / PARTIAL 0 / FAILED 0 / DELETED 0 / RESTRICTED 0" in final_response
+    assert "## 分析结论交付规则" in final_response
+    assert "不得重新计算或凭记忆改写上述数字" in final_response
+
+
+def test_pipeline_rejects_an_empty_delivery_handoff(monkeypatch, tmp_path):
+    pipeline = _pipeline_module()
+    collection, _collection_digest = _collection(tmp_path)
+    output = tmp_path / "invalid-delivery"
+    monkeypatch.setattr(pipeline, "_final_response", lambda _summary: "")
+
+    with pytest.raises(pipeline.PipelineError, match="final-response.md is empty"):
+        pipeline.run_pipeline(
+            str(collection),
+            str(output),
+            template_text=_minimal_template(),
+        )
+
+    assert not output.exists()
+
+
+def test_final_seals_business_result_and_renders_dynamic_contract(tmp_path):
     pipeline = _pipeline_module()
     collection, collection_digest = _collection(tmp_path)
     classification_payload = _classification_payload()
@@ -338,7 +524,7 @@ def test_final_seals_business_result_and_renders_10_5_4_6_contract(tmp_path):
     assert analysis_payload["business_insight_status"] == "completed"
     business = analysis_payload["business_insights"]
     assert len(business["performance_patterns"]) == 6
-    assert len(business["topic_ideas"]) == 10
+    assert len(business["topic_ideas"]) == 8
     assert len(business["content_modes"]) == 5
     assert len(business["experiments"]) == 4
     assert (
@@ -357,7 +543,7 @@ def test_final_seals_business_result_and_renders_10_5_4_6_contract(tmp_path):
         assert "内容领域" in rendered
         assert "人设 / 品牌表达" in rendered
         assert "高表现公开文案特征" in rendered
-        assert "选题方向 10" in rendered
+        assert "选题方向 08" in rendered
         assert "内容模式 05" in rendered
         assert "实验假设 04" in rendered
         assert "https://www.douyin.com/video/15" in rendered
@@ -408,7 +594,7 @@ def test_invalid_business_result_fails_before_publishing(tmp_path, mutation):
     elif mutation == "group":
         business["performance_patterns"][0]["evidence"][0]["post_id"] = "01"
     elif mutation == "count":
-        business["topic_ideas"].pop()
+        business["topic_ideas"] = business["topic_ideas"][:2]
     else:
         business["account_positioning"]["target_audience"]["evidence"][0][
             "url"

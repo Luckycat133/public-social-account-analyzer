@@ -14,6 +14,7 @@
 
 | 文件 | 内容 | 当前状态 |
 |---|---|---|
+| `agent-runs/` | Skill 行为复盘所用的原始 Agent JSONL 轨迹，含初始对照与 2026-07-28 A/B 测试会话。 | 🟡 历史测试输入；只用于复盘，不代表当前产品输出。 |
 | `agent-action-path-observations.md` | 多轮 Agent/subagent 行动路径记录及其时效性说明。 | 含 🟢/🟡/🔴 分项状态；阅读时以每条记录的标注为准。 |
 | `bilibili-live-acceptance-2026-07-27.md` | B站真实采集验收记录（含 medialist 30 条 + 动态入口受限、修复清单）。 | 🟢 VALID；与 `subagent-end-to-end` 互补，前者讲单一账号验证、后者讲多代理覆盖。 |
 | `bilibili-2026-07-27-subagent-end-to-end.md` | B站 4 个 subagent 端到端验证（默认 30 / 日期×数量 / 拒识 / 两阶段 JSON 回填）。 | 🟢 VALID；含 Bug 1（双约束披露）+ Bug 2（拒识内联平台清单）修复实证。 |

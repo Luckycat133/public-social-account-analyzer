@@ -208,7 +208,7 @@ PRD 明确要求互动率必须分别命名、分母透明，**禁止统一称�
 枚举取值（verbatim，不得新增或改写）：
 
 ```
-talking_head, tutorial, commentary, interview, vlog, news, review, compilation, image_text, live_clip, other
+talking_head, tutorial, commentary, interview, vlog, news, review, compilation, animation, gameplay, image_text, live_clip, other
 ```
 
 - 无法归入上述任一类时取 `other`；
@@ -288,7 +288,7 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
   目标受众只能表述为由公开内容面向推导的潜在受众假设，不得声称真实粉丝画像。
 - `performance_patterns` 固定为高/低表现各 3 项：公开标题、公开文案开头、公开文案结构。
   高、低组证据并集各至少覆盖 3 个对应组作品；无法公开核验时写 `not_observable` 与限制，不得声称观察过视频画面。
-- 建议清单固定为 10 个选题、5 个可复用内容模式和 4 个单变量实验。实验必须预先声明变量、控制条件、
+- 建议清单按证据规模生成 3–8 个选题、2–5 个可复用内容模式和 2–4 个单变量实验。实验必须预先声明变量、控制条件、
   公开成功指标、决策规则与观察窗口；只能提出假设，不得承诺提升表现。
 - 每个定位、模式、选题和实验至少绑定一个冻结父作品的源字段原文；URL 与采集时间由脚本从父作品补齐，
   模型不得提交 URL 或指标。
@@ -383,7 +383,9 @@ question, contradiction, result_first, pain_point, controversy, list, curiosity,
 ### 6.7 严格业务洞察阶段
 
 - 业务洞察只在完整 taxonomy 之后执行。输入 JSON 必须同时绑定 collection commit SHA-256 与 `source/classification-results.json` 原始字节 SHA-256；任一摘要缺失或不一致时，在输出目录预留前失败。
-- 根清单固定为：账号定位五维（`target_audience`、`content_domain`、`value_proposition`、`persona_expression`、`follow_reason`）、6 个 `performance_patterns`、10 个 `topic_ideas`、5 个 `content_modes`、4 个 `experiments` 与 limitations。数量、ID、顺序、字段清单和类型必须精确，禁止额外键、重复键、NaN/Infinity 或布尔值冒充整数。
+- 根清单固定字段为：账号定位五维（`target_audience`、`content_domain`、`value_proposition`、`persona_expression`、`follow_reason`）、6 个 `performance_patterns`、3–8 个 `topic_ideas`、2–5 个 `content_modes`、2–4 个 `experiments` 与 limitations。实际数量由 draft 模板冻结，ID 必须从 01 连续编号；禁止额外键、重复键、NaN/Infinity 或布尔值冒充整数。
+- taxonomy 在 15 条及以上样本中最多保留 10 个非 unknown 主题，且单例主题占比不得超过 60%；否则作为主题碎片化拒绝。触达轴固定使用 views，互动效率轴使用 view-based engagement rate，并排除低于正播放量第 25 百分位的小分母记录。
+- 强概括（共同、普遍、通常、主要、已验证、证明）至少绑定 3 个不同作品；受众年龄等人口属性必须在引用原文中直接出现。离线批量验证器一次返回全部可检测错误。
 - 模型 evidence 只能提交 `post_id`、`source_field`、`excerpt`。脚本从同一冻结父作品补齐平台、规范作品 URL、URL 类型、采集时间与来源；摘录必须是对应标题/正文的精确子串，或 taxonomy 字段的精确值。模型不得提交或修改 URL、指标、排名、采集时间和确定性高低分组。
 - 6 个模式 ID 固定为 high/low × title/opening/structure。title 只引用公开标题；opening 只引用公开文案前 120 字；structure 只引用公开文案全文。每个高/低组的三类模式证据并集至少覆盖 3 个该组作品，不能跨组引用。
 - 公开文案不等于视频画面或真实视频开头。缺少字幕、转写或其他可核验公开证据时，模式必须使用 `not_observable` / `unobservable`、空 evidence 和明确 limitation；分析状态降为 `partial-model`，流水线原因包含 `PARTIAL_BUSINESS_INSIGHTS`。
@@ -439,7 +441,7 @@ U+2028 / U+2029 是内容而非分隔符，仅用二者连接两个对象必须�
 | 类别 | 取值（verbatim） | 来源 |
 |---|---|---|
 | collection_status（有效子集） | `SUCCESS`, `PARTIAL` | data-schema §9.3 |
-| format | `talking_head`, `tutorial`, `commentary`, `interview`, `vlog`, `news`, `review`, `compilation`, `image_text`, `live_clip`, `other` | data-schema §9.5 |
+| format | `talking_head`, `tutorial`, `commentary`, `interview`, `vlog`, `news`, `review`, `compilation`, `animation`, `gameplay`, `image_text`, `live_clip`, `other` | data-schema §9.5 |
 | funnel_stage | `awareness`, `education`, `engagement`, `conversion`, `retention`, `unknown` | data-schema §9.6 |
 | hook_type | `question`, `contradiction`, `result_first`, `pain_point`, `controversy`, `list`, `curiosity`, `authority`, `story`, `none`, `unknown` | data-schema §9.7 |
 | task_status（参考） | `CREATED`, `COLLECTING`, `NORMALIZING`, `ANALYZING`, `COMPLETED`, `PARTIAL`, `FAILED` | data-schema §9.1 |

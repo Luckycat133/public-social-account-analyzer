@@ -1,8 +1,12 @@
 # 文档地图与命名规范
 
-本目录（`docs/`）存放项目**人类可读**的设计、指南、需求与观测记录。代码与 AI Agent 技能包在仓库根与 `skill/`，此处只放说明性文档，不提交任何采集报告或数据集运行结果。
+本目录（`docs/`）存放项目**人类可读**的设计、指南、需求与观测记录。代码与 AI Agent 技能包位于仓库根与 `skill/`，此处只放说明性文档，不提交任何采集报告或数据集运行结果。
 
-## 目录导航
+## 目的
+
+`docs/` 是项目的静态说明中心，帮助读者快速定位架构、使用、需求与验收类文档，并约定文档的命名、组织与链接规范，避免文档散落、命名混乱与死链。
+
+## 结构概览（目录导航）
 
 | 子目录 | 用途 | 主要内容 |
 |---|---|---|
@@ -17,6 +21,15 @@
 1. **英文 snake_case 为主**：目录与绝大多数文件名使用小写英文 + 下划线（如 `operations-trial-template.md`、`STRUCTURE.md`）。历史遗留的中文文件名（如 PRD 文档）保留原样，但需在本文档登记，且**避免新增中文根文件名**。
 2. **按主题入子目录**：新文档按上表归入 `architecture/`、`guides/`、`prd/`、`observations/`、`plans/` 之一；**禁止**在 `docs/` 根目录平铺文件。
 3. **带日期前缀的过程文件**：一次性设计稿 / 实施计划用 `YYYY-MM-DD-<topic>.md` 命名，放入对应子目录；已落地的历史设计稿若不再参考，应归档或删除，不在活跃文档区堆积。
-4. **失效 / 历史文件处理**：观测类文件用 🟢VALID / 🟡SUPERSEDED / 🔴STALE 标注时效（见 `observations/README.md`）；被取代或已过时的文件从活跃区移除，不得保留为「当前承诺」。
+4. **失效 / 历史文件处理**：观测类文件用 🟢VALID / 🟡SUPERSEDED / 🔴STALE 标注时效（见 [`observations/README.md`](observations/README.md)）；被取代或已过时的文件从活跃区移除，不得保留为「当前承诺」。
 5. **链接一致性**：文档间引用使用相对路径，且随文件移动同步更新；删除或移动文件前必须 `grep` 全仓修正所有引用，避免死链。
 6. **运行产物不入库**：`workspace/`、`*-workspace/`、`archive/`（及 `.superpowers/`）由 `.gitignore` 排除；文档只写静态说明。
+
+## 参见
+
+- [`architecture/STRUCTURE.md`](architecture/STRUCTURE.md) — 目录结构、模块职责、依赖关系与边界。
+- [`guides/deployment-package-checklist.md`](guides/deployment-package-checklist.md) — 部署打包与 dev/部署漂移（drift）检测清单。
+- [`guides/operations-trial-template.md`](guides/operations-trial-template.md) — PRD AC-10 运营人员试用反馈模板。
+- [`prd/需求实现状态与抖音能力边界.md`](prd/需求实现状态与抖音能力边界.md) — 当前实现审计与抖音能力边界。
+- [`plans/2026-07-24-p1-comment-insights.md`](plans/2026-07-24-p1-comment-insights.md) — 评论洞察链路的设计与实施记录。
+- [`observations/README.md`](observations/README.md) — 观测与验收记录的时效标注说明。
