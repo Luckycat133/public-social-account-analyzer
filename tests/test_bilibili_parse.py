@@ -333,6 +333,7 @@ def test_empty_post_exposes_hidden_field_visibility():
 
     raw = _empty_post("BVempty")
 
+    assert raw["collection_status"] == "PARTIAL"
     assert raw["field_visibility"]["views"] == "hidden"
     assert raw["field_visibility"]["title"] == "hidden"
     assert raw["field_visibility"]["is_pinned"] == "hidden"
@@ -497,7 +498,7 @@ def test_dynamics_parse():
     # 普通视频动态
     card = _extract_dynamic_card(_mk_dyn_item("BVdyn01", is_forward=False))
     check("动态卡提取 bvid", card["bvid"] == "BVdyn01")
-    check("动态卡 is_forward=False", card["is_forward"] is False)
+    check("动态卡 orig=null → is_forward=None", card["is_forward"] is None)
     check("动态卡 play 原始为 str(117)", card["stat"]["play"] == "117")
     post = c.normalize_post(_build_dynamic_raw(card))
     check("动态 content_type=dynamic(对齐 data-schema §9.4)", post["content_type"] == "dynamic")
@@ -587,6 +588,60 @@ def test_discover_dynamics_pagination():
     check("discover_dynamics 返回 2 条", len(cards) == 2)
     check("discover_dynamics 未无限循环(calls<=5)", s.calls <= 5)
     check("discover_dynamics 调用了 _extract_dynamic_card", cards[0]["bvid"] == "BVp1")
+
+
+def test_discover_dynamics_counts_unusable_item_pages_as_empty():
+    """Two item-bearing pages without extractable cards terminate discovery."""
+    from collectors.bilibili import Session
+
+    class _FakeSession(Session):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def get_json(self, path, params=None, wbi=False, referer=None, retry=3):
+            self.calls += 1
+            return {
+                "code": 0,
+                "data": {
+                    "has_more": True,
+                    "offset": str(self.calls),
+                    "items": [_mk_dyn_item("", with_bvid=False)],
+                },
+            }
+
+    session = _FakeSession()
+
+    assert session.discover_dynamics("123", 100) == []
+    assert session.calls == 2
+
+
+def test_discover_medialist_page_budget_scales_with_limit(monkeypatch):
+    """A 500-item request is not truncated by the former 20-page cap."""
+    from collectors import bilibili
+    from collectors.bilibili import Session
+
+    class _FakeSession(Session):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def get_json(self, path, params=None, wbi=False, referer=None, retry=3):
+            self.calls += 1
+            first = (self.calls - 1) * 20
+            items = [
+                {"id": first + index + 1, "bv_id": f"BV{first + index + 1:010d}"}
+                for index in range(20)
+            ]
+            return {"code": 0, "data": {"has_more": True, "media_list": items}}
+
+    monkeypatch.setattr(bilibili.time, "sleep", lambda _seconds: None)
+    session = _FakeSession()
+
+    posts = session.discover_medialist("123", 500)
+
+    assert len(posts) == 500
+    assert session.calls == 25
 
 
 def test_collect_dynamics_callable():

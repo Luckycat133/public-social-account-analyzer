@@ -456,7 +456,8 @@ class Session:
         seen_bvids: set[str] = set()
         oid = "0"
         size = 20
-        for _ in range(20):  # 上限保护
+        max_pages = max(1, (limit + size - 1) // size + 2)
+        for _ in range(max_pages):  # 上限保护
             try:
                 data = self.get_json(
                     "/x/v2/medialist/resource/list",
@@ -708,15 +709,17 @@ class Session:
                 )
             d = data.get("data") or {}
             items = d.get("items") or []
+            extracted_count = 0
             for it in items:
                 card = _extract_dynamic_card(it)
                 if card:
+                    extracted_count += 1
                     published_at = _to_iso(card.get("pub_ts"))
                     if _date_matches(published_at, date_range):
                         out.append(card)
                         if len(out) >= limit:
                             return out[:limit]
-            if not items:
+            if extracted_count == 0:
                 empty_streak += 1
                 if empty_streak >= 2:
                     break
@@ -1880,7 +1883,7 @@ def _empty_post(bvid: str) -> dict:
         "is_pinned": None,
         "is_repost": None,
         "is_promoted": None,
-        "collection_status": "ok",
+        "collection_status": "PARTIAL",
         "collected_at": _now_iso(),
         "source_url": f"{VIDEO}{bvid}",
         "platform_metrics": {
@@ -1936,7 +1939,7 @@ def _extract_dynamic_card(it: dict) -> dict | None:
         ),
         "pub_ts": pts,
         "pub_time": author.get("pub_time"),
-        "is_forward": bool(it.get("orig")) if "orig" in it else None,
+        "is_forward": None if (orig := it.get("orig")) is None else bool(orig),
         "stat": {
             "play": astat.get("play"),
             "danmaku": astat.get("danmaku"),
