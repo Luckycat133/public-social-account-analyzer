@@ -2,10 +2,44 @@
 
 离线、确定性，直接调用 render_report 纯函数。
 """
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 import analyze
 import render_report
+
+
+def test_disclaimer_alignment_uses_task_contract_source():
+    scripts = Path(__file__).resolve().parents[1] / "skill" / "scripts"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(scripts)
+    code = """
+import json
+import task_contract
+task_contract.PUBLIC_PAGE_DISCLAIMER = "PUBLIC-DISCLAIMER-SENTINEL"
+task_contract.AUTHORIZED_DISCLAIMER = "AUTHORIZED-DISCLAIMER-SENTINEL"
+import render_report
+print(json.dumps([
+    render_report.PUBLIC_PAGE_DISCLAIMER,
+    render_report.AUTHORIZED_DISCLAIMER,
+]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert json.loads(result.stdout) == [
+        "PUBLIC-DISCLAIMER-SENTINEL",
+        "AUTHORIZED-DISCLAIMER-SENTINEL",
+    ]
 
 
 # ---------------------------------------------------------------------------

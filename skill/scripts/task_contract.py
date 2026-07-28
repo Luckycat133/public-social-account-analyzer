@@ -12,6 +12,9 @@ from urllib.parse import urlsplit
 
 
 MAX_ANALYSIS_GOAL_LENGTH = 500
+PUBLIC_PAGE_DISCLAIMER = (
+    "本报告基于公开页面快照，不代表账号后台真实曝光、触达、完播或转化数据。"
+)
 AUTHORIZED_DISCLAIMER = (
     "本报告基于账号本人授权 OpenAPI 返回的公开来源证据，"
     "不代表账号后台真实曝光、触达、完播或转化数据。"

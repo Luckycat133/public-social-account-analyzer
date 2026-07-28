@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 
 from immutable_workspace import WorkspaceError, reject_sealed_workspace
 from collectors.url_policy import canonical_item_url, canonical_profile_url
+from task_contract import AUTHORIZED_DISCLAIMER, PUBLIC_PAGE_DISCLAIMER
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +84,6 @@ _PLACEHOLDER_PATTERN = re.compile(
 )
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-PUBLIC_PAGE_DISCLAIMER = "本报告基于公开页面快照，不代表账号后台真实曝光、触达、完播或转化数据。"
-AUTHORIZED_DISCLAIMER = (
-    "本报告基于账号本人授权 OpenAPI 返回的公开来源证据，"
-    "不代表账号后台真实曝光、触达、完播或转化数据。"
-)
 PUBLIC_PAGE_FOOTER = "本报告由公开页面快照自动生成 · 数据仅供参考，不构成后台真实指标"
 AUTHORIZED_FOOTER = (
     "本报告由账号本人授权 OpenAPI 公开证据自动生成 · "
