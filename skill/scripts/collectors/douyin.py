@@ -437,7 +437,11 @@ class DouyinCollector(BaseCollector):
                 charset = resp.headers.get_content_charset() or "utf-8"
                 return resp.read().decode(charset, errors="replace")
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403, 429):
+            if e.code == 401:
+                raise DouyinError(
+                    STOP_LOGIN, f"HTTP 401 需登录: {url}"
+                )
+            if e.code in (403, 429):
                 raise DouyinError(
                     STOP_ACCESS_RESTRICTED, f"HTTP {e.code} 访问受限: {url}"
                 )

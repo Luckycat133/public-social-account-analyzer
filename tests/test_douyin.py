@@ -885,9 +885,17 @@ def test_collect_post_detail_respects_the_browser_fallback_disable_switch(monkey
     assert exc_info.value.stop_reason == STOP_PARSER_FAILED
 
 
-@pytest.mark.parametrize("status", [401, 403, 429])
+@pytest.mark.parametrize(
+    ("status", "expected_stop_reason"),
+    [
+        (401, "LOGIN_REQUIRED"),
+        (403, STOP_ACCESS_RESTRICTED),
+        (429, STOP_ACCESS_RESTRICTED),
+    ],
+    ids=["401-login", "403-access-restricted", "429-rate-limited"],
+)
 def test_collect_post_detail_never_falls_back_after_http_restrictions(
-    monkeypatch, status
+    monkeypatch, status, expected_stop_reason
 ):
     import urllib.error
 
@@ -912,7 +920,7 @@ def test_collect_post_detail_never_falls_back_after_http_restrictions(
     with pytest.raises(DouyinError) as exc_info:
         collector.collect_post_detail("https://www.douyin.com/video/7001")
 
-    assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert exc_info.value.stop_reason == expected_stop_reason
     assert browser_calls == []
 
 
