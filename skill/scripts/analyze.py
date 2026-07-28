@@ -23,6 +23,9 @@ from urllib.parse import urlsplit
 from immutable_workspace import WorkspaceError, reject_sealed_workspace
 from csv_contract import parse_hashtag_cell, parse_structured_object_cell
 from field_coverage import METRIC_FIELDS as PUBLIC_METRIC_FIELDS, compute_field_coverage
+from task_contract import TAX_FORMAT as _TAX_FORMAT
+from task_contract import TAX_FUNNEL as _TAX_FUNNEL
+from task_contract import TAX_HOOK as _TAX_HOOK
 from collectors.url_policy import (
     canonical_item_url,
     canonical_profile_url,
@@ -1356,7 +1359,13 @@ def compute_cadence(valid: List[Dict[str, Any]]) -> Dict[str, Any]:
         for d in dates:
             key = f"{d.year}-{d.month:02d}"
             monthly[key] = monthly.get(key, 0) + 1
-    monthly_distribution = dict(sorted(monthly.items()))
+    monthly_distribution = dict(sorted(
+        monthly.items(),
+        key=lambda item: (
+            int(item[0].split("-")[0]),
+            int(item[0].split("-")[1]),
+        ),
+    ))
 
     month_counts = list(monthly_distribution.values())
     seasonal_intensity = None
@@ -2090,8 +2099,6 @@ def build_post_records(
 # §5 LLM 协同分类（确定性计算 + LLM 语义标注 标准接口）
 # ---------------------------------------------------------------------------
 
-# Taxonomy enums remain local until plan item #32 promotes them to the public
-# task contract; validate_model_results intentionally consumes these exact values.
 _TAX_FORMAT_ORDER = (
     "talking_head",
     "tutorial",
@@ -2107,10 +2114,6 @@ _TAX_FORMAT_ORDER = (
     "live_clip",
     "other",
 )
-_TAX_FORMAT = frozenset(_TAX_FORMAT_ORDER)
-_TAX_FUNNEL = {"awareness", "education", "engagement", "conversion", "retention", "unknown"}
-_TAX_HOOK = {"question", "contradiction", "result_first", "pain_point", "controversy",
-             "list", "curiosity", "authority", "story", "none", "unknown"}
 _HIGH_LOW_FEATURE_FIELDS = (
     "topic",
     "format",
@@ -3179,11 +3182,11 @@ def _validate_business_claim(
             claim.get("evidence"), by_id, label
         ),
     }
-    _validate_business_claim_support(clean, label)
+    validate_business_claim_support(clean, label)
     return clean
 
 
-def _validate_business_claim_support(claim: Dict[str, Any], label: str) -> None:
+def validate_business_claim_support(claim: Dict[str, Any], label: str) -> None:
     """Reject broad or demographic claims unsupported by cited public text."""
     statement = claim["statement"]
     evidence = claim["evidence"]
@@ -3212,6 +3215,11 @@ def _validate_business_claim_support(claim: Dict[str, Any], label: str) -> None:
                 f"business insight {label} demographic claim is unsupported"
             )
     _validate_business_statement_support(statement, evidence, label)
+
+
+def _validate_business_claim_support(claim: Dict[str, Any], label: str) -> None:
+    """Compatibility alias for the public semantic-support validator."""
+    validate_business_claim_support(claim, label)
 
 
 def _validate_business_statement_support(

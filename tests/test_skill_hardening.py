@@ -152,7 +152,7 @@ def test_semantic_support_guard_rejects_broad_and_demographic_leaps():
     evidence = [{"post_id": "1", "excerpt": "创作者分享学习方法"}]
 
     with pytest.raises(ValueError, match="semantic support"):
-        analyze._validate_business_claim_support(
+        analyze.validate_business_claim_support(
             {"statement": "这一需求已验证", "evidence": evidence}, "claim"
         )
 
@@ -251,7 +251,7 @@ def test_business_template_uses_evidence_ids_and_context_exposes_group_options()
         "4:text", "5:text", "6:text"
     ]
     with pytest.raises(ValueError, match="demographic claim"):
-        analyze._validate_business_claim_support(
+        analyze.validate_business_claim_support(
             {
                 "statement": "主要受众是中学生",
                 "evidence": [
@@ -268,7 +268,7 @@ def test_business_semantic_guard_rejects_creator_identity_and_causal_pattern():
     evidence = [{"post_id": "1", "excerpt": "作为学生党，我分享动画制作过程"}]
 
     with pytest.raises(ValueError, match="creator identity"):
-        analyze._validate_business_claim_support(
+        analyze.validate_business_claim_support(
             {"statement": "主要受众是学生党创作者", "evidence": evidence},
             "target audience",
         )

@@ -1560,6 +1560,23 @@ def test_nonexhaustive_index_source_suppresses_cadence_inference():
     assert cadence["longest_gap_hours"] is None
 
 
+def test_monthly_distribution_sort_key_orders_year_and_month_numerically():
+    cadence = analyze.compute_cadence(
+        [
+            {
+                "published_at": datetime(1000, 1, 1),
+                "published_at_precision": "datetime",
+            },
+            {
+                "published_at": datetime(999, 12, 1),
+                "published_at_precision": "datetime",
+            },
+        ]
+    )
+
+    assert list(cadence["monthly_distribution"]) == ["999-12", "1000-01"]
+
+
 def test_render_in_memory_rejects_missing_required_input():
     with pytest.raises(render_report.RenderError, match="profile"):
         render_report.render_in_memory(

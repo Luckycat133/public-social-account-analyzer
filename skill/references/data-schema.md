@@ -193,7 +193,7 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 | requested_limit | integer | 是 | 是 | 30 | 限量模式默认 30、范围 1–100；公开 `--all` 为接受后的 `max_items`（默认 10,000、硬上限 50,000）；授权 OpenAPI `--all` 为 `null` |
 | date_from | datetime | 否 | 是 | 2026-06-01T00:00:00+08:00 | 采集起始时间 |
 | date_to | datetime | 否 | 是 | 2026-07-23T23:59:59+08:00 | 采集结束时间 |
-| analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | `--analysis-goal`；省略为 `null`，提供时须为去首尾空白后的非空字符串、最多 500 字符且不含控制字符 |
+| analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | `--analysis-goal`；省略为 `null`，提供时须为 NFKC 规范化并去首尾空白后的非空字符串、最多 500 UTF-8 字节且不含控制字符 |
 | include_comments | boolean | 是 | 否 | false | 评论采样开关，默认关闭 |
 | enrich_details | boolean | 否 | 否 | false | 仅补充缺失公开字段的抖音详情开关 |
 | task_status | enum | 是 | 否 | COMPLETED | 生命周期状态（§9.1） |

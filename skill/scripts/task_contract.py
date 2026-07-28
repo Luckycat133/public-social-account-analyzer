@@ -11,7 +11,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 
-MAX_ANALYSIS_GOAL_LENGTH = 500
+MAX_ANALYSIS_GOAL_BYTES = 500
 PUBLIC_PAGE_DISCLAIMER = (
     "本报告基于公开页面快照，不代表账号后台真实曝光、触达、完播或转化数据。"
 )
@@ -19,6 +19,42 @@ AUTHORIZED_DISCLAIMER = (
     "本报告基于账号本人授权 OpenAPI 返回的公开来源证据，"
     "不代表账号后台真实曝光、触达、完播或转化数据。"
 )
+TAX_FORMAT: frozenset[str] = frozenset({
+    "talking_head",
+    "tutorial",
+    "commentary",
+    "interview",
+    "vlog",
+    "news",
+    "review",
+    "compilation",
+    "animation",
+    "gameplay",
+    "image_text",
+    "live_clip",
+    "other",
+})
+TAX_FUNNEL: frozenset[str] = frozenset({
+    "awareness",
+    "education",
+    "engagement",
+    "conversion",
+    "retention",
+    "unknown",
+})
+TAX_HOOK: frozenset[str] = frozenset({
+    "question",
+    "contradiction",
+    "result_first",
+    "pain_point",
+    "controversy",
+    "list",
+    "curiosity",
+    "authority",
+    "story",
+    "none",
+    "unknown",
+})
 _BILIBILI_PROFILE_RE = re.compile(
     r"https://space\.bilibili\.com/([1-9][0-9]*)(?:[/?#].*)?\Z"
 )
@@ -135,7 +171,7 @@ def validate_analysis_goal(value: object) -> str | None:
     normalized = unicodedata.normalize("NFKC", value).strip()
     if not normalized:
         raise TaskContractError("analysis_goal 不能为空")
-    if len(normalized) > MAX_ANALYSIS_GOAL_LENGTH:
+    if len(normalized.encode("utf-8")) > MAX_ANALYSIS_GOAL_BYTES:
         raise TaskContractError("analysis_goal 过长")
     if any(unicodedata.category(char).startswith("C") for char in normalized):
         raise TaskContractError("analysis_goal 不允许控制字符")

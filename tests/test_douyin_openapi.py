@@ -1414,7 +1414,9 @@ def test_authorized_task_persists_task_id_and_analysis_goal(tmp_path):
     assert isinstance(task["task_id"], str) and task["task_id"]
 
 
-@pytest.mark.parametrize("goal", [123, "", " ", "x" * 501, "a\nb", "a\x00b"])
+@pytest.mark.parametrize(
+    "goal", [123, "", " ", "x" * 501, "界" * 167, "a\nb", "a\x00b"]
+)
 def test_authorized_rejects_invalid_analysis_goal_before_output_or_transport(
     tmp_path, goal
 ):

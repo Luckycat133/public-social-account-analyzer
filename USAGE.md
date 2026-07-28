@@ -49,7 +49,7 @@ python3 skill/scripts/collect.py <URL> [OPTIONS]
 - `--out PATH`：指定输出目录路径。默认自动生成为仓库根 `workspace/<platform>-<account>-<date>/`（从仓库根执行命令）。显式路径必须尚不存在；只选择路径，不要提前 `mkdir`，失败重试时使用新后缀，不删除旧目录。
 - `--all`：仅用于抖音公开主页；在有界临时浏览器会话中尽量观察到可信列表末页，不能与显式 `--limit` 联用。
 - `--max-items / --max-seconds / --max-scrolls`：公开 `--all` 的安全预算。默认 `10000 / 1800 / 2000`，硬上限 `50000 / 14400 / 20000`；只能与 `--all` 联用。
-- `--analysis-goal STRING`：可选分析目的，最多 500 字符且不允许控制字符。
+- `--analysis-goal STRING`：可选分析目的，规范化后最多 500 UTF-8 字节且不允许控制字符。
 - `--comments`：开启评论采样（默认关闭）。
 - `--enrich-details`：仅用于抖音；对列表中已有真实作品 URL 补充缺失的公开详情。不会据此发现新作品，单条失败只记详情状态。
 - `--date-from / --date-to`：采集时间范围（YYYY-MM-DD 或 ISO 8601，北京时间）。两者与所选限量或抖音 `--all` 范围共同限定结果。

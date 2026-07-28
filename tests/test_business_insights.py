@@ -707,3 +707,14 @@ def test_business_results_do_not_change_deterministic_analysis_objects():
     assert {key: baseline[key] for key in frozen_keys} == {
         key: enriched[key] for key in frozen_keys
     }
+def test_business_claim_support_public_api():
+    public_validator = getattr(analyze, "validate_business_claim_support", None)
+    assert callable(public_validator)
+    with pytest.raises(ValueError, match="semantic support"):
+        public_validator(
+            {
+                "statement": "这一需求已验证",
+                "evidence": [{"post_id": "1", "excerpt": "单条公开样本"}],
+            },
+            "claim",
+        )

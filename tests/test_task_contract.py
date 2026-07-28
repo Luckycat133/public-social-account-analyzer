@@ -9,6 +9,45 @@ import pytest
 import task_contract as contract
 
 
+def test_taxonomy_constants_public():
+    assert getattr(contract, "TAX_FORMAT", None) == {
+        "talking_head",
+        "tutorial",
+        "commentary",
+        "interview",
+        "vlog",
+        "news",
+        "review",
+        "compilation",
+        "animation",
+        "gameplay",
+        "image_text",
+        "live_clip",
+        "other",
+    }
+    assert getattr(contract, "TAX_FUNNEL", None) == {
+        "awareness",
+        "education",
+        "engagement",
+        "conversion",
+        "retention",
+        "unknown",
+    }
+    assert getattr(contract, "TAX_HOOK", None) == {
+        "question",
+        "contradiction",
+        "result_first",
+        "pain_point",
+        "controversy",
+        "list",
+        "curiosity",
+        "authority",
+        "story",
+        "none",
+        "unknown",
+    }
+
+
 def test_task_and_stop_reason_contracts_are_consistent():
     assert contract.TASK_STATUSES == {
         "CREATED",
@@ -58,9 +97,17 @@ def test_validate_analysis_goal_normalizes_nfkc():
     assert contract.validate_analysis_goal("  ＡＢＣ  ") == "ABC"
 
 
+def test_validate_analysis_goal_bytes_bound():
+    assert contract.MAX_ANALYSIS_GOAL_BYTES == 500
+    assert contract.validate_analysis_goal("界" * 166) == "界" * 166
+    assert contract.validate_analysis_goal("x" * 500) == "x" * 500
+    with pytest.raises(contract.TaskContractError):
+        contract.validate_analysis_goal("界" * 167)
+
+
 @pytest.mark.parametrize(
     "value",
-    [1, "", "   ", "x" * 501, "line\nfeed", "nul\x00byte"],
+    [1, "", "   ", "x" * 501, "界" * 167, "line\nfeed", "nul\x00byte"],
 )
 def test_validate_analysis_goal_rejects_invalid_values(value):
     with pytest.raises(contract.TaskContractError):
@@ -92,4 +139,3 @@ def test_account_output_key_hashes_all_platform_identities(
     key = contract.account_output_key(platform, url)
     assert re.fullmatch(r"[0-9a-f]{12}", key)
     assert key != identity
-

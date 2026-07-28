@@ -11,6 +11,7 @@ import re
 from typing import Any
 
 import analyze
+from task_contract import TAX_FORMAT, TAX_FUNNEL, TAX_HOOK
 
 
 def _load(path: str) -> Any:
@@ -28,9 +29,6 @@ def collect_taxonomy_errors(posts: list[dict], results: Any) -> list[str]:
         "series_name", "is_original", "has_product_placement",
         "analysis_labels", "classification_confidence",
     }
-    formats = analyze._TAX_FORMAT
-    funnels = analyze._TAX_FUNNEL
-    hooks = analyze._TAX_HOOK
     for index, item in enumerate(results, start=1):
         label = f"item[{index}]"
         if not isinstance(item, dict):
@@ -49,11 +47,11 @@ def collect_taxonomy_errors(posts: list[dict], results: Any) -> list[str]:
             errors.append(f"{label}.post_id: duplicate {post_id}")
         else:
             seen.add(post_id)
-        if item.get("format") not in formats:
+        if item.get("format") not in TAX_FORMAT:
             errors.append(f"{label}.format: invalid enum")
-        if item.get("funnel_stage") not in funnels:
+        if item.get("funnel_stage") not in TAX_FUNNEL:
             errors.append(f"{label}.funnel_stage: invalid enum")
-        if item.get("hook_type") not in hooks:
+        if item.get("hook_type") not in TAX_HOOK:
             errors.append(f"{label}.hook_type: invalid enum")
         topic = item.get("topic")
         if not isinstance(topic, str) or not topic.strip() or (
