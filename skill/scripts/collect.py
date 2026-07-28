@@ -1980,7 +1980,7 @@ def run(
 
     user_from = _parse_date(date_from)
     user_to = _default_date_to(date_to)
-    explicit_since = _parse_date(since) if since is not None else None
+    explicit_since = _default_date_to(since) if since is not None else None
     if date_from is not None and user_from is None:
         print("[FAILED] --date-from 无法解析", file=sys.stderr)
         return 2
@@ -2060,6 +2060,12 @@ def run(
             return 2
 
     env_value = os.environ.get("SOCIAL_BROWSER_FALLBACK")
+    if env_value is not None and env_value not in {"0", "1"}:
+        print(
+            "[FAILED] SOCIAL_BROWSER_FALLBACK 只接受 0 或 1",
+            file=sys.stderr,
+        )
+        return 2
     douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
     # Keep the default zero-argument loader call compatible with integrations
     # that replace it, while passing the policy only when it disables Douyin.
@@ -2773,39 +2779,7 @@ def main() -> None:
         args.resume or args.resume_out is not None or args.since is not None
     ):
         ap.error("checkpoint 恢复不能与增量 --resume 混用")
-    custom_all_budget = any(
-        value is not None
-        for value in (args.max_items, args.max_seconds, args.max_scrolls)
-    )
-    if custom_all_budget and not args.collect_all:
-        ap.error("--max-items/--max-seconds/--max-scrolls 必须与 --all 联用")
-    try:
-        limit = validate_public_limit(
-            PUBLIC_LIMIT_DEFAULT if args.limit is None else args.limit
-        )
-        if args.collect_all:
-            max_items = (
-                PUBLIC_ALL_DEFAULT_MAX_ITEMS
-                if args.max_items is None
-                else args.max_items
-            )
-            max_seconds = (
-                PUBLIC_ALL_DEFAULT_MAX_SECONDS
-                if args.max_seconds is None
-                else args.max_seconds
-            )
-            max_scrolls = (
-                PUBLIC_ALL_DEFAULT_MAX_SCROLLS
-                if args.max_scrolls is None
-                else args.max_scrolls
-            )
-            max_items, max_seconds, max_scrolls = validate_public_all_budgets(
-                max_items, max_seconds, max_scrolls
-            )
-        else:
-            max_items = max_seconds = max_scrolls = None
-    except ValueError as exc:
-        ap.error(str(exc))
+    limit = PUBLIC_LIMIT_DEFAULT if args.limit is None else args.limit
     date_from_iso = _parse_date(args.date_from)
     date_to_iso = _default_date_to(args.date_to)
     if args.date_from and not date_from_iso:
@@ -2818,8 +2792,8 @@ def main() -> None:
         args.url, limit, args.out, args.comments, date_from_iso, date_to_iso,
         resume=args.resume, resume_out=args.resume_out, since=args.since,
         browser_fallback=args.browser_fallback,
-        collect_all=args.collect_all, max_items=max_items,
-        max_seconds=max_seconds, max_scrolls=max_scrolls,
+        collect_all=args.collect_all, max_items=args.max_items,
+        max_seconds=args.max_seconds, max_scrolls=args.max_scrolls,
         enrich_details=args.enrich_details,
         analysis_goal=args.analysis_goal,
         checkpoint_out=args.checkpoint_out,

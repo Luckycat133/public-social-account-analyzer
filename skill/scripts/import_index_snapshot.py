@@ -213,6 +213,8 @@ def _date_bound(value: Any, label: str, *, end_of_day: bool = False) -> str | No
             day = datetime.strptime(text, "%Y-%m-%d")
         except ValueError as exc:
             raise EvidenceError(f"{label} 不是合法日期") from exc
+        if not 2000 <= day.year <= 2100:
+            raise EvidenceError(f"{label} 年份必须在 2000 到 2100 之间")
         if end_of_day:
             day = day.replace(hour=23, minute=59, second=59)
         return day.replace(tzinfo=BEIJING).isoformat()
@@ -221,6 +223,8 @@ def _date_bound(value: Any, label: str, *, end_of_day: bool = False) -> str | No
         parsed = datetime.fromisoformat(candidate)
     except ValueError as exc:
         raise EvidenceError(f"{label} 不是合法 ISO 8601 时间") from exc
+    if not 2000 <= parsed.year <= 2100:
+        raise EvidenceError(f"{label} 年份必须在 2000 到 2100 之间")
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         parsed = parsed.replace(tzinfo=BEIJING)
     return parsed.isoformat()
@@ -410,6 +414,8 @@ def validate_evidence(
         author_name = _text(
             item.get("author_name"), f"posts[{source_rank - 1}].author_name", maximum=200
         )
+        # _ACCOUNT_NAME_MATCH: strict equality after the shared NFKC/whitespace
+        # normalization in _text; fuzzy or substring matching is not permitted.
         if author_name != account_name:
             raise EvidenceError(
                 f"posts[{source_rank - 1}].author_name 与目标账号不一致"

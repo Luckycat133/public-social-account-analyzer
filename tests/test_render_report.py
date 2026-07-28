@@ -14,6 +14,17 @@ import analyze
 import render_report
 
 
+def test_safe_get_preserves_explicit_none_and_defaults_missing_paths():
+    payload = {"meta": {"classification_status": None}}
+
+    assert render_report._safe_get(
+        payload, "meta", "classification_status", default="missing"
+    ) is None
+    assert render_report._safe_get(
+        payload, "meta", "stop_reason", default="missing"
+    ) == "missing"
+
+
 def test_disclaimer_alignment_uses_task_contract_source():
     scripts = Path(__file__).resolve().parents[1] / "skill" / "scripts"
     env = dict(os.environ)

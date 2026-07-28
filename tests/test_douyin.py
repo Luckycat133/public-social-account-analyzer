@@ -1560,7 +1560,11 @@ def test_all_rejects_non_douyin_urls_before_writing(monkeypatch, tmp_path):
 def test_all_cli_budgets_must_be_positive(monkeypatch, flag, value):
     import collect
 
-    monkeypatch.setattr(collect, "run", lambda *args, **kwargs: pytest.fail("must reject"))
+    monkeypatch.setattr(
+        collect,
+        "_load_adapters",
+        lambda *args, **kwargs: pytest.fail("must reject before adapter loading"),
+    )
     monkeypatch.setattr("sys.argv", ["collect.py", ACCOUNT_URL, "--all", flag, value])
 
     with pytest.raises(SystemExit) as exc_info:

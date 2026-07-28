@@ -596,6 +596,36 @@ def test_resume_effective_since_after_date_to_rejects_without_mutation(
     assert _exact_tree_digest(out) == before
 
 
+def test_since_date_only_starts_after_end_of_day(monkeypatch, tmp_path):
+    old = tmp_path / "existing"
+    _setup_existing(
+        str(old),
+        [{
+            "post_id": "BV_KEEP",
+            "bvid": "BV_KEEP",
+            "published_at": "2026-07-18T10:00:00+08:00",
+        }],
+    )
+    observed = []
+
+    class SinceAdapter(FakeAdapter):
+        def collect_post_list(self, url, limit=30, date_range=None):
+            observed.append(date_range)
+            return super().collect_post_list(url, limit=limit, date_range=date_range)
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [SinceAdapter()])
+    monkeypatch.setattr(collect, "_pick", lambda adapters, url: adapters[0])
+
+    assert collect.run(
+        BILIBILI_URL,
+        out_dir=str(old),
+        resume=True,
+        resume_out=str(tmp_path / "next"),
+        since="2026-07-19",
+    ) == 0
+    assert observed[0][0] == "2026-07-19T23:59:59+08:00"
+
+
 def test_committed_resume_degrades_when_jsonl_is_explicitly_empty(
     monkeypatch, tmp_path
 ):

@@ -374,7 +374,7 @@ def test_all_and_explicit_limit_are_mutually_exclusive_at_cli(monkeypatch):
 def test_limited_cli_rejects_out_of_range_limit_without_clamping(
     monkeypatch, value
 ):
-    monkeypatch.setattr(collect, "run", _must_not_run)
+    monkeypatch.setattr(collect, "_load_adapters", _must_not_load_adapters)
     monkeypatch.setattr("sys.argv", ["collect.py", BILIBILI_URL, "--limit", value])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -417,7 +417,7 @@ def test_resume_out_requires_resume_at_cli(monkeypatch):
     ],
 )
 def test_custom_all_budget_requires_all_at_cli(monkeypatch, flag, value):
-    monkeypatch.setattr(collect, "run", _must_not_run)
+    monkeypatch.setattr(collect, "_load_adapters", _must_not_load_adapters)
     monkeypatch.setattr("sys.argv", ["collect.py", BILIBILI_URL, flag, value])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -436,7 +436,7 @@ def test_custom_all_budget_requires_all_at_cli(monkeypatch, flag, value):
     ],
 )
 def test_all_cli_rejects_values_above_hard_caps(monkeypatch, flag, value):
-    monkeypatch.setattr(collect, "run", _must_not_run)
+    monkeypatch.setattr(collect, "_load_adapters", _must_not_load_adapters)
     monkeypatch.setattr(
         "sys.argv", ["collect.py", DOUYIN_URL, "--all", flag, value]
     )
@@ -854,7 +854,7 @@ def test_access_failure_still_persists_structured_execution_timing(
 
 @pytest.mark.parametrize(
     "goal",
-    [123, "", "   ", "x" * 501, "分析\n注入", "分析\x00注入"],
+    [123, "", "   ", "x" * 501, "界" * 167, "分析\n注入", "分析\x00注入"],
 )
 def test_public_rejects_invalid_analysis_goal_before_network_or_output(
     monkeypatch, tmp_path, goal

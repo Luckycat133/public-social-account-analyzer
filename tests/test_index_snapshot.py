@@ -258,6 +258,14 @@ def test_invalid_identity_provenance_and_values_are_rejected(mutate, message):
         importer.validate_evidence(evidence, limit=30)
 
 
+def test_account_name_matching_is_strict_not_fuzzy():
+    evidence = _jingxuan_evidence()
+    evidence["account"]["account_name"] = "大漠叔叔官方"
+
+    with pytest.raises(importer.EvidenceError, match="author_name"):
+        importer.validate_evidence(evidence)
+
+
 def test_source_kind_contracts_cannot_be_blended():
     search = _search_evidence()
     search["posts"][0]["post_id"] = "123"
@@ -502,6 +510,25 @@ def test_index_run_normalizes_date_window_and_keeps_only_known_in_range_posts(
     assert task["date_to"] == "2026-07-20T23:59:59+08:00"
     assert task["collected_count"] == summary["collected_count"] == 1
     assert [post["post_id"] for post in posts] == ["7646317821839805739"]
+
+
+@pytest.mark.parametrize("date_value", ["1999-12-31", "2101-01-01"])
+def test_year_sanity_rejects_date_windows_outside_supported_range(date_value):
+    with pytest.raises(importer.EvidenceError, match="2000.*2100"):
+        importer.validate_evidence(
+            _jingxuan_evidence(),
+            date_from=date_value,
+        )
+
+
+def test_year_sanity_accepts_inclusive_date_window_boundaries():
+    result = importer.validate_evidence(
+        _jingxuan_evidence(),
+        date_from="2000-01-01",
+        date_to="2100-12-31",
+    )
+
+    assert len(result["posts"]) == 2
 
 
 def test_bounded_search_index_with_unknown_dates_is_empty_without_workspace(

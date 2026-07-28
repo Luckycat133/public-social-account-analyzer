@@ -588,9 +588,9 @@ def _safe_get(d, *keys, default=None):
     for k in keys:
         if not isinstance(cur, dict):
             return default
-        cur = cur.get(k, default)
-        if cur is None:
+        if k not in cur:
             return default
+        cur = cur[k]
     return cur
 
 
