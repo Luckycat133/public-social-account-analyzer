@@ -181,11 +181,11 @@ def parse_metric(raw: Any) -> tuple[Optional[int], str]:
 # ---------------------------------------------------------------------------
 # 时间标准化（纯函数）
 # ---------------------------------------------------------------------------
-def parse_time(raw: Any) -> Optional[datetime]:
+def parse_time(raw: Any, *, reference_year: int | None = None) -> Optional[datetime]:
     """解析发布/采集时间为带时区的 datetime；无时区按 +08:00。
 
     接受：ISO 8601（含 Z / 偏移）、"YYYY-MM-DD HH:MM:SS"、
-    "YYYY-MM-DD"、"YYYY年M月D日"、"M月D日"（取当前年）。
+    "YYYY-MM-DD"、"YYYY年M月D日"、"M月D日"（优先取参考年）。
     不可解析 → None。
     """
     if raw is None:
@@ -247,11 +247,11 @@ def parse_time(raw: Any) -> Optional[datetime]:
         except ValueError:
             pass
 
-    # 5) "M月D日"（取当前年）
+    # 5) "M月D日"（批量归一化时锚定同批最新作品的年份）
     m = re.match(r"^(\d{1,2})月(\d{1,2})日", s)
     if m:
         try:
-            ref_year = datetime.now(CST).year
+            ref_year = reference_year or datetime.now(CST).year
             return datetime(
                 ref_year, int(m.group(1)), int(m.group(2)), tzinfo=CST
             )
@@ -327,7 +327,9 @@ def join_hashtags(raw: Any) -> str:
 # ---------------------------------------------------------------------------
 # 单条 Post 归一化（纯函数）
 # ---------------------------------------------------------------------------
-def _normalize_post_record(raw: dict) -> tuple[dict, list[dict], list[dict]]:
+def _normalize_post_record(
+    raw: dict, *, published_reference_year: int | None = None
+) -> tuple[dict, list[dict], list[dict]]:
     """把一条原始 Post 字典归一化为统一模型的一行（dict，键即 CSV 列）。
 
     返回 (row, errors)：
@@ -369,7 +371,7 @@ def _normalize_post_record(raw: dict) -> tuple[dict, list[dict], list[dict]]:
     post_id = raw.get("post_id")
 
     raw_published = raw.get("published_at")
-    published = parse_time(raw_published)
+    published = parse_time(raw_published, reference_year=published_reference_year)
     # 字段出现但无法解析 → 记录结构化错误（缺失/空值不算失败）。
     if raw_published is not None and str(raw_published).strip() != "" and published is None:
         log_parse_error("published_at", raw_published)
@@ -488,10 +490,27 @@ def _normalize_post_record(raw: dict) -> tuple[dict, list[dict], list[dict]]:
     return row, errors, warnings
 
 
-def normalize_post(raw: dict) -> tuple[dict, list[dict]]:
+def normalize_post(
+    raw: dict, *, published_reference_year: int | None = None
+) -> tuple[dict, list[dict]]:
     """Normalize one post while retaining the established two-value API."""
-    row, errors, _warnings = _normalize_post_record(raw)
+    row, errors, _warnings = _normalize_post_record(
+        raw, published_reference_year=published_reference_year
+    )
     return row, errors
+
+
+def _latest_explicit_published_year(raw_posts: list[dict]) -> int | None:
+    """Return the year of the latest parseable post that states its year."""
+    latest: datetime | None = None
+    for raw in raw_posts:
+        value = raw.get("published_at")
+        if isinstance(value, str) and re.match(r"^\s*\d{1,2}月\d{1,2}日", value):
+            continue
+        parsed = parse_time(value)
+        if parsed is not None and (latest is None or parsed > latest):
+            latest = parsed
+    return latest.year if latest is not None else None
 
 
 def post_is_valid(row: dict) -> bool:
@@ -624,12 +643,15 @@ def normalize_in_memory(
         raw_posts.append(value)
 
     kept_raw, duplicate_count = dedup_posts(raw_posts)
+    published_reference_year = _latest_explicit_published_year(kept_raw)
     normalized: list[dict] = []
     per_post_visibility: dict[str, dict] = {}
     errors: list[dict] = []
     warnings: list[dict] = []
     for raw in kept_raw:
-        row, post_errors, post_warnings = _normalize_post_record(raw)
+        row, post_errors, post_warnings = _normalize_post_record(
+            raw, published_reference_year=published_reference_year
+        )
         errors.extend(post_errors)
         warnings.extend(post_warnings)
         normalized.append(row)
@@ -694,6 +716,7 @@ def run(input_dir: str, output_dir: str) -> dict:
 
     raw_posts, parse_errors = read_posts_jsonl(posts_path)
     kept_raw, duplicate_count = dedup_posts(raw_posts)
+    published_reference_year = _latest_explicit_published_year(kept_raw)
 
     # 归一化每条；附加 _visibility（仅供统计，不写入 CSV）；收集字段级解析错误。
     normalized: list[dict] = []
@@ -701,7 +724,9 @@ def run(input_dir: str, output_dir: str) -> dict:
     errors: list[dict] = []
     warnings: list[dict] = []
     for raw in kept_raw:
-        row, post_errors, post_warnings = _normalize_post_record(raw)
+        row, post_errors, post_warnings = _normalize_post_record(
+            raw, published_reference_year=published_reference_year
+        )
         errors.extend(post_errors)
         warnings.extend(post_warnings)
         normalized.append(row)

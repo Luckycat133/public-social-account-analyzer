@@ -24,6 +24,7 @@ from analyze import (
     build_taxonomy_result_template,
 )
 from execution_timing import ExecutionTimer
+from field_coverage import compute_field_coverage
 from immutable_workspace import (
     ANALYSIS_ARTIFACTS,
     ANALYSIS_OPTIONAL_ARTIFACTS,
@@ -447,6 +448,12 @@ def _delivery_summary(
     sample = analysis.get("sample_boundary") or {}
     comments = analysis.get("comment_analysis") or {}
     status_counts = sample.get("status_counts") or {}
+    posts = analysis.get("posts")
+    field_coverage = (
+        compute_field_coverage(posts)
+        if isinstance(posts, list)
+        else sample.get("field_coverage") or {}
+    )
     stop_reason = safe_stop_reason_label(meta.get("stop_reason"))
     restriction_scope = None
     if stop_reason in STOP_REASONS:
@@ -487,7 +494,7 @@ def _delivery_summary(
                 )
             },
         },
-        "field_coverage": sample.get("field_coverage") or {},
+        "field_coverage": field_coverage,
         "classification": {
             "status": analysis.get("classification_status"),
             "coverage_rate": (

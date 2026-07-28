@@ -45,3 +45,27 @@ def test_optional_artifact_co_occurrence():
             expected_artifacts=frozenset(actual),
         )
 
+
+def test_field_coverage_consistent():
+    summary = pipeline._delivery_summary(
+        {
+            "posts": [
+                {"metrics": {"views": 10, "likes": None}},
+                {"metrics": {"views": None, "likes": 0}},
+            ],
+            "sample_boundary": {
+                "field_coverage": {"views": 1.0, "likes": 1.0},
+            },
+        },
+        task_status="COMPLETED",
+    )
+
+    assert summary["field_coverage"] == {
+        "views": 0.5,
+        "likes": 0.5,
+        "comments": 0.0,
+        "favorites": 0.0,
+        "shares": 0.0,
+        "coins": 0.0,
+        "danmaku": 0.0,
+    }

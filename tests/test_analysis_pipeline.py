@@ -1475,6 +1475,91 @@ def test_collection_status_counts_keep_compatibility_totals_and_flag_exclusion()
     assert boundary["excluded_flagged_post_ids"] == ["pinned-success"]
 
 
+def test_flagged_post_without_id_is_omitted_from_boundary_ids():
+    flagged = normalize.normalize_post({
+        **_sample_post("temporary-id"),
+        "post_id": None,
+        "is_pinned": True,
+    })[0]
+
+    result = analyze.analyze_in_memory(
+        _sample_profile(),
+        [flagged],
+        {"task_id": "missing-flagged-id", "platform": "douyin"},
+    )
+
+    boundary = result.analysis["sample_boundary"]
+    assert boundary["excluded_flagged"] == 1
+    assert boundary["excluded_flagged_post_ids"] == []
+
+
+def test_partial_publish_date_uses_latest_post_year():
+    older = {**_sample_post("older"), "published_at": "7月23日"}
+    latest = {
+        **_sample_post("latest"),
+        "published_at": "2024-11-03T08:30:00+08:00",
+    }
+    payload = "\n".join(json.dumps(post, ensure_ascii=False) for post in (older, latest))
+
+    result = normalize.normalize_in_memory(_sample_profile(), payload)
+
+    by_id = {row["post_id"]: row for row in result.rows}
+    assert by_id["older"]["published_at"] == "2024-07-23T00:00:00+08:00"
+
+
+def test_field_coverage_helper():
+    from field_coverage import compute_field_coverage
+
+    top_level = [
+        {"views": 0, "likes": None},
+        {"views": None, "likes": 2},
+    ]
+    nested = [
+        {"metrics": {"views": 0, "likes": None}},
+        {"metrics": {"views": None, "likes": 2}},
+    ]
+    expected = {
+        "views": 0.5,
+        "likes": 0.5,
+        "comments": 0.0,
+        "favorites": 0.0,
+        "shares": 0.0,
+        "coins": 0.0,
+        "danmaku": 0.0,
+    }
+
+    assert compute_field_coverage(top_level) == expected
+    assert compute_field_coverage(nested) == expected
+    assert compute_field_coverage([]) == {
+        "views": None,
+        "likes": None,
+        "comments": None,
+        "favorites": None,
+        "shares": None,
+        "coins": None,
+        "danmaku": None,
+    }
+
+
+def test_nonexhaustive_index_source_suppresses_cadence_inference():
+    result = analyze.analyze_in_memory(
+        _sample_profile(),
+        _normalized_rows(),
+        {
+            "task_id": "index-cadence",
+            "platform": "douyin",
+            "collection_source": "douyin_search_index",
+            "evidence_is_exhaustive": False,
+        },
+    )
+
+    cadence = result.analysis["publish_cadence"]
+    assert cadence["cadence_inference_allowed"] is False
+    assert cadence["weekly_avg"] is None
+    assert cadence["median_interval_hours"] is None
+    assert cadence["longest_gap_hours"] is None
+
+
 def test_render_in_memory_rejects_missing_required_input():
     with pytest.raises(render_report.RenderError, match="profile"):
         render_report.render_in_memory(
