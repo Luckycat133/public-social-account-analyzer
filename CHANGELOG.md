@@ -6,9 +6,21 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-28
+
+### Added
+
+- 新增随分发包提供的密封 B站离线 collection fixture，用于在互相隔离的临时目录中复现 taxonomy draft 验收。
+
 ### Changed
 
-- README、使用指南、路线图和部署清单现统一展示 `0.5.0` / 数据集 `0.2.0`，明确外部分类必须与 `--with-llm-tax` 同时使用，并补齐独立部署所需的运行模块与 P0 数据集治理文件。
+- README、使用指南、路线图和部署清单现统一展示 `0.5.1` / 数据集 `0.2.0`，明确外部分类必须与 `--with-llm-tax` 同时使用，并补齐独立部署所需的运行模块与 P0 数据集治理文件。
+
+### Fixed
+
+- 限定 setuptools 仅发现 `skill*` 包，避免运行生成 `workspace/` 后第二次 editable install 失败。
+- 修正 Skill、测试手册和使用指南中的分类命令，使 business draft、validate-only 与 final 均满足 taxonomy CLI 守卫。
+- 将开发仓库的 `git diff --check` 与无 `.git` 的独立 ZIP 验收分开，要求每个 Agent 使用独立临时根目录，并补齐完整回归依赖的 `tools/`，避免退出码 129、跨会话产物和缺失工具被误报为通过。
 
 ## [0.5.0] - 2026-07-28
 

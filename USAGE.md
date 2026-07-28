@@ -253,8 +253,8 @@ python3 skill/scripts/run_pipeline.py \
 `pending-model` draft 当作最终交付：
 
 1. `--with-llm-tax` 创建 taxonomy draft；Agent 从完整预填模板开始，在提交目录外生成覆盖全部父作品的分类 JSON，不手抄确定字段。
-2. 从同一个 collection 传 `--classification-results ... --with-business-insights` 创建 business draft；Agent 从 evidence catalog 选择 `evidence_id`，不手抄原文三元组，并在目录外生成业务洞察 JSON。
-3. 两份结果先通过 collection-aware 批量预检，再用 `--validate-only` 运行正式契约；随后从同一个 collection 同时传两份结果创建 final。只有 `classification_status=completed`、`business_insight_status=completed` 且 manifest 封存两份原始结果，才可声称完整策略分析完成。
+2. 从同一个 collection 传 `--with-llm-tax --classification-results ... --with-business-insights` 创建 business draft；Agent 从 evidence catalog 选择 `evidence_id`，不手抄原文三元组，并在目录外生成业务洞察 JSON。
+3. 两份结果先通过 collection-aware 批量预检，再用带 `--with-llm-tax` 的 `--validate-only` 运行正式契约；随后从同一个 collection 同时传两份结果创建 final。只有 `classification_status=completed`、`business_insight_status=completed` 且 manifest 封存两份原始结果，才可声称完整策略分析完成。
 4. 交付前先读 final 的 `final-response.md` 与 `delivery-summary.json`，保留其中状态和数字；按 views 排序称触达组，按播放分母比率排序称互动效率组，单篇异常值不冒充共同点。
 
 业务证据只能提交 catalog 中的 `evidence_id`；父 `post_id`、源字段、精确摘录、URL 与采集时间由脚本补齐。标题模式只引用标题；公开文案“开头”限前 120 字；没有公开字幕/转写时不得把文案结构说成真实视频结构，不可观察项会使 final 变为 `PARTIAL_BUSINESS_INSIGHTS`。

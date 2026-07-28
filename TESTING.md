@@ -14,9 +14,12 @@
 
 ## 1. 安装开发依赖
 
+每次验收都在同一个 shell 中创建独立临时根目录；不得复用其他 Agent 留下的虚拟环境或模型结果：
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+export PSAA_ACCEPTANCE_ROOT="$(mktemp -d)"
+python3 -m venv "$PSAA_ACCEPTANCE_ROOT/venv"
+source "$PSAA_ACCEPTANCE_ROOT/venv/bin/activate"
 python3 -m pip install -e ".[dev]"
 ```
 
@@ -38,19 +41,30 @@ python3 -m pytest tests/test_resolve_profile_url.py -q
 python3 -m pytest tests/ -q
 python3 skill/scripts/split_dataset.py --verify
 python3 -m py_compile skill/scripts/*.py skill/scripts/collectors/*.py
-git diff --check
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git diff --check
+else
+  echo "SKIP: git diff --check（独立 ZIP 不含 .git）"
+fi
 ```
 
-这些测试不依赖实时平台网络；采集器传输均使用 fixture 或 mock。四条命令都成功才可发布。
+前三项不依赖实时平台网络；采集器传输均使用 fixture 或 mock。`git diff --check` 是开发仓库发布门禁；独立 ZIP 明确跳过该项，以 ZIP 完整性检查替代，不得把退出码 129 记为通过。
 
 ## 4. 测试 taxonomy draft
 
-使用已有不可变 collection，输出路径必须不存在：
+使用随包分发的不可变离线 collection。以下 §4–§6 命令继续使用 §1 的同一个 shell 和临时根目录：
+
+```bash
+export PSAA_ACCEPTANCE_COLLECTION="$PWD/skill/evals/fixtures/bilibili-pinned-collection"
+test -f "$PSAA_ACCEPTANCE_COLLECTION/.complete"
+```
+
+输出路径必须不存在：
 
 ```bash
 python3 skill/scripts/run_pipeline.py \
-  --input workspace/<collection> \
-  --output workspace/test-taxonomy-draft \
+  --input "$PSAA_ACCEPTANCE_COLLECTION" \
+  --output "$PSAA_ACCEPTANCE_ROOT/taxonomy-draft" \
   --with-llm-tax
 ```
 
@@ -62,13 +76,15 @@ python3 skill/scripts/run_pipeline.py \
 - `delivery-summary.json`
 - `final-response.md`
 
-把模板复制到提交目录之外，填写为 `/tmp/taxonomy-results.json`，然后一次查看全部可检测错误：
+把模板复制到提交目录之外，填写为 `$PSAA_ACCEPTANCE_ROOT/taxonomy-results.json`，然后一次查看全部可检测错误：
 
 ```bash
+cp "$PSAA_ACCEPTANCE_ROOT/taxonomy-draft/taxonomy-result-template.json" \
+  "$PSAA_ACCEPTANCE_ROOT/taxonomy-results.json"
 python3 skill/scripts/validate_model_results.py \
-  --collection workspace/<collection> \
-  --analysis workspace/test-taxonomy-draft/analysis.json \
-  --taxonomy /tmp/taxonomy-results.json
+  --collection "$PSAA_ACCEPTANCE_COLLECTION" \
+  --analysis "$PSAA_ACCEPTANCE_ROOT/taxonomy-draft/analysis.json" \
+  --taxonomy "$PSAA_ACCEPTANCE_ROOT/taxonomy-results.json"
 ```
 
 合法结果返回码为 0，且输出 `"valid": true`；有错误时返回码为 2，并在 `errors` 数组一次列出全部问题。
@@ -77,21 +93,24 @@ python3 skill/scripts/validate_model_results.py \
 
 ```bash
 python3 skill/scripts/run_pipeline.py \
-  --input workspace/<collection> \
-  --output workspace/test-business-draft \
-  --classification-results /tmp/taxonomy-results.json \
+  --input "$PSAA_ACCEPTANCE_COLLECTION" \
+  --output "$PSAA_ACCEPTANCE_ROOT/business-draft" \
+  --with-llm-tax \
+  --classification-results "$PSAA_ACCEPTANCE_ROOT/taxonomy-results.json" \
   --with-business-insights
 ```
 
 检查 `business-context.json`、`business-evidence-catalog.jsonl` 和 `business-result-template.json`。选题、模式、实验数量应分别落在 3–8、2–5、2–4 范围，并与模板冻结数量一致。
 
-填写 `/tmp/business-results.json` 后运行：
+把模板复制到 `$PSAA_ACCEPTANCE_ROOT/business-results.json` 并填写后运行：
 
 ```bash
+cp "$PSAA_ACCEPTANCE_ROOT/business-draft/business-result-template.json" \
+  "$PSAA_ACCEPTANCE_ROOT/business-results.json"
 python3 skill/scripts/validate_model_results.py \
-  --collection workspace/<collection> \
-  --analysis workspace/test-business-draft/analysis.json \
-  --business /tmp/business-results.json
+  --collection "$PSAA_ACCEPTANCE_COLLECTION" \
+  --analysis "$PSAA_ACCEPTANCE_ROOT/business-draft/analysis.json" \
+  --business "$PSAA_ACCEPTANCE_ROOT/business-results.json"
 ```
 
 业务结果的每条 `evidence` 只保留 `evidence_id`；不要手抄 excerpt。`performance_evidence_options` 给出每个 high/low pattern 可选的组内 ID。`observability="supported"` 时 `limitation` 必须是 JSON `null`，不能写成字符串 `"null"`。
@@ -101,20 +120,22 @@ python3 skill/scripts/validate_model_results.py \
 ```bash
 python3 skill/scripts/run_pipeline.py \
   --validate-only \
-  --input workspace/<collection> \
-  --classification-results /tmp/taxonomy-results.json \
-  --business-insight-results /tmp/business-results.json
+  --input "$PSAA_ACCEPTANCE_COLLECTION" \
+  --with-llm-tax \
+  --classification-results "$PSAA_ACCEPTANCE_ROOT/taxonomy-results.json" \
+  --business-insight-results "$PSAA_ACCEPTANCE_ROOT/business-results.json"
 ```
 
 最后生成 final：
 
 ```bash
 python3 skill/scripts/run_pipeline.py \
-  --input workspace/<collection> \
-  --output workspace/test-final \
-  --classification-results /tmp/taxonomy-results.json \
+  --input "$PSAA_ACCEPTANCE_COLLECTION" \
+  --output "$PSAA_ACCEPTANCE_ROOT/final" \
+  --with-llm-tax \
+  --classification-results "$PSAA_ACCEPTANCE_ROOT/taxonomy-results.json" \
   --with-business-insights \
-  --business-insight-results /tmp/business-results.json
+  --business-insight-results "$PSAA_ACCEPTANCE_ROOT/business-results.json"
 ```
 
 验收 `task.json.task_status`、`analysis.json`、Markdown、HTML、`delivery-summary.json` 与 manifest；不要只看命令退出码。
@@ -127,7 +148,7 @@ python3 skill/scripts/run_pipeline.py \
 python3 skill/scripts/resolve_profile_url.py "<b23.tv 主页短链>"
 python3 skill/scripts/collect.py "<B站规范主页或主页短链>" \
   --limit 5 \
-  --out workspace/live-smoke
+  --out "$PSAA_ACCEPTANCE_ROOT/live-smoke"
 ```
 
 实时平台测试可能受访问限制、频控或页面变化影响，不作为单元测试成功的前提。若为 `PARTIAL` 或 `FAILED`，同时检查 `stop_reason`、`diagnostic_code`、采集覆盖账本和已保留的公开证据。

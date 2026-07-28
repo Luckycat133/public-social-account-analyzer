@@ -92,6 +92,8 @@ tests/
 skill/evals/
 ├── cases.md
 ├── evals.json
+├── fixtures/
+│   └── bilibili-pinned-collection/    # 可直接运行 pipeline 的密封离线验收输入
 └── datasets/
     ├── CHANGELOG.md
     ├── README.md
@@ -118,6 +120,20 @@ docs/
     ├── 公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx
     └── 需求实现状态与抖音能力边界.md
 ```
+
+### 1.5 验收辅助工具（完整回归必需）
+
+```text
+tools/
+├── demo/
+│   ├── README.md
+│   └── run_demo.py
+└── skill_eval/
+    ├── aggregate.py
+    └── runner.py
+```
+
+`tests/test_demo_runner.py` 与 `tests/test_skill_eval_aggregate.py` 会直接加载这些工具；独立分发包若遗漏 `tools/`，不能声称完整回归通过。
 
 ---
 
@@ -200,15 +216,17 @@ python3 -m pytest tests/ -q --tb=no 2>&1 | tail -3
 
 drift 任意一条失败 → 阻塞发布。
 
+独立 ZIP 不含 `.git`，因此其中的 `git diff --check` 应按 `TESTING.md` 明确跳过；不得把 Git 的退出码 129 记为通过。ZIP 必须改为验证压缩数据完整性，并使用 `skill/evals/fixtures/bilibili-pinned-collection` 运行 taxonomy draft 烟雾测试。
+
 ---
 
 ## 4. 版本发布流程（建议）
 
-1. dev 版本按 `pyproject.toml` 打 tag，例如当前 pre-1.0 版本使用 `git tag v0.5.0`
+1. dev 版本按 `pyproject.toml` 打 tag，例如当前 pre-1.0 版本使用 `git tag v0.5.1`
 2. 在 dev `skill/SKILL.md` 顶部 frontmatter 注明版本（如项目采用该字段）
 3. 用第 3 节的 drift 检测全绿
 4. 更新 `CHANGELOG.md`（Keep a Changelog v1.1.0）
-5. 仅当选择“独立打包”时，按实际版本打包 §1 内容，例如 `public-social-account-analyzer-v0.5.0.zip`
+5. 仅当选择“独立打包”时，按实际版本打包 §1 内容，例如 `public-social-account-analyzer-v0.5.1.zip`
 6. 否则保持软链接，本节不适用
 
 ---

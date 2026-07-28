@@ -115,6 +115,9 @@ def test_model_prompts_reference_compact_artifacts_instead_of_embedding_records(
     assert "taxonomy-result-template.json" in taxonomy
     assert "business-evidence-catalog.jsonl" in business
     assert "business-result-template.json" in business
+    assert "保留模板已有的键名、id、basis" in business
+    assert "success_metric 保留模板值" in business
+    assert "保留每条 post_id" in taxonomy
     assert len(taxonomy) < 8000
     assert len(business) < 10000
 

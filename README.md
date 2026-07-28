@@ -1,6 +1,6 @@
 # 公开社交媒体账号内容分析器 (Public Social Account Analyzer)
 
-[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.1-blue.svg)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](pyproject.toml)
 
 > 基于 Python 3.9+ 与 Agent Skills 规范实现的公开社交账号分析系统。支持 B站（Bilibili）、抖音（Douyin）公开主页数据的合规采集、指标归一化、中位数/分位数分析与多格式报告生成。
@@ -38,9 +38,9 @@
 
 ## 版本状态
 
-- 当前项目版本：`0.5.0`（pre-1.0；每个次版本表示一个可验收能力里程碑）。
+- 当前项目版本：`0.5.1`（pre-1.0；补丁版本用于兼容性与验收修复）。
 - 当前评测数据集版本：`0.2.0`，与项目版本独立演进。
-- `0.1.0` 至 `0.5.0` 的版本日期、功能边界和安全修复见 [CHANGELOG.md](CHANGELOG.md)。
+- `0.1.0` 至 `0.5.1` 的版本日期、功能边界和安全修复见 [CHANGELOG.md](CHANGELOG.md)。
 - 工程合同已完成自动化验证；账号本人 OpenAPI 真实凭据验收和 AC-10 运营试用仍属于外部验收项。
 
 ---
