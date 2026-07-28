@@ -715,7 +715,8 @@ def test_default_public_output_uses_repository_workspace(monkeypatch, tmp_path):
 
     assert collect.run(BILIBILI_URL) == 0
 
-    tasks = list((repo / "workspace").glob("bilibili-123-*"))
+    key = hashlib.sha256(b"123").hexdigest()[:12]
+    tasks = list((repo / "workspace").glob(f"bilibili-{key}-*"))
     assert len(tasks) == 1
     assert (tasks[0] / "task.json").is_file()
     assert not (repo / "skill" / "workspace").exists()
@@ -1016,7 +1017,8 @@ def test_default_public_tasks_for_same_account_and_day_are_independent(
     assert collect.run(BILIBILI_URL) == 0
     assert collect.run(BILIBILI_URL) == 0
 
-    tasks = sorted((repo / "workspace").glob("bilibili-123-*"))
+    key = hashlib.sha256(b"123").hexdigest()[:12]
+    tasks = sorted((repo / "workspace").glob(f"bilibili-{key}-*"))
     assert len(tasks) == 2
     assert tasks[0] != tasks[1]
     assert all((task / "task.json").is_file() for task in tasks)
@@ -1029,7 +1031,8 @@ def test_default_public_output_skips_symlink_collision_without_following_it(
     workspace = repo / "workspace"
     workspace.mkdir(parents=True)
     date = collect.datetime.now(collect._BEIJING).strftime("%Y%m%d")
-    base = workspace / f"bilibili-123-{date}"
+    key = hashlib.sha256(b"123").hexdigest()[:12]
+    base = workspace / f"bilibili-{key}-{date}"
     outside = tmp_path / "outside"
     outside.mkdir()
     marker = outside / "keep.txt"

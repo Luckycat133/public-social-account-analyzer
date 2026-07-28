@@ -69,6 +69,14 @@ ANALYSIS_OPTIONAL_ARTIFACTS = frozenset(
     }
 )
 ANALYSIS_ARTIFACTS = ANALYSIS_REQUIRED_ARTIFACTS | ANALYSIS_OPTIONAL_ARTIFACTS
+ANALYSIS_OPTIONAL_ARTIFACT_REQUIREMENTS = {
+    "taxonomy-input.jsonl": frozenset({"taxonomy-prompt.md"}),
+    "taxonomy-result-template.json": frozenset({"taxonomy-prompt.md"}),
+    "source/classification-results.json": frozenset({"taxonomy-prompt.md"}),
+    "business-context.json": frozenset({"business-insights-prompt.md"}),
+    "business-evidence-catalog.jsonl": frozenset({"business-insights-prompt.md"}),
+    "business-result-template.json": frozenset({"business-insights-prompt.md"}),
+}
 
 
 class WorkspaceError(RuntimeError):
@@ -913,6 +921,7 @@ class ImmutableWorkspace:
             )
             chain.validate(error_type=WorkspaceIdentityError)
             parent_fd = chain.leaf_fd
+            parent_identity = chain.entries[-1].identity
             try:
                 os.mkdir(name, 0o700, dir_fd=parent_fd)
             except FileExistsError as exc:
@@ -935,7 +944,7 @@ class ImmutableWorkspace:
                 target_identity=target_entry.identity,
                 source_identity=source_entry.identity,
                 target_name=name,
-                parent_identity=chain.entries[-3].identity,
+                parent_identity=parent_identity,
                 posix_chain=chain,
             )
             transferred = True

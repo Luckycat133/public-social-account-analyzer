@@ -262,6 +262,7 @@ def _draft(tmp_path: Path):
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
         with_comment_insights=True,
     )
@@ -351,6 +352,7 @@ def test_comment_insight_final_binds_raw_result_and_renders_all_categories(tmp_p
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
         with_comment_insights=True,
         comment_insight_results_path=str(result_path),
@@ -472,6 +474,7 @@ def test_invalid_comment_insight_result_fails_before_publish(tmp_path, mutation)
             str(collection),
             str(output),
             template_text=_minimal_template(),
+            with_taxonomy_prompt=True,
             classification_results_path=str(classification_path),
             with_comment_insights=True,
             comment_insight_results_path=str(result_path),

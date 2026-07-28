@@ -27,6 +27,7 @@ from execution_timing import ExecutionTimer
 from immutable_workspace import (
     ANALYSIS_ARTIFACTS,
     ANALYSIS_OPTIONAL_ARTIFACTS,
+    ANALYSIS_OPTIONAL_ARTIFACT_REQUIREMENTS,
     ANALYSIS_REQUIRED_ARTIFACTS,
     DEFAULT_MAX_ARTIFACT_BYTES,
     FORMAT,
@@ -351,6 +352,13 @@ def _validate_output_payloads(
         raise PipelineError("analysis artifact inventory is incomplete")
     if not actual.issubset(ANALYSIS_ARTIFACTS):
         raise PipelineError("analysis artifact inventory is not allowlisted")
+    for relative, requirements in ANALYSIS_OPTIONAL_ARTIFACT_REQUIREMENTS.items():
+        missing_requirements = requirements - actual
+        if relative in actual and missing_requirements:
+            raise PipelineError(
+                f"{relative} requires "
+                + ", ".join(sorted(missing_requirements))
+            )
 
     for relative in (
         "source/profile.json",
@@ -439,9 +447,9 @@ def _delivery_summary(
     sample = analysis.get("sample_boundary") or {}
     comments = analysis.get("comment_analysis") or {}
     status_counts = sample.get("status_counts") or {}
-    stop_reason = meta.get("stop_reason")
+    stop_reason = safe_stop_reason_label(meta.get("stop_reason"))
     restriction_scope = None
-    if stop_reason is not None:
+    if stop_reason in STOP_REASONS:
         diagnostic = meta.get("diagnostic_code") or "task_level"
         restriction_scope = (
             f"{diagnostic}; item_level_restricted="
@@ -564,10 +572,15 @@ def validate_pipeline_inputs(
     collection_dir: str,
     *,
     classification_results_path: str | None = None,
+    with_taxonomy_prompt: bool = False,
     business_insight_results_path: str | None = None,
     comment_insight_results_path: str | None = None,
 ) -> AnalysisResult:
     """Run authoritative normalization and model-result validation without output."""
+    if classification_results_path is not None and not with_taxonomy_prompt:
+        raise PipelineError(
+            "EXTERNAL_TAXONOMY: classification-results requires --with-llm-tax"
+        )
     classification_payload: bytes | None = None
     classification_results: list[dict[str, Any]] | None = None
     if classification_results_path is not None:
@@ -660,6 +673,10 @@ def run_pipeline(
     comment_insight_results_path: str | None = None,
 ) -> PipelineResult:
     """Verify a sealed collection and commit a separate derived workspace."""
+    if classification_results_path is not None and not with_taxonomy_prompt:
+        raise PipelineError(
+            "EXTERNAL_TAXONOMY: classification-results requires --with-llm-tax"
+        )
     execution_timer = ExecutionTimer()
     with execution_timer.phase("collection_input"):
         output = preflight_workspace_target(output_dir)
@@ -1078,6 +1095,7 @@ def main(argv: list[str] | None = None) -> int:
             validate_pipeline_inputs(
                 args.input,
                 classification_results_path=args.classification_results,
+                with_taxonomy_prompt=args.with_llm_tax,
                 business_insight_results_path=args.business_insight_results,
                 comment_insight_results_path=args.comment_insight_results,
             )

@@ -22,6 +22,22 @@ ARTIFACTS = frozenset(
 )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory handles required")
+def test_parent_identity_posix(tmp_path):
+    target = tmp_path / "task"
+    reservation = workspace.ImmutableWorkspace.reserve(
+        str(target), allowed_artifacts={"task.json"}
+    )
+    try:
+        parent_stat = os.stat(tmp_path)
+        held_stat = os.fstat(reservation.parent_handle)
+        expected = (parent_stat.st_dev, parent_stat.st_ino)
+        assert reservation.parent_identity == expected
+        assert (held_stat.st_dev, held_stat.st_ino) == expected
+    finally:
+        reservation.close()
+
+
 def _committed(tmp_path: Path, name: str = "task") -> Path:
     target = tmp_path / name
     reservation = workspace.ImmutableWorkspace.reserve(

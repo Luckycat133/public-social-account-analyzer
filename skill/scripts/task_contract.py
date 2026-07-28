@@ -12,6 +12,10 @@ from urllib.parse import urlsplit
 
 
 MAX_ANALYSIS_GOAL_LENGTH = 500
+AUTHORIZED_DISCLAIMER = (
+    "本报告基于账号本人授权 OpenAPI 返回的公开来源证据，"
+    "不代表账号后台真实曝光、触达、完播或转化数据。"
+)
 _BILIBILI_PROFILE_RE = re.compile(
     r"https://space\.bilibili\.com/([1-9][0-9]*)(?:[/?#].*)?\Z"
 )
@@ -149,11 +153,5 @@ def account_output_key(platform: str, canonical_url: str) -> str:
     """Return a non-sensitive stable key for the default task directory."""
     path = urlsplit(canonical_url).path.rstrip("/")
     identity = path.rsplit("/", 1)[-1]
-    if platform == "bilibili" and re.fullmatch(r"\d+", identity):
-        return identity
-    if platform == "douyin" and re.fullmatch(
-        r"[A-Za-z0-9_-]{1,512}", identity
-    ):
-        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-    material = canonical_url.encode("utf-8")
+    material = (identity or canonical_url).encode("utf-8")
     return hashlib.sha256(material).hexdigest()[:12]

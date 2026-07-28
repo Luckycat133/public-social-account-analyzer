@@ -299,6 +299,7 @@ def test_business_prompt_binds_classification_bytes_and_states_strict_schema(
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
         with_business_insights=True,
     )
@@ -330,6 +331,7 @@ def test_business_prompt_exposes_copy_safe_source_bound_evidence_catalog(tmp_pat
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
         with_business_insights=True,
     )
@@ -376,6 +378,7 @@ def test_validate_only_accepts_model_results_without_creating_workspace(
     exit_code = pipeline.main([
         "--validate-only",
         "--input", str(collection),
+        "--with-llm-tax",
         "--classification-results", str(classification_path),
         "--business-insight-results", str(business_path),
     ])
@@ -408,6 +411,7 @@ def test_final_pipeline_writes_deterministic_delivery_handoff(tmp_path):
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
         with_business_insights=True,
         business_insight_results_path=str(business_path),
@@ -419,7 +423,7 @@ def test_final_pipeline_writes_deterministic_delivery_handoff(tmp_path):
     assert handoff == {
         "schema_version": 1,
         "task_status": "COMPLETED",
-        "stop_reason": None,
+        "stop_reason": "null",
         "restriction_scope": None,
         "sample": {
             "requested": 15,
@@ -512,6 +516,7 @@ def test_final_seals_business_result_and_renders_dynamic_contract(tmp_path):
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
         with_business_insights=True,
         business_insight_results_path=str(business_path),
@@ -610,6 +615,7 @@ def test_invalid_business_result_fails_before_publishing(tmp_path, mutation):
             str(collection),
             str(output),
             template_text=_minimal_template(),
+            with_taxonomy_prompt=True,
             classification_results_path=str(classification_path),
             with_business_insights=True,
             business_insight_results_path=str(business_path),
@@ -650,6 +656,7 @@ def test_unobservable_copy_pattern_keeps_final_partial_and_explicit(tmp_path):
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
         with_business_insights=True,
         business_insight_results_path=str(business_path),

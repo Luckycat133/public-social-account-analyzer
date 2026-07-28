@@ -1761,6 +1761,7 @@ def test_inferred_collection_status_makes_pipeline_normalization_partial(
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
     )
 
@@ -1836,6 +1837,7 @@ def test_complete_classification_is_validated_applied_and_copied_exactly(tmp_pat
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
     )
 
@@ -1870,7 +1872,12 @@ def test_complete_classification_is_validated_applied_and_copied_exactly(tmp_pat
     )
     assert {item["path"] for item in verified["artifacts"]} == set(
         pipeline.ANALYSIS_REQUIRED_ARTIFACTS
-    ) | {"source/classification-results.json"}
+    ) | {
+        "source/classification-results.json",
+        "taxonomy-prompt.md",
+        "taxonomy-input.jsonl",
+        "taxonomy-result-template.json",
+    }
 
 
 def test_complete_classification_with_incomplete_evidence_stays_partial(tmp_path):
@@ -1893,6 +1900,7 @@ def test_complete_classification_with_incomplete_evidence_stays_partial(tmp_path
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
     )
 
@@ -1936,6 +1944,7 @@ def test_complete_classification_and_item_evidence_complete_pipeline(tmp_path):
         str(collection),
         str(output),
         template_text=_minimal_template(),
+        with_taxonomy_prompt=True,
         classification_results_path=str(classification_path),
     )
 
@@ -1994,6 +2003,7 @@ def test_invalid_or_incomplete_classification_creates_no_output(
             str(collection),
             str(output),
             template_text=_minimal_template(),
+            with_taxonomy_prompt=True,
             classification_results_path=str(classification_path),
         )
 
@@ -2113,6 +2123,7 @@ def test_cli_accepts_classification_results_file(tmp_path):
             str(output),
             "--template",
             str(template_path),
+            "--with-llm-tax",
             "--classification-results",
             str(classification_path),
         ]
@@ -2560,6 +2571,7 @@ def test_inconsistent_completed_feature_contract_fails_before_output_reservation
             str(collection),
             str(output),
             template_text=_minimal_template(),
+            with_taxonomy_prompt=True,
             classification_results_path=str(classification_path),
         )
 
@@ -2640,6 +2652,7 @@ def test_inconsistent_breakdown_contract_fails_before_output_reservation(
             str(collection),
             str(output),
             template_text=_minimal_template(),
+            with_taxonomy_prompt=True,
             classification_results_path=str(classification_path),
         )
 
