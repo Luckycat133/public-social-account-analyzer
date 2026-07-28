@@ -230,7 +230,7 @@ def canonical_json(value: Any) -> str:
 
 
 def serialize_csv_cell(column: str, value: Any) -> Any:
-    """Apply the normalized CSV contract to one value."""
+    """Apply the normalized CSV contract, rounding durations to seconds."""
     if value is None:
         return ""
     if column == "hashtags":
@@ -242,7 +242,7 @@ def serialize_csv_cell(column: str, value: Any) -> Any:
     if column == "duration_seconds":
         try:
             numeric = float(value)
-            return "" if math.isnan(numeric) or math.isinf(numeric) else int(numeric)
+            return "" if math.isnan(numeric) or math.isinf(numeric) else round(numeric)
         except (ValueError, TypeError, OverflowError):
             return ""
     return value
@@ -263,7 +263,7 @@ def deserialize_csv_cell(
     *,
     warning_sink: WarningSink | None = None,
 ) -> Any:
-    """Restore canonical CSV cells to JSON-safe source-record values."""
+    """Restore JSON-safe values, preserving integer numeric-cell types."""
     if column == "hashtags":
         return parse_hashtag_cell(value, warning_sink=warning_sink)
     if column in STRUCTURED_FIELDS:
@@ -294,6 +294,8 @@ def deserialize_csv_cell(
             RecursionError,
         ):
             parsed = None
+        if isinstance(parsed, str) and re.fullmatch(r"-?\d+", parsed):
+            return int(parsed)
         if (
             isinstance(parsed, (int, float))
             and not isinstance(parsed, bool)

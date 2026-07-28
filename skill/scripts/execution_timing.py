@@ -33,14 +33,30 @@ class ExecutionTimer:
         """Return a JSON-safe snapshot without stopping future measurements."""
         ended_at = datetime.now(self._wall_timezone)
         duration_ns = max(0, time.monotonic_ns() - self._started_ns)
+        duration_ms = duration_ns // 1_000_000
+        phase_items = sorted(self._phase_durations_ns.items())
+        phase_durations_ms = {
+            name: phase_ns // 1_000_000 for name, phase_ns in phase_items
+        }
+        remainder_ms = duration_ms - sum(phase_durations_ms.values())
+        if phase_items and remainder_ms >= 0:
+            rounds, extra = divmod(remainder_ms, len(phase_items))
+            phase_durations_ms = {
+                name: phase_durations_ms[name] + rounds + (index < extra)
+                for index, (name, _phase_ns) in enumerate(phase_items)
+            }
+        elif phase_items:
+            total_phase_ns = sum(phase_ns for _name, phase_ns in phase_items)
+            phase_durations_ms = {
+                name: phase_ns * duration_ms // total_phase_ns
+                for name, phase_ns in phase_items
+            }
+            extra = duration_ms - sum(phase_durations_ms.values())
+            for name, _phase_ns in phase_items[:extra]:
+                phase_durations_ms[name] += 1
         return {
             "started_at": self._started_at.isoformat(),
             "ended_at": ended_at.isoformat(),
-            "duration_ms": duration_ns // 1_000_000,
-            "phase_durations_ms": {
-                name: duration_ns // 1_000_000
-                for name, duration_ns in sorted(
-                    self._phase_durations_ns.items()
-                )
-            },
+            "duration_ms": duration_ms,
+            "phase_durations_ms": phase_durations_ms,
         }
