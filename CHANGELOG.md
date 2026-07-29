@@ -6,14 +6,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- `skill/SKILL.md` 新增"可复现契约断言"章节，包含 B 站 `series_name` 必须绑定公开证据的离线协议（import → 构造 → 抛出 `ValueError` → 验证消息前缀），与 `tests/test_series_name_public_evidence_repro.py` 一一对应；并附 抖音 OpenAPI 身份与末页合同条款的离线自检清单。
-
-### Added
-
-- 新增 `tests/test_series_name_public_evidence_repro.py`，离线复跑 iter-2 / CASE-021：B 站父作品缺少公开 `series_name` 时拒绝分类端的猜测值（带 `series_name` + `public evidence` 消息前缀断言），并验证合法 `null` 不被误拒；全量 `pytest tests/` 仍 1519 passed。
-
 ## [0.5.1] - 2026-07-28
 
 ### Added
