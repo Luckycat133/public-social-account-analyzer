@@ -10,6 +10,12 @@
 
 - `skill/SKILL.md` 新增「可复现契约断言」章节：把 B 站 `series_name` 必须绑定公开证据（源自 iter-2 eval-3）和抖音 OpenAPI 身份与末页合同（源自 iter-2 eval-4）这两条语义工作与脚本级实现绑定为可重放的 offline 协议，并提供通用的 heredoc 模板和异常消息关键字段前缀断言。
 - `tests/test_series_name_public_evidence_repro.py`：中文 docstring 的离线 pytest，正向断言父作品 `platform_metrics.series_name` 为 null 时分类端猜测值必须被 `validate_classification_results` 拒绝（带 `series_name` + `public evidence` 关键字段前缀），反向断言合法的 null 不得误拒。回归基线 1517 → 1519。
+- `tests/test_openapi_contract_repro.py`：抖音 OpenAPI 协议 #2 六条离线断言（userinfo 逐字回证、token 隔离、_SAFE_ERROR_CODES 白名单、编排层身份二次核验、SKILL.md 文档完整性、frontmatter 结构守护）。回归基线 1519 → 1525。
+- B 站采集器：`BILIBILI_MIN_INTERVAL` 环境变量，允许操作员调大请求间隔（单位秒，范围 0–30，超限忽略），默认 1.2s 不变；`collection_coverage.buvid_established` 字段记录 buvid 是否成功建立，供限流诊断。
+
+### Changed
+
+- B 站采集器 `ensure_buvid`：finger/spi 失败静默处理不变，但现在通过 `_buvid_established` 字段向外暴露，`collection_coverage` 中明确可见。
 
 ## [0.5.1] - 2026-07-28
 

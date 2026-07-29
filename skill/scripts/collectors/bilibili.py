@@ -201,11 +201,22 @@ class Session:
     ):
         self.cookies: dict[str, str] = {}
         self.timeout = timeout
+        # BILIBILI_MIN_INTERVAL 允许操作员调大请求间隔（单位秒，上限 30）以降低风控概率。
+        # 只接受正数；非法值忽略，保留调用方传入的 min_interval。
+        _env_interval = os.environ.get("BILIBILI_MIN_INTERVAL")
+        if _env_interval is not None:
+            try:
+                _v = float(_env_interval)
+                if 0 < _v <= 30:
+                    min_interval = _v
+            except ValueError:
+                pass
         self.min_interval = min_interval
         self._last = 0.0
         self._wbi: tuple[str, str] | None = None
         self._blocked_reason: str | None = None
         self._buvid_initialized = False
+        self._buvid_established = False  # 供外层写入 collection_coverage
         # 保留配置字段以兼容调用方和显式浏览器工具，但平台保护响应绝不会触发浏览器降级。
         self._browser_fallback = (
             os.environ.get("BILIBILI_BROWSER_FALLBACK") == "1"
@@ -420,6 +431,7 @@ class Session:
         del force  # 兼容旧调用签名；当前任务绝不轮换已经建立的公开身份。
         if self.cookies.get("buvid3"):
             self._buvid_initialized = True
+            self._buvid_established = True
             return
         if self._buvid_initialized:
             return
@@ -429,9 +441,12 @@ class Session:
             d = data.get("data") or {}
             if d.get("b_3"):
                 self.cookies["buvid3"] = d["b_3"]
+                self._buvid_established = True
             if d.get("b_4"):
                 self.cookies["buvid4"] = d["b_4"]
         except BilibiliError:
+            # finger/spi 失败不中止任务，但后续请求缺少 buvid 风控概率更高。
+            # _buvid_established 保持 False，供外层写入 collection_coverage 供诊断。
             return
 
     # -- 投稿发现 --
@@ -1064,6 +1079,7 @@ class BilibiliCollector(BaseCollector):
             "regular_observed_count": 0,
             "dynamic_status": "NOT_ATTEMPTED",
             "dynamic_observed_count": 0,
+            "buvid_established": getattr(s, "_buvid_established", None),
         }
 
         # 置顶视频检测（top/arc，免 wbi、稳定）——用于标记 is_pinned

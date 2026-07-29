@@ -1165,6 +1165,7 @@ def test_post_list_merges_dynamic_only_posts_and_deduplicates_bvid(monkeypatch):
         "range_filter_applied": False,
         "range_match_count": 3,
         "range_no_match": False,
+        "buvid_established": None,
     }
 
 
@@ -1228,6 +1229,7 @@ def test_dynamic_protection_stops_before_optional_tags_and_records_substage(
         "regular_observed_count": 1,
         "dynamic_status": "ACCESS_RESTRICTED",
         "dynamic_observed_count": 0,
+        "buvid_established": None,
     }
 
 
