@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- `skill/SKILL.md` 新增「可复现契约断言」章节：把 B 站 `series_name` 必须绑定公开证据（源自 iter-2 eval-3）和抖音 OpenAPI 身份与末页合同（源自 iter-2 eval-4）这两条语义工作与脚本级实现绑定为可重放的 offline 协议，并提供通用的 heredoc 模板和异常消息关键字段前缀断言。
+- `tests/test_series_name_public_evidence_repro.py`：中文 docstring 的离线 pytest，正向断言父作品 `platform_metrics.series_name` 为 null 时分类端猜测值必须被 `validate_classification_results` 拒绝（带 `series_name` + `public evidence` 关键字段前缀），反向断言合法的 null 不得误拒。回归基线 1517 → 1519。
+
 ## [0.5.1] - 2026-07-28
 
 ### Added

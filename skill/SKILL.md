@@ -175,6 +175,75 @@ description: 分析公开社交媒体账号内容策略、选题、发布节奏�
 - 采集与分析 `task.json` 必须记录带时区的 `started_at` / `ended_at`、非负整数 `duration_ms` 和固定阶段 `phase_durations_ms`。这些字段用于工程可观测性，不等于“真实 30 条全流程 ≤10 分钟”已经通过。
 - AC-03 / AC-06 不能用源数据与 CSV 自洽替代人工真值。先运行 `python tests/manual_accuracy_check.py prepare --collection <collection> --analysis <final-analysis> --out <outside/truth.json> --sample 10`，由人工逐页填写后再运行 `verify --truth <truth.json>`；未填写时只能标记未验收。
 
+## 可复现契约断言（Offline Acceptance Protocol）
+
+下面这些断言**不联网、不开浏览器、不改产物**，用于把"分类 / 业务洞察 / OpenAPI 身份与末页"等语义工作与脚本级实现**直接绑定**。任何 Agent 在执行对应工作前**应当**先用本节协议自检；任何一个失败都意味着实现被破坏，**应立即停止提交**而不是退回到"凭印象推断"。
+
+### 通用协议（每条断言通用）
+
+1. 启动 Python 子进程：`python3 -c '<heredoc>'`，在 heredoc 内 `sys.path.insert(0, "<skill>/scripts")` 后导入实现的 callable 函数。
+2. 按目标契约构造输入；缺字段一律用 `None` / `{}`，**不得凭印象填值**。
+3. 调用实现并捕获 `(return, exception_type, exception_message, traceback_tail)`：
+   - 实现应当 raise 时，只验证**类型**与消息的**关键字段前缀**，不绑定完整字符串（消息可能在合理范围内细化）。
+   - 实现应当 return 时，只验证返回结构的关键键与合法取值。
+4. 把调用形式、异常 / 返回、原代码行号、关键输出写入 `<workspace>/offline_assertion_<id>/outputs/result.json`。评估分数仅看断言是否通过与原代码行号是否一致。
+
+### 协议 #1：B 站 `series_name` 必须绑定公开证据（源自 iter-2 eval-3 / CASE-021）
+
+父作品 `platform_metrics.series_name` 为 `null` 时，分类结果中 `series_name` 也必须为 `null`；不得从标题、标签、相似作品或常识补出栏目 / 合集名。任何其它取值都应当被 `validate_classification_results` 拒绝并附 `ValueError`，消息必须明显包含 `series_name` 与 `public evidence` 两个关键字段前缀。离线 pytest 实现在 `tests/test_series_name_public_evidence_repro.py`，跑通即视为契约被守。
+
+Heredoc 模板（token / 账号 ID 占位符必须按实际替换；评估脚本不允许脱敏替换）：
+
+```python
+import sys
+sys.path.insert(0, '<skill>/scripts')
+from analyze import validate_classification_results
+
+parent_posts = [{
+    'platform': 'bilibili',
+    'post_id': 'BV_offline_probe',
+    'is_repost': None,
+    'platform_metrics': {},  # 公开字段里没有 series_name
+}]
+classification_results = [{
+    'post_id': 'BV_offline_probe',
+    'topic': 'unknown', 'format': 'other', 'funnel_stage': 'unknown',
+    'hook_type': 'unknown',
+    'series_name': '标题猜测栏目',  # ← 违规值
+    'is_original': None,
+    'has_product_placement': None,
+    'analysis_labels': [],
+    'classification_confidence': 0.0,
+}]
+try:
+    validate_classification_results(parent_posts, classification_results)
+    raise SystemExit('FAIL:实现接受了猜测的 series_name')
+except ValueError as e:
+    msg = str(e)
+    assert 'series_name' in msg and 'public evidence' in msg, (
+        f'异常消息应同时提到 series_name 与 public evidence,实际: {msg!r}'
+    )
+    print('PASS:', msg)
+```
+
+### 协议 #2：抖音 OpenAPI 身份与末页合同（源自 iter-2 eval-4 / CASE-019）
+
+凭据留在环境，不触发实际网络；评估脚本应直接校验下面这些**文档级不变量**，并引用 `skill/scripts/collectors/douyin_openapi.py` 与 `skill/scripts/collect_douyin_authorized.py` 的当前行号（行号随提交漂移，契约脚本须把行号取出来比对）。任一条不通过都视为合同破坏。
+
+- `userinfo` 必须在任何 `video.list` 之前以同次 OAuth 的 access token + `open_id` 做身份回证；`data.open_id` 与输入 `open_id` **逐字一致**才放行视频页请求。
+- 只有官方 `video.list` 响应的 `has_more=false` 能使 `is_exhaustive=true` / `terminal_page_observed=true`；数量、时长、空闲预算、滚动预算和平台保护都不能标记穷尽。
+- token 仅允许在固定 HTTPS `oauth/userinfo` 的 form-urlencoded 请求体和 `video.list` 的 `access-token` 请求头出现；URL、命令行、shell 历史、日志、异常、诊断、产物中均不得出现。
+- 第三方 `open_id` 查询（包括把别人 token 拿来查任何其他账号）必须拒绝；userinfo 阶段 `data.open_id` 不一致即写 `FAILED / OPENAPI_ERROR`，**绝不退回"再试一次"**。
+
+### 协议 #3：公开页面快照免责声明与字段可见性
+
+匿名来源的最终报告必须显著标记"公开页面快照，不代表账号后台真实曝光和转化"；未被页面公开展示的字段统一 `null`，不写 `0`，不推断。与 Gotchas 段 `null` ≠ 0 同源，与本研究所有 PRD 接受标准的 AC 契约一致。
+
+### 评估与回归
+
+- 每个协议在 `evals/evals.json` 中保留一条 `prompt + expected_output + assertions`；`pytest tests/` 全量通过率视作契约稳定性。
+- 任一协议失败 → 视为对应实现已破坏，立刻停止当期任务并在任务报告里以红色 stop_reason 标记，**不基于印象继续推进**。
+
 ## 输出验证清单
 
 - [ ] 最终答复在分析结论前先展示数据质量摘要（成功/失败/受限数量与字段覆盖率）
