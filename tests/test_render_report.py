@@ -358,8 +358,37 @@ def test_non_exhaustive_bilibili_sample_is_not_mislabeled_as_index_evidence():
 
     for rendered in (md, html):
         assert "索引证据" not in rendered
-        assert "周均发布量" in rendered
+        assert "样本窗口折算周均" in rendered
+        assert "不用于推断账号整体发布频率" in rendered
         assert "5.00" in rendered
+
+
+def test_latest_n_cadence_uses_sample_labels_and_skips_scheduling_advice():
+    analysis = _sample_analysis()
+    analysis["meta"] = {
+        "platform": "douyin",
+        "evidence_is_exhaustive": False,
+    }
+    analysis["publish_cadence"].update({
+        "scope": "latest_n_sample",
+        "cadence_inference_allowed": False,
+        "scope_note": (
+            "当前为明确条数限制的最新作品样本；仅描述样本窗口，"
+            "不用于推断账号整体发布频率或排播规律。"
+        ),
+    })
+    analysis["sample_boundary"] = {"valid": 5}
+
+    cadence_md, cadence_html = render_report.build_publish_cadence(analysis)
+    strategy_md, strategy_html = render_report.build_strategy(analysis, {})
+
+    for rendered in (cadence_md, cadence_html):
+        assert "样本窗口折算周均" in rendered
+        assert "样本发布间隔中位数" in rendered
+        assert "不用于推断账号整体发布频率" in rendered
+    for rendered in (strategy_md, strategy_html):
+        assert "优先排播" not in rendered
+        assert "稳定更新锚点" not in rendered
 
 
 def test_render_rejects_conflicting_root_and_meta_classification_lifecycle():
@@ -880,6 +909,318 @@ def _auditable_performance_item(**overrides):
     return item
 
 
+def _auditable_performance_items(count):
+    return [
+        _auditable_performance_item(
+            post_id=str(1000 + index),
+            title=f"样本 {index}",
+            post_url=f"https://www.douyin.com/video/{1000 + index}",
+            evidence_url=f"https://www.douyin.com/video/{1000 + index}",
+            rank=index + 1,
+            value=100 - index,
+        )
+        for index in range(count)
+    ]
+
+
+def test_decision_summary_connects_computed_metrics_to_content_evidence():
+    top_post = _auditable_performance_item(
+        title="最高触达作品",
+        value=10_771,
+        main_metric="views",
+        metrics={
+            "views": 10_771,
+            "likes": 420,
+            "comments": 31,
+            "favorites": 89,
+            "shares": 12,
+            "coins": None,
+            "danmaku": None,
+        },
+    )
+    posts = [
+        {
+            **_auditable_performance_item(
+                post_id=str(2000 + index),
+                post_url=f"https://www.douyin.com/video/{2000 + index}",
+                evidence_url=f"https://www.douyin.com/video/{2000 + index}",
+            ),
+            "topic": "校园" if index < 12 else "游戏",
+            "format": "故事" if index < 11 else "实况",
+        }
+        for index in range(20)
+    ]
+    analysis = {
+        "meta": {
+            "platform": "douyin",
+            "main_sort_metric": "views",
+            "evidence_is_exhaustive": True,
+            "classification_status": "completed",
+            "business_insight_status": "completed",
+        },
+        "classification_status": "completed",
+        "sample_boundary": {
+            "valid": 20,
+            "time_range": {
+                "content_earliest": "2024-01-01",
+                "content_latest": "2026-07-01",
+            },
+        },
+        "metric_summary": {
+            "views": {
+                "count": 20,
+                "median": 212,
+                "p25": 70,
+                "p75": 427,
+                "minimum": 12,
+                "maximum": 10_771,
+                "missing_rate": 0.0,
+            }
+        },
+        "engagement": {
+            "view_based_engagement_rate": {
+                "count": 20,
+                "median": 0.08,
+            },
+            "deep_approval_rate": {"count": 20, "median": 0.03},
+            "community_discussion_rate": {"count": 20, "median": 0.012},
+        },
+        "publish_cadence": {
+            "median_interval_hours": 288,
+            "cadence_inference_allowed": True,
+        },
+        "high_performance": [top_post],
+        "posts": posts,
+    }
+
+    markdown, html = render_report.build_decision_summary(analysis)
+
+    for rendered in (markdown, html):
+        assert "20 条有效作品" in rendered
+        assert "播放中位数 212" in rendered
+        assert "70–427" in rendered
+        assert "峰值约为中位数 50.8 倍" in rendered
+        assert "播放互动率中位数 8.0%" in rendered
+        assert "深度认可率 3.0%" in rendered
+        assert "社群讨论率 1.2%" in rendered
+        assert "主题「校园」占 60.0%（12/20）" in rendered
+        assert "发布间隔中位数 12.0 天" in rendered
+        assert "最高触达作品" in rendered
+    assert "[作品链接](https://www.douyin.com/video/1001)" in markdown
+    assert 'href="https://www.douyin.com/video/1001"' in html
+
+
+def test_render_places_decision_summary_before_detailed_sections():
+    top_post = _auditable_performance_item(
+        main_metric="views",
+        value=1000,
+        metrics={"views": 1000},
+    )
+    analysis = {
+        "classification_status": "completed",
+        "meta": {
+            "platform": "douyin",
+            "account_name": "摘要账号",
+            "classification_status": "completed",
+            "main_sort_metric": "views",
+            "evidence_is_exhaustive": False,
+        },
+        "sample_boundary": {
+            "valid": 20,
+            "time_range": {
+                "content_earliest": "2026-01-01",
+                "content_latest": "2026-07-01",
+            },
+        },
+        "metric_summary": {
+            "views": {
+                "count": 20,
+                "median": 200,
+                "p25": 100,
+                "p75": 400,
+                "minimum": 10,
+                "maximum": 1000,
+                "missing_rate": 0.0,
+            }
+        },
+        "high_performance": [top_post],
+        "low_performance": [],
+        "posts": [],
+    }
+
+    result = render_report.render_in_memory(
+        profile={"platform": "douyin", "account_name": "摘要账号"},
+        posts_csv=[{"post_url": top_post["post_url"]}],
+        analysis=analysis,
+        template=_template_with_existing_placeholders(),
+    )
+
+    assert result.markdown.index("**决策摘要**") < result.markdown.index(
+        "## 1. 报告标题与任务信息"
+    )
+    assert "决策摘要" in result.html
+    assert result.html.index("决策摘要") < result.html.index("任务状态")
+
+
+def test_render_rejects_reversed_metric_quantiles():
+    analysis = {
+        "classification_status": "completed",
+        "meta": {
+            "platform": "bilibili",
+            "account_name": "分位数校验账号",
+            "classification_status": "completed",
+            "main_sort_metric": "views",
+            "evidence_is_exhaustive": False,
+        },
+        "sample_boundary": {"valid": 20},
+        "metric_summary": {
+            "views": {
+                "count": 20,
+                "median": 212,
+                "p25": 427,
+                "p75": 70,
+                "minimum": 12,
+                "maximum": 10_771,
+                "missing_rate": 0.0,
+            }
+        },
+        "high_performance": [],
+        "low_performance": [],
+        "posts": [],
+    }
+
+    with pytest.raises(
+        render_report.RenderError,
+        match="metric_summary.views quantiles are inconsistent",
+    ):
+        render_report.render_in_memory(
+            profile={
+                "platform": "bilibili",
+                "account_name": "分位数校验账号",
+            },
+            posts_csv=[],
+            analysis=analysis,
+            template=_template_with_existing_placeholders(),
+        )
+
+
+def test_human_report_limits_high_group_without_mutating_audit_payload():
+    items = _auditable_performance_items(12)
+    analysis = {
+        "meta": {"platform": "douyin", "main_sort_metric": "likes"},
+        "high_performance": items,
+        "low_performance": [],
+        "core_insights": [{
+            "id": "performance-high",
+            "kind": "high_performance",
+            "statement": "完整高表现组。",
+            "main_metric": "likes",
+            "evidence": [
+                {
+                    "post_id": item["post_id"],
+                    "url": item["evidence_url"],
+                    "url_kind": "item",
+                    "collected_at": item["collected_at"],
+                    "metrics": item["metrics"],
+                    "rank": item["rank"],
+                    "value": item["value"],
+                }
+                for item in items
+            ],
+        }],
+    }
+
+    markdown, html = render_report.build_high_performance(analysis)
+
+    for rendered in (markdown, html):
+        assert rendered.count("item（作品链接）") == 5
+        assert "完整高表现组共 12 条" in rendered
+        assert "完整证据保存在 analysis.json" in rendered
+        assert "1004" in rendered
+        assert "1005" not in rendered
+        assert "核心洞察 performance-high" not in rendered
+    assert len(analysis["high_performance"]) == 12
+    assert len(analysis["core_insights"][0]["evidence"]) == 12
+
+
+def test_human_report_uses_most_extreme_low_group_representatives():
+    items = _auditable_performance_items(12)
+    analysis = {
+        "meta": {"platform": "douyin", "main_sort_metric": "likes"},
+        "high_performance": [],
+        "low_performance": items,
+        "core_insights": [],
+    }
+
+    markdown, html = render_report.build_low_performance(analysis)
+
+    for rendered in (markdown, html):
+        assert rendered.count("item（作品链接）") == 5
+        assert "完整低表现组共 12 条" in rendered
+        assert "1007" in rendered
+        assert "1011" in rendered
+        assert "1006" not in rendered
+    assert len(analysis["low_performance"]) == 12
+
+
+def test_human_report_sources_list_only_cited_posts_and_point_to_audit_files():
+    items = _auditable_performance_items(12)
+    analysis = {
+        "meta": {
+            "platform": "douyin",
+            "account_name": "可读报告测试",
+            "main_sort_metric": "likes",
+        },
+        "posts": items,
+        "high_performance": items[:1],
+        "low_performance": [],
+        "core_insights": [],
+    }
+    profile = {
+        "platform": "douyin",
+        "account_name": "可读报告测试",
+        "profile_url": "https://www.douyin.com/user/example",
+    }
+
+    result = render_report.render_in_memory(
+        profile=profile,
+        posts_csv=items,
+        analysis=analysis,
+        template=_template_with_existing_placeholders(),
+    )
+    sources = result.markdown.split("## 12. 来源链接", 1)[1]
+
+    assert "https://www.douyin.com/video/1000" in sources
+    assert "https://www.douyin.com/video/1001" not in sources
+    assert "normalized-posts.csv" in sources
+    assert "analysis.json" in sources
+
+
+def test_pending_semantic_analysis_is_labeled_as_data_overview():
+    analysis = {
+        "classification_status": "pending-model",
+        "meta": {
+            "platform": "douyin",
+            "account_name": "待分析账号",
+            "classification_status": "pending-model",
+        },
+        "posts": [],
+        "high_performance": [],
+        "low_performance": [],
+    }
+
+    result = render_report.render_in_memory(
+        profile={"platform": "douyin", "account_name": "待分析账号"},
+        posts_csv=[],
+        analysis=analysis,
+        template=_template_with_existing_placeholders(),
+    )
+
+    assert result.markdown.startswith("# 公开账号数据概览：待分析账号")
+    assert "语义分类尚未完成" in result.markdown
+    assert "不能作为深度内容策略报告" in result.markdown
+
+
 def test_performance_rows_render_complete_audit_contract_in_both_formats():
     analysis = {
         "meta": {"main_sort_metric": "likes"},
@@ -1008,7 +1349,7 @@ def test_profile_index_anchor_requires_a_canonical_douyin_profile(candidate):
     assert f'href="{candidate}"' not in html
 
 
-def test_core_insights_render_source_statements_and_every_evidence_row():
+def test_core_insights_remain_in_audit_payload_instead_of_repeating_in_report():
     item = _auditable_performance_item()
     analysis = {
         "meta": {"platform": "douyin", "main_sort_metric": "likes"},
@@ -1037,18 +1378,15 @@ def test_core_insights_render_source_statements_and_every_evidence_row():
 
     md, html = render_report.build_high_performance(analysis)
 
-    expected = (
-        "performance-high",
-        "高表现组按 likes 确定性排名。",
-        "1002",
-        "item（作品链接）",
-        "rank=2",
-        "likes=41",
-        "2026-07-03T10:00:00+08:00",
-    )
     for rendered in (md, html):
-        for value in expected:
-            assert value in rendered
+        assert "完整证据保存在 analysis.json" in rendered
+        assert "performance-high" not in rendered
+        assert "高表现组按 likes 确定性排名。" not in rendered
+        assert "1002" not in rendered
+    evidence = analysis["core_insights"][0]["evidence"]
+    assert evidence[0]["post_id"] == "1002"
+    assert evidence[0]["rank"] == 2
+    assert evidence[0]["value"] == 41
 
 
 def test_business_evidence_deduplicates_exact_records_in_first_seen_order():
@@ -1095,6 +1433,45 @@ def test_business_evidence_deduplicates_exact_records_in_first_seen_order():
     assert html.count("<td>text</td><td>证据乙</td>") == 1
     assert markdown.index("证据甲") < markdown.index("证据乙")
     assert html.index("证据甲") < html.index("证据乙")
+
+
+def test_human_business_claim_caps_inline_evidence_and_points_to_audit_source():
+    evidence = [
+        {
+            "post_id": str(2000 + index),
+            "source_field": "title",
+            "excerpt": f"证据 {index}",
+            "url": f"https://www.douyin.com/video/{2000 + index}",
+            "url_kind": "item",
+            "item_url_known": True,
+            "collected_at": "2026-07-03T10:00:00+08:00",
+        }
+        for index in range(6)
+    ]
+    analysis = {
+        "meta": {"platform": "douyin"},
+        "business_insights": {
+            "status": "completed",
+            "topic_ideas": [{
+                "id": "topic-01",
+                "title": "有判断的选题",
+                "rationale": "这是面向人的解释，而不是证据清单。",
+                "evidence": evidence,
+            }],
+            "experiments": [],
+            "limitations": [],
+        },
+    }
+
+    markdown, html = render_report.build_strategy(analysis, {})
+
+    for rendered in (markdown, html):
+        assert "证据 0" in rendered
+        assert "证据 2" in rendered
+        assert "证据 3" not in rendered
+        assert "正文仅展示 3 条代表证据" in rendered
+        assert "source/business-insight-results.json" in rendered
+    assert len(analysis["business_insights"]["topic_ideas"][0]["evidence"]) == 6
 
 
 def test_performance_and_insight_fields_escape_markup_and_reject_unsafe_urls():
@@ -1212,7 +1589,21 @@ def test_sources_keep_canonical_jingxuan_item_link_bound_to_parent_id():
                 "collection_source": "douyin_jingxuan",
             }
         ],
-        "high_performance": [],
+            "high_performance": [{
+                "platform": "douyin",
+                "post_id": post_id,
+                "title": "精选作品",
+                "post_url": url,
+                "evidence_url": url,
+                "item_url_known": True,
+                "url_kind": "item",
+                "collection_source": "douyin_jingxuan",
+                "main_metric": "likes",
+                "value": 1,
+                "rank": 1,
+                "metrics": {"likes": 1},
+                "collected_at": "2026-07-30T10:00:00+08:00",
+            }],
         "low_performance": [],
     }
 

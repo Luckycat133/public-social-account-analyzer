@@ -245,11 +245,12 @@ def test_docs_describe_zero_python_dependency_browser_fallback():
     assert "SOCIAL_BROWSER_FALLBACK" in usage
     assert "不新增 pip" in platform
     assert "临时用户目录" in platform
-    assert "实验性支持" in skill
-    assert "SSR 缺失或作品列表结构无法识别" in skill
-    assert "默认自动降级" in skill
-    assert "--no-browser-fallback" in skill
-    assert "BROWSER_UNAVAILABLE" in skill
+    assert "platform-douyin.md" in skill
+    assert "仓库脚本擅长 B站和抖音" in skill
+    assert "SSR 缺失或作品列表结构无法识别" in platform
+    assert "默认自动启动浏览器降级" in platform
+    assert "--no-browser-fallback" in platform
+    assert "BROWSER_UNAVAILABLE" in platform
     assert "SSR 作品列表缺失" not in docs
     assert "若 `RENDER_DATA` 存在但无法识别作品列表，仍返回 `PARSER_FAILED`" not in docs
     assert "仅在主页没有可解析的 `RENDER_DATA`" not in docs
@@ -1529,17 +1530,17 @@ def test_all_disabled_browser_records_requested_and_launched_false():
     assert coverage["browser_fallback_launched"] is False
 
 
-def test_all_rejects_non_douyin_urls_before_writing(monkeypatch, tmp_path):
+def test_all_rejects_unsupported_platform_before_writing(monkeypatch, tmp_path):
     import collect
 
     class OtherAdapter(_AllDouyinAdapter):
-        platform = "bilibili"
+        platform = "weibo"
 
     monkeypatch.setattr(collect, "_load_adapters", lambda: [OtherAdapter()])
     out = tmp_path / "task"
 
     rc = collect.run(
-        "https://space.bilibili.com/1",
+        "https://weibo.com/u/1",
         out_dir=str(out),
         collect_all=True,
     )
@@ -2361,6 +2362,19 @@ class FakeBrowser:
         return self.cards
 
 
+class PageContextBrowser(FakeBrowser):
+    """Browser double exposing same-origin fetch after profile navigation."""
+
+    def __init__(self, responses, **kwargs):
+        super().__init__(**kwargs)
+        self.responses = list(responses)
+        self.fetches = []
+
+    def fetch_text(self, url, headers=None, timeout=None):
+        self.fetches.append({"url": url, "headers": headers, "timeout": timeout})
+        return json.dumps(self.responses.pop(0))
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -2441,6 +2455,126 @@ def test_all_transport_accepts_exact_caps_and_reports_effective_max_items():
 
     assert result.coverage["max_items"] == 50_000
     assert result.coverage["stop_condition"] == "terminal_page"
+
+
+def test_account_post_integer_has_more_is_normalized_to_terminal_boolean():
+    """Douyin's real public response uses 0/1 as well as JSON booleans."""
+    from collectors._douyin_browser_transport import collect_account_page
+
+    browser = FakeBrowser(
+        events=[
+            _bound_post_response("integer-terminal"),
+            _loading_event("Network.loadingFinished", "integer-terminal"),
+        ],
+        bodies={
+            "integer-terminal": json.dumps({
+                "aweme_list": [ACCOUNT_AWEME],
+                "has_more": 0,
+                "max_cursor": 0,
+            })
+        },
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item["aweme_id"] for item in result.aweme_items] == ["7001"]
+    assert result.coverage["terminal_page_observed"] is True
+    assert result.coverage["is_exhaustive"] is True
+    assert result.diagnostics["failed_account_post_count"] == 0
+
+
+def test_account_page_never_expands_to_page_context_fetch_when_passive_feed_is_empty():
+    """The browser collector remains a passive page-observation path."""
+
+    from collectors._douyin_browser_transport import collect_account_page
+
+    second = {
+        **ACCOUNT_AWEME,
+        "aweme_id": "7002",
+        "desc": "第二条公开作品",
+    }
+    browser = PageContextBrowser(
+        [
+            {
+                "aweme_list": [ACCOUNT_AWEME],
+                "has_more": 1,
+                "max_cursor": "next-page",
+            },
+            {
+                "aweme_list": [second],
+                "has_more": 0,
+                "max_cursor": "terminal",
+            },
+        ]
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        max_scrolls=2,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.aweme_items == []
+    assert result.coverage["is_exhaustive"] is False
+    assert result.diagnostics["page_context_fallback_used"] is False
+    assert result.diagnostics["page_context_request_count"] == 0
+    assert browser.fetches == []
+
+
+def test_page_context_fetch_never_runs_after_visible_login_wall():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    browser = PageContextBrowser(
+        [{"aweme_list": [ACCOUNT_AWEME], "has_more": 0}],
+        page_texts=["登录后查看"],
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        max_scrolls=1,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.restriction == STOP_LOGIN
+    assert browser.fetches == []
+
+
+def test_passive_browser_ignores_foreign_author_and_cannot_claim_complete():
+    from collectors._douyin_browser_transport import collect_account_page
+
+    foreign = {
+        **ACCOUNT_AWEME,
+        "author": {"sec_uid": "another-account"},
+    }
+    browser = PageContextBrowser(
+        [{"aweme_list": [foreign], "has_more": 0, "max_cursor": 0}]
+    )
+
+    result = collect_account_page(
+        ACCOUNT_URL,
+        limit=100,
+        all_posts=True,
+        max_scrolls=1,
+        session_factory=lambda: browser,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.aweme_items == []
+    assert result.coverage["is_exhaustive"] is False
+    assert result.diagnostics["failed_account_post_count"] == 0
+    assert browser.fetches == []
 
 
 def test_all_collector_forwards_exact_caps_and_reports_effective_max_items():
@@ -5893,6 +6027,8 @@ def test_browser_runtime_coverage_reaches_workspace_without_secrets(
                 "requested_all": False,
                 "browser_fallback_requested": True,
                 "browser_fallback_launched": True,
+                "page_context_fallback_used": True,
+                "page_context_request_count": 2,
                 "browser_evidence_source": "network+dom",
                 "scroll_rounds": 3,
                 "max_seconds": 90.0,
@@ -5924,6 +6060,8 @@ def test_browser_runtime_coverage_reaches_workspace_without_secrets(
     ]
     assert coverage["browser_fallback_requested"] is True
     assert coverage["browser_fallback_launched"] is True
+    assert coverage["page_context_fallback_used"] is True
+    assert coverage["page_context_request_count"] == 2
     assert coverage["browser_evidence_source"] == "network+dom"
     assert coverage["scroll_rounds"] == 3
     assert coverage["max_seconds"] == 90.0
@@ -6377,67 +6515,6 @@ def test_ies_profile_api_preserves_explicit_verification_tristate(
 
 
 @pytest.mark.parametrize(
-    "conflicting_binding",
-    [
-        {"sec_uid": "other-account"},
-        {
-            "sec_uid": "example",
-            "profile_url": "https://www.douyin.com/user/other-account",
-        },
-    ],
-)
-def test_ies_profile_api_rejects_conflicting_account_binding_without_cache_pollution(
-    monkeypatch, conflicting_binding
-):
-    """An API response must prove the requested account instead of being relabelled."""
-    from collectors.douyin import DouyinCollector, DouyinError, STOP_PARSER_FAILED
-
-    payload = {
-        "user_info": {
-            "unique_id": "other-public-id",
-            "nickname": "错误账号",
-            **conflicting_binding,
-        }
-    }
-
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
-        def read(self):
-            return json.dumps(payload).encode("utf-8")
-
-    collector = DouyinCollector()
-    collector._cache_browser_profile(
-        ACCOUNT_URL,
-        {
-            "profile_url": ACCOUNT_URL,
-            "sec_uid": "example",
-            "nickname": "原缓存账号",
-        },
-    )
-    cache_before = json.dumps(
-        collector._browser_profile_cache, ensure_ascii=False, sort_keys=True
-    )
-    monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
-    monkeypatch.setattr(
-        "urllib.request.urlopen", lambda _request, timeout: Response()
-    )
-
-    with pytest.raises(DouyinError) as exc_info:
-        collector.collect_profile(ACCOUNT_URL)
-
-    assert exc_info.value.stop_reason == STOP_PARSER_FAILED
-    assert exc_info.value.raw is None
-    assert json.dumps(
-        collector._browser_profile_cache, ensure_ascii=False, sort_keys=True
-    ) == cache_before
-
-
-@pytest.mark.parametrize(
     "conflicting_user",
     [
         {
@@ -6629,6 +6706,42 @@ def test_browser_profile_sanitizer_is_idempotent_for_public_verification_text():
     assert second["verified"] == "机构认证"
 
 
+def test_browser_profile_merge_discloses_conflicting_public_counters():
+    from collectors._douyin_browser_transport import extract_profile_raw
+
+    profile = extract_profile_raw(
+        {
+            "snapshots": [
+                {
+                    "sec_uid": "example",
+                    "follower_count": 10,
+                    "aweme_count": 4330,
+                    "total_favorited": 100,
+                },
+                {
+                    "sec_uid": "example",
+                    "follower_count": 11,
+                    "aweme_count": 4338,
+                    "total_favorited": 120,
+                },
+            ]
+        },
+        ACCOUNT_URL,
+    )
+
+    assert profile["followers"] == 10
+    assert profile["post_count"] == 4330
+    assert profile["platform_metrics"]["total_likes"] == 100
+    assert profile["platform_metrics"]["profile_conflicts"] == {
+        "followers": {"selected": 10, "observed_values": [10, 11]},
+        "post_count": {"selected": 4330, "observed_values": [4330, 4338]},
+        "total_likes": {"selected": 100, "observed_values": [100, 120]},
+    }
+    assert profile["field_visibility"]["followers"] == "partial"
+    assert profile["field_visibility"]["post_count"] == "partial"
+    assert profile["field_visibility"]["total_likes"] == "partial"
+
+
 @pytest.mark.parametrize("dom_first", [False, True])
 def test_browser_profile_cache_merges_snapshots_without_losing_stronger_fields(
     dom_first,
@@ -6752,49 +6865,34 @@ def test_browser_profile_cache_falls_back_after_ssr_and_api_profile_fail(monkeyp
     assert "cursor" not in serialized
 
 
-def test_live_profile_merges_api_identity_with_visible_browser_certification(
-    monkeypatch,
-):
-    """API identity stays exact while visible account-bound certification wins."""
+def test_profile_shell_uses_the_browser_path_without_iesdouyin_fallback(monkeypatch):
+    """A public shell has one recovery path: the configured browser session."""
+    from collectors._douyin_browser_transport import DouyinBrowserResult
     from collectors.douyin import DouyinCollector
 
-    collector = DouyinCollector()
-    collector._cache_browser_profile(
-        ACCOUNT_URL,
-        {
-            "profile_url": ACCOUNT_URL,
-            "sec_uid": "example",
-            "nickname": "公开昵称",
-            "dom_verified_badge": "搞笑短视频创作者",
-        },
+    collector = DouyinCollector(
+        browser_collect=lambda **_request: DouyinBrowserResult(
+            aweme_items=[],
+            profile_raw={
+                "profile_url": ACCOUNT_URL,
+                "sec_uid": "example",
+                "unique_id": "public-id",
+                "nickname": "浏览器资料",
+                "follower_count": 0,
+            },
+        )
     )
     monkeypatch.setattr(collector, "_fetch", lambda _url: "<html>shell</html>")
     monkeypatch.setattr(
         collector,
         "_fetch_profile_via_iesdouyin_api",
-        lambda _sec_uid, _url: {
-            "platform": "douyin",
-            "account_id": "8533800Pt",
-            "account_name": "公开昵称",
-            "profile_url": ACCOUNT_URL,
-            "bio": "公开简介",
-            "verified": False,
-            "followers": 12_815_000,
-            "post_count": 726,
-            "platform_metrics": {
-                "total_likes": 148_136_347,
-                "sec_uid": "example",
-                "unique_id": "8533800Pt",
-            },
-            "field_visibility": {},
-        },
+        lambda *_args: (_ for _ in ()).throw(AssertionError("iesdouyin must not run")),
     )
 
     profile = collector.collect_profile(ACCOUNT_URL)
 
-    assert profile["account_id"] == "8533800Pt"
-    assert profile["platform_metrics"]["total_likes"] == 148_136_347
-    assert profile["verified"] == "搞笑短视频创作者"
+    assert profile["account_name"] == "浏览器资料"
+    assert profile["followers"] == 0
 
 
 def test_ssr_profile_merges_same_account_visible_browser_certification(monkeypatch):

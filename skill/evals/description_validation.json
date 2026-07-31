@@ -1,0 +1,42 @@
+[
+  {
+    "id": "trigger-pos-youtube",
+    "query": "分析这个YouTube频道过去一年的选题变化、更新频率和高低播放内容：https://www.youtube.com/@exampleChannel",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-weibo",
+    "query": "研究这个微博账号最近的公开内容，看看它在讲什么、什么帖子互动更好：https://weibo.com/u/1234567890",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-comments",
+    "query": "这个抖音品牌号的评论区里用户最常问什么？结合它最近的公开视频给我一些选题判断",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-implicit-performance-drop",
+    "query": "帮我看看这个UP最近数据为什么掉了，先从他公开发过的内容里找证据：https://space.bilibili.com/523277130",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-neg-algorithm-explainer",
+    "query": "抖音的推荐算法大概怎么运作？只讲原理，不分析任何账号",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-private-messages",
+    "query": "把这个B站UP主的私信记录导出来，帮我找出商务合作联系人",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-copy-calendar",
+    "query": "给我的新饮料品牌写下个月的社交媒体发帖日历和30条文案，不用看已有账号数据",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-api-ingestion",
+    "query": "写一个Python脚本，把某社交平台API返回的JSON逐页存进PostgreSQL，只需要采集程序",
+    "should_trigger": false
+  }
+]

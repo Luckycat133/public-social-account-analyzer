@@ -8,28 +8,31 @@
    Skill）与 ``--setting-sources project``（不加载用户级设置，杜绝
    ``~/.claude/skills`` 泄漏）。with_skill 侧则把 Skill 复制进工作区的
    ``.claude/skills/<name>``。两侧使用同一模型，保证可比。
-2. **标准目录结构**：产物固定写入
+2. **标准目录结构与版本指纹**：产物固定写入
    ``<iteration>/eval-<name>/<config>/run-<n>/``，包含 run.json、
    response.md、timing.json（数值墙钟秒 + 可用时的 token 用量）与
-   grading-input.json（断言清单，供独立 grader 填写 grading.json）。
+   grading-input.json（断言清单，供独立 grader 填写 grading.json）；根元数据
+   保存实际复制的 `SKILL.md` SHA-256，防止旧安装包被误当成当前版本。
 
 token 说明：使用 ``--output-format json`` 时从 Claude Code 返回的
 usage 字段读取；不可用时写 null，绝不估算。
 
-前置条件：``claude`` CLI 已登录（``claude /login``）。runner 启动时做
-preflight 冒烟，未登录立即以 BLOCKED 退出，不产出半成品目录。
+前置条件：``claude`` CLI 已配置可用的 Anthropic 或 Ollama 兼容端点。runner
+启动时做 preflight 冒烟；端点、认证或本地模型不可用时立即以 BLOCKED 退出，
+不产出半成品目录。
 
 用法::
 
     python tools/skill_eval/runner.py \
         --evals skill/evals/evals.json --ids 1,7,10 \
         --iteration workspace/skill-evals/claude-isolated/iteration-2 \
-        --skill-dir skill --runs 1 [--model sonnet] [--timeout 900]
+        --skill-dir skill --runs 3 [--model sonnet] [--timeout 900]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -71,8 +74,9 @@ def preflight(model: str) -> None:
     combined = (proc.stdout + proc.stderr).lower()
     if "not logged in" in combined or "please run /login" in combined:
         raise SystemExit(
-            "BLOCKED: claude CLI is not logged in. Run `claude /login` "
-            "in a terminal first; the runner refuses to start half-runs."
+            "BLOCKED: claude CLI has no usable authentication/endpoint. "
+            "Configure `claude /login` or an Ollama Anthropic-compatible "
+            "endpoint first; the runner refuses to start half-runs."
         )
     if proc.returncode != 0:
         raise SystemExit(f"BLOCKED: claude preflight failed: {combined[:400]}")
@@ -154,9 +158,22 @@ def execute_run(
     except json.JSONDecodeError:
         pass
 
-    (run_dir / "response.md").write_text(
-        response_text if isinstance(response_text, str) else json.dumps(
-            response_text, ensure_ascii=False), encoding="utf-8")
+    response_body = (
+        response_text
+        if isinstance(response_text, str)
+        else json.dumps(response_text, ensure_ascii=False)
+    )
+    (run_dir / "response.md").write_text(response_body, encoding="utf-8")
+    viewer_outputs = run_dir / "outputs"
+    viewer_outputs.mkdir()
+    (viewer_outputs / "response.md").write_text(
+        response_body, encoding="utf-8"
+    )
+    (run_dir / "eval_metadata.json").write_text(json.dumps({
+        "eval_id": eval_def.get("id"),
+        "eval_name": eval_def.get("name"),
+        "prompt": eval_def.get("prompt"),
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if stderr.strip():
         (run_dir / "stderr.log").write_text(stderr, encoding="utf-8")
 
@@ -205,7 +222,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--iteration", required=True)
     parser.add_argument("--skill-dir", required=True)
     parser.add_argument("--configs", default="with_skill,without_skill")
-    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--model", default="sonnet")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--skip-preflight", action="store_true")
@@ -217,11 +234,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not (skill_dir / "SKILL.md").is_file():
         raise SystemExit(f"error: {skill_dir} is not a skill directory")
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
+    if args.runs < 1:
+        raise SystemExit("error: --runs must be >= 1")
+    unsupported_configs = [c for c in configs if c not in {
+        "with_skill", "without_skill",
+    }]
+    if unsupported_configs:
+        raise SystemExit(
+            "error: unsupported config(s): " + ", ".join(unsupported_configs)
+        )
 
     if not args.skip_preflight:
         preflight(args.model)
 
     iteration = Path(args.iteration)
+    iteration.mkdir(parents=True, exist_ok=True)
+    skill_contract_sha256 = hashlib.sha256(
+        (skill_dir / "SKILL.md").read_bytes()
+    ).hexdigest()
+    (iteration / "run-metadata.json").write_text(json.dumps({
+        "skill_name": SKILL_NAME,
+        "skill_contract_sha256": skill_contract_sha256,
+        "executor_model": args.model,
+        "runs_per_configuration": args.runs,
+        "configurations": configs,
+        "baseline_kind": "physically_isolated_without_skill",
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     for eval_def in evals:
         eval_dir = iteration / f"eval-{slugify(eval_def['name'])}"
         eval_dir.mkdir(parents=True, exist_ok=True)

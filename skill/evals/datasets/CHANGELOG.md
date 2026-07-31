@@ -5,6 +5,19 @@ All notable changes to the evaluation dataset are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and dataset versions use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-29
+
+### Changed
+
+- 模糊的 B站/抖音账号分析请求现在评测按用户目标与证据充分性自适应路由，不再断言固定最近 30 条或固定完整采集。
+- 明确日期窗口使用完整采集编排证明覆盖，取消抖音日期任务的隐含 100 条上限。
+- B站完整覆盖用例保留默认 10,000 条、硬上限 50,000 条预算；快速模糊请求不机械触发该预算。
+
+### Added
+
+- 新增抖音模糊请求、无签名同源页内分页、瞬态限制有界重试、最佳部分证据选择与样本节奏标签用例。
+- 新增用例后按固定 seed 42、test ratio 0.30 重新生成 validation/test 分区与 manifest。
+
 ## [0.2.0] - 2026-07-27
 
 ### Added

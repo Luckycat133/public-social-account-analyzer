@@ -1,0 +1,62 @@
+[
+  {
+    "id": "trigger-pos-bilibili-url",
+    "query": "分析这个B站账号最近的视频选题和发布节奏：https://space.bilibili.com/946974",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-douyin-colloquial",
+    "query": "帮我看看特别乌啦啦最近为什么有些视频特别爆、有些很一般，顺便总结他的内容套路",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-account-name-only",
+    "query": "研究一下B站的‘两颗皮蛋’，我想知道这个UP主主要有哪些栏目",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-user-data",
+    "query": "我已经导出了某品牌抖音号近半年的公开视频 CSV，帮我按选题、互动和发布时间分析内容策略",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-xiaohongshu",
+    "query": "看看这个小红书博主的公开笔记，分析她的选题结构和高赞内容共性：https://www.xiaohongshu.com/user/profile/5f0c2a1b0000000001001234",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-compare-accounts",
+    "query": "对比这两个公开美食账号最近三个月的内容定位、更新节奏和互动表现，告诉我各自强项",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-neg-download",
+    "query": "帮我把这个B站视频的原始文件下载下来：https://www.bilibili.com/video/BV1xx411c7mD",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-private-dashboard",
+    "query": "登录我自己的抖音创作者后台，把完播率、粉丝画像和收入明细导出来",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-account-operation",
+    "query": "帮我登录这个抖音号，把最近三条评论都回复一下",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-generic-methodology",
+    "query": "写一篇B站内容运营入门文章，面向刚毕业的新人，2000字左右",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-single-video-summary",
+    "query": "把这条YouTube视频转成文字并总结其中的三个主要观点：https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-trend-research",
+    "query": "整理一下本周小红书上流行的露营话题和热门标签，不需要研究具体账号",
+    "should_trigger": false
+  }
+]

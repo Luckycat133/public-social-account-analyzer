@@ -1,6 +1,6 @@
 # 公开社交媒体账号分析 Skill 评估数据集
 
-![Dataset Version](https://img.shields.io/badge/dataset-v0.2.0-blue)
+![Dataset Version](https://img.shields.io/badge/dataset-v0.3.0-blue)
 ![Format](https://img.shields.io/badge/format-JSONL-green)
 ![Split](https://img.shields.io/badge/split-stratified%20seed%2042-orange)
 
@@ -23,7 +23,7 @@
 
 当前数据由项目维护者根据以下仓库内契约人工整理：
 
-- `skill/SKILL.md` 中的触发条件、执行流程、输出契约与合规边界；
+- `skill/SKILL.md` 中的触发条件与合规边界，以及 `skill/references/workflow.md` 中的执行和输出契约；
 - `skill/evals/evals.json` 中的端到端评估用例；
 - `skill/evals/cases.md` 中的确定性验收场景；
 - `skill/references/` 中的数据模型、异常和平台规则。
@@ -185,6 +185,10 @@ python3 skill/scripts/split_dataset.py --verify
 ```
 
 完整开发、验收和发布流程见 [USAGE.md](USAGE.md)。路径配置示例见 [config.example.json](config.example.json)。
+
+Skill description 另使用 `skill/evals/description_train.json` 与
+`skill/evals/description_validation.json` 的固定 60/40 划分：共 20 条现实正例和近失负例，
+每题重复 3 次；只允许根据 train 失败修改 description。
 
 ## 版本管理
 

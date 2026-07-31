@@ -30,17 +30,23 @@ def validate_public_limit(value):
     return value
 
 
-def validate_public_all_budgets(max_items, max_seconds, max_scrolls):
-    """Return accepted public ``--all`` budgets without silently changing them."""
+def validate_public_all_max_items(value):
+    """Return an accepted bounded complete-collection item budget."""
     if (
-        isinstance(max_items, bool)
-        or not isinstance(max_items, int)
-        or max_items < 1
-        or max_items > PUBLIC_ALL_HARD_MAX_ITEMS
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > PUBLIC_ALL_HARD_MAX_ITEMS
     ):
         raise ValueError(
             f"max_items must be an integer from 1 to {PUBLIC_ALL_HARD_MAX_ITEMS}"
         )
+    return value
+
+
+def validate_public_all_budgets(max_items, max_seconds, max_scrolls):
+    """Return accepted public ``--all`` budgets without silently changing them."""
+    max_items = validate_public_all_max_items(max_items)
     if (
         isinstance(max_seconds, bool)
         or not isinstance(max_seconds, (int, float))

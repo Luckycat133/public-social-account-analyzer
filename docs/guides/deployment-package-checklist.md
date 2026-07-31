@@ -29,13 +29,20 @@
 
 > 如果你的部署是软链接到 dev `skill/`，则下表全部自动跟随；本节只在你需要做独立打包/分发时阅读。
 
+发布制品分为两类：Skill Creator 生成的 `.skill` 是运行时安装包，包含 `SKILL.md`、`VERSION`、`agents/`、`scripts/`、`references/` 和 `assets/`，标准打包器会排除根级 `evals/`；仓库级发布 ZIP 用于完整回归和审计，才必须同时包含本节列出的 `tests/`、`skill/evals/`、`docs/` 和 `tools/`。不得用运行时 `.skill` 声称“已携带完整回归环境”。
+
 ### 1.1 脚本层（运行时必需）
 
 ```text
 skill/
 ├── SKILL.md                           # Agent 入口指令
+├── VERSION                            # 安装包语义版本
+├── agents/
+│   └── openai.yaml                    # UI 名称、简介与默认调用提示
 ├── scripts/
 │   ├── collect.py                     # 采集入口
+│   ├── collect_bilibili_complete.py  # B站默认完整采集 + 有界重试
+│   ├── collect_douyin_complete.py    # 抖音默认完整采集 + 有界重试
 │   ├── normalize.py                   # 归一化
 │   ├── analyze.py                     # 指标 + 分类槽位
 │   ├── render_report.py               # 报告渲染
@@ -55,6 +62,7 @@ skill/
 │       ├── base.py
 │       ├── bilibili.py
 │       ├── douyin.py
+│       ├── douyin_cookies.py
 │       ├── douyin_openapi.py
 │       ├── weibo.py
 │       ├── browser_backend.py
@@ -67,6 +75,10 @@ skill/
 │   ├── data-schema.md
 │   ├── analysis-rules.md
 │   ├── exceptions.md
+│   ├── douyin-cookie-guide.md       # 用户合法会话导出指引
+│   ├── workflow.md
+│   ├── offline-acceptance.md
+│   ├── release-acceptance.md
 │   ├── platform-bilibili.md
 │   ├── platform-douyin.md
 │   ├── platform-weibo.md
@@ -84,7 +96,7 @@ tests/
 └── manual_accuracy_check.py           # AC-03 / AC-06 外部人工真值验收
 ```
 
-部署包**必须**含 `tests/`。否则 AC-09（≥15 个自动化测试）无法在部署端验证。
+仓库级发布 ZIP **必须**含 `tests/`。否则 AC-09（≥15 个自动化测试）无法在部署端验证；运行时 `.skill` 不承担这个验收用途。
 
 ### 1.3 评估与数据集（验收支撑）
 
@@ -115,6 +127,7 @@ docs/
 │   └── STRUCTURE.md
 ├── guides/
 │   ├── operations-trial-template.md        # AC-10 模板
+│   ├── prd-v1.0-acceptance-test-plan.md    # PRD 测试题、执行方法与发布门
 │   └── deployment-package-checklist.md     # 本文件
 └── prd/
     ├── 公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx
@@ -187,7 +200,10 @@ done
 
 # 2. 关键模块存在性
 for f in skill/scripts/run_pipeline.py skill/scripts/execution_timing.py \
+         skill/scripts/collect_bilibili_complete.py \
+         skill/scripts/collect_douyin_complete.py \
          tests/conftest.py tests/manual_accuracy_check.py \
+         skill/references/workflow.md skill/references/offline-acceptance.md \
          skill/references/douyin-index-evidence.md skill/evals/evals.json ; do
   if [ -e "/Users/jack/Documents/public-social-account-analyzer/$f" ]; then
     echo "OK  : $f"
@@ -198,9 +214,12 @@ done
 
 # 3. 采集 CLI 标志对齐
 python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/collect.py --help 2>&1 \
-  | grep -oE -- "--(all|enrich-details|no-browser-fallback|resume-out|max-items|checkpoint-out|resume-checkpoint)" \
+  | grep -oE -- "--(all|douyin-cookie-file|enrich-details|no-browser-fallback|resume-out|max-items|checkpoint-out|resume-checkpoint)" \
   | sort -u
-# 应输出全部 7 个 → 部署版与 dev 版 CLI 一致
+# 应输出全部 8 个 → 部署版与 dev 版 CLI 一致
+python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/collect_bilibili_complete.py --help >/dev/null
+python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/collect_douyin_complete.py --help >/dev/null
+# 两个默认完整采集编排入口都必须可执行
 
 # 4. 分析 CLI 标志对齐
 python3 /Users/jack/.agents/skills/public-social-account-analyzer/scripts/run_pipeline.py --help 2>&1 \
@@ -222,11 +241,11 @@ drift 任意一条失败 → 阻塞发布。
 
 ## 4. 版本发布流程（建议）
 
-1. dev 版本按 `pyproject.toml` 打 tag，例如当前 pre-1.0 版本使用 `git tag v0.5.1`
-2. 在 dev `skill/SKILL.md` 顶部 frontmatter 注明版本（如项目采用该字段）
+1. dev 版本按 `pyproject.toml` 打 tag，例如当前 pre-1.0 版本使用 `git tag v0.7.5`
+2. 同步 `skill/VERSION`；当前 frontmatter 由触发合同测试固定为四行，不另加版本字段
 3. 用第 3 节的 drift 检测全绿
 4. 更新 `CHANGELOG.md`（Keep a Changelog v1.1.0）
-5. 仅当选择“独立打包”时，按实际版本打包 §1 内容，例如 `public-social-account-analyzer-v0.5.1.zip`
+5. 仅当选择“独立打包”时，先将 `skill/` 复制到临时目录的 `public-social-account-analyzer/`，再运行 `python3 /path/to/skill-creator/scripts/package_skill.py /tmp/.../public-social-account-analyzer dist`，产出 `dist/public-social-account-analyzer.skill`。这样包内根目录与 frontmatter `name` 一致。包内 `VERSION` 必须与 `pyproject.toml` 一致；如需仓库级 ZIP，另命名为 `public-social-account-analyzer-v0.7.5.zip`。
 6. 否则保持软链接，本节不适用
 
 ---

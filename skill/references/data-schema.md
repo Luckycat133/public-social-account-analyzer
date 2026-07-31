@@ -3,6 +3,8 @@
 > 本文件是 **字段字典（field dictionary）**，冻结所有采集、归一化、分析与报告层共享的数据结构。
 > 在字段定义变更前，不得正式实现平台采集器；任何字段增删都须同步更新本文件、归一化脚本、分析脚本和报告模板。
 > 配套规范：`references/exceptions.md`（异常与状态机）、`references/analysis-rules.md`（指标与分类）、各 `references/platform-*.md`（平台字段映射）。
+>
+> 这些字段与目录约束只适用于本 Skill 生成的正式制品。Agent 的阶段性聊天答复或其他公开研究路径不需要伪造这套目录结构，但仍要遵守身份绑定、未知值、证据范围和不夸大原则。
 
 ## 1. 设计原则
 
@@ -44,11 +46,11 @@ workspace/<platform>-<account>-analysis/
   source/classification-results.json # 可选；严格核验后按原字节封存
   source/business-insight-results.json # 可选；绑定 collection/taxonomy 摘要后按原字节封存
   source/comment-insight-results.json # 可选；绑定评论源/规范语义输入摘要后按原字节封存
-  normalized-posts.csv             # 从 source/posts.jsonl 重新生成
+  normalized-posts.csv             # 从 source/posts.jsonl 重新生成；全量逐条审计表
   normalized-coverage.json         # 归一化覆盖与损失说明
-  analysis.json                    # 结构化分析结果
-  account-analysis-report.md # 分析报告（Markdown）
-  dashboard.html             # 可视化报告（HTML）
+  analysis.json                    # 全量结构化分析、排名与证据
+  account-analysis-report.md       # 面向人的有界分析报告（Markdown）
+  dashboard.html                   # 面向人的可视化报告（HTML）
   task.json                  # 派生任务状态与 phase_results
   pipeline-report.md         # 流水线阶段摘要
   taxonomy-prompt.md         # 可选；请求分类提示时生成
@@ -95,6 +97,10 @@ workspace/<platform>-<account>-analysis/
 `ANALYSIS_PARTIAL`；多个独立原因按稳定顺序并存且不得重复。无部分原因时为空数组。
 相同状态与原因必须同步进入 `analysis.json.meta`
 和最终报告，不能让派生任务与报告继续显示上游任务状态。
+采集 `task.json` 还包含 `skill_release` 与 `skill_contract_sha256`：前者必须逐字等于包内
+`VERSION`，后者绑定 `SKILL.md` 精确字节，用于区分测试实际加载的发行版与合同。`delivery-summary.json.delivery_ready` 只在 taxonomy
+及所有 requested business/comment 模型阶段均完成时为 `true`；上游 collection 为 `PARTIAL`
+时仍可交付带明确限制的部分证据分析，但 pending-model draft 永远不是可交付 final。
 
 ### 2.1 完整语义分类输入
 
@@ -190,7 +196,7 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 | task_id | string | 是 | 否 | bilibili-20260723T010203000000Z-a1b2c3d4 | 每个新任务生成的唯一非空标识 |
 | platform | enum | 是 | 否 | bilibili | bilibili / douyin / weibo |
 | profile_url | string | 是 | 否 | https://space.bilibili.com/123 | 账号主页 URL |
-| requested_limit | integer | 是 | 是 | 30 | 限量模式默认 30、范围 1–100；公开 `--all` 为接受后的 `max_items`（默认 10,000、硬上限 50,000）；授权 OpenAPI `--all` 为 `null` |
+| requested_limit | integer | 是 | 是 | 10000 | 公开 CLI 省略范围时默认完整采集：B站与抖音均使用接受后的 `max_items`（默认 10,000、硬上限 50,000）；只有显式 `--limit N` 才进入 1–100 的限量模式；授权 OpenAPI `--all` 为 `null` |
 | date_from | datetime | 否 | 是 | 2026-06-01T00:00:00+08:00 | 采集起始时间 |
 | date_to | datetime | 否 | 是 | 2026-07-23T23:59:59+08:00 | 采集结束时间 |
 | analysis_goal | string | 否 | 是 | 分析选题和发布节奏 | `--analysis-goal`；省略为 `null`，提供时须为 NFKC 规范化并去首尾空白后的非空字符串、最多 500 UTF-8 字节且不含控制字符 |
@@ -205,6 +211,7 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 | new_count | integer | 否 | 否 | 20 | 本次新增条数 |
 | resume_source | object | 否 | 是 | `{format, digest_algorithm, digest}` | 只读续采来源的格式和提交/内容 SHA-256；非续采为 `null` |
 | diagnostic_code | string | 否 | 是 | SANDBOX_INDEX_FALLBACK | 安全诊断码；不是 `stop_reason` |
+| platform_response_code | integer | 否 | 是 | -799 | 平台明确返回且通过边界校验的数值码；未知或非数值为 `null`，不保存响应正文 |
 | collection_source | string | 否 | 是 | douyin_search_index | 实际采集/证据来源 |
 | source_kind | string | 否 | 是 | douyin_search_index | 索引证据类型；当前与 `collection_source` 同值 |
 | source_url | string | 否 | 是 | https://www.douyin.com/user/... | 任务级证据 URL |
@@ -234,8 +241,8 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 - 执行前向用户回显 `platform`、`requested_limit`、`date_from`/`date_to`、`include_comments`。
 - Web 索引降级必须设置 `task_status=PARTIAL`、保留真实上游 `stop_reason`，并填写来源与
   快照字段；未知快照时间保持 `null`，可单独保存来源显示的 `snapshot_age_label`。
-- `diagnostic_code` 只能是内部固定的 `[A-Z][A-Z0-9_]{0,63}` 安全枚举；不能保存适配器
-  异常文本、响应或查询。错误日志的 `occurred_at` 必须在捕获该事件时生成，不得复用任务
+- `diagnostic_code` 只能是内部固定的 `[A-Z][A-Z0-9_]{0,63}` 安全枚举；`platform_response_code`
+  只能是 `-999999..999999` 内的整数。两者都不能保存适配器异常文本、响应正文或查询。错误日志的 `occurred_at` 必须在捕获该事件时生成，不得复用任务
   初始化时的 `collected_at`。
 - `source/index-evidence.json` 不是搜索引擎 HTML 或连接器原始转储。Agent 先核验公开来源，
   导入脚本再只持久化白名单字段；Cookie、请求头、内部引用、签名参数和原始页面正文不得落盘。
@@ -243,8 +250,10 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 
 ### 3.1 collection_coverage 覆盖与完备性账本
 
-抖音 `--all` 使用公开页面自身发起的 XHR/Fetch 响应与正常滚动来观察作品列表分页，不重建、
-重放或补签请求。账本仅保留下列白名单字段：
+抖音完整模式优先使用公开页面自身发起的 XHR/Fetch 响应与正常滚动来观察作品列表分页。
+若被动网络没有形成可用账号列表且页面没有可见保护提示，可由同一主页上下文发起固定字段、
+无签名的同源公开分页请求；不复制签名。只有用户显式提供 `--douyin-cookie-file` 时才在隔离
+临时浏览器内使用其授权会话，Cookie 本身不写入产物。账本仅保留下列白名单字段：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -262,8 +271,11 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 | `stop_condition` | enum | `terminal_page` / `idle` / `timeout` / `repeated_cursor` / `max_items` / `max_scrolls` / `date_lower_bound` |
 | `restriction_source` | enum | 抖音临时浏览器明确看到限制页时固定为 `browser_visible_text`；其他来源不得伪造该值 |
 | `restriction_marker` | enum | 与根级停止原因绑定的安全枚举：`LOGIN_WALL_VISIBLE` / `VERIFICATION_CHALLENGE_VISIBLE` / `ACCESS_RESTRICTION_VISIBLE` / `ACCOUNT_UNAVAILABLE_VISIBLE` / `NO_PUBLIC_CONTENT_VISIBLE` |
+| `page_context_fallback_used` | boolean | 是否实际发起过受控同源页内分页；仅为运行诊断，不证明穷尽 |
+| `page_context_request_count` | integer | 已尝试的受控同源页内分页请求数；不包含 URL、查询、头或正文 |
+| `evidence_access` | enum | `anonymous_public` 或 `user_authorized_session`；只披露证据访问方式，不含身份或凭据 |
 
-只有精确 HTTP 200、可选顶层 `status_code` / `error_code` 为整数 0 的已验证作品列表载荷上的显式 `has_more=false`，并且会话内每个可能属于目标账号的列表
+只有精确 HTTP 200、可选顶层 `status_code` / `error_code` 为整数 0 的已验证作品列表载荷上的显式 `has_more=false`（平台以整数表达时只接受精确 `0/1` 并先规范为布尔值），并且会话内每个可能属于目标账号的列表
 候选都合并成一个经过账号绑定、作品身份和列表结构校验、且候选内分页事实一致的逻辑页，才可以令
 `is_exhaustive=true`。末页出现后停止滚动，但继续轮询并处理新候选，直到至少一次
 `poll_event=None` 的静默边界或预算到期；最终空轮询后不得再调用可能排入新事件的 CDP
@@ -285,17 +297,26 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 `max_scrolls=2,000`；允许显式上调，但硬上限分别为 `50,000`、`14,400` 秒和
 `20,000` 轮。零值、负值、非有限秒数、类型不符和超过硬上限都必须拒绝，不得静默钳制。
 
-B站限量采集复用 `collection_coverage` 保存一个独立的列表子阶段账本；它不证明历史全量，
-`requested_all/terminal_page_observed/is_exhaustive` 仍为 `false`：
+B站限量与安全全量采集复用 `collection_coverage` 保存列表子阶段账本。限量模式不证明历史
+全量；`--all` 的 `max_items` 接受 1–50,000，并分别记录常规分页和动态分页的停止事实：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `regular_source` | enum | `medialist` / `arc` / `search`，本次实际使用的常规投稿发现路径 |
 | `regular_observed_count` | integer | 常规列表在 limit 前按 BV first-wins 去重后的非负数量 |
-| `dynamic_status` | enum | `NOT_ATTEMPTED` / `UNAVAILABLE` / `OBSERVED` 或固定任务停止枚举 `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `ACCESS_RESTRICTED` / `PARSER_FAILED` / `INTERNAL_ERROR` |
+| `dynamic_status` | enum | `NOT_ATTEMPTED` / `UNAVAILABLE` / `OBSERVED` 或固定任务停止枚举 `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `RATE_LIMITED` / `ACCESS_RESTRICTED` / `PARSER_FAILED` / `INTERNAL_ERROR` |
 | `dynamic_observed_count` | integer | 动态入口已解析并按 BV 去重的非负数量；可在受限前保留部分值 |
+| `terminal_page_observed` | boolean | 常规投稿分页是否明确观察到末页 |
+| `observed_page_count` | integer | 已观察的常规投稿页数 |
+| `observed_post_count` | integer | 常规与动态合并后的去重作品数 |
+| `stop_condition` | enum | 常规投稿停止原因：`terminal_page` / `max_items` / `repeated_cursor` / `date_lower_bound` |
+| `dynamic_terminal_page_observed` | boolean | 动态分页是否明确观察到末页 |
+| `dynamic_stop_condition` | enum | 动态停止原因：`terminal_page` / `max_items` / `idle` / `repeated_cursor` / `date_lower_bound` |
 
-`dynamic_status=OBSERVED` 只表示本次有界动态入口观察没有报错，不表示账号历史动态穷尽。
+`dynamic_status=OBSERVED` 只表示本次有界动态入口观察没有报错；仍须
+`dynamic_terminal_page_observed=true` 才能作为穷尽证据。总体 `is_exhaustive=true` 同时要求
+`requested_all=true`、常规 `terminal_page_observed=true`、常规 `stop_condition=terminal_page`
+和动态末页证据。
 非 `OBSERVED` 状态必须在最终报告披露“可能遗漏仅出现在动态入口的公开视频”。覆盖账本只
 允许上述枚举和计数，不能保存 endpoint、offset、查询、响应正文或异常消息。动态发现使用
 固定安全诊断码 `BILIBILI_DYNAMIC_DISCOVERY`；诊断码不是新的 `stop_reason`。
@@ -345,7 +366,8 @@ boolean、非负 exact integer 与停止枚举进入派生 `analysis.meta.collec
 ### 3.3 comment_collection 评论采样账本
 
 启用 `--comments` 时，通用公开采集命令写入下列聚合计数。每条作品最多请求和保留 20 条
-评论；`--all` 对所有已保留作品尝试评论采样，不受普通默认样本数 30 的隐式限制。
+评论；完整采集模式对所有已保留作品尝试评论采样，不存在默认 30 条的隐式限制。只有用户显式
+传入 `--limit N` 时，评论父作品范围才随该最新 N 条样本收窄。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -388,10 +410,17 @@ boolean、非负 exact integer 与停止枚举进入派生 `analysis.meta.collec
 | field_visibility | object | 是 | 否 | — | 字段可见性（§8） |
 
 `platform_metrics` 账号层常见键：
-- 抖音：`total_likes`（获赞总量）、`douyin_id`（页面显示抖音号）、`latest_post_at`；
+- 抖音：`total_likes`（获赞总量）、`douyin_id`（页面显示抖音号）、`latest_post_at`、
+  `profile_conflicts`；
   索引降级还可保存 `collection_source`、`source_url`、`snapshot_crawled_at`
 - 微博：`following`（关注数）
 - B站：一般为空对象 `{}`
+
+`profile_conflicts` 只在多个已验证公开资料来源对 `followers`、`post_count` 或
+`total_likes` 给出不同非负整数时出现。键仅限这三项；每项固定为
+`{"selected": <首个已验证值>, "observed_values": [<去重且有界的观测值>]}`。
+对应顶层字段或平台指标保留 `selected`，相应 `field_visibility` 必须为 `partial`。不得将冲突
+静默覆盖，也不得把原始响应、来源 URL、查询、页面正文或异常文本放入该对象。
 
 授权 OpenAPI 例外：接口确认同次 access token + `open_id` 对应的账号，不得把 `open_id` 猜测成公开主页
 路径。此模式的 `profile_url` 使用固定的官方 userinfo 端点作为来源证据，
@@ -600,6 +629,18 @@ ID 绑定作品证据。任何来源 URL 均不得保留原始 query、fragment 
   `platform_metrics.series_name` 的公开正证据；父字段为 `null` 时分类结果也必须为
   `null`，不得从标题、标签或相似内容猜测栏目 / 合集。
 
+`analysis.json.publish_cadence` 在常规节奏字段之外固定包含：
+
+- `scope`：`exhaustive` / `explicit_date_window_exhaustive` /
+  `latest_n_sample` / `explicit_date_window_sample` /
+  `bounded_complete_attempt_sample` / `index_sample`；
+- `cadence_inference_allowed`：只有分析元数据的 `evidence_is_exhaustive=true` 时为 `true`；
+- `scope_note`：解释当前是完整公开列表、完整日期窗口，还是不可外推的可见样本窗口。
+
+非穷尽结果可以保留样本日期、星期、月份和窗口内的描述性数值，但报告标签必须使用
+“可见样本数量”“样本窗口折算周均”“样本发布间隔”等措辞，且不得生成账号级排播建议。
+索引样本继续按 `analysis-rules.md` 置空无法可靠计算的周均、间隔与季节性强度。
+
 ### 7.1 高低表现确定性输出
 
 `performance_meta` 始终包含 `status`、`main_metric`、`measured_count` 和
@@ -656,9 +697,14 @@ selected_count`，保留 4 位小数；`status` 为 `COMPLETE` 或
 根级 `core_insights` 只输出高/低组事实。每项固定包含 `id`、`kind`、
 `statement`、`main_metric`、`evidence`；每条 evidence 固定包含
 `post_id`、`url`、`url_kind`、`collected_at`、`metrics`、`rank`、`value`。
-正式 Markdown/HTML 渲染器必须在既有 12 个章节占位符内完整呈现上述高/低条目与
-`core_insights`，不增加模板占位符，也不以主页 `profile_index` 冒充作品链接。
-证据顺序必须与确定性高/低组选取顺序一致，不得引用组外记录或补充因果解释。
+`analysis.json` 必须完整保存上述高/低条目与 `core_insights`，供机器校验和审计使用。人类可读
+Markdown/HTML 不复制完整审计数组：高表现只展示排序最前 5 条，低表现展示差异最明显的末 5 条；
+`core_insights.evidence` 不在正文重复渲染。正文说明完整组大小并指向 `analysis.json`，不得修改或
+裁剪结构化载荷。正文证据顺序必须沿用确定性组选取顺序，不得引用组外记录或补充因果解释。
+来源章节只列正文实际引用的规范作品链接与账号主页；全量 URL 留在 `normalized-posts.csv` 和
+`analysis.json`。单条模型业务主张最多内联 3 条去重代表证据，其余保存在
+`source/business-insight-results.json`。
+该模板形状不是 Agent 聊天表达的限制；聊天可按用户需要提供摘要、FAQ 或补充说明，并明确其不是受此 schema 校验的正式 artifact。
 
 ### 7.2 评论证据确定性输出
 
@@ -872,7 +918,7 @@ boolean。样本不足时 groups/features 为空且状态为 `insufficient-sampl
 - `ACCESS_RESTRICTED`：其他访问限制
 - `PARSER_FAILED`：页面可访问但解析失败
 - `NO_PUBLIC_CONTENT`：账号确实没有公开内容
-- `UNSUPPORTED_PLATFORM`：URL 不属于支持平台
+- `UNSUPPORTED_PLATFORM`：URL 不属于本 Skill 专用适配器覆盖的平台；只终止本 Skill 的采集任务，不限制上层 Agent 改用其他合规公开研究路径
 - `ADAPTER_UNAVAILABLE`：平台适配器未实现或未启用（如微博 P1 未启用）
 - `INTERNAL_ERROR`：脚本 / 内部错误
 - `OPENAPI_ERROR`：授权抖音 OpenAPI 请求或响应错误；令牌与服务端原始描述不得进入产物

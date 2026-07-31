@@ -21,6 +21,98 @@ from collectors.bilibili import (
 )
 
 
+def test_complete_collection_reaches_terminal_before_applying_date_window(
+    monkeypatch,
+):
+    collector = BilibiliCollector()
+    calls = []
+
+    def collect_posts(url, limit, date_range=None, *, _complete_mode=False):
+        calls.append((url, limit, date_range))
+        assert _complete_mode is True
+        collector._collection_coverage = {
+            "terminal_page_observed": True,
+            "dynamic_status": "OBSERVED",
+            "dynamic_terminal_page_observed": True,
+            "observed_page_count": 2,
+            "stop_condition": "terminal_page",
+        }
+        return [
+            {"post_id": "old", "published_at": "2025-01-01T00:00:00+08:00"},
+            {"post_id": "hit", "published_at": "2026-03-01T00:00:00+08:00"},
+        ]
+
+    monkeypatch.setattr(collector, "collect_post_list", collect_posts)
+
+    posts = collector.collect_all_post_list(
+        "https://space.bilibili.com/123",
+        date_range=(
+            "2026-01-01T00:00:00+08:00",
+            "2026-06-30T23:59:59+08:00",
+        ),
+    )
+
+    assert calls == [("https://space.bilibili.com/123", 10_000, None)]
+    assert [post["post_id"] for post in posts] == ["hit"]
+    assert collector.get_collection_coverage()["observed_post_count"] == 2
+    assert collector.get_collection_coverage()["range_match_count"] == 1
+    assert collector.get_collection_coverage()["is_exhaustive"] is True
+
+
+def test_complete_collection_accepts_more_than_limited_mode_ceiling(monkeypatch):
+    collector = BilibiliCollector()
+
+    class CompleteSession:
+        _buvid_established = True
+
+        def ensure_buvid(self):
+            return None
+
+        def discover_medialist(self, mid, limit, date_range=None):
+            assert mid == "123"
+            assert limit == 225
+            assert date_range is None
+            return [
+                {
+                    "bv_id": f"BV{index:010d}",
+                    "title": f"post-{index}",
+                    "pubtime": 1_700_000_000 + index,
+                    "cnt_info": {},
+                }
+                for index in range(225)
+            ]
+
+        def get_discovery_coverage(self):
+            return {
+                "terminal_page_observed": True,
+                "observed_page_count": 5,
+                "observed_post_count": 225,
+                "stop_condition": "terminal_page",
+            }
+
+        def collect_pinned(self, mid):
+            return False, None
+
+        def discover_dynamics(self, mid, limit, date_range=None):
+            return []
+
+        def get_dynamic_discovery_coverage(self):
+            return {
+                "dynamic_terminal_page_observed": True,
+                "dynamic_stop_condition": "terminal_page",
+            }
+
+    monkeypatch.setattr(collector, "_new_session", CompleteSession)
+
+    posts = collector.collect_all_post_list(
+        "https://space.bilibili.com/123",
+        max_items=225,
+    )
+
+    assert len(posts) == 225
+    assert collector.get_collection_coverage()["is_exhaustive"] is True
+
+
 def test_platform_rate_limit_stops_without_retry_identity_rotation_or_browser(
     monkeypatch,
 ):
@@ -53,7 +145,8 @@ def test_platform_rate_limit_stops_without_retry_identity_rotation_or_browser(
     with pytest.raises(BilibiliError) as exc_info:
         session.get_json("/x/space/wbi/arc/search", retry=20)
 
-    assert exc_info.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert exc_info.value.stop_reason == "RATE_LIMITED"
+    assert exc_info.value.platform_response_code == -799
     assert len(calls) == 1
     assert rotations == []
     assert browser_calls == []
@@ -157,14 +250,16 @@ def test_explicit_english_verification_page_opens_circuit(monkeypatch, body):
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "expected_reason"),
     [
-        "<html>WAF request was banned</html>",
-        "<html>rate limit: too many requests</html>",
-        "<html>access denied</html>",
+        ("<html>WAF request was banned</html>", STOP_ACCESS_RESTRICTED),
+        ("<html>rate limit: too many requests</html>", "RATE_LIMITED"),
+        ("<html>access denied</html>", STOP_ACCESS_RESTRICTED),
     ],
 )
-def test_explicit_non_json_access_protection_opens_circuit(monkeypatch, body):
+def test_explicit_non_json_access_protection_opens_circuit(
+    monkeypatch, body, expected_reason
+):
     session = Session(browser_fallback=False)
     calls: list[str] = []
     monkeypatch.setattr(
@@ -175,11 +270,11 @@ def test_explicit_non_json_access_protection_opens_circuit(monkeypatch, body):
 
     with pytest.raises(BilibiliError) as first:
         session.get_json("/x/web-interface/view", retry=1)
-    assert first.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert first.value.stop_reason == expected_reason
 
     with pytest.raises(BilibiliError) as second:
         session.get_json("/x/web-interface/card", retry=1)
-    assert second.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert second.value.stop_reason == expected_reason
     assert len(calls) == 1
 
 
@@ -195,6 +290,7 @@ def test_platform_block_opens_session_circuit_breaker(monkeypatch):
     with pytest.raises(BilibiliError) as first:
         session.get_json("/x/web-interface/card", retry=1)
     assert first.value.stop_reason == STOP_ACCESS_RESTRICTED
+    assert first.value.platform_response_code == -412
 
     monkeypatch.setattr(
         session,
@@ -206,6 +302,72 @@ def test_platform_block_opens_session_circuit_breaker(monkeypatch):
 
     assert second.value.stop_reason == STOP_ACCESS_RESTRICTED
     assert len(calls) == 1
+
+
+def test_access_check_preserves_minus_352_for_bounded_outer_retry():
+    class RestrictedSession:
+        def ensure_buvid(self):
+            return None
+
+        def get_json(self, path, params, retry=2):
+            raise BilibiliError(
+                "VERIFICATION_REQUIRED",
+                "restricted",
+                platform_response_code=-352,
+            )
+
+    collector = BilibiliCollector()
+    collector._task_session = RestrictedSession()
+
+    result = collector.check_access("https://space.bilibili.com/123")
+
+    assert result == {
+        "accessible": False,
+        "status": "restricted",
+        "stop_reason": "VERIFICATION_REQUIRED",
+        "diagnostic_code": "BILIBILI_PROFILE_ACCESS",
+        "platform_response_code": -352,
+    }
+
+
+def test_pinned_discovery_failure_names_the_failed_stage():
+    calls = []
+
+    class RestrictedPinnedSession:
+        _buvid_established = True
+
+        def ensure_buvid(self):
+            return None
+
+        def collect_pinned(self, mid):
+            calls.append("pinned")
+            raise BilibiliError(
+                STOP_ACCESS_RESTRICTED,
+                "restricted",
+                platform_response_code=-412,
+            )
+
+        def discover_medialist(self, mid, limit):
+            calls.append("medialist")
+            return [{
+                "bv_id": "BVpreserved",
+                "title": "已取得的常规投稿",
+                "copy_right": 1,
+                "cnt_info": {"play": 10},
+            }]
+
+    collector = BilibiliCollector()
+    collector._task_session = RestrictedPinnedSession()
+
+    with pytest.raises(BilibiliError) as exc_info:
+        collector.collect_post_list("https://space.bilibili.com/123", limit=1)
+
+    assert exc_info.value.diagnostic_code == "BILIBILI_PINNED_DISCOVERY"
+    assert exc_info.value.platform_response_code == -412
+    assert calls == ["medialist", "pinned"]
+    assert [post["post_id"] for post in exc_info.value.partial_posts] == [
+        "BVpreserved"
+    ]
 
 
 def test_transport_failure_retries_once_with_same_identity(monkeypatch):
@@ -286,6 +448,32 @@ def test_discover_arc_never_rotates_identity_between_pages(monkeypatch):
 
     assert len(session.discover_arc("123", 51)) == 50
     assert rotations == []
+
+
+def test_arc_fallback_records_terminal_page_for_complete_collection(monkeypatch):
+    session = Session(browser_fallback=False)
+    pages = [
+        [{"bvid": f"BVfirst{index}"} for index in range(50)],
+        [{"bvid": f"BVlast{index}"} for index in range(45)],
+    ]
+    calls = 0
+
+    def get_json(path, params=None, **kwargs):
+        nonlocal calls
+        page = pages[calls]
+        calls += 1
+        return {"code": 0, "data": {"list": {"vlist": page}}}
+
+    monkeypatch.setattr(session, "get_json", get_json)
+    monkeypatch.setattr("collectors.bilibili.time.sleep", lambda _: None)
+
+    assert len(session.discover_arc("123", 100)) == 95
+    assert session.get_discovery_coverage() == {
+        "terminal_page_observed": True,
+        "observed_page_count": 2,
+        "observed_post_count": 95,
+        "stop_condition": "terminal_page",
+    }
 
 
 def test_arc_page_protection_keeps_prior_page_entries(monkeypatch):
@@ -438,6 +626,43 @@ def test_medialist_deduplicates_page_boundary_before_applying_limit(monkeypatch)
     assert calls == 2
 
 
+def test_medialist_records_terminal_page_for_complete_collection(monkeypatch):
+    session = Session(browser_fallback=False)
+    pages = [
+        {
+            "code": 0,
+            "data": {
+                "media_list": [
+                    {"id": page * 20 + index + 1, "bv_id": f"BV{page}{index}"}
+                    for index in range(size)
+                ],
+                "has_more": page < 2,
+            },
+        }
+        for page, size in ((0, 20), (1, 20), (2, 5))
+    ]
+    calls = 0
+
+    def get_json(path, params=None, **kwargs):
+        nonlocal calls
+        response = pages[calls]
+        calls += 1
+        return response
+
+    monkeypatch.setattr(session, "get_json", get_json)
+    monkeypatch.setattr("collectors.bilibili.time.sleep", lambda _: None)
+
+    entries = session.discover_medialist("123", 100)
+
+    assert len(entries) == 45
+    assert session.get_discovery_coverage() == {
+        "terminal_page_observed": True,
+        "observed_page_count": 3,
+        "observed_post_count": 45,
+        "stop_condition": "terminal_page",
+    }
+
+
 def test_medialist_page_protection_keeps_prior_page_entries(monkeypatch):
     session = Session(browser_fallback=False)
     calls = 0
@@ -514,7 +739,7 @@ def test_post_list_converts_prior_medialist_pages_to_partial_posts(monkeypatch):
     assert retained["title"] == "retained first-page record"
     assert retained["views"] == 0
     assert retained["comments"] == 0
-    assert retained["is_pinned"] is True
+    assert retained["is_pinned"] is None
 
 
 def test_dynamic_page_protection_keeps_prior_page_cards(monkeypatch):
@@ -567,65 +792,29 @@ def test_dynamic_page_protection_keeps_prior_page_cards(monkeypatch):
     assert exc_info.value.partial_entries[0]["bvid"] == "BVdynamic"
 
 
-def test_post_list_keeps_dynamic_page_records_on_protection(monkeypatch):
-    class DynamicProtectionSession:
-        def ensure_buvid(self):
-            return None
+def test_dynamic_discovery_distinguishes_terminal_page_from_idle_stop(monkeypatch):
+    session = Session(browser_fallback=False)
+    responses = iter([
+        {
+            "code": 0,
+            "data": {"items": [], "has_more": True, "offset": "next"},
+        },
+        {
+            "code": 0,
+            "data": {"items": [], "has_more": True, "offset": "next"},
+        },
+    ])
+    monkeypatch.setattr(session, "get_json", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("collectors.bilibili.time.sleep", lambda _: None)
 
-        def collect_pinned(self, mid):
-            return True, None
-
-        def discover_medialist(self, mid, limit):
-            return [
-                {
-                    "bv_id": "BVregular",
-                    "title": "regular",
-                    "pubtime": 200,
-                    "cnt_info": {"play": 1},
-                }
-            ]
-
-        def collect_tags(self, bvid):
-            return []
-
-        def discover_dynamics(self, mid, limit):
-            raise BilibiliError(
-                STOP_ACCESS_RESTRICTED,
-                "page blocked",
-                partial_entries=[
-                    {
-                        "bvid": "BVdynamic",
-                        "title": "retained dynamic",
-                        "pub_ts": 300,
-                        "is_forward": False,
-                        "stat": {
-                            "play": 0,
-                            "like": 0,
-                            "comment": 0,
-                            "forward": 0,
-                            "danmaku": 0,
-                        },
-                    }
-                ],
-            )
-
-    collector = BilibiliCollector(browser_fallback=False)
-    monkeypatch.setattr(collector, "_new_session", DynamicProtectionSession)
-
-    with pytest.raises(BilibiliError) as exc_info:
-        collector.collect_post_list(
-            "https://space.bilibili.com/123", limit=2
-        )
-
-    assert [post["post_id"] for post in exc_info.value.partial_posts] == [
-        "BVdynamic",
-        "BVregular",
-    ]
-    assert exc_info.value.partial_posts[0]["views"] == 0
-    assert exc_info.value.partial_posts[0]["collection_status"] == "PARTIAL"
+    assert session.discover_dynamics("123", 100) == []
+    assert session.get_dynamic_discovery_coverage() == {
+        "dynamic_terminal_page_observed": False,
+        "dynamic_stop_condition": "idle",
+    }
 
 
-def test_post_list_forwards_date_window_to_all_discovery_paths(monkeypatch):
+def test_post_list_forwards_date_window_to_the_selected_regular_path(monkeypatch):
     requested_range = (
         "1970-01-01T08:03:10+08:00",
         "1970-01-01T08:03:30+08:00",
@@ -651,10 +840,6 @@ def test_post_list_forwards_date_window_to_all_discovery_paths(monkeypatch):
         def collect_tags(self, bvid):
             return []
 
-        def discover_dynamics(self, mid, limit, date_range=None):
-            calls.append(("dynamics", date_range))
-            return []
-
     collector = BilibiliCollector(browser_fallback=False)
     monkeypatch.setattr(collector, "_new_session", DateAwareSession)
 
@@ -665,10 +850,51 @@ def test_post_list_forwards_date_window_to_all_discovery_paths(monkeypatch):
     )
 
     assert [post["post_id"] for post in posts] == ["BVrange"]
-    assert calls == [
-        ("medialist", requested_range),
-        ("dynamics", requested_range),
-    ]
+    assert calls == [("medialist", requested_range)]
+
+
+def test_post_list_stops_after_the_two_regular_discovery_paths(monkeypatch):
+    """A regular collection never expands into weak search or dynamic feeds."""
+    calls = []
+
+    class TwoPathSession:
+        def ensure_buvid(self):
+            return None
+
+        def discover_medialist(self, mid, limit):
+            calls.append("medialist")
+            return []
+
+        def discover_arc(self, mid, limit):
+            calls.append("arc")
+            return [{
+                "bvid": "BVstable",
+                "title": "stable fallback",
+                "play": 1,
+            }]
+
+        def collect_pinned(self, mid):
+            return True, None
+
+        def get_json(self, path, params=None, **kwargs):
+            return {"code": 0, "data": {"bvid": "BVstable", "stat": {}}}
+
+        def collect_tags(self, bvid):
+            return []
+
+        def discover_search(self, *args, **kwargs):
+            raise AssertionError("weak search fallback must not run")
+
+        def discover_dynamics(self, *args, **kwargs):
+            raise AssertionError("dynamic feed must not run by default")
+
+    collector = BilibiliCollector(browser_fallback=False)
+    monkeypatch.setattr(collector, "_new_session", TwoPathSession)
+
+    posts = collector.collect_post_list("https://space.bilibili.com/123", limit=1)
+
+    assert calls == ["medialist", "arc"]
+    assert [post["post_id"] for post in posts] == ["BVstable"]
 
 
 def test_post_list_does_not_change_endpoint_after_access_restriction(
@@ -1091,148 +1317,6 @@ def test_platform_protection_carries_posts_collected_before_the_stop(monkeypatch
     ] == ["SUCCESS", "PARTIAL"]
 
 
-def test_post_list_merges_dynamic_only_posts_and_deduplicates_bvid(monkeypatch):
-    tag_calls: list[str] = []
-
-    class RegularAndDynamicSession:
-        def ensure_buvid(self):
-            return None
-
-        def collect_pinned(self, mid):
-            return True, None
-
-        def discover_medialist(self, mid, limit):
-            return [
-                {
-                    "bv_id": "BVregular",
-                    "title": "regular",
-                    "pubtime": 100,
-                    "cnt_info": {"play": 10},
-                },
-                {
-                    "bv_id": "BVduplicate",
-                    "title": "regular wins duplicate",
-                    "pubtime": 200,
-                    "cnt_info": {"play": 20},
-                },
-            ]
-
-        def collect_tags(self, bvid):
-            tag_calls.append(bvid)
-            return []
-
-        def discover_dynamics(self, mid, limit):
-            return [
-                {
-                    "bvid": "BVduplicate",
-                    "title": "dynamic duplicate",
-                    "pub_ts": 200,
-                    "is_forward": False,
-                    "stat": {"play": 200},
-                },
-                {
-                    "bvid": "BVdynamic",
-                    "title": "dynamic only",
-                    "pub_ts": 300,
-                    "is_forward": False,
-                    "stat": {"play": 30},
-                },
-            ]
-
-    collector = BilibiliCollector(browser_fallback=False)
-    monkeypatch.setattr(collector, "_new_session", RegularAndDynamicSession)
-
-    posts = collector.collect_post_list(
-        "https://space.bilibili.com/123", limit=3
-    )
-
-    assert [post["post_id"] for post in posts] == [
-        "BVdynamic",
-        "BVduplicate",
-        "BVregular",
-    ]
-    assert posts[0]["content_type"] == "dynamic"
-    assert posts[0]["collection_status"] == "PARTIAL"
-    assert posts[1]["content_type"] == "video"
-    assert posts[1]["title"] == "regular wins duplicate"
-    assert tag_calls == ["BVdynamic", "BVduplicate", "BVregular"]
-    assert collector.get_collection_coverage() == {
-        "regular_source": "medialist",
-        "regular_observed_count": 2,
-        "dynamic_status": "OBSERVED",
-        "dynamic_observed_count": 2,
-        # 无 date_range 时不应误报双约束；range_match_count 反映过滤后规模。
-        "range_filter_applied": False,
-        "range_match_count": 3,
-        "range_no_match": False,
-        "buvid_established": None,
-    }
-
-
-def test_dynamic_protection_stops_before_optional_tags_and_records_substage(
-    monkeypatch,
-):
-    events: list[str] = []
-
-    class DynamicProtectionSession:
-        def ensure_buvid(self):
-            return None
-
-        def collect_pinned(self, mid):
-            return True, None
-
-        def discover_medialist(self, mid, limit):
-            events.append("regular")
-            return [{
-                "bv_id": "BVregular",
-                "title": "regular",
-                "pubtime": 100,
-                "cnt_info": {
-                    "play": 1,
-                    "thumb_up": 0,
-                    "reply": 0,
-                    "collect": 0,
-                    "share": 0,
-                    "coin": 0,
-                    "danmaku": 0,
-                },
-            }]
-
-        def discover_dynamics(self, mid, limit):
-            events.append("dynamic")
-            raise BilibiliError(
-                STOP_ACCESS_RESTRICTED,
-                "SECRET_DYNAMIC_RESPONSE",
-            )
-
-        def collect_tags(self, bvid):
-            events.append("tag")
-            pytest.fail("tag enrichment must not run after dynamic protection")
-
-    collector = BilibiliCollector(browser_fallback=False)
-    monkeypatch.setattr(collector, "_new_session", DynamicProtectionSession)
-
-    with pytest.raises(BilibiliError) as exc_info:
-        collector.collect_post_list(
-            "https://space.bilibili.com/123",
-            limit=1,
-        )
-
-    error = exc_info.value
-    assert error.stop_reason == STOP_ACCESS_RESTRICTED
-    assert error.diagnostic_code == "BILIBILI_DYNAMIC_DISCOVERY"
-    assert events == ["regular", "dynamic"]
-    assert [post["post_id"] for post in error.partial_posts] == ["BVregular"]
-    assert error.partial_posts[0]["collection_status"] == "SUCCESS"
-    assert collector.get_collection_coverage() == {
-        "regular_source": "medialist",
-        "regular_observed_count": 1,
-        "dynamic_status": "ACCESS_RESTRICTED",
-        "dynamic_observed_count": 0,
-        "buvid_established": None,
-    }
-
-
 def test_dynamic_page_protection_keeps_partial_cards_and_safe_diagnostic(
     monkeypatch,
 ):
@@ -1470,7 +1554,7 @@ def test_empty_view_payload_is_parser_failure(monkeypatch):
     assert exc_info.value.stop_reason == STOP_PARSER_FAILED
 
 
-def test_usage_never_promises_bilibili_browser_retry_after_protection():
+def test_usage_allows_bounded_task_retry_without_browser_fallback():
     usage = (
         Path(__file__).resolve().parents[1] / "USAGE.md"
     ).read_text(encoding="utf-8")
@@ -1479,7 +1563,9 @@ def test_usage_never_promises_bilibili_browser_retry_after_protection():
     assert "设置为 `1` 启用 B站 传输层浏览器降级重试机制" not in usage
     faq = usage.split("### Q3:", 1)[1].split("### Q4:", 1)[0]
     assert "立即停止" in faq
-    assert "浏览器" not in faq
+    assert "总尝试数最多" in faq
+    assert "30 秒" in faq and "60 秒" in faq
+    assert "不要轮换 `buvid`、出口 IP 或切换浏览器" in faq
 
 
 def test_authoritative_docs_keep_bilibili_protection_and_comment_contracts_exact():
@@ -1503,7 +1589,7 @@ def test_authoritative_docs_keep_bilibili_protection_and_comment_contracts_exact
     assert "BILIBILI_BROWSER_FALLBACK=1" not in bilibili
 
     assert "B站" in readme and "平台保护" in readme and "立即停止" in readme
-    assert "仅控制抖音" in skill
+    assert "platform-douyin.md" in skill
     assert "仅控制抖音" in douyin
     assert "第 3 层：平台保护停止策略" in bilibili
     assert "同一任务" in bilibili and "浏览器" in bilibili

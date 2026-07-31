@@ -1,6 +1,6 @@
 """iter-2 eval-4 / CASE-019 —— 抖音 OpenAPI 源结构的不变量离线复跑。
 
-本测试对应 `skill/SKILL.md` "可复现契约断言" 章节里协议 #2 的源结构版。
+本测试对应 `skill/references/offline-acceptance.md` 的抖音 OpenAPI 离线协议。
 **不联网、不开浏览器、不调用 OpenAPI**；只检查源文件里仍然持有
 协议 #2 承诺的不变量（userinfo 身份逐字回证、token 只在 form body /
 access-token header、has_more=false 是穷尽唯一来源、`SAFE_ERROR_CODES`
@@ -126,23 +126,20 @@ def test_orchestration_layer_rechecks_identity():
     )
 
 
-def test_skill_md_documents_openapi_protocol_2():
-    """文档完整性: SKILL.md 在交付时必须含有 '可复现契约断言' 章节并显式
-    提到 douyin_openapi.py 与 collect_douyin_authorized.py 这两个源文件。
-    若协议文档漂移到其它文档/被删除,本测试必须失败。
-    """
-    text = SKILL_MD.read_text(encoding="utf-8")
-    assert "可复现契约断言" in text, (
-        "SKILL.md 缺少 '可复现契约断言' 章节,可能被静默删除"
-    )
+def test_offline_acceptance_documents_openapi_protocol_2():
+    """详细离线协议保存在按需参考中，不把主 Skill 写成合同墙。"""
+    text = (
+        REPO_ROOT / "skill" / "references" / "offline-acceptance.md"
+    ).read_text(encoding="utf-8")
+    assert "抖音 OpenAPI 身份与末页" in text
     assert "douyin_openapi.py" in text, (
-        "SKILL.md 应引用 douyin_openapi.py 作为协议 #2 的实现定位"
+        "离线验收参考应定位 douyin_openapi.py"
     )
     assert "collect_douyin_authorized.py" in text, (
-        "SKILL.md 应引用 collect_douyin_authorized.py 作为协议 #2 的实现定位"
+        "离线验收参考应定位 collect_douyin_authorized.py"
     )
     assert "userinfo" in text and "has_more=false" in text, (
-        "SKILL.md 协议 #2 必须明确提到 userinfo 回证与 has_more=false 末页两条核心不变量"
+        "离线协议应保留 userinfo 回证与 has_more=false 末页两条核心不变量"
     )
 
 

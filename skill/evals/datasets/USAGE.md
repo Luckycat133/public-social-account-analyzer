@@ -93,6 +93,11 @@ python3 skill/scripts/split_dataset.py --verify
 
 有 Skill/无 Skill 模型基准必须对同一 prompt 同时启动，使用干净上下文，保存输出、逐项评分、耗时和 token；至少重复3次后报告均值、标准差和差值。
 
+description 触发优化不复用本目录的 70/30 行为数据划分，而使用
+`skill/evals/description_train.json`（12 条）和
+`skill/evals/description_validation.json`（8 条）的固定 60/40 划分。每题运行 3 次，
+只根据 train 的漏触发/误触发修改描述；validation 仅用于候选选择。
+
 ## 3. 数据使用规范
 
 ### 验证集

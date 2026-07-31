@@ -9,14 +9,15 @@ render_report.py —— 公开社媒账号分析 · 报告渲染器
   - analysis.json             结构化分析结果
 
 生成：
-  - account-analysis-report.md  12 节 Markdown 报告
-  - dashboard.html              填充模板占位符的 HTML 报告
+  - account-analysis-report.md  面向人的有界 Markdown 报告
+  - dashboard.html              面向人的 HTML 报告
 
 设计约束（见 references/data-schema.md、references/analysis-rules.md、
 assets/report-template.html）：
   - 仅使用 Python 标准库（csv / json / argparse / re / pathlib / datetime）。
   - 确定性、无网络、无 LLM。
   - 12 个占位符逐一替换；无法填充时回退为「暂无数据」。
+  - 全量排名、逐条指标与证据保留在 CSV/JSON；正文只展示代表项和实际引用。
   - 坏链检查：报告引用的 post_url 不在 normalized-posts.csv 集合内 → 告警。
   - 空图检查：替换后若残留 <img src="http..."> → 告警。
 """
@@ -93,6 +94,8 @@ AUTHORIZED_FOOTER = (
 DISCLAIMER = PUBLIC_PAGE_DISCLAIMER
 EMPTY_MD = "暂无数据"
 EMPTY_HTML = '<p class="empty">暂无数据</p>'
+REPORT_REPRESENTATIVE_LIMIT = 5
+REPORT_INLINE_EVIDENCE_LIMIT = 3
 
 # 全局告警与引用收集（供坏链/空图检查使用）
 WARNINGS: list[str] = []
@@ -736,6 +739,14 @@ def build_task_info(analysis, profile, posts_csv) -> tuple[str, str]:
         ["任务状态", meta.get("task_status") or "—"],
         ["停止原因", meta.get("stop_reason") or "—"],
         ["安全诊断码", meta.get("diagnostic_code") or "—"],
+        [
+            "平台响应码",
+            (
+                str(meta["platform_response_code"])
+                if meta.get("platform_response_code") is not None
+                else "—"
+            ),
+        ],
         ["采集来源", meta.get("collection_source") or "—"],
         ["索引快照时间", meta.get("snapshot_crawled_at") or "—"],
         ["索引年龄标注", meta.get("snapshot_age_label") or "—"],
@@ -936,6 +947,8 @@ def _cadence_inference_allowed(analysis, cadence) -> bool:
     meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
     if cadence.get("cadence_inference_allowed") is False:
         return False
+    if meta.get("evidence_is_exhaustive") is False:
+        return False
     return not (
         meta.get("collection_source") in INDEX_COLLECTION_SOURCES
         and meta.get("evidence_is_exhaustive") is False
@@ -958,6 +971,31 @@ def _validate_lifecycle_consistency(analysis) -> None:
     ):
         if key in analysis and key in meta and analysis.get(key) != meta.get(key):
             raise RenderError(f"analysis lifecycle conflict for {key}")
+
+
+def _validate_statistical_consistency(analysis) -> None:
+    """Reject summaries whose quartiles cannot describe one distribution."""
+    metric_summary = analysis.get("metric_summary")
+    if not isinstance(metric_summary, dict):
+        return
+    for metric, summary in metric_summary.items():
+        if not isinstance(summary, dict):
+            continue
+        values = [summary.get(key) for key in ("p25", "median", "p75")]
+        if any(value is None for value in values):
+            continue
+        if not all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            for value in values
+        ):
+            raise RenderError(f"metric_summary.{metric} quantiles are invalid")
+        p25, median, p75 = values
+        if not p25 <= median <= p75:
+            raise RenderError(
+                f"metric_summary.{metric} quantiles are inconsistent"
+            )
 
 
 def _classification_is_completed(analysis) -> bool:
@@ -990,11 +1028,11 @@ def build_publish_cadence(analysis) -> tuple[str, str]:
     unit = cad.get("interval_unit", "hours")
     rows = [
         ["总发布数量" if inference_allowed else "可见样本数量", fmt_int(cad.get("total_posts"))],
-        ["活跃发布日数", fmt_int(cad.get("coverage_days"))],
-        ["覆盖周数", fmt_int(cad.get("coverage_weeks"))],
-        ["周均发布量", fmt_float(cad.get("weekly_avg"))],
-        ["发布间隔中位数", f"{fmt_float(cad.get('median_interval_hours'))} {unit}"],
-        ["最长断更时间", f"{fmt_float(cad.get('longest_gap_hours'))} {unit}"],
+        ["活跃发布日数" if inference_allowed else "样本活跃发布日数", fmt_int(cad.get("coverage_days"))],
+        ["覆盖周数" if inference_allowed else "样本覆盖周数", fmt_int(cad.get("coverage_weeks"))],
+        ["周均发布量" if inference_allowed else "样本窗口折算周均", fmt_float(cad.get("weekly_avg"))],
+        ["发布间隔中位数" if inference_allowed else "样本发布间隔中位数", f"{fmt_float(cad.get('median_interval_hours'))} {unit}"],
+        ["最长断更时间" if inference_allowed else "样本最长间隔", f"{fmt_float(cad.get('longest_gap_hours'))} {unit}"],
     ]
     md = md_table(["节奏指标", "数值"], rows)
 
@@ -1009,10 +1047,18 @@ def build_publish_cadence(analysis) -> tuple[str, str]:
     html = html_table(["节奏指标", "数值"],
                       [[Raw(h_esc(k)), Raw(h_esc(v))] for k, v in rows])
     if not inference_allowed:
-        sample_note = (
-            "索引证据并非穷尽作品列表；以下仅描述可见样本的日期分布，"
-            "不用于推断账号发布频率、发布间隔或排播规律。"
-        )
+        sample_note = cad.get("scope_note")
+        if not isinstance(sample_note, str) or not sample_note.strip():
+            meta = analysis.get("meta", {}) if isinstance(analysis, dict) else {}
+            sample_note = (
+                "索引证据并非穷尽作品列表；以下仅描述可见样本的日期分布，"
+                "不用于推断账号发布频率、发布间隔或排播规律。"
+                if meta.get("collection_source") in INDEX_COLLECTION_SOURCES
+                else (
+                    "当前证据不是已验证的穷尽作品列表；以下仅描述可见样本窗口，"
+                    "不用于推断账号整体发布频率、发布间隔或排播规律。"
+                )
+            )
         md += f"\n\n> {sample_note}"
         html += f'<p class="note">{h_esc(sample_note)}</p>'
     cadence_note = cad.get("note")
@@ -1232,6 +1278,170 @@ def _performance_reference(
     )
 
 
+def build_decision_summary(analysis) -> tuple[str, str]:
+    """Render a compact evidence-backed reading of computed analysis results."""
+    if not isinstance(analysis, dict):
+        return EMPTY_MD, EMPTY_HTML
+
+    meta = analysis.get("meta") if isinstance(analysis.get("meta"), dict) else {}
+    sample = (
+        analysis.get("sample_boundary")
+        if isinstance(analysis.get("sample_boundary"), dict)
+        else {}
+    )
+    rows_md: list[list[object]] = []
+    rows_html: list[list[object]] = []
+
+    def append_row(question: str, finding: str, evidence_md, evidence_html) -> None:
+        rows_md.append([question, finding, evidence_md])
+        rows_html.append([question, finding, evidence_html])
+
+    valid = sample.get("valid")
+    time_range = sample.get("time_range")
+    time_range = time_range if isinstance(time_range, dict) else {}
+    earliest = time_range.get("content_earliest")
+    latest = time_range.get("content_latest")
+    if valid is not None:
+        scope = "已验证穷尽范围" if meta.get("evidence_is_exhaustive") is True else "当前可见样本"
+        finding = f"{fmt_int(valid)} 条有效作品；{scope}。"
+        evidence = (
+            f"时间范围 {earliest or '—'} 至 {latest or '—'}；"
+            "sample_boundary"
+        )
+        append_row("证据范围", finding, evidence, evidence)
+
+    metric_summary = (
+        analysis.get("metric_summary")
+        if isinstance(analysis.get("metric_summary"), dict)
+        else {}
+    )
+    main_metric = meta.get("main_sort_metric")
+    if not isinstance(metric_summary.get(main_metric), dict):
+        main_metric = "views" if isinstance(metric_summary.get("views"), dict) else None
+    if main_metric is None:
+        main_metric = next(
+            (key for key, value in metric_summary.items() if isinstance(value, dict)),
+            None,
+        )
+    metric_stats = metric_summary.get(main_metric) if main_metric else None
+    if isinstance(metric_stats, dict) and metric_stats.get("median") is not None:
+        label = "播放" if main_metric == "views" else METRIC_LABELS.get(
+            main_metric, str(main_metric)
+        )
+        finding = (
+            f"{label}中位数 {fmt_metric(metric_stats.get('median'))}；"
+            f"中间 50% 为 {fmt_metric(metric_stats.get('p25'))}–"
+            f"{fmt_metric(metric_stats.get('p75'))}；"
+            f"峰值 {fmt_metric(metric_stats.get('maximum'))}。"
+        )
+        try:
+            median_value = float(metric_stats.get("median"))
+            maximum_value = float(metric_stats.get("maximum"))
+        except (TypeError, ValueError):
+            median_value = maximum_value = 0.0
+        if median_value > 0 and math.isfinite(maximum_value):
+            finding += (
+                "峰值约为中位数 "
+                f"{fmt_float(maximum_value / median_value, 1)} 倍。"
+            )
+        evidence_md: object = f"analysis.json · metric_summary.{main_metric}"
+        evidence_html: object = evidence_md
+        high = analysis.get("high_performance")
+        if isinstance(high, list) and high and isinstance(high[0], dict):
+            top = high[0]
+            reference_md, reference_html = _performance_reference(
+                top,
+                meta.get("platform"),
+                meta.get("collection_source"),
+            )
+            title = top.get("title") or top.get("post_id") or "代表作品"
+            evidence_md = MdRaw(
+                f"{md_escape_text(title)}；{reference_md.s}"
+            )
+            evidence_html = Raw(
+                f"{h_esc(title)}；{reference_html.s}"
+            )
+        append_row("触达基线", finding, evidence_md, evidence_html)
+
+    engagement = (
+        analysis.get("engagement")
+        if isinstance(analysis.get("engagement"), dict)
+        else {}
+    )
+    view_engagement = engagement.get("view_based_engagement_rate")
+    if isinstance(view_engagement, dict) and view_engagement.get("median") is not None:
+        engagement_parts = [
+            "播放互动率中位数 "
+            f"{fmt_pct(view_engagement.get('median'))}"
+        ]
+        deep_approval = engagement.get("deep_approval_rate")
+        if isinstance(deep_approval, dict) and deep_approval.get("median") is not None:
+            engagement_parts.append(
+                f"深度认可率 {fmt_pct(deep_approval.get('median'))}"
+            )
+        discussion = engagement.get("community_discussion_rate")
+        if isinstance(discussion, dict) and discussion.get("median") is not None:
+            engagement_parts.append(
+                f"社群讨论率 {fmt_pct(discussion.get('median'))}"
+            )
+        finding = "；".join(engagement_parts) + "；均以播放为分母，只用于账号内部比较。"
+        evidence = "analysis.json · engagement.view_based_engagement_rate"
+        append_row("互动基线", finding, evidence, evidence)
+
+    posts = analysis.get("posts") if isinstance(analysis.get("posts"), list) else []
+    if _classification_is_completed(analysis) and posts:
+        for key, label in (("topic", "主题"), ("format", "内容形式")):
+            values = [
+                str(post.get(key))
+                for post in posts
+                if isinstance(post, dict)
+                and post.get(key) not in (None, "", "unknown", "other")
+            ]
+            if not values:
+                continue
+            top_value, top_count = Counter(values).most_common(1)[0]
+            finding = (
+                f"{label}「{top_value}」占 {fmt_pct(top_count / len(values))}"
+                f"（{top_count}/{len(values)}）。"
+            )
+            evidence = f"analysis.json · posts[].{key}（已完成分类）"
+            append_row("内容结构", finding, evidence, evidence)
+
+    cadence = (
+        analysis.get("publish_cadence")
+        if isinstance(analysis.get("publish_cadence"), dict)
+        else {}
+    )
+    interval_hours = cadence.get("median_interval_hours")
+    if _cadence_inference_allowed(analysis, cadence) and interval_hours is not None:
+        try:
+            interval_days = float(interval_hours) / 24
+        except (TypeError, ValueError):
+            interval_days = None
+        if interval_days is not None:
+            finding = f"发布间隔中位数 {fmt_float(interval_days, 1)} 天。"
+            evidence = "analysis.json · publish_cadence.median_interval_hours"
+            append_row("发布节奏", finding, evidence, evidence)
+
+    if not rows_md:
+        return EMPTY_MD, EMPTY_HTML
+    note = (
+        "这里先回答最重要的问题；详细分布、完整表现组、语义证据与限制"
+        "在后续章节和 analysis.json 中展开。"
+    )
+    markdown = (
+        "**决策摘要**\n\n"
+        + md_table(["问题", "当前判断", "依据"], rows_md)
+        + f"\n\n> {note}"
+    )
+    html = (
+        '<p class="note">决策摘要</p>'
+        + html_table(["问题", "当前判断", "依据"], rows_html)
+        + f'<p class="note">{h_esc(note)}</p>'
+    )
+    return markdown, html
+
+
 def _main_metric_text(record, main_metric, metric_label) -> str:
     metric = record.get("main_metric") or main_metric
     label = metric_label or (METRIC_LABELS.get(metric, metric) if metric else "—")
@@ -1316,85 +1526,6 @@ def _render_perf_group(
     return md_table(headers, rows_md), html_table(headers, rows_html)
 
 
-def _render_core_insights(
-    analysis,
-    kind: str,
-    default_platform=None,
-    default_collection_source=None,
-) -> tuple[str, str]:
-    insights = analysis.get("core_insights") if isinstance(analysis, dict) else None
-    if not isinstance(insights, list):
-        return "", ""
-    md_blocks: list[str] = []
-    html_blocks: list[str] = []
-    for insight in insights:
-        if not isinstance(insight, dict) or insight.get("kind") != kind:
-            continue
-        insight_id = insight.get("id") or "—"
-        statement = insight.get("statement") or "—"
-        main_metric = insight.get("main_metric") or "—"
-        evidence_rows_md = []
-        evidence_rows_html = []
-        evidence_items = insight.get("evidence")
-        if not isinstance(evidence_items, list):
-            evidence_items = []
-        for evidence in evidence_items:
-            if not isinstance(evidence, dict):
-                continue
-            md_reference, html_reference = _report_reference(
-                evidence,
-                url_field="url",
-                require_item_known=False,
-                default_platform=default_platform,
-                default_collection_source=default_collection_source,
-            )
-            metric_value = f"{main_metric}={fmt_metric(evidence.get('value'))}"
-            rank = f"rank={fmt_int(evidence.get('rank'))}"
-            metrics_text = _metrics_contract_text(evidence.get("metrics"))
-            collected_at = evidence.get("collected_at") or "—"
-            evidence_rows_md.append(
-                [
-                    evidence.get("post_id") or "—",
-                    md_reference,
-                    rank,
-                    metric_value,
-                    metrics_text,
-                    collected_at,
-                ]
-            )
-            evidence_rows_html.append(
-                [
-                    evidence.get("post_id") or "—",
-                    html_reference,
-                    rank,
-                    metric_value,
-                    metrics_text,
-                    collected_at,
-                ]
-            )
-        headers = [
-            "post_id",
-            "URL 类型 / 证据",
-            "全局排名",
-            "主指标名称与值",
-            "完整 metrics",
-            "collected_at",
-        ]
-        md_blocks.append(
-            f"**核心洞察 {md_escape_text(insight_id)}**\n\n"
-            f"- statement: {md_escape_text(statement)}\n\n"
-            + md_table(headers, evidence_rows_md)
-        )
-        html_blocks.append(
-            '<div class="core-insight">'
-            f"<p><strong>核心洞察 {h_esc(insight_id)}</strong></p>"
-            f"<p>statement: {h_esc(statement)}</p>"
-            + html_table(headers, evidence_rows_html)
-            + "</div>"
-        )
-    return "\n\n".join(md_blocks), "".join(html_blocks)
-
-
 def _append_report_block(
     md: str, html: str, extra_md: str, extra_html: str
 ) -> tuple[str, str]:
@@ -1442,8 +1573,7 @@ def _business_evidence_table(analysis, evidence_items) -> tuple[str, str]:
         meta.get("collection_source") if isinstance(meta, dict) else None
     )
     headers = ["post_id", "证据字段", "原文摘录", "URL 类型 / 证据", "collected_at"]
-    rows_md = []
-    rows_html = []
+    unique_evidence = []
     seen_evidence: set[str] = set()
     for evidence in evidence_items:
         if not isinstance(evidence, dict):
@@ -1462,6 +1592,11 @@ def _business_evidence_table(analysis, evidence_items) -> tuple[str, str]:
             if evidence_key in seen_evidence:
                 continue
             seen_evidence.add(evidence_key)
+        unique_evidence.append(evidence)
+
+    rows_md = []
+    rows_html = []
+    for evidence in unique_evidence[:REPORT_INLINE_EVIDENCE_LIMIT]:
         md_reference, html_reference = _report_reference(
             evidence,
             url_field="url",
@@ -1482,7 +1617,16 @@ def _business_evidence_table(analysis, evidence_items) -> tuple[str, str]:
         )
     if not rows_md:
         return "", ""
-    return md_table(headers, rows_md), html_table(headers, rows_html)
+    markdown = md_table(headers, rows_md)
+    html = html_table(headers, rows_html)
+    if len(unique_evidence) > REPORT_INLINE_EVIDENCE_LIMIT:
+        note = (
+            f"正文仅展示 {REPORT_INLINE_EVIDENCE_LIMIT} 条代表证据；"
+            "完整证据保存在 source/business-insight-results.json。"
+        )
+        markdown += f"\n\n> {note}"
+        html += f'<p class="note">{h_esc(note)}</p>'
+    return markdown, html
 
 
 def _business_positioning_block(analysis) -> tuple[str, str]:
@@ -1766,20 +1910,29 @@ def build_high_performance(analysis) -> tuple[str, str]:
     platform, collection_source = _performance_provenance_context(analysis)
     high = analysis.get("high_performance")
     low = analysis.get("low_performance")
+    display_high = (
+        high[:REPORT_REPRESENTATIVE_LIMIT]
+        if isinstance(high, list)
+        else high
+    )
     md, html = _render_perf_group(
-        high,
+        display_high,
         main_metric,
         metric_label,
         platform,
         collection_source,
     )
-    insight_md, insight_html = _render_core_insights(
-        analysis,
-        "high_performance",
-        platform,
-        collection_source,
-    )
-    md, html = _append_report_block(md, html, insight_md, insight_html)
+    if isinstance(high, list) and high:
+        audit_md = (
+            f"> 正文展示最具代表性的 {len(display_high)} 条；完整高表现组共 "
+            f"{len(high)} 条，完整证据保存在 analysis.json。"
+        )
+        audit_html = (
+            '<p class="note">正文展示最具代表性的 '
+            f"{len(display_high)} 条；完整高表现组共 {len(high)} 条，"
+            "完整证据保存在 analysis.json。</p>"
+        )
+        md, html = _append_report_block(md, html, audit_md, audit_html)
     pattern_md, pattern_html = _business_patterns_block(analysis, "high")
     md, html = _append_report_block(md, html, pattern_md, pattern_html)
     axes_md, axes_html = _performance_axes_block(analysis)
@@ -1797,20 +1950,29 @@ def build_low_performance(analysis) -> tuple[str, str]:
     main_metric, metric_label, metric_note = _performance_metric_context(analysis)
     platform, collection_source = _performance_provenance_context(analysis)
     group = analysis.get("low_performance")
+    display_group = (
+        group[-REPORT_REPRESENTATIVE_LIMIT:]
+        if isinstance(group, list)
+        else group
+    )
     md, html = _render_perf_group(
-        group,
+        display_group,
         main_metric,
         metric_label,
         platform,
         collection_source,
     )
-    insight_md, insight_html = _render_core_insights(
-        analysis,
-        "low_performance",
-        platform,
-        collection_source,
-    )
-    md, html = _append_report_block(md, html, insight_md, insight_html)
+    if isinstance(group, list) and group:
+        audit_md = (
+            f"> 正文展示差异最明显的 {len(display_group)} 条；完整低表现组共 "
+            f"{len(group)} 条，完整证据保存在 analysis.json。"
+        )
+        audit_html = (
+            '<p class="note">正文展示差异最明显的 '
+            f"{len(display_group)} 条；完整低表现组共 {len(group)} 条，"
+            "完整证据保存在 analysis.json。</p>"
+        )
+        md, html = _append_report_block(md, html, audit_md, audit_html)
     pattern_md, pattern_html = _business_patterns_block(analysis, "low")
     md, html = _append_report_block(md, html, pattern_md, pattern_html)
     return _append_performance_note(md, html, metric_note)
@@ -2721,6 +2883,12 @@ def build_sources(analysis, profile) -> tuple[str, str]:
     )
     if canonical_profile is not None and canonical_profile == prof_url:
         urls.append(("账号主页", canonical_profile))
+    state = _RENDER_STATE.get()
+    referenced = (
+        state.referenced_post_urls
+        if state is not None
+        else REFERENCED_POST_URLS
+    )
     posts = analysis.get("posts", []) if isinstance(analysis, dict) else []
     for p in posts:
         if not isinstance(p, dict):
@@ -2736,14 +2904,27 @@ def build_sources(analysis, profile) -> tuple[str, str]:
         )
         if canonical_post is None or canonical_post != post_url:
             continue
-        ref_post(canonical_post)
-        urls.append((p.get("post_id") or canonical_post, canonical_post))
+        if state is not None and canonical_post not in state.known_post_urls:
+            warn(
+                "bad_link: analysis.json 中的 post_url 不在 "
+                f"normalized-posts.csv 中: {canonical_post}"
+            )
+        if canonical_post in referenced:
+            urls.append((p.get("post_id") or canonical_post, canonical_post))
 
-    if not urls:
-        return EMPTY_MD, EMPTY_HTML
-    md = "\n".join(f"- {link_md(u, t)}" for t, u in urls)
-    html = "<ul class='tight'>" + "".join(
-        f"<li>{link_html(u, t).s}</li>" for t, u in urls) + "</ul>"
+    audit_note = (
+        "完整逐条作品、指标与证据保存在 workspace 的 "
+        "normalized-posts.csv 和 analysis.json；正文来源仅列实际引用。"
+    )
+    md_parts = [f"- {link_md(u, t)}" for t, u in urls]
+    md_parts.extend(["", f"> {audit_note}"])
+    md = "\n".join(md_parts)
+    html = ""
+    if urls:
+        html = "<ul class='tight'>" + "".join(
+            f"<li>{link_html(u, t).s}</li>" for t, u in urls
+        ) + "</ul>"
+    html += f'<p class="note">{h_esc(audit_note)}</p>'
     return md, html
 
 
@@ -2792,6 +2973,7 @@ def render_in_memory(
     if not isinstance(analysis, dict):
         raise RenderError("missing or invalid analysis input")
     _validate_lifecycle_consistency(analysis)
+    _validate_statistical_consistency(analysis)
     if not isinstance(template, str) or not template:
         raise RenderError("missing or invalid report template")
     template_without_comments = re.sub(
@@ -2812,6 +2994,12 @@ def render_in_memory(
     )
     token = _RENDER_STATE.set(state)
     try:
+        try:
+            decision_summary_md, decision_summary_html = build_decision_summary(
+                analysis
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RenderError("render decision summary failed") from exc
         builders = {
             "task_info": lambda: build_task_info(analysis, profile, posts_csv),
             "quality_summary": lambda: build_quality_summary(analysis),
@@ -2851,10 +3039,12 @@ def render_in_memory(
         )
         safe_account_name = md_escape_text(account_name)
         safe_platform = md_escape_text(platform)
+        classification_complete = _classification_is_completed(analysis)
+        report_kind = "公开社媒账号分析报告" if classification_complete else "公开账号数据概览"
         title = (
-            f"公开社媒账号分析报告：{safe_account_name}（{safe_platform}）"
+            f"{report_kind}：{safe_account_name}（{safe_platform}）"
             if platform
-            else f"公开社媒账号分析报告：{safe_account_name}"
+            else f"{report_kind}：{safe_account_name}"
         )
         collection_source = (
             (analysis.get("meta", {}) or {}).get("collection_source")
@@ -2866,6 +3056,22 @@ def render_in_memory(
             else PUBLIC_PAGE_DISCLAIMER
         )
         md_parts = [f"# {title}", "", disclaimer, ""]
+        if not classification_complete:
+            overview_notice = (
+                "当前语义分类尚未完成；本文件是公开数据概览，"
+                "不能作为深度内容策略报告。完整语义分析完成后应重新生成。"
+            )
+            md_parts.extend([f"> {overview_notice}", ""])
+            sections_html["task_info"] = (
+                f'<p class="note">{h_esc(overview_notice)}</p>'
+                + sections_html["task_info"]
+            )
+        if decision_summary_md != EMPTY_MD:
+            md_parts.extend([decision_summary_md, ""])
+        if decision_summary_html != EMPTY_HTML:
+            sections_html["task_info"] = (
+                decision_summary_html + sections_html["task_info"]
+            )
         for index, (name, section_title) in enumerate(SECTION_DEFS, 1):
             md_parts.extend(
                 [

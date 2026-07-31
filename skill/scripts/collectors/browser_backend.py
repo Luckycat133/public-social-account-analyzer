@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import base64
+import glob
+import importlib.util
 import json
 import os
 import shutil
@@ -69,29 +71,116 @@ def _platform_key() -> str:
     return "linux"
 
 
+_PLAYWRIGHT_EXECUTABLE_PATTERNS: Dict[str, tuple[str, ...]] = {
+    "darwin": (
+        "chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium",
+        "chromium_headless_shell-*/chrome-headless-shell-mac*/chrome-headless-shell",
+    ),
+    "linux": (
+        "chromium-*/chrome-linux*/chrome",
+        "chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell",
+    ),
+    "windows": (
+        "chromium-*/chrome-win*/chrome.exe",
+        "chromium_headless_shell-*/chrome-headless-shell-win*/chrome-headless-shell.exe",
+    ),
+}
+
+
+def _playwright_browser_roots(platform: str) -> list[str]:
+    """Return bounded cache roots without starting Playwright or installing tools."""
+    configured = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if configured and configured != "0":
+        return [os.path.abspath(os.path.expanduser(configured))]
+
+    roots: list[str] = []
+    if platform == "darwin":
+        roots.append(os.path.expanduser("~/Library/Caches/ms-playwright"))
+    elif platform == "windows":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            roots.append(os.path.join(local_app_data, "ms-playwright"))
+    else:
+        roots.append(os.path.expanduser("~/.cache/ms-playwright"))
+
+    if configured == "0":
+        try:
+            spec = importlib.util.find_spec("playwright")
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None and spec.origin:
+            package_dir = os.path.dirname(os.path.abspath(spec.origin))
+            roots.append(
+                os.path.join(package_dir, "driver", "package", ".local-browsers")
+            )
+    return roots
+
+
+def _find_playwright_browsers(platform: str) -> list[str]:
+    """Find every already-provisioned Playwright Chromium executable."""
+    found: list[str] = []
+    patterns = _PLAYWRIGHT_EXECUTABLE_PATTERNS.get(platform, ())
+    for root in _playwright_browser_roots(platform):
+        for pattern in patterns:
+            for candidate in sorted(
+                glob.glob(os.path.join(root, pattern)), reverse=True
+            ):
+                if not os.path.isfile(candidate):
+                    continue
+                if platform != "windows" and not os.access(candidate, os.X_OK):
+                    continue
+                if candidate not in found:
+                    found.append(candidate)
+    return found
+
+
+def _find_playwright_browser(platform: str) -> Optional[str]:
+    """Compatibility helper returning the first managed browser."""
+    candidates = _find_playwright_browsers(platform)
+    return candidates[0] if candidates else None
+
+
+def find_browsers(explicit: Optional[str] = None) -> list[str]:
+    """Return usable browser candidates in stable preference order.
+
+    An explicit constructor argument or environment override is authoritative.
+    Automatic discovery returns every system candidate followed by every
+    already-provisioned Playwright candidate so startup can fail over without
+    installing software or touching a user's browser profile.
+    """
+    if explicit:
+        return [explicit]
+    env = os.environ.get("BROWSER_BIN") or os.environ.get("CHROME_BIN")
+    if env:
+        return [env]
+    platform = _platform_key()
+    found: list[str] = []
+    for candidate in _CANDIDATES.get(platform, []):
+        resolved = None
+        if "/" in candidate or "\\" in candidate:
+            if os.path.exists(candidate):
+                resolved = candidate
+        else:
+            resolved = shutil.which(candidate)
+        if resolved and resolved not in found:
+            found.append(resolved)
+    for candidate in _find_playwright_browsers(platform):
+        if candidate not in found:
+            found.append(candidate)
+    return found
+
+
 def find_browser(explicit: Optional[str] = None) -> Optional[str]:
     """探测可用的浏览器二进制路径。
 
     - 优先使用 explicit 显式路径；
     - 其次读取 BROWSER_BIN / CHROME_BIN 环境变量；
-    - 最后按当前平台候选列表（绝对路径用 os.path.exists，命令名用 shutil.which）探测。
+    - 再按当前平台候选列表（绝对路径用 os.path.exists，命令名用 shutil.which）探测；
+    - 最后复用已安装的 Playwright Chromium 缓存，不启动 Playwright、不安装浏览器。
     全部失败返回 None（由调用方决定如何上报，不在此处静默兜底到本机特定路径）。
     """
-    if explicit:
-        return explicit
-    env = os.environ.get("BROWSER_BIN") or os.environ.get("CHROME_BIN")
-    if env:
-        return env
-    key = _platform_key()
-    for cand in _CANDIDATES.get(key, []):
-        if "/" in cand or "\\" in cand:
-            if os.path.exists(cand):
-                return cand
-        else:
-            found = shutil.which(cand)
-            if found:
-                return found
-    return None
+    candidates = find_browsers(explicit)
+    return candidates[0] if candidates else None
 
 
 def _free_port() -> int:
@@ -327,19 +416,38 @@ class BrowserSession:
         self._events: deque = deque()
         self._startup_timeout = startup_timeout
         self._cleanup_diagnostics: list[str] = []
+        self.selected_browser_bin: Optional[str] = None
 
     # -- 生命周期 --
     def start(self) -> "BrowserSession":
         if self._proc is not None:
             return self
-        try:
-            bin_path = self.browser_bin or find_browser()
-            if not bin_path or not os.path.exists(bin_path):
-                raise BrowserError(
+        candidates = find_browsers(self.browser_bin)
+        if not candidates:
+            raise BrowserError(
+                "未找到可用的浏览器二进制；请安装 Chrome/Chromium/Edge，"
+                "或通过 BROWSER_BIN 环境变量指定路径。",
+                diagnostic_code="BROWSER_UNAVAILABLE",
+            )
+        original_timeout = self._startup_timeout
+        deadline = time.monotonic() + original_timeout
+        last_error: Optional[Exception] = None
+        for index, bin_path in enumerate(candidates):
+            if not os.path.exists(bin_path):
+                last_error = BrowserError(
                     "未找到可用的浏览器二进制；请安装 Chrome/Chromium/Edge，"
                     "或通过 BROWSER_BIN 环境变量指定路径。",
                     diagnostic_code="BROWSER_UNAVAILABLE",
                 )
+                if self.browser_bin is not None or len(candidates) == 1:
+                    raise last_error
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            remaining_candidates = len(candidates) - index
+            self._startup_timeout = max(0.1, remaining / remaining_candidates)
+            self.selected_browser_bin = bin_path
             if self._user_data_dir is None:
                 self._user_data_dir = tempfile.mkdtemp(prefix="psaa-cdp-")
             args = [
@@ -352,27 +460,43 @@ class BrowserSession:
             ]
             if self.headless:
                 args.append("--headless=new")
-            self._proc = subprocess.Popen(
-                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            self._wait_for_devtools()
-            self._connect()
+            try:
+                self._proc = subprocess.Popen(
+                    args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                self._wait_for_devtools()
+                self._connect()
+            except Exception as exc:
+                last_error = exc
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                self._ws_url = None
+                self._events.clear()
+                if self.browser_bin is not None or len(candidates) == 1:
+                    self._startup_timeout = original_timeout
+                    if isinstance(exc, OSError):
+                        raise BrowserError(
+                            f"启动浏览器失败: {exc}",
+                            diagnostic_code="BROWSER_TRANSPORT_FAILED",
+                        ) from exc
+                    raise
+                continue
+            self._startup_timeout = original_timeout
             return self
-        except OSError as e:
-            try:
-                self.close()
-            except Exception:
-                pass
+        self._startup_timeout = original_timeout
+        if isinstance(last_error, BrowserError):
             raise BrowserError(
-                f"启动浏览器失败: {e}",
-                diagnostic_code="BROWSER_TRANSPORT_FAILED",
-            )
-        except Exception:
-            try:
-                self.close()
-            except Exception:
-                pass
-            raise
+                "所有已发现的浏览器候选均启动失败",
+                diagnostic_code=(
+                    last_error.diagnostic_code or "BROWSER_TRANSPORT_FAILED"
+                ),
+            ) from last_error
+        raise BrowserError(
+            "所有已发现的浏览器候选均启动失败",
+            diagnostic_code="BROWSER_TRANSPORT_FAILED",
+        ) from last_error
 
     def _wait_for_devtools(self) -> None:
         import urllib.request
@@ -396,7 +520,10 @@ class BrowserSession:
                 if page:
                     ws_url = page["webSocketDebuggerUrl"]
                     break
-                with urllib.request.urlopen(f"{base}/json/new?about:blank", timeout=2) as r:
+                create_target = urllib.request.Request(
+                    f"{base}/json/new?about:blank", method="PUT"
+                )
+                with urllib.request.urlopen(create_target, timeout=2) as r:
                     new_t = json.loads(r.read().decode("utf-8"))
                 if new_t.get("webSocketDebuggerUrl"):
                     ws_url = new_t["webSocketDebuggerUrl"]
@@ -506,6 +633,24 @@ class BrowserSession:
                 },
             )
 
+    def set_cookie_records(self, records: tuple[dict[str, Any], ...]) -> None:
+        """Inject prevalidated user-session cookies before the first navigation."""
+        for record in records:
+            params = {
+                key: record[key]
+                for key in (
+                    "name",
+                    "value",
+                    "domain",
+                    "path",
+                    "secure",
+                    "httpOnly",
+                )
+            }
+            result = self._send_cdp("Network.setCookie", params)
+            if result.get("success") is not True:
+                raise BrowserError("用户授权 Cookie 无法注入临时浏览器会话")
+
     def evaluate(
         self,
         expression: str,
@@ -577,7 +722,12 @@ class BrowserSession:
         )
         return value if isinstance(value, str) else ""
 
-    def fetch_text(self, url: str, headers: Optional[Dict[str, str]] = None) -> str:
+    def fetch_text(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: Optional[float] = None,
+    ) -> str:
         """经浏览器 fetch 取响应体文本。由调用方负责后续 JSON 解析与业务码判断。"""
         hdrs = {k: v for k, v in (headers or {}).items() if v}
         # json.dumps 的产物本身即合法 JS 字面量（字符串/对象），直接嵌入即可，
@@ -588,7 +738,15 @@ class BrowserSession:
             "  return await resp.text();"
             "})()"
         ) % (json.dumps(url), json.dumps(hdrs))
-        value = self.evaluate(expr, await_promise=True)
+        value = (
+            self.evaluate(expr, await_promise=True)
+            if timeout is None
+            else self.evaluate(
+                expr,
+                await_promise=True,
+                timeout=timeout,
+            )
+        )
         return value if isinstance(value, str) else ""
 
     def get_response_body(

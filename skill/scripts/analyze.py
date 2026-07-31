@@ -108,6 +108,7 @@ COLLECTION_COVERAGE_BOOL_FIELDS = frozenset({
     "range_no_match",
     "browser_fallback_requested",
     "browser_fallback_launched",
+    "page_context_fallback_used",
 })
 COLLECTION_COVERAGE_COUNT_FIELDS = frozenset({
     "max_items",
@@ -122,6 +123,7 @@ COLLECTION_COVERAGE_COUNT_FIELDS = frozenset({
     "max_scrolls",
     "regular_observed_count",
     "dynamic_observed_count",
+    "page_context_request_count",
 })
 COLLECTION_COVERAGE_BROWSER_SOURCES = frozenset({
     "none",
@@ -169,6 +171,7 @@ BILIBILI_DYNAMIC_STATUSES = frozenset({
     "LOGIN_REQUIRED",
     "VERIFICATION_REQUIRED",
     "ACCESS_RESTRICTED",
+    "RATE_LIMITED",
     "PARSER_FAILED",
     "INTERNAL_ERROR",
 })
@@ -1444,6 +1447,56 @@ def restrict_nonexhaustive_index_cadence(cadence: Dict[str, Any]) -> Dict[str, A
         f"{previous_note} {boundary_note}" if previous_note else boundary_note
     )
     return restricted
+
+
+def apply_cadence_scope(
+    cadence: Dict[str, Any],
+    params: Dict[str, Any],
+    evidence_is_exhaustive: Optional[bool],
+) -> Dict[str, Any]:
+    """Label the evidence window and gate account-level cadence inference."""
+    scoped = dict(cadence)
+    has_date_window = bool(params.get("date_from") or params.get("date_to"))
+    coverage = params.get("collection_coverage")
+    coverage = coverage if isinstance(coverage, dict) else {}
+    source = params.get("collection_source")
+    if evidence_is_exhaustive is True:
+        scoped["scope"] = (
+            "explicit_date_window_exhaustive" if has_date_window else "exhaustive"
+        )
+        scoped["cadence_inference_allowed"] = True
+        scoped["scope_note"] = (
+            "节奏指标基于已验证到达末页的公开作品列表，并按指定日期窗口过滤。"
+            if has_date_window
+            else "节奏指标基于已验证到达末页的完整公开作品列表。"
+        )
+        return scoped
+    scoped["cadence_inference_allowed"] = False
+    if source in INDEX_COLLECTION_SOURCES:
+        scoped["scope"] = "index_sample"
+        scoped["scope_note"] = (
+            "索引证据并非穷尽作品列表；以下仅描述可见样本的日期分布，"
+            "不用于推断账号发布频率、发布间隔或排播规律。"
+        )
+    elif has_date_window:
+        scoped["scope"] = "explicit_date_window_sample"
+        scoped["scope_note"] = (
+            "当前仅取得指定日期窗口内的非穷尽样本；以下描述样本窗口，"
+            "不用于推断账号整体发布频率或排播规律。"
+        )
+    elif coverage.get("requested_all") is True:
+        scoped["scope"] = "bounded_complete_attempt_sample"
+        scoped["scope_note"] = (
+            "完整采集尝试未取得末页完备性证据；以下仅描述已采样本窗口，"
+            "不用于推断账号整体发布频率或排播规律。"
+        )
+    else:
+        scoped["scope"] = "latest_n_sample"
+        scoped["scope_note"] = (
+            "当前为明确条数限制的最新作品样本；以下仅描述样本窗口，"
+            "不用于推断账号整体发布频率或排播规律。"
+        )
+    return scoped
 
 
 # ---------------------------------------------------------------------------
@@ -4294,6 +4347,13 @@ def analyze_in_memory(
         or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", diagnostic_code) is None
     ):
         raise ValueError("diagnostic code is invalid")
+    platform_response_code = params.get("platform_response_code")
+    if platform_response_code is not None and (
+        not isinstance(platform_response_code, int)
+        or isinstance(platform_response_code, bool)
+        or not -999_999 <= platform_response_code <= 999_999
+    ):
+        raise ValueError("platform response code is invalid")
     collection_coverage, evidence_is_exhaustive = (
         _validated_collection_coverage(
             params, normalized_count=len(normalized_rows)
@@ -4336,9 +4396,10 @@ def analyze_in_memory(
     if (
         params.get("collection_source")
         in ("douyin_jingxuan", "douyin_search_index")
-        and params.get("evidence_is_exhaustive") is False
+        and evidence_is_exhaustive is False
     ):
         cadence = restrict_nonexhaustive_index_cadence(cadence)
+    cadence = apply_cadence_scope(cadence, params, evidence_is_exhaustive)
     metric_summary = compute_metric_summary(valid, profile)
     medians = compute_medians(valid)
     followers = parse_int(profile.get("followers"))
@@ -4558,6 +4619,7 @@ def analyze_in_memory(
         "task_status": params.get("task_status"),
         "stop_reason": params.get("stop_reason"),
         "diagnostic_code": params.get("diagnostic_code"),
+        "platform_response_code": platform_response_code,
         "collection_source": params.get("collection_source"),
         "source_kind": params.get("source_kind"),
         "source_url": params.get("source_url"),

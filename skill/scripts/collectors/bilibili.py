@@ -10,11 +10,12 @@ HTTP 412），而 curl 携带完整浏览器头（Origin / Sec-Fetch / --compres
   - buvid3/buvid4 前置（finger/spi，JSON 直接返回 b_3/b_4，无需解析 Set-Cookie）
   - 高风险层 space 接口必须走 wbi 签名，且签名字典**必须含 web_location**（注意：acc/info 用 333.1007，arc/search 用 333.1387，用错会导致签名被拒 -799）
   - 正确路径为 /x/space/wbi/acc/info 与 /x/space/wbi/arc/search
-  - 平台一旦返回限流、验证码或登录墙，当前任务立即停止；不会轮换身份、切换端点
-    或改走浏览器。仅没有收到平台响应的本地传输失败可用同一身份重试一次。
+  - 平台一旦返回保护响应，当前任务立即停止；外层编排可按固定退避在新工作区
+    有界重试，但不会轮换账号、出口 IP、登录态或改走浏览器。
 
 合规边界（见 SKILL.md 与 references/platform-bilibili.md）：
-- 不登录、不绕过验证码 / WBI / 频控；遇阻停止并抛 BilibiliError(stop_reason)。
+- 不登录、不破解验证码；公开列表使用 WBI 签名，遇阻停止当前会话并抛出
+  BilibiliError(stop_reason)，由外层决定是否有界重试。
 - 字段不可见写 None（绝不用 0 代替未知）。
 - 不分析、不存储，只返回结构化原始数据（由上层脚本落盘）。
 """
@@ -30,7 +31,13 @@ import urllib.parse
 from functools import reduce
 from typing import Any
 
-from ._constants import PUBLIC_LIMIT_DEFAULT, validate_public_limit
+from ._constants import (
+    PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+    PUBLIC_LIMIT_DEFAULT,
+    validate_public_all_budgets,
+    validate_public_all_max_items,
+    validate_public_limit,
+)
 from ._utils import now_iso as _now_iso
 from ._utils import parse_int as _int
 from ._utils import ts_to_iso as _to_iso
@@ -50,6 +57,7 @@ STOP_LOGIN = "LOGIN_REQUIRED"
 STOP_VERIFICATION = "VERIFICATION_REQUIRED"
 STOP_ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
 STOP_ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
+STOP_RATE_LIMITED = "RATE_LIMITED"
 # 本地结构缺失使用 PARSER_FAILED；端点均明确返回空列表使用 NO_PUBLIC_CONTENT。
 STOP_PARSER_FAILED = "PARSER_FAILED"
 STOP_NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
@@ -59,11 +67,13 @@ STOP_COMMENTS_UNAVAILABLE = "COMMENTS_UNAVAILABLE"
 
 # 安全诊断码只描述内部阶段，不包含端点参数、账号 ID、响应正文或异常文本。
 DIAG_MEDIALIST_DISCOVERY = "BILIBILI_MEDIALIST_DISCOVERY"
+DIAG_PINNED_DISCOVERY = "BILIBILI_PINNED_DISCOVERY"
 DIAG_ARC_DISCOVERY = "BILIBILI_ARC_DISCOVERY"
 DIAG_SEARCH_DISCOVERY = "BILIBILI_SEARCH_DISCOVERY"
 DIAG_DYNAMIC_DISCOVERY = "BILIBILI_DYNAMIC_DISCOVERY"
 DIAG_VIEW_DETAIL = "BILIBILI_VIEW_DETAIL"
 DIAG_TAG_ENRICHMENT = "BILIBILI_TAG_ENRICHMENT"
+DIAG_PROFILE_ACCESS = "BILIBILI_PROFILE_ACCESS"
 
 BILIBILI_DYNAMIC_STATUSES = frozenset({
     "NOT_ATTEMPTED",
@@ -72,6 +82,7 @@ BILIBILI_DYNAMIC_STATUSES = frozenset({
     STOP_LOGIN,
     STOP_VERIFICATION,
     STOP_ACCESS_RESTRICTED,
+    STOP_RATE_LIMITED,
     STOP_PARSER_FAILED,
     STOP_INTERNAL,
 })
@@ -91,6 +102,7 @@ PLATFORM_PROTECTION_REASONS = {
     STOP_LOGIN,
     STOP_VERIFICATION,
     STOP_ACCESS_RESTRICTED,
+    STOP_RATE_LIMITED,
 }
 # space 类 wbi 接口的 web_location（签名字典必须包含，否则签名被拒 -412）
 # 注意：不同 space 子接口要求不同 web_location：
@@ -120,6 +132,7 @@ class BilibiliError(Exception):
         partial_posts: list[dict] | None = None,
         partial_entries: list[dict] | None = None,
         diagnostic_code: str | None = None,
+        platform_response_code: int | None = None,
     ):
         super().__init__(message)
         self.stop_reason = stop_reason
@@ -128,6 +141,7 @@ class BilibiliError(Exception):
         self.partial_posts = list(partial_posts or [])
         self.partial_entries = list(partial_entries or [])
         self.diagnostic_code = diagnostic_code
+        self.platform_response_code = platform_response_code
 
 
 class _TransportError(BilibiliError):
@@ -164,7 +178,7 @@ def enc_wbi(params: dict, img_key: str, sub_key: str) -> dict:
 def _stop_reason_for_code(code: Any) -> str:
     return {
         -412: STOP_ACCESS_RESTRICTED,
-        -799: STOP_ACCESS_RESTRICTED,
+        -799: STOP_RATE_LIMITED,
         -401: STOP_VERIFICATION,
         -352: STOP_VERIFICATION,
         -403: STOP_ACCESS_RESTRICTED,
@@ -215,14 +229,25 @@ class Session:
         self._last = 0.0
         self._wbi: tuple[str, str] | None = None
         self._blocked_reason: str | None = None
+        self._blocked_platform_response_code: int | None = None
         self._buvid_initialized = False
         self._buvid_established = False  # 供外层写入 collection_coverage
+        self._discovery_coverage: dict[str, Any] = {}
+        self._dynamic_discovery_coverage: dict[str, Any] = {}
         # 保留配置字段以兼容调用方和显式浏览器工具，但平台保护响应绝不会触发浏览器降级。
         self._browser_fallback = (
             os.environ.get("BILIBILI_BROWSER_FALLBACK") == "1"
             if browser_fallback is None
             else bool(browser_fallback)
         )
+
+    def get_discovery_coverage(self) -> dict[str, Any]:
+        """Return pagination facts from the most recent regular discovery."""
+        return dict(self._discovery_coverage)
+
+    def get_dynamic_discovery_coverage(self) -> dict[str, Any]:
+        """Return terminal evidence for the most recent dynamic discovery."""
+        return dict(self._dynamic_discovery_coverage)
 
     def _throttle(self) -> None:
         gap = self.min_interval - (time.time() - self._last)
@@ -264,11 +289,15 @@ class Session:
             raise BilibiliError(
                 self._blocked_reason,
                 "B站会话已因平台保护响应停止",
+                platform_response_code=self._blocked_platform_response_code,
             )
 
     def _trip_circuit(self, error: BilibiliError) -> None:
         if error.stop_reason in PLATFORM_PROTECTION_REASONS:
             self._blocked_reason = error.stop_reason
+            self._blocked_platform_response_code = getattr(
+                error, "platform_response_code", None
+            )
 
     def raise_for_task(
         self,
@@ -338,6 +367,7 @@ class Session:
             raise BilibiliError(
                 _stop_reason_for_code(code),
                 f"{path} 被平台拒绝 (code={code})",
+                platform_response_code=code,
             )
         if not raise_on_error:
             return data
@@ -345,6 +375,9 @@ class Session:
             _stop_reason_for_code(code),
             f"{path} code={code} {data.get('message')}",
             data,
+            platform_response_code=(
+                code if isinstance(code, int) and not isinstance(code, bool) else None
+            ),
         )
 
     def _fetch_via_browser(self, full: str, referer: str) -> str:
@@ -392,21 +425,30 @@ class Session:
         if any(
             marker in low
             for marker in (
-                "waf",
-                "request was banned",
-                "access denied",
-                "forbidden",
                 "too many requests",
                 "rate limit",
                 "rate-limit",
                 "ratelimit",
-                "precondition failed",
                 "请求过于频繁",
+                "频控",
+                "限流",
+            )
+        ):
+            return BilibiliError(
+                STOP_RATE_LIMITED,
+                f"非 JSON 响应含平台频控证据: {path}",
+            )
+        if any(
+            marker in low
+            for marker in (
+                "waf",
+                "request was banned",
+                "access denied",
+                "forbidden",
+                "precondition failed",
                 "访问受限",
                 "拒绝访问",
                 "请求被拦截",
-                "频控",
-                "限流",
             )
         ):
             return BilibiliError(
@@ -473,6 +515,13 @@ class Session:
         seen_bvids: set[str] = set()
         oid = "0"
         size = 20
+        observed_pages = 0
+        self._discovery_coverage = {
+            "terminal_page_observed": False,
+            "observed_page_count": 0,
+            "observed_post_count": 0,
+            "stop_condition": "limit",
+        }
         max_pages = max(1, (limit + size - 1) // size + 2)
         for _ in range(max_pages):  # 上限保护
             try:
@@ -500,7 +549,14 @@ class Session:
                 )
             d = data.get("data") or {}
             media_list = d.get("media_list") or []
+            observed_pages += 1
             if not media_list:
+                self._discovery_coverage = {
+                    "terminal_page_observed": True,
+                    "observed_page_count": observed_pages,
+                    "observed_post_count": len(out),
+                    "stop_condition": "terminal_page",
+                }
                 break
             reached_lower_bound = False
             for item in media_list:
@@ -513,6 +569,15 @@ class Session:
                 if _date_matches(published_at, date_range):
                     out.append(item)
                     if len(out) >= limit:
+                        terminal = not bool(d.get("has_more"))
+                        self._discovery_coverage = {
+                            "terminal_page_observed": terminal,
+                            "observed_page_count": observed_pages,
+                            "observed_post_count": len(out),
+                            "stop_condition": (
+                                "terminal_page" if terminal else "max_items"
+                            ),
+                        }
                         return out[:limit]
                 if (
                     date_range
@@ -522,13 +587,31 @@ class Session:
                 ):
                     reached_lower_bound = True
             if reached_lower_bound:
+                self._discovery_coverage = {
+                    "terminal_page_observed": False,
+                    "observed_page_count": observed_pages,
+                    "observed_post_count": len(out),
+                    "stop_condition": "date_lower_bound",
+                }
                 break
             if not d.get("has_more"):
+                self._discovery_coverage = {
+                    "terminal_page_observed": True,
+                    "observed_page_count": observed_pages,
+                    "observed_post_count": len(out),
+                    "stop_condition": "terminal_page",
+                }
                 break
             # 游标更新为当前页最后一条的 id
             last = media_list[-1]
             new_oid = str(last.get("id") or "")
             if not new_oid or new_oid == oid:
+                self._discovery_coverage = {
+                    "terminal_page_observed": False,
+                    "observed_page_count": observed_pages,
+                    "observed_post_count": len(out),
+                    "stop_condition": "repeated_cursor",
+                }
                 break
             oid = new_oid
             time.sleep(1.0)  # 翻页间隔，降低风控概率
@@ -594,6 +677,13 @@ class Session:
         seen_bvids: set[str] = set()
         ps = 50
         pn = 1
+        observed_pages = 0
+        self._discovery_coverage = {
+            "terminal_page_observed": False,
+            "observed_page_count": 0,
+            "observed_post_count": 0,
+            "stop_condition": "limit",
+        }
         while len(out) < limit:
             if pn > 1:
                 # 翻页时仅节流，始终复用任务创建时的公开身份。
@@ -622,7 +712,14 @@ class Session:
                     diagnostic_code=DIAG_ARC_DISCOVERY,
                 )
             vlist = (data.get("data") or {}).get("list", {}).get("vlist", [])
+            observed_pages += 1
             if not vlist:
+                self._discovery_coverage = {
+                    "terminal_page_observed": True,
+                    "observed_page_count": observed_pages,
+                    "observed_post_count": len(out),
+                    "stop_condition": "terminal_page",
+                }
                 break
             reached_lower_bound = False
             for item in vlist:
@@ -637,6 +734,15 @@ class Session:
                 if _date_matches(published_at, date_range):
                     out.append(item)
                     if len(out) >= limit:
+                        terminal = len(vlist) < ps
+                        self._discovery_coverage = {
+                            "terminal_page_observed": terminal,
+                            "observed_page_count": observed_pages,
+                            "observed_post_count": len(out),
+                            "stop_condition": (
+                                "terminal_page" if terminal else "max_items"
+                            ),
+                        }
                         return out[:limit]
                 if (
                     date_range
@@ -646,6 +752,15 @@ class Session:
                 ):
                     reached_lower_bound = True
             if reached_lower_bound or len(vlist) < ps:
+                terminal = len(vlist) < ps and not reached_lower_bound
+                self._discovery_coverage = {
+                    "terminal_page_observed": terminal,
+                    "observed_page_count": observed_pages,
+                    "observed_post_count": len(out),
+                    "stop_condition": (
+                        "terminal_page" if terminal else "date_lower_bound"
+                    ),
+                }
                 break  # 已到末页
             pn += 1
         return out[:limit]
@@ -699,6 +814,10 @@ class Session:
         out: list = []
         offset = ""
         empty_streak = 0
+        self._dynamic_discovery_coverage = {
+            "dynamic_terminal_page_observed": False,
+            "dynamic_stop_condition": "max_items",
+        }
         for _ in range(20):
             if out and offset:
                 time.sleep(1.0)  # 分页间隔，降低被风控概率
@@ -735,17 +854,36 @@ class Session:
                     if _date_matches(published_at, date_range):
                         out.append(card)
                         if len(out) >= limit:
+                            terminal = not bool(d.get("has_more"))
+                            self._dynamic_discovery_coverage = {
+                                "dynamic_terminal_page_observed": terminal,
+                                "dynamic_stop_condition": (
+                                    "terminal_page" if terminal else "max_items"
+                                ),
+                            }
                             return out[:limit]
             if extracted_count == 0:
                 empty_streak += 1
                 if empty_streak >= 2:
+                    self._dynamic_discovery_coverage = {
+                        "dynamic_terminal_page_observed": False,
+                        "dynamic_stop_condition": "idle",
+                    }
                     break
             else:
                 empty_streak = 0
             if not d.get("has_more"):
+                self._dynamic_discovery_coverage = {
+                    "dynamic_terminal_page_observed": True,
+                    "dynamic_stop_condition": "terminal_page",
+                }
                 break
             new_offset = d.get("offset") or ""
             if new_offset == offset and empty_streak >= 2:
+                self._dynamic_discovery_coverage = {
+                    "dynamic_terminal_page_observed": False,
+                    "dynamic_stop_condition": "repeated_cursor",
+                }
                 break
             offset = new_offset
         return out[:limit]
@@ -885,6 +1023,7 @@ class BilibiliCollector(BaseCollector):
         self._task_session: Session | None = None
         self._cached_profile_card: dict | None = None
         self._collection_coverage: dict[str, Any] = {}
+        self._skip_optional_tags = False
 
     def _new_session(self) -> Session:
         """Return the collector task's single shared session."""
@@ -944,6 +1083,10 @@ class BilibiliCollector(BaseCollector):
             "accessible": False,
             "status": "restricted",
             "stop_reason": (last.stop_reason if last else STOP_ACCESS_RESTRICTED),
+            "diagnostic_code": DIAG_PROFILE_ACCESS,
+            "platform_response_code": (
+                last.platform_response_code if last is not None else None
+            ),
         }
 
     # -- 资料 --
@@ -1070,34 +1213,26 @@ class BilibiliCollector(BaseCollector):
         url: str,
         limit: int = PUBLIC_LIMIT_DEFAULT,
         date_range=None,
+        *,
+        _complete_mode: bool = False,
     ) -> list:
-        limit = validate_public_limit(limit)
+        limit = (
+            validate_public_all_max_items(limit)
+            if _complete_mode
+            else validate_public_limit(limit)
+        )
         mid = _mid_from_url(url)
         s = self._new_session()
         s.ensure_buvid()
         self._collection_coverage = {
             "regular_observed_count": 0,
-            "dynamic_status": "NOT_ATTEMPTED",
-            "dynamic_observed_count": 0,
             "buvid_established": getattr(s, "_buvid_established", None),
         }
 
-        # 置顶视频检测（top/arc，免 wbi、稳定）——用于标记 is_pinned
-        pinned_result = s.collect_pinned(mid)
-        if (
-            isinstance(pinned_result, tuple)
-            and len(pinned_result) == 2
-            and isinstance(pinned_result[0], bool)
-        ):
-            pinned_observed, pinned_bvid = pinned_result
-        elif isinstance(pinned_result, str) and pinned_result.strip():
-            # 旧 Session/测试双直接返回 BV 号，它仍是明确的置顶证据。
-            pinned_observed, pinned_bvid = True, pinned_result.strip()
-        else:
-            # 向下兼容旧测试双/外部适配；无证据必须保持未知。
-            pinned_observed, pinned_bvid = False, None
+        # 常规列表优先，避免可选置顶端点先受限时丢失本可取得的投稿。
+        pinned_observed, pinned_bvid = False, None
 
-        # 三级降级链：medialist(免wbi+完整指标) → arc/search(wbi) → search/type(BV列表)
+        # 两条高成功率常规列表路径：medialist → WBI arc/search。
         entries = None
         source = None
 
@@ -1158,88 +1293,45 @@ class BilibiliCollector(BaseCollector):
                     raise
                 entries = None
 
-        # 降级 B：search/type（仅 BV 列表，需逐条 view 补全）
         if not entries:
-            try:
-                bvids = s.discover_search(mid, url, limit)
-                entries = [{"bvid": b} for b in bvids]
-                source = "search"
-            except BilibiliError as e:
-                _set_diagnostic(e, DIAG_SEARCH_DISCOVERY)
-                raise e
+            raise BilibiliError(
+                STOP_NO_PUBLIC_CONTENT,
+                "常规投稿列表未返回可验证作品",
+                diagnostic_code=DIAG_ARC_DISCOVERY,
+            )
 
         entries = _deduplicate_discovery_entries(entries)
         self._collection_coverage.update({
             "regular_source": source,
             "regular_observed_count": len(entries),
         })
+        discovery_coverage = getattr(s, "get_discovery_coverage", None)
+        if callable(discovery_coverage):
+            self._collection_coverage.update(discovery_coverage())
 
-        # 动态发现优先于逐条 view/tag 补充。它只发起一次列表阶段，并在任何平台
-        # 保护响应后立刻停止；这样不会把 fragile WBI 观察放到几十次可选标签请求之后。
-        dynamic_cards: list[dict] = []
-        discover_dynamics = getattr(s, "discover_dynamics", None)
-        if callable(discover_dynamics):
-            try:
-                dynamic_cards = (
-                    discover_dynamics(mid, limit, date_range=date_range)
-                    if date_range
-                    else discover_dynamics(mid, limit)
-                )
-                dynamic_cards = _deduplicate_dynamic_cards(dynamic_cards)
-                self._collection_coverage.update({
-                    "dynamic_status": "OBSERVED",
-                    "dynamic_observed_count": len(dynamic_cards),
-                })
-            except BilibiliError as error:
-                _set_diagnostic(error, DIAG_DYNAMIC_DISCOVERY)
-                dynamic_cards = _deduplicate_dynamic_cards(
-                    error.partial_entries
-                )
-                dynamic_status = (
-                    error.stop_reason
-                    if error.stop_reason in BILIBILI_DYNAMIC_STATUSES
-                    else STOP_PARSER_FAILED
-                )
-                self._collection_coverage.update({
-                    "dynamic_status": dynamic_status,
-                    "dynamic_observed_count": len(dynamic_cards),
-                })
-                partial_posts = self._normalize_discovery_entries(
-                    entries,
-                    source,
-                    url,
-                    pinned_observed,
-                    pinned_bvid,
-                )
-                self._merge_dynamic_cards(
-                    partial_posts,
-                    dynamic_cards,
-                    pinned_observed=pinned_observed,
-                    pinned_bvid=pinned_bvid,
-                )
-                self._sort_posts(partial_posts)
-                error.partial_posts = partial_posts[:limit]
-                raise
-            except Exception:
-                self._collection_coverage.update({
-                    "dynamic_status": STOP_PARSER_FAILED,
-                    "dynamic_observed_count": 0,
-                })
-                partial_posts = self._normalize_discovery_entries(
-                    entries,
-                    source,
-                    url,
-                    pinned_observed,
-                    pinned_bvid,
-                )
-                raise BilibiliError(
-                    STOP_PARSER_FAILED,
-                    "动态 feed 解析失败",
-                    partial_posts=partial_posts[:limit],
-                    diagnostic_code=DIAG_DYNAMIC_DISCOVERY,
-                ) from None
-        else:
-            self._collection_coverage["dynamic_status"] = "UNAVAILABLE"
+        # 置顶视频检测（top/arc）属于可选补充。平台保护仍立即停止，但须保留
+        # 已经完成的常规列表证据，并把 is_pinned 保持为未知。
+        try:
+            pinned_result = s.collect_pinned(mid)
+        except BilibiliError as error:
+            _set_diagnostic(error, DIAG_PINNED_DISCOVERY)
+            error.partial_posts = self._normalize_discovery_entries(
+                entries,
+                source,
+                url,
+                pinned_observed,
+                pinned_bvid,
+            )
+            raise
+        if (
+            isinstance(pinned_result, tuple)
+            and len(pinned_result) == 2
+            and isinstance(pinned_result[0], bool)
+        ):
+            pinned_observed, pinned_bvid = pinned_result
+        elif isinstance(pinned_result, str) and pinned_result.strip():
+            # 旧 Session/测试双直接返回 BV 号，它仍是明确的置顶证据。
+            pinned_observed, pinned_bvid = True, pinned_result.strip()
 
         posts = []
         any_view_ok = False
@@ -1279,33 +1371,6 @@ class BilibiliCollector(BaseCollector):
                         _mark_detail_unavailable(base)
                 except Exception:
                     _mark_detail_unavailable(base)
-            else:
-                base = _empty_post(bvid)
-                # search 降级仅有 BV，必须 view 补全
-                try:
-                    v = s.get_json("/x/web-interface/view", {"bvid": bvid})
-                    view_data = v.get("data") if isinstance(v, dict) else None
-                    if v.get("code") == 0 and isinstance(view_data, dict):
-                        base = _build_post_raw_from_view(view_data, url)
-                        any_view_ok = True
-                    elif v.get("code") == -404:
-                        _mark_post_deleted(base)
-                    else:
-                        _mark_detail_unavailable(base)
-                except BilibiliError as error:
-                    _set_diagnostic(error, DIAG_VIEW_DETAIL)
-                    if _is_platform_protection(error):
-                        _mark_detail_unavailable(base)
-                        _raise_with_partial_posts(
-                            error, posts, self.normalize_post(base)
-                        )
-                    if error.stop_reason == STOP_ACCOUNT_UNAVAILABLE:
-                        _mark_post_deleted(base)
-                    else:
-                        _mark_detail_unavailable(base)
-                except Exception:
-                    _mark_detail_unavailable(base)
-
             # 置顶标记
             if pinned_observed:
                 base["is_pinned"] = bool(
@@ -1316,18 +1381,12 @@ class BilibiliCollector(BaseCollector):
 
             posts.append(self.normalize_post(base))
 
-        self._merge_dynamic_cards(
-            posts,
-            dynamic_cards,
-            pinned_observed=pinned_observed,
-            pinned_bvid=pinned_bvid,
-        )
         self._sort_posts(posts)
 
         if not posts:
             raise BilibiliError(
                 STOP_NO_PUBLIC_CONTENT,
-                f"三级降级链均无可用投稿 (mid={mid})",
+                f"两条常规列表路径均无可用投稿 (mid={mid})",
             )
 
         # 日期范围过滤（Best-effort）——记录过滤前的数量与匹配数，
@@ -1355,19 +1414,13 @@ class BilibiliCollector(BaseCollector):
             and not posts
         )
 
-        # search 降级且全部 view 补全失败 → 空骨架无指标，如实上抛
-        if source == "search" and not any_view_ok and posts:
-            raise BilibiliError(
-                STOP_PARSER_FAILED,
-                f"search 降级且全部 view 补全失败 (mid={mid})",
-                partial_posts=posts,
-                diagnostic_code=DIAG_VIEW_DETAIL,
-            )
-
         # 仅对最终去重且会落盘的作品补标签，每个 BV 最多一次。动态或其他列表阶段
         # 一旦触发保护，函数已在上方停止，不会继续发起这些可选请求。
         posts = posts[:limit]
         for post in posts:
+            if self._skip_optional_tags:
+                _mark_tags_unavailable(post)
+                continue
             if str(post.get("collection_status") or "").upper() == "DELETED":
                 continue
             post_id = str(post.get("post_id") or "")
@@ -1398,6 +1451,53 @@ class BilibiliCollector(BaseCollector):
                 if tag and tag not in merged:
                     merged.append(tag)
             post["hashtags"] = merged
+        return posts
+
+    def collect_all_post_list(
+        self,
+        url: str,
+        date_range=None,
+        max_items: int = PUBLIC_ALL_DEFAULT_MAX_ITEMS,
+        max_seconds: float = 1_800.0,
+        max_scrolls: int = 2_000,
+    ) -> list[dict]:
+        """Collect Bilibili posts to a terminal page within bounded budgets.
+
+        The time and scroll budgets share the cross-platform CLI contract but
+        Bilibili pagination is request/cursor based. Optional per-video tag
+        enrichment is skipped so a complete list does not create O(n) traffic.
+        """
+        max_items, max_seconds, max_scrolls = validate_public_all_budgets(
+            max_items, max_seconds, max_scrolls
+        )
+        del max_seconds, max_scrolls
+        self._skip_optional_tags = True
+        try:
+            observed_posts = self.collect_post_list(
+                url,
+                limit=max_items,
+                date_range=None,
+                _complete_mode=True,
+            )
+        finally:
+            self._skip_optional_tags = False
+        posts = [
+            post
+            for post in observed_posts
+            if _date_matches(post.get("published_at"), date_range)
+        ]
+        terminal = self._collection_coverage.get("terminal_page_observed") is True
+        self._collection_coverage.update({
+            "requested_all": True,
+            "max_items": max_items,
+            "observed_post_count": len(observed_posts),
+            "is_exhaustive": bool(terminal),
+            "range_filter_applied": date_range is not None,
+            "range_match_count": len(posts),
+            "range_no_match": bool(
+                date_range is not None and observed_posts and not posts
+            ),
+        })
         return posts
 
     # -- 单条详情 --

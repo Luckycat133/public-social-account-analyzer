@@ -1298,6 +1298,85 @@ def test_failure_report_summarizes_success_errors_and_stop_stage(tmp_path):
     assert "- 停止阶段: collect_post_list" in report
 
 
+def test_post_list_failure_persists_safe_platform_response_code(
+    monkeypatch, tmp_path, capsys
+):
+    import collect
+
+    class RestrictedError(Exception):
+        stop_reason = "RATE_LIMITED"
+        diagnostic_code = "BILIBILI_MEDIALIST_DISCOVERY"
+        platform_response_code = -799
+        partial_posts = []
+
+    class RestrictedAdapter(_SafeCommentAdapter):
+        platform = "bilibili"
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {"accessible": True}
+
+        def collect_post_list(self, url, limit=30, date_range=None):
+            raise RestrictedError("untrusted upstream response")
+
+        def collect_profile(self, url):
+            return {"platform": "bilibili", "field_visibility": {}}
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [RestrictedAdapter()])
+    out = tmp_path / "task"
+
+    assert collect.run(
+        "https://space.bilibili.com/337521240", out_dir=str(out)
+    ) == 3
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["stop_reason"] == "RATE_LIMITED"
+    assert task["diagnostic_code"] == "BILIBILI_MEDIALIST_DISCOVERY"
+    assert task["platform_response_code"] == -799
+
+    report = (out / "collection-report.md").read_text(encoding="utf-8")
+    assert "platform_response_code=-799" in report
+    stderr = capsys.readouterr().err
+    assert "stop_reason=RATE_LIMITED" in stderr
+    assert "diagnostic_code=BILIBILI_MEDIALIST_DISCOVERY" in stderr
+    assert "platform_response_code=-799" in stderr
+
+
+def test_access_failure_persists_safe_platform_response_code(
+    monkeypatch, tmp_path
+):
+    import collect
+
+    class RestrictedAtAccessAdapter(_SafeCommentAdapter):
+        platform = "bilibili"
+
+        def supports(self, url):
+            return True
+
+        def check_access(self, url):
+            return {
+                "accessible": False,
+                "stop_reason": "VERIFICATION_REQUIRED",
+                "diagnostic_code": "BILIBILI_PROFILE_ACCESS",
+                "platform_response_code": -352,
+            }
+
+    monkeypatch.setattr(
+        collect, "_load_adapters", lambda: [RestrictedAtAccessAdapter()]
+    )
+    out = tmp_path / "task"
+
+    assert collect.run(
+        "https://space.bilibili.com/337521240", out_dir=str(out)
+    ) == 3
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["diagnostic_code"] == "BILIBILI_PROFILE_ACCESS"
+    assert task["platform_response_code"] == -352
+
+
 def test_report_counts_success_and_partial_rows_separately(tmp_path):
     import collect
 

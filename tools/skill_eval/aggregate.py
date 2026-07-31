@@ -25,13 +25,16 @@ grading.json 兼容字段：
 timing 容错：total_duration_seconds 允许为 int/float/数字字符串；
 null、非数字字符串、缺失、对象等一律归一化为 None，绝不抛异常。
 
-输出：benchmark.json（结构化）与 benchmark.md（可读表格），含
+输出：benchmark.json（结构化）、benchmark.md（可读表格）与
+review-benchmark.json（skill-creator eval viewer 精确 schema），含
 宏平均/微平均通过率、逐题 delta、可用 timing 聚合，以及每题每配置
-多次 run 的通过率均值/标准差（run 数 >= 2 时）。
+多次 run 的通过率均值/标准差（run 数 >= 2 时）。若 iteration 根目录
+存在 run-metadata.json，还会核验声明次数、配对配置、评分完整性及
+耗时/token 指标可用性；--strict 会对不完整协议返回非零退出码。
 
 用法::
 
-    python tools/skill_eval/aggregate.py <iteration-dir> [--out <dir>]
+    python tools/skill_eval/aggregate.py <iteration-dir> [--out <dir>] [--strict]
 """
 
 from __future__ import annotations
@@ -67,6 +70,13 @@ def coerce_duration_seconds(value: Any) -> Optional[float]:
             return parsed
         return None
     return None  # None / dict / list / 其他一律视为不可用
+
+
+def coerce_token_count(value: Any) -> Optional[int]:
+    """把 token 数归一化为非负整数；未知值保持 None。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -113,24 +123,36 @@ def parse_grading(grading: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def extract_timing(run_dir: Path, grading: Optional[Dict[str, Any]]) -> Optional[float]:
-    """优先 timing.json，其次 grading.timing；全部容错。"""
+def extract_timing_metrics(
+    run_dir: Path, grading: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """提取墙钟耗时与 token；未知指标保持 None，绝不以 0 代替。"""
+    duration: Optional[float] = None
+    tokens: Optional[int] = None
     timing = load_json(run_dir / "timing.json")
     if timing is not None:
         for key in ("total_duration_seconds", "duration_seconds"):
             got = coerce_duration_seconds(timing.get(key))
             if got is not None:
-                return got
-        got = coerce_duration_seconds(timing.get("duration_ms"))
-        if got is not None:
-            return got / 1000.0
-    if grading is not None:
+                duration = got
+                break
+        if duration is None:
+            got = coerce_duration_seconds(timing.get("duration_ms"))
+            if got is not None:
+                duration = got / 1000.0
+        tokens = coerce_token_count(timing.get("total_tokens"))
+    if grading is not None and duration is None:
         tblock = grading.get("timing")
         if isinstance(tblock, dict):
             got = coerce_duration_seconds(tblock.get("total_duration_seconds"))
             if got is not None:
-                return got
-    return None
+                duration = got
+    return {"duration_seconds": duration, "total_tokens": tokens}
+
+
+def extract_timing(run_dir: Path, grading: Optional[Dict[str, Any]]) -> Optional[float]:
+    """兼容旧调用方：只返回墙钟秒。"""
+    return extract_timing_metrics(run_dir, grading)["duration_seconds"]
 
 
 # ---------------------------------------------------------------------------
@@ -167,11 +189,12 @@ def aggregate_config(config_dir: Path) -> Dict[str, Any]:
     for run_dir in run_dirs:
         grading = load_json(run_dir / "grading.json")
         parsed = parse_grading(grading) if grading else None
-        duration = extract_timing(run_dir, grading)
+        timing_metrics = extract_timing_metrics(run_dir, grading)
         entry: Dict[str, Any] = {
             "run": run_dir.name if run_dir != config_dir else "run-1",
             "grading_available": parsed is not None,
-            "total_duration_seconds": duration,
+            "total_duration_seconds": timing_metrics["duration_seconds"],
+            "total_tokens": timing_metrics["total_tokens"],
         }
         if parsed:
             entry.update(parsed)
@@ -184,6 +207,8 @@ def aggregate_config(config_dir: Path) -> Dict[str, Any]:
              if r.get("pass_rate") is not None]
     durations = [r["total_duration_seconds"] for r in runs
                  if r.get("total_duration_seconds") is not None]
+    token_counts = [r["total_tokens"] for r in runs
+                    if r.get("total_tokens") is not None]
     graded = [r for r in runs if r["grading_available"]]
     return {
         "runs": runs,
@@ -196,6 +221,82 @@ def aggregate_config(config_dir: Path) -> Dict[str, Any]:
         "pass_rate_stdev": stdev(rates),
         "duration_seconds_mean": mean(durations),
         "duration_available_runs": len(durations),
+        "tokens_mean": mean([float(value) for value in token_counts]),
+        "token_available_runs": len(token_counts),
+    }
+
+
+def audit_protocol(
+    evals: List[Dict[str, Any]], run_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """核验配对评测的声明次数与磁盘事实，避免虚报方差。"""
+    raw_declared = run_metadata.get("runs_per_configuration")
+    declared = (
+        raw_declared
+        if isinstance(raw_declared, int)
+        and not isinstance(raw_declared, bool)
+        and raw_declared > 0
+        else None
+    )
+    issues: List[Dict[str, Any]] = []
+    if declared is None:
+        issues.append({
+            "code": "MISSING_RUN_METADATA",
+            "eval": None,
+            "configuration": None,
+            "message": "run-metadata.json 未声明有效的 runs_per_configuration",
+        })
+    elif declared < 3:
+        issues.append({
+            "code": "INSUFFICIENT_REPETITIONS",
+            "eval": None,
+            "configuration": None,
+            "expected": 3,
+            "observed": declared,
+            "message": f"稳定性基准至少需要 3 次重复，当前声明 {declared}",
+        })
+
+    duration_runs = token_runs = total_runs = 0
+    for entry in evals:
+        for config in CONFIG_NAMES:
+            block = entry["configs"][config]
+            total_runs += block["run_count"]
+            duration_runs += block["duration_available_runs"]
+            token_runs += block["token_available_runs"]
+            if declared is not None and block["run_count"] != declared:
+                issues.append({
+                    "code": "RUN_COUNT_MISMATCH",
+                    "eval": entry["eval"],
+                    "configuration": config,
+                    "expected": declared,
+                    "observed": block["run_count"],
+                    "message": (
+                        f"{entry['eval']} / {config}: 实际 {block['run_count']}，"
+                        f"声明 {declared}"
+                    ),
+                })
+            if block["graded_run_count"] != block["run_count"]:
+                issues.append({
+                    "code": "UNGRADED_RUNS",
+                    "eval": entry["eval"],
+                    "configuration": config,
+                    "expected": block["run_count"],
+                    "observed": block["graded_run_count"],
+                    "message": (
+                        f"{entry['eval']} / {config}: "
+                        f"{block['run_count'] - block['graded_run_count']} 个 run 缺少有效评分"
+                    ),
+                })
+
+    return {
+        "status": "COMPLETE" if not issues else "INCOMPLETE",
+        "declared_runs_per_configuration": declared,
+        "issues": issues,
+        "metric_availability": {
+            "duration_runs": duration_runs,
+            "token_runs": token_runs,
+            "total_runs": total_runs,
+        },
     }
 
 
@@ -236,7 +337,164 @@ def aggregate_iteration(iteration_dir: Path) -> Dict[str, Any]:
             "micro_total": total,
             "micro_pass_rate": (passed / total) if total else None,
         }
-    return {"iteration": iteration_dir.name, "evals": evals, "summary": summary}
+    run_metadata = load_json(iteration_dir / "run-metadata.json") or {}
+    protocol = audit_protocol(evals, run_metadata)
+    return {
+        "iteration": iteration_dir.name,
+        "evals": evals,
+        "summary": summary,
+        "protocol": protocol,
+    }
+
+
+def _viewer_stats(values: List[float]) -> Optional[Dict[str, float]]:
+    """Return the exact statistics block expected by skill-creator's viewer."""
+    if not values:
+        return None
+    return {
+        "mean": mean(values),
+        "stddev": stdev(values) or 0.0,
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def _viewer_run_number(run_dir: Path, fallback: int) -> int:
+    if run_dir.name.startswith("run-"):
+        try:
+            value = int(run_dir.name.removeprefix("run-"))
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    return fallback
+
+
+def build_review_benchmark(
+    iteration_dir: Path, result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Adapt the audit-rich aggregate to skill-creator's viewer schema."""
+    root_metadata = load_json(iteration_dir / "run-metadata.json") or {}
+    viewer_runs: List[Dict[str, Any]] = []
+    eval_ids: List[Any] = []
+
+    for eval_dir in sorted(iteration_dir.iterdir()):
+        if not eval_dir.is_dir() or not eval_dir.name.startswith("eval-"):
+            continue
+        eval_metadata = load_json(eval_dir / "eval_metadata.json") or {}
+        eval_id = eval_metadata.get("eval_id")
+        eval_name = (
+            eval_metadata.get("eval_name")
+            or eval_dir.name.removeprefix("eval-")
+        )
+        if eval_id is not None and eval_id not in eval_ids:
+            eval_ids.append(eval_id)
+        for config in CONFIG_NAMES:
+            run_dirs = discover_runs(eval_dir / config)
+            for fallback, run_dir in enumerate(run_dirs, start=1):
+                grading = load_json(run_dir / "grading.json")
+                parsed = parse_grading(grading) if grading else None
+                metrics = extract_timing_metrics(run_dir, grading)
+                passed = parsed["passed"] if parsed else 0
+                failed = parsed["failed"] if parsed else 0
+                total = parsed["total"] if parsed else 0
+                expectations = (
+                    grading.get("expectations", [])
+                    if isinstance(grading, dict)
+                    and isinstance(grading.get("expectations"), list)
+                    else []
+                )
+                viewer_runs.append({
+                    "eval_id": eval_id,
+                    "eval_name": eval_name,
+                    "configuration": config,
+                    "run_number": _viewer_run_number(run_dir, fallback),
+                    "result": {
+                        "pass_rate": (
+                            passed / total if parsed and total else None
+                        ),
+                        "passed": passed,
+                        "failed": failed,
+                        "total": total,
+                        "time_seconds": metrics["duration_seconds"],
+                        "tokens": metrics["total_tokens"],
+                        "errors": 0,
+                    },
+                    "expectations": expectations,
+                    "notes": ([] if parsed else ["grading unavailable"]),
+                })
+
+    metadata: Dict[str, Any] = {}
+    for key in (
+        "skill_name", "skill_path", "executor_model", "analyzer_model",
+        "timestamp", "runs_per_configuration",
+    ):
+        value = root_metadata.get(key)
+        if value is not None:
+            metadata[key] = value
+    metadata["evals_run"] = eval_ids
+
+    run_summary: Dict[str, Any] = {}
+    for config in CONFIG_NAMES:
+        config_runs = [
+            run for run in viewer_runs if run["configuration"] == config
+        ]
+        block: Dict[str, Any] = {}
+        for source_key, output_key in (
+            ("pass_rate", "pass_rate"),
+            ("time_seconds", "time_seconds"),
+            ("tokens", "tokens"),
+        ):
+            values = [
+                float(run["result"][source_key])
+                for run in config_runs
+                if run["result"].get(source_key) is not None
+            ]
+            stat_block = _viewer_stats(values)
+            if stat_block is not None:
+                block[output_key] = stat_block
+        run_summary[config] = block
+
+    delta: Dict[str, str] = {}
+    for metric in ("pass_rate", "time_seconds", "tokens"):
+        with_stat = run_summary["with_skill"].get(metric)
+        without_stat = run_summary["without_skill"].get(metric)
+        if with_stat is None or without_stat is None:
+            continue
+        difference = with_stat["mean"] - without_stat["mean"]
+        delta[metric] = (
+            f"{difference:+.3f}" if metric == "pass_rate"
+            else f"{difference:+.1f}"
+        )
+    run_summary["delta"] = delta
+
+    notes: List[str] = []
+    protocol = result.get("protocol") or {}
+    if protocol.get("status") != "COMPLETE":
+        notes.append("Benchmark protocol is incomplete; inspect protocol issues.")
+    if root_metadata.get("physical_isolation") is False:
+        baseline = root_metadata.get("baseline_kind") or "instruction-isolated"
+        notes.append(
+            f"Baseline isolation is {baseline}; physical isolation was unavailable."
+        )
+    availability = protocol.get("metric_availability") or {}
+    total_runs = availability.get("total_runs")
+    if isinstance(total_runs, int) and total_runs > 0:
+        if availability.get("duration_runs") != total_runs:
+            notes.append("Duration is unavailable for one or more runs.")
+        if availability.get("token_runs") != total_runs:
+            notes.append("Token usage is unavailable for one or more runs.")
+    for key in ("metric_limitations", "local_ollama_preflight"):
+        value = root_metadata.get(key)
+        if isinstance(value, str) and value:
+            notes.append(value)
+
+    return {
+        "metadata": metadata,
+        "runs": viewer_runs,
+        "run_summary": run_summary,
+        "notes": notes,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +537,20 @@ def render_markdown(result: Dict[str, Any]) -> str:
             f"（{fmt_rate(block['micro_pass_rate'])}）"
         )
     lines.append("")
+    protocol = result["protocol"]
+    lines.append(f"## 评测协议\n")
+    lines.append(f"- 协议完整性：{protocol['status']}")
+    declared = protocol["declared_runs_per_configuration"]
+    lines.append(f"- 每配置声明重复次数：{declared if declared is not None else 'n/a'}")
+    availability = protocol["metric_availability"]
+    lines.append(
+        f"- 指标可用性：耗时 {availability['duration_runs']}/"
+        f"{availability['total_runs']}，token {availability['token_runs']}/"
+        f"{availability['total_runs']}"
+    )
+    for issue in protocol["issues"]:
+        lines.append(f"- [{issue['code']}] {issue['message']}")
+    lines.append("")
     lines.append("> N/A 断言（条件未触发）不计入分母。"
                  "耗时缺失的 run 不参与耗时聚合，绝不以 0 回填。")
     return "\n".join(lines) + "\n"
@@ -289,6 +561,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("iteration_dir", help="iteration 目录路径")
     parser.add_argument("--out", default=None,
                         help="输出目录（默认写回 iteration 目录）")
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="评测协议不完整时在写出诊断后返回 4",
+    )
     args = parser.parse_args(argv)
 
     iteration_dir = Path(args.iteration_dir)
@@ -308,7 +584,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     (out_dir / "benchmark.md").write_text(
         render_markdown(result), encoding="utf-8"
     )
-    print(f"benchmark written to {out_dir}/benchmark.json and benchmark.md")
+    review_benchmark = build_review_benchmark(iteration_dir, result)
+    (out_dir / "review-benchmark.json").write_text(
+        json.dumps(review_benchmark, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"benchmark written to {out_dir}/benchmark.json, benchmark.md, "
+        "and review-benchmark.json"
+    )
+    if args.strict and result["protocol"]["status"] != "COMPLETE":
+        print("error: benchmark protocol is incomplete", file=sys.stderr)
+        return 4
     return 0
 
 

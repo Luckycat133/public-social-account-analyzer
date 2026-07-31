@@ -422,6 +422,9 @@ def test_final_pipeline_writes_deterministic_delivery_handoff(tmp_path):
     )
     assert handoff == {
         "schema_version": 1,
+        "delivery_ready": True,
+        "delivery_kind": "strategy",
+        "strategy_ready": True,
         "task_status": "COMPLETED",
         "stop_reason": "null",
         "restriction_scope": None,

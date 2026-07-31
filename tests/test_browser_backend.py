@@ -90,12 +90,119 @@ def test_find_browser_windows_path(monkeypatch):
     assert find_browser() == r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 
-def test_find_browser_not_found(monkeypatch):
+def test_find_browser_not_found(tmp_path, monkeypatch):
     monkeypatch.setenv("BROWSER_BIN", "")
     monkeypatch.setenv("CHROME_BIN", "")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
     monkeypatch.setattr("collectors.browser_backend.shutil.which", lambda _: None)
     monkeypatch.setattr("collectors.browser_backend.os.path.exists", lambda _: False)
     assert find_browser() is None
+
+
+def test_find_browser_uses_existing_playwright_managed_chromium(
+    tmp_path, monkeypatch
+):
+    """A cached Playwright browser must not be misreported as unavailable."""
+    browser = (
+        tmp_path
+        / "chromium-1234"
+        / "chrome-linux64"
+        / "chrome"
+    )
+    browser.parent.mkdir(parents=True)
+    browser.write_bytes(b"browser")
+    browser.chmod(0o755)
+
+    monkeypatch.setattr("collectors.browser_backend._platform_key", lambda: "linux")
+    monkeypatch.setenv("BROWSER_BIN", "")
+    monkeypatch.setenv("CHROME_BIN", "")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
+    monkeypatch.setattr("collectors.browser_backend.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "collectors.browser_backend.os.path.exists", lambda _: False
+    )
+
+    assert find_browser() == str(browser)
+
+
+def test_find_browsers_returns_every_usable_candidate_in_stable_order(
+    tmp_path, monkeypatch
+):
+    import collectors.browser_backend as backend
+
+    system_browser = tmp_path / "system-browser"
+    playwright_browser = tmp_path / "playwright-browser"
+    system_browser.write_bytes(b"system")
+    playwright_browser.write_bytes(b"playwright")
+    system_browser.chmod(0o755)
+    playwright_browser.chmod(0o755)
+    monkeypatch.setenv("BROWSER_BIN", "")
+    monkeypatch.setenv("CHROME_BIN", "")
+    monkeypatch.setattr(backend, "_platform_key", lambda: "linux")
+    monkeypatch.setattr(backend, "_CANDIDATES", {"linux": [str(system_browser)]})
+    monkeypatch.setattr(
+        backend, "_find_playwright_browsers", lambda _platform: [str(playwright_browser)],
+        raising=False,
+    )
+
+    assert backend.find_browsers() == [
+        str(system_browser),
+        str(playwright_browser),
+    ]
+
+
+def test_session_start_tries_next_discovered_browser_after_startup_failure(
+    tmp_path, monkeypatch
+):
+    import collectors.browser_backend as backend
+
+    bad = tmp_path / "bad-browser"
+    good = tmp_path / "good-browser"
+    bad.write_bytes(b"bad")
+    good.write_bytes(b"good")
+    bad.chmod(0o755)
+    good.chmod(0o755)
+    launched = []
+
+    class FakeProc:
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout):
+            return 0
+
+    monkeypatch.setattr(
+        backend, "find_browsers", lambda explicit=None: [str(bad), str(good)],
+        raising=False,
+    )
+    monkeypatch.setattr(backend, "find_browser", lambda explicit=None: str(bad))
+
+    def fake_popen(args, **_kwargs):
+        launched.append(args[0])
+        return FakeProc()
+
+    monkeypatch.setattr(backend.subprocess, "Popen", fake_popen)
+    session = backend.BrowserSession(port=9222, startup_timeout=1.0)
+
+    def wait_for_devtools():
+        if session.selected_browser_bin == str(bad):
+            raise BrowserError("first candidate failed")
+
+    monkeypatch.setattr(session, "_wait_for_devtools", wait_for_devtools)
+    monkeypatch.setattr(session, "_connect", lambda: None)
+
+    try:
+        assert session.start() is session
+        assert launched == [str(bad), str(good)]
+        assert session.selected_browser_bin == str(good)
+    finally:
+        session.close()
 
 
 # --------------------------------------------------------------------------
@@ -127,6 +234,41 @@ def test_session_start_no_binary_raises():
         raise AssertionError("expected BrowserError")
     except BrowserError as e:
         assert "未找到" in str(e) or "浏览器" in str(e)
+
+
+def test_wait_for_devtools_creates_target_with_put(monkeypatch):
+    """Chromium headless shell accepts PUT, not legacy GET, for /json/new."""
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.payload
+
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request)
+        if isinstance(request, str) and request.endswith("/json/list"):
+            return FakeResponse([])
+        if getattr(request, "method", None) == "PUT":
+            return FakeResponse({"webSocketDebuggerUrl": "ws://target"})
+        raise RuntimeError("legacy GET /json/new rejected")
+
+    session = BrowserSession(port=9222, startup_timeout=1.0)
+    session._proc = type("RunningProc", (), {"poll": lambda self: None})()
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    session._wait_for_devtools()
+
+    assert session._ws_url == "ws://target"
+    assert getattr(calls[-1], "method", None) == "PUT"
 
 
 def test_diagnostic_code(monkeypatch, tmp_path):

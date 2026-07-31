@@ -83,7 +83,7 @@
   此时 `collect_profile` / `collect_post_list` / `collect_post_detail` / `check_access`
   一律抛出携带 `ADAPTER_UNAVAILABLE` 的 `RuntimeError`，编排器据此将任务
   `stop_reason = ADAPTER_UNAVAILABLE`、`task_status = FAILED`，**不得**假装已采集、
-  不得写入任何空数据行。
+  不得写入任何空数据行。该状态只属于专用适配器任务；Agent 应把控制权交还公开网页、搜索、浏览器或用户材料等合规路径，不得据此宣布整个用户请求失败。
 - **`weibo.py` 完全不存在**：编排器同样判定为 `ADAPTER_UNAVAILABLE`（平台适配器未实现）。
 - **访问限制（未来启用后）**：若微博要求登录 → `LOGIN_REQUIRED`；出现验证码 / 滑块 →
   `VERIFICATION_REQUIRED`；频控 → `ACCESS_RESTRICTED`；账号不存在 / 封禁 →

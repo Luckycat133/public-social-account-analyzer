@@ -1,8 +1,10 @@
 """Bounded, zero-Python-dependency collection of public Douyin page data.
 
 The browser follows the public page normally.  This module observes eligible
-CDP responses after they finish loading and, when needed, reads only visible
-DOM-card fields.  It never constructs signed requests or handles challenges.
+CDP responses and, if no account-list response appears, may issue a frozen,
+unsigned same-origin public list fetch from that page context.  It then falls
+back to visible DOM-card fields.  It never copies signatures or handles
+challenges.
 """
 
 from __future__ import annotations
@@ -67,6 +69,7 @@ DETAIL_DEFAULT_MAX_CANDIDATES = 8
 DETAIL_MAX_CANDIDATES = 32
 DETAIL_DEFAULT_MAX_BODY_CHARS = 1_000_000
 DETAIL_MAX_BODY_CHARS = 4_000_000
+ACCOUNT_PAGE_CONTEXT_MAX_BODY_CHARS = 4_000_000
 
 _ALLOWED_RESPONSE_HOSTS = ("douyin.com", "iesdouyin.com")
 _DOM_PROFILE_HELPERS = r"""
@@ -383,12 +386,24 @@ def _account_id_strength(profile: dict[str, Any]) -> int:
 def _merge_profile_evidence(
     existing: dict[str, Any], incoming: dict[str, Any]
 ) -> None:
-    """Fill profile gaps while allowing stronger certification evidence."""
+    """Fill gaps, upgrade strong identity evidence, and disclose counters."""
     existing_verified = existing.get("verified")
     incoming_verified = incoming.get("verified")
     existing_account_strength = _account_id_strength(existing)
     incoming_account_strength = _account_id_strength(incoming)
     incoming_account_id = incoming.get("account_id")
+    counter_pairs = {
+        "followers": (existing.get("followers"), incoming.get("followers")),
+        "post_count": (existing.get("post_count"), incoming.get("post_count")),
+        "total_likes": (
+            (existing.get("platform_metrics") or {}).get("total_likes")
+            if isinstance(existing.get("platform_metrics"), dict)
+            else None,
+            (incoming.get("platform_metrics") or {}).get("total_likes")
+            if isinstance(incoming.get("platform_metrics"), dict)
+            else None,
+        ),
+    }
     _merge_missing(existing, incoming)
     if incoming_account_strength > existing_account_strength:
         existing["account_id"] = copy.deepcopy(incoming_account_id)
@@ -396,6 +411,83 @@ def _merge_profile_evidence(
         existing_verified
     ):
         existing["verified"] = copy.deepcopy(incoming_verified)
+    metrics = existing.get("platform_metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+        existing["platform_metrics"] = metrics
+    conflicts = metrics.get("profile_conflicts")
+    conflicts = copy.deepcopy(conflicts) if isinstance(conflicts, dict) else {}
+    incoming_metrics = incoming.get("platform_metrics")
+    incoming_conflicts = (
+        incoming_metrics.get("profile_conflicts")
+        if isinstance(incoming_metrics, dict)
+        else None
+    )
+    if isinstance(incoming_conflicts, dict):
+        for field_name, entry in incoming_conflicts.items():
+            if field_name not in {"followers", "post_count", "total_likes"}:
+                continue
+            values = entry.get("observed_values") if isinstance(entry, dict) else None
+            if not isinstance(values, list):
+                continue
+            current = conflicts.setdefault(field_name, {"observed_values": []})
+            for value in values:
+                if (
+                    type(value) is int
+                    and value >= 0
+                    and value not in current["observed_values"]
+                    and len(current["observed_values"]) < 16
+                ):
+                    current["observed_values"].append(value)
+    for field_name, (selected, observed) in counter_pairs.items():
+        if (
+            type(selected) is not int
+            or type(observed) is not int
+            or selected < 0
+            or observed < 0
+            or selected == observed
+        ):
+            continue
+        current = conflicts.setdefault(field_name, {"observed_values": []})
+        for value in (selected, observed):
+            if value not in current["observed_values"]:
+                current["observed_values"].append(value)
+    selected_values = {
+        "followers": existing.get("followers"),
+        "post_count": existing.get("post_count"),
+        "total_likes": metrics.get("total_likes"),
+    }
+    clean_conflicts = {}
+    visibility = existing.get("field_visibility")
+    if not isinstance(visibility, dict):
+        visibility = {}
+        existing["field_visibility"] = visibility
+    for field_name, entry in conflicts.items():
+        values = entry.get("observed_values") if isinstance(entry, dict) else None
+        selected = selected_values.get(field_name)
+        if (
+            not isinstance(values, list)
+            or type(selected) is not int
+            or selected < 0
+        ):
+            continue
+        unique = []
+        for value in values:
+            if type(value) is int and value >= 0 and value not in unique:
+                unique.append(value)
+        if selected not in unique:
+            unique.insert(0, selected)
+        if len(unique) < 2:
+            continue
+        clean_conflicts[field_name] = {
+            "selected": selected,
+            "observed_values": unique[:16],
+        }
+        visibility[field_name] = "partial"
+    if clean_conflicts:
+        metrics["profile_conflicts"] = clean_conflicts
+    else:
+        metrics.pop("profile_conflicts", None)
 
 
 def _first_present(source: dict[str, Any], *keys: str) -> Any:
@@ -583,6 +675,38 @@ def sanitize_profile_raw(
         )
         if metric_value is not None
     }
+    raw_conflicts = metrics.get("profile_conflicts")
+    clean_conflicts: dict[str, dict[str, Any]] = {}
+    selected_counters = {
+        "followers": followers,
+        "post_count": post_count,
+        "total_likes": total_likes,
+    }
+    if isinstance(raw_conflicts, dict):
+        for field_name in ("followers", "post_count", "total_likes"):
+            entry = raw_conflicts.get(field_name)
+            values = entry.get("observed_values") if isinstance(entry, dict) else None
+            selected = selected_counters[field_name]
+            if not isinstance(values, list) or type(selected) is not int:
+                continue
+            unique = []
+            for observed in values:
+                if (
+                    type(observed) is int
+                    and observed >= 0
+                    and observed not in unique
+                    and len(unique) < 16
+                ):
+                    unique.append(observed)
+            if selected not in unique:
+                unique.insert(0, selected)
+            if len(unique) >= 2:
+                clean_conflicts[field_name] = {
+                    "selected": selected,
+                    "observed_values": unique,
+                }
+    if clean_conflicts:
+        public_metrics["profile_conflicts"] = clean_conflicts
     if verification_source is not None:
         public_metrics[verification_source] = verification_source_value
     return {
@@ -610,9 +734,18 @@ def sanitize_profile_raw(
             "account_name": "visible" if account_name is not None else "hidden",
             "bio": "visible" if bio is not None else "hidden",
             "verified": "visible" if verified is not None else "hidden",
-            "followers": "visible" if followers is not None else "hidden",
-            "post_count": "visible" if post_count is not None else "hidden",
-            "total_likes": "visible" if total_likes is not None else "hidden",
+            "followers": (
+                "partial" if "followers" in clean_conflicts
+                else "visible" if followers is not None else "hidden"
+            ),
+            "post_count": (
+                "partial" if "post_count" in clean_conflicts
+                else "visible" if post_count is not None else "hidden"
+            ),
+            "total_likes": (
+                "partial" if "total_likes" in clean_conflicts
+                else "visible" if total_likes is not None else "hidden"
+            ),
         },
     }
 
@@ -873,6 +1006,15 @@ def _is_valid_pagination_cursor(value: Any) -> bool:
     )
 
 
+def _normalized_has_more(value: Any) -> tuple[Optional[bool], bool]:
+    """Normalize the public endpoint's boolean or exact integer 0/1 form."""
+    if isinstance(value, bool):
+        return value, True
+    if type(value) is int and value in (0, 1):
+        return bool(value), True
+    return None, False
+
+
 def _audit_account_post_candidate(
     data: Any,
     expected_sec_uid: str,
@@ -927,10 +1069,11 @@ def _audit_account_post_candidate(
 
         has_more = owner.get("has_more")
         metadata_valid = True
-        if "has_more" in owner and not isinstance(has_more, bool):
-            has_more = None
-            metadata_valid = False
-            invalid = True
+        if "has_more" in owner:
+            has_more, has_more_valid = _normalized_has_more(has_more)
+            if not has_more_valid:
+                metadata_valid = False
+                invalid = True
 
         cursor_values: list[Any] = []
         for cursor_key in ("max_cursor", "cursor", "min_cursor"):
@@ -1076,8 +1219,8 @@ def extract_post_page_observations(
             if raw_items and not unique:
                 continue
             has_more = value.get("has_more")
-            if not isinstance(has_more, bool):
-                has_more = None
+            if "has_more" in value:
+                has_more, _ = _normalized_has_more(has_more)
             cursor = next(
                 (
                     value[key]
@@ -1379,6 +1522,24 @@ def _date_relation(
     return "in_range"
 
 
+def _page_context_post_list_url(sec_uid: str, cursor: Any) -> str:
+    """Build one unsigned, same-origin public list request from frozen fields."""
+    if _ACCOUNT_ID.fullmatch(sec_uid) is None:
+        raise ValueError("invalid Douyin account identifier")
+    normalized_cursor = cursor if _is_valid_pagination_cursor(cursor) else 0
+    query = urllib.parse.urlencode({
+        "device_platform": "webapp",
+        "aid": "6383",
+        "channel": "channel_pc_web",
+        "publish_video_strategy_type": "2",
+        "source": "channel_tab_feed",
+        "sec_user_id": sec_uid,
+        "max_cursor": str(normalized_cursor),
+        "count": "20",
+    })
+    return f"https://www.douyin.com/aweme/v1/web/aweme/post/?{query}"
+
+
 @contextmanager
 def _collection_session(session_factory, cleanup_state: dict[str, Any]):
     """Retain collection state when a normal context exit reports cleanup failure."""
@@ -1404,6 +1565,7 @@ def collect_account_page(
     all_posts: bool = False,
     max_seconds: Optional[float] = None,
     max_scrolls: Optional[int] = None,
+    cookie_records: tuple[dict[str, Any], ...] = (),
     session_factory=BrowserSession,
     monotonic=time.monotonic,
     sleep=time.sleep,
@@ -1458,6 +1620,12 @@ def collect_account_page(
     cursor_fingerprints: set[str] = set()
     repeated_cursor_count = 0
     profile_raw: Optional[dict[str, Any]] = None
+    page_context_fallback_used = False
+    page_context_request_count = 0
+    page_context_next_cursor: Any = 0
+    page_context_disabled = False
+    page_context_request_urls: set[str] = set()
+    page_context_request_ids: set[str] = set()
 
     def remaining() -> float:
         return max(0.0, deadline - monotonic())
@@ -1496,10 +1664,76 @@ def collect_account_page(
         elif relation == "past_lower_bound":
             past_lower_bound_since_boundary = True
 
-    def read_pending(request_id: str, session: BrowserSession) -> bool:
-        """Try once; temporary body errors leave the candidate retryable."""
+    def consume_decoded(
+        decoded: Any,
+        *,
+        is_account_post_response: bool,
+        account_binding: str,
+        blocks_exhaustive: bool,
+    ) -> tuple[bool, Optional[PostPageObservation]]:
+        """Apply one decoded response through the shared strict evidence path."""
         nonlocal observed_page_count, terminal_page_observed
         nonlocal repeated_cursor_count, stop_condition, profile_raw
+        nonlocal failed_account_post_count
+        before = len(items)
+        audit = (
+            _audit_account_post_candidate(
+                decoded,
+                expected_sec_uid,
+                account_binding,
+            )
+            if is_account_post_response
+            else None
+        )
+        if audit is not None and audit.invalid:
+            if blocks_exhaustive:
+                failed_account_post_count += 1
+            for item in audit.items:
+                store_network_item(item)
+            return len(items) > before, None
+        observations = (
+            [audit.observation]
+            if audit is not None and audit.observation is not None
+            else []
+        )
+        if (
+            audit is None
+            or (
+                account_binding != _BINDING_CONFLICT
+                and not audit.invalid
+            )
+        ):
+            discovered_profile = extract_profile_raw(decoded, url)
+            if discovered_profile is not None:
+                if profile_raw is None:
+                    profile_raw = discovered_profile
+                else:
+                    _merge_profile_evidence(profile_raw, discovered_profile)
+        if blocks_exhaustive and not observations:
+            # A valid JSON body is not proof that an account page was consumed.
+            failed_account_post_count += 1
+        observation_result: Optional[PostPageObservation] = None
+        for observation in observations:
+            observation_result = observation
+            observed_page_count += 1
+            fingerprint = _cursor_fingerprint(observation.cursor)
+            if fingerprint is not None:
+                if fingerprint in cursor_fingerprints:
+                    repeated_cursor_count += 1
+                    if all_posts and observation.has_more is not False:
+                        stop_condition = "repeated_cursor"
+                else:
+                    cursor_fingerprints.add(fingerprint)
+            if observation.has_more is False:
+                terminal_page_observed = True
+                if all_posts and stop_condition != "repeated_cursor":
+                    stop_condition = "terminal_page"
+            for item in observation.items:
+                store_network_item(item)
+        return len(items) > before, observation_result
+
+    def read_pending(request_id: str, session: BrowserSession) -> bool:
+        """Try once; temporary body errors leave the candidate retryable."""
         nonlocal failed_account_post_count
         candidate = pending.get(request_id)
         if candidate is None:
@@ -1527,67 +1761,13 @@ def collect_account_page(
         safe_url = candidate["safe_url"]
         if safe_url not in safe_paths:
             safe_paths.append(safe_url)
-        before = len(items)
-        audit = (
-            _audit_account_post_candidate(
-                decoded,
-                expected_sec_uid,
-                candidate["account_binding"],
-            )
-            if candidate["is_account_post_response"]
-            else None
+        added, _ = consume_decoded(
+            decoded,
+            is_account_post_response=candidate["is_account_post_response"],
+            account_binding=candidate["account_binding"],
+            blocks_exhaustive=candidate["blocks_exhaustive"],
         )
-        if audit is not None and audit.invalid:
-            if candidate["blocks_exhaustive"]:
-                failed_account_post_count += 1
-            for item in audit.items:
-                store_network_item(item)
-            return len(items) > before
-        observations = (
-            [audit.observation]
-            if audit is not None and audit.observation is not None
-            else []
-        )
-        if (
-            audit is None
-            or (
-                candidate["account_binding"] != _BINDING_CONFLICT
-                and not audit.invalid
-            )
-        ):
-            discovered_profile = extract_profile_raw(decoded, url)
-            if discovered_profile is not None:
-                if profile_raw is None:
-                    profile_raw = discovered_profile
-                else:
-                    _merge_profile_evidence(profile_raw, discovered_profile)
-        if (
-            candidate["blocks_exhaustive"]
-            and not observations
-        ):
-            # A syntactically valid body is not evidence that a list page was
-            # consumed. Unknown schemas, unrecognized non-empty lists, and
-            # author-binding failures could otherwise hide a page before a
-            # later terminal response.
-            failed_account_post_count += 1
-        if observations:
-            for observation in observations:
-                observed_page_count += 1
-                fingerprint = _cursor_fingerprint(observation.cursor)
-                if fingerprint is not None:
-                    if fingerprint in cursor_fingerprints:
-                        repeated_cursor_count += 1
-                        if all_posts and observation.has_more is not False:
-                            stop_condition = "repeated_cursor"
-                    else:
-                        cursor_fingerprints.add(fingerprint)
-                if observation.has_more is False:
-                    terminal_page_observed = True
-                    if all_posts and stop_condition != "repeated_cursor":
-                        stop_condition = "terminal_page"
-                for item in observation.items:
-                    store_network_item(item)
-        return len(items) > before
+        return added
 
     def flush_pending(session: BrowserSession, *, drain: bool = False) -> None:
         # Header-only fakes do not emit loadingFinished.  A quiet boundary is a
@@ -1604,6 +1784,22 @@ def collect_account_page(
         method = event.get("method") if isinstance(event, dict) else None
         params = event.get("params") if isinstance(event, dict) else None
         params = params if isinstance(params, dict) else {}
+        if method == "Network.responseReceived":
+            response = params.get("response")
+            response_url = response.get("url") if isinstance(response, dict) else None
+            request_id = params.get("requestId")
+            if (
+                isinstance(response_url, str)
+                and response_url in page_context_request_urls
+                and isinstance(request_id, str)
+            ):
+                page_context_request_ids.add(request_id)
+                return
+        if method in {"Network.loadingFinished", "Network.loadingFailed"}:
+            request_id = params.get("requestId")
+            if isinstance(request_id, str) and request_id in page_context_request_ids:
+                page_context_request_ids.discard(request_id)
+                return
         candidate = _allowed_response(event or {})
         if candidate:
             candidate_response_count += 1
@@ -1668,6 +1864,11 @@ def collect_account_page(
                 break
         return attempted
 
+    def fetch_page_context_candidate(session: BrowserSession) -> bool:
+        """Keep collection passive; page-context requests are not a recovery path."""
+        del session
+        return False
+
     def drain_terminal_until_quiet(session: BrowserSession) -> None:
         """Finish terminal collection only after a command-free quiet poll."""
         nonlocal deadline_expired, restriction, stop_condition
@@ -1710,6 +1911,8 @@ def collect_account_page(
             return
 
     with _collection_session(session_factory, cleanup_state) as session:
+        if cookie_records:
+            session.set_cookie_records(cookie_records)
         budget = remaining()
         if budget <= 0:
             deadline_expired = True
@@ -1758,6 +1961,16 @@ def collect_account_page(
             if restriction:
                 stop_condition = restriction
                 break
+            if event is None and fetch_page_context_candidate(session):
+                if all_posts and stop_condition in {
+                    "terminal_page",
+                    "repeated_cursor",
+                }:
+                    break
+                if target_count() >= requested:
+                    stop_condition = "max_items" if all_posts else "limit"
+                    break
+                continue
             if all_posts and stop_condition in {
                 "terminal_page",
                 "repeated_cursor",
@@ -1771,16 +1984,16 @@ def collect_account_page(
 
             if round_in_progress:
                 idle = 0 if len(items) > round_start_count else idle + 1
-                if date_confirmation_pending:
+                if not all_posts and date_confirmation_pending:
                     if not in_range_since_boundary:
                         stop_condition = "date_lower_bound"
                         break
-                elif past_lower_bound_since_boundary:
+                elif not all_posts and past_lower_bound_since_boundary:
                     date_confirmation_pending = True
                 if idle >= MAX_IDLE_ROUNDS:
                     stop_condition = "idle"
                     break
-            elif past_lower_bound_since_boundary:
+            elif not all_posts and past_lower_bound_since_boundary:
                 date_confirmation_pending = True
 
             if scrolls >= scroll_budget:
@@ -1941,6 +2154,8 @@ def collect_account_page(
             "pending_response_count": len(pending),
             "unresolved_account_post_count": unresolved_account_post_count,
             "failed_account_post_count": failed_account_post_count,
+            "page_context_fallback_used": page_context_fallback_used,
+            "page_context_request_count": page_context_request_count,
             "stop_condition": stop_condition,
             **(
                 {"cleanup_codes": cleanup_state["cleanup_codes"]}
@@ -1950,9 +2165,14 @@ def collect_account_page(
         },
         coverage={
             "requested_all": bool(all_posts),
+            "evidence_access": (
+                "user_authorized_session" if cookie_records else "anonymous_public"
+            ),
             "browser_fallback_requested": True,
             "browser_fallback_launched": True,
             "browser_evidence_source": source,
+            "page_context_fallback_used": page_context_fallback_used,
+            "page_context_request_count": page_context_request_count,
             **(
                 {
                     "restriction_source": (
@@ -1990,6 +2210,7 @@ def collect_post_page(
     max_seconds: float = DETAIL_DEFAULT_MAX_SECONDS,
     max_candidates: int = DETAIL_DEFAULT_MAX_CANDIDATES,
     max_body_chars: int = DETAIL_DEFAULT_MAX_BODY_CHARS,
+    cookie_records: tuple[dict[str, Any], ...] = (),
     session_factory=BrowserSession,
     monotonic=time.monotonic,
 ) -> DouyinBrowserResult:
@@ -2030,6 +2251,8 @@ def collect_post_page(
     cleanup_state: dict[str, Any] = {}
 
     with _collection_session(session_factory, cleanup_state) as session:
+        if cookie_records:
+            session.set_cookie_records(cookie_records)
         budget = max(0.0, deadline - monotonic())
         if budget > 0:
             _call_with_timeout(

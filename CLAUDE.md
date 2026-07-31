@@ -215,4 +215,4 @@ chore: ...
 - Architecture: `docs/architecture/STRUCTURE.md`
 - Operations guide: `USAGE.md`
 - Skill Agent contract: `skill/SKILL.md`
-- Past agent observations / designs: `docs/observations/`, `docs/plans/`, `docs/architecture/`
+- PRD acceptance plan: `docs/guides/prd-v1.0-acceptance-test-plan.md`

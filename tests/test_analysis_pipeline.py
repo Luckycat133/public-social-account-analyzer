@@ -759,6 +759,8 @@ def test_pipeline_preserves_safe_browser_runtime_coverage(
     runtime_coverage = {
         "browser_fallback_requested": True,
         "browser_fallback_launched": True,
+        "page_context_fallback_used": True,
+        "page_context_request_count": 2,
         "browser_evidence_source": browser_evidence_source,
         "scroll_rounds": 3,
         "max_seconds": 90.0,
@@ -917,7 +919,7 @@ def test_analysis_preserves_valid_bilibili_collection_substage_ledger():
         "range_no_match": False,
         "regular_source": "medialist",
         "regular_observed_count": 1,
-        "dynamic_status": "ACCESS_RESTRICTED",
+        "dynamic_status": "RATE_LIMITED",
         "dynamic_observed_count": 0,
     }
 
@@ -928,13 +930,15 @@ def test_analysis_preserves_valid_bilibili_collection_substage_ledger():
             "task_id": "bilibili-coverage",
             "platform": "bilibili",
             "task_status": "PARTIAL",
-            "stop_reason": "ACCESS_RESTRICTED",
+            "stop_reason": "RATE_LIMITED",
             "diagnostic_code": "BILIBILI_DYNAMIC_DISCOVERY",
+            "platform_response_code": -799,
             "collection_coverage": coverage,
         },
     ).analysis
 
     assert result["meta"]["diagnostic_code"] == "BILIBILI_DYNAMIC_DISCOVERY"
+    assert result["meta"]["platform_response_code"] == -799
     assert result["meta"]["collection_coverage"] == coverage
 
 
@@ -1558,6 +1562,77 @@ def test_nonexhaustive_index_source_suppresses_cadence_inference():
     assert cadence["weekly_avg"] is None
     assert cadence["median_interval_hours"] is None
     assert cadence["longest_gap_hours"] is None
+
+
+def test_explicit_latest_n_sample_is_not_promoted_to_account_cadence():
+    result = analyze.analyze_in_memory(
+        _sample_profile(),
+        _normalized_rows(),
+        {
+            "task_id": "latest-n-cadence",
+            "platform": "douyin",
+            "task_status": "COMPLETED",
+            "requested_limit": 30,
+            "collected_count": 1,
+        },
+    )
+
+    cadence = result.analysis["publish_cadence"]
+    assert cadence["scope"] == "latest_n_sample"
+    assert cadence["cadence_inference_allowed"] is False
+    assert cadence["weekly_avg"] is not None
+
+
+def test_verified_terminal_collection_allows_account_cadence_inference():
+    result = analyze.analyze_in_memory(
+        _sample_profile(),
+        _normalized_rows(),
+        {
+            "task_id": "complete-cadence",
+            "platform": "douyin",
+            "task_status": "COMPLETED",
+            "stop_reason": None,
+            "requested_limit": 10_000,
+            "collected_count": 1,
+            "collection_coverage": _public_terminal_coverage(),
+        },
+    )
+
+    cadence = result.analysis["publish_cadence"]
+    assert cadence["scope"] == "exhaustive"
+    assert cadence["cadence_inference_allowed"] is True
+
+
+def test_explicit_date_window_is_labeled_even_when_collection_is_incomplete():
+    result = analyze.analyze_in_memory(
+        _sample_profile(),
+        _normalized_rows(),
+        {
+            "task_id": "date-window-cadence",
+            "platform": "douyin",
+            "task_status": "PARTIAL",
+            "stop_reason": "PARSER_FAILED",
+            "requested_limit": 10_000,
+            "collected_count": 1,
+            "date_from": "2026-01-01T00:00:00+08:00",
+            "date_to": "2026-01-31T23:59:59+08:00",
+            "collection_coverage": {
+                "requested_all": True,
+                "max_items": 10_000,
+                "is_exhaustive": False,
+                "terminal_page_observed": False,
+                "observed_post_count": 1,
+                "stop_condition": "timeout",
+                "range_filter_applied": True,
+                "range_match_count": 1,
+                "range_no_match": False,
+            },
+        },
+    )
+
+    cadence = result.analysis["publish_cadence"]
+    assert cadence["scope"] == "explicit_date_window_sample"
+    assert cadence["cadence_inference_allowed"] is False
 
 
 def test_monthly_distribution_sort_key_orders_year_and_month_numerically():

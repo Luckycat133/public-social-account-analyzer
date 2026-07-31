@@ -6,16 +6,150 @@
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-07-31
+
+### Changed
+
+- 收敛专用采集器的默认数据路径：B站常规投稿仅保留 `medialist/resource/list` 与 WBI `arc/search`；不再自动追加 `search/type` 或空间动态 feed。抖音公开主页统一为 SSR/隔离浏览器同一页面会话，用户 Cookie 只改变会话可见范围；移除 `iesdouyin` 旧资料接口作为运行时兜底。
+- 报告型任务遇到风控后改为先告知用户已验证范围、完整采集的重试成本与时间预算，并等待其选择继续完整采集、提供授权路径或接受样本；未明确接受部分样本时不生成报告。
+
+### Added
+
+- 新增技能包内的《抖音 Cookie 文件指南》，按 Windows/macOS/Linux 桌面浏览器、Firefox 与仅有手机三类环境给出导出自己合法会话的简明步骤、故障处理和不得泄露凭据的红线。
+
+### Added
+
+- 正式报告新增账号边界合同：中途切换平台、主页或账号 ID 时必须新建独立任务与证据路径，不得复用前一账号的统计、分类或文案。
+- 新增三类 Agent 行为回归场景：中途换号隔离、B站部分采集遇保护时保持 `PARTIAL`、当前 Skill 脚本缺失时拒绝用旧备份生成正式报告。
+
+### Changed
+
+- 正式报告现在必须使用当前 Skill 包的完整采集入口与 `run_pipeline.py`；脚本不完整时只能交付明确标记的阶段性样本概览。
+- B站投稿列表降级路径明确为 `x/v2/medialist/resource/list` 的 `type=1&biz_id=<UID>` 语义，避免误用收藏夹 `x/v3/fav/*` 接口。
+- “完整/全量”B站任务只有在可信末页和 `is_exhaustive=true` 同时成立时才允许如此标记；平台保护、超时、预算或局部条目一律保持非穷尽语义。
+
+### Fixed
+
+- 报告渲染前校验每个原始指标摘要的 `p25 ≤ median ≤ p75`；分位数反转、非数值或非有限值不再进入正式报告。
+
+## [0.7.4] - 2026-07-30
+
+### Added
+
+- 新增抖音账号发现经验：只有昵称或抖音号时，优先通过抖音第一方移动搜索核对名称、抖音号、认证、简介和粉丝量，并提取真实 `/user/<sec_uid>` 主页；明确禁止把 vanity ID 直接拼成主页。
+- 新增 0.7.4 抖音实机回归摘要，记录无 Cookie 会话下主页资料成功、作品列表登录墙、部分证据交付和 Cookie 后续验收门。
+
+### Changed
+
+- 将有长期价值的 Skill 自治能力、触发准确率和人类报告分层测试整理到 `docs/acceptance/`，新增统一索引、原始证据策略和评测局限说明。
+- 项目结构只保留当前源码、可复现测试定义、稳定验收摘要和最新分发包；逐轮 Agent 输出与完整 Skill 快照继续作为可再生本地产物，不进入活跃文档。
+- `task.json.skill_release` 现在逐字使用包内语义版本 `0.7.4`，与 `skill/VERSION` 和发布验收合同一致；`skill_contract_sha256` 继续绑定实际 `SKILL.md` 字节。
+
+### Removed
+
+- 删除已被稳定验收摘要取代的 `evals-workspace` 多轮快照、静态评审页面、重复输出，过时的 0.7.2 ZIP，以及测试缓存、macOS 元数据和 WorkBuddy 过程文件。
+
+### Fixed
+
+- 修复 `collect_bilibili_complete.py` 与 `collect_douyin_complete.py` 在 `workspace/` 生成物根目录尚不存在时误报输出目录不安全的问题；编排器现在安全创建一层缺失父目录，同时继续拒绝已占用 attempt、深层缺失和不安全路径。
+
+## [0.7.3] - 2026-07-30
+
+### Added
+
+- 抖音采集新增 `--douyin-cookie-file`：接受常见浏览器导出的 JSON Cookie 数组、简单 JSON 名值对象或 Cookie Header 文本，并在首次页面导航前注入隔离的临时浏览器会话；完整采集编排会把同一文件路径传给每个独立 attempt。
+- 覆盖账本新增 `evidence_access=anonymous_public|user_authorized_session`，让报告审查能区分匿名证据与用户授权会话证据，而不暴露身份或凭据。
+
+### Changed
+
+- 云端抖音匿名页遇到登录墙时，不再把它视为最终失败：用户提供合法会话 Cookie 后可继续采集；Cookie 过期、验证码、频控或账号绑定冲突时保留已有证据并按真实覆盖结束。
+- 抖音文档把 Cookie、Web 搜索索引、用户自带数据和账号本人 OpenAPI 明确为不同适用范围的恢复路径，不再用单一匿名边界代替 Agent 判断。
+
+### Security
+
+- Cookie 文件限制为 64 KiB、最多 128 项、单值最多 4096 字符且仅接受 `douyin.com` 域；错误不回显秘密，Cookie、请求头和原始响应不写入工作区、报告或日志。
+
+## [0.7.2] - 2026-07-30
+
+### Changed
+
+- 将人类报告与审计数据正式分层：`account-analysis-report.md` / `dashboard.html` 的高低表现组各只展示 5 条代表作品，来源节只列正文实际引用；完整作品、排名、指标、URL 与 `core_insights` 继续原样保存在 `normalized-posts.csv`、`analysis.json` 和已封存模型结果中。
+- 单条业务洞察在正文最多展示 3 条去重代表证据，其余证据留在 `source/business-insight-results.json`；避免用重复证据表替代解释和判断。
+- taxonomy 尚未完成时将人类可读产物明确标为“公开账号数据概览”，不得把确定性指标汇总包装成深度内容策略报告；内容策略、行动建议和业务打法应完成相应 taxonomy/business 语义阶段。
+
+### Fixed
+
+- 修复大样本报告随采集规模线性膨胀的问题。782 条规模复验从旧版约 1,699 行 / 281 KB 降为 177 行 / 7.7 KB，同时审计层仍保留全部 782 条作品及高低组各 157 条记录。
+
+## [0.7.1] - 2026-07-30
+
+### Added
+
+- 新增 `tools/skill_eval/codex_trigger.py` 与离线单元测试，基于 `gpt-5.6-terra` / low 执行自然提示触发评测：每条在全新临时上下文中重复 3 次，只有 Agent 在首个实际动作前自主读取目标 `SKILL.md` 才计为触发，其他 Skill 读取、口头声明、超时与进程退出均不冒充成功。
+- 新增 20 条固定 60/40 train/validation 触发题，覆盖 B站、抖音、小红书、YouTube、微博、用户自带公开数据，以及媒体下载、后台私有数据、账号操作、泛趋势研究和通用运营写作等近失负例。原描述基线为 19/20 题、55/60 次判断正确（91.7%）；0.7.1 候选为 20/20 题、57/60 次正确（95.0%）。
+
+### Changed
+
+- 将主 `SKILL.md` 从边界与合同主导改写为经验库：平台路径、样本扩张、阻塞恢复和分析框架均作为可选启发，由 Agent 根据用户目标自主组合；详细 schema、安全和不可变提交协议只在选择相应正式工具时按需加载。
+- 评测不再强制最终答复采用“数据质量摘要先于结论”的固定顺序，改为同时检查可用判断、证据范围、覆盖缺口与不确定性；OpenAPI 与 `series_name` 的可复现合同守卫迁移到离线验收参考，不再占据主 Skill 上下文。
+- 触发数据集与跨平台经验定位对齐：小红书、YouTube 等公开账号分析属于应触发场景，用本 Skill 的证据与分析经验辅助 Agent；只有与账号公开内容分析无关或以私有数据、下载、账号控制为核心的请求保持不触发。
+- description 明确以“一个或多个具体公开账号、创作者或品牌号”为触发对象，并排除不研究具体账号的泛平台趋势/标签任务；Terra/low 的 train 误触发从 3/3 降为 0/3，同时 validation 保持 8/8 题通过。
+
+## [0.7.0] - 2026-07-29
+
+### Added
+
+- 新增包内 `VERSION`、`references/release-acceptance.md` 与仓库级 PRD V1.0 验收计划，把 FR-001～FR-015、七项非功能需求、AC-01～AC-10 映射到离线、Agent 黑盒、真实联网和外部人工测试，并提供 16 道实机题及客观判定。
+
+- 浏览器后端现在复用已安装的 Playwright Chromium/Headless Shell 缓存；评测根元数据记录实际 `SKILL.md` SHA-256，避免旧版或嵌套安装包污染对照结果。
+- 新增 `collect_bilibili_complete.py`：B站策略任务在默认 10,000、硬上限 50,000 条的预算内保持分页到明确末页，并对 `RATE_LIMITED/ACCESS_RESTRICTED` 及明确的 `-352` WBI 风控失败使用新目录做 30/60 秒、最多三次的有界重试。
+- 新增 `collect_douyin_complete.py`：抖音模糊范围任务默认执行有界完整采集；仅对根级 `RATE_LIMITED/ACCESS_RESTRICTED` 使用新目录做 30/60 秒、最多三次重试，全部失败时选择证据最多的密封 attempt。
+- 抖音浏览器传输新增固定字段、无签名的同源页内公开分页回退；仅在被动网络无可用账号列表且页面无保护提示时启用，并以安全布尔值/计数披露使用情况。
+- 采集任务新增 `skill_release` 与 `skill_contract_sha256`，可定位测试实际运行的 Skill 版本。
+- 分析交付新增 `delivery_ready` 与 `--require-delivery-ready`，缺少 taxonomy/business/comment 必需结果时拒绝创建可交付 final。
+- 分析交付新增 `--evidence-only`：零作品或仅有账号资料时也能从密封 collection 生成固定、可追溯的事实交付，不再迫使 Agent 手写失败报告。
+- 新增 `references/workflow.md`、`references/offline-acceptance.md` 与 Agent Skill 开发评测指南，明确按需加载、同题有/无 Skill 对照、三次重复、证据评分、严格聚合及人工审阅流程。
+- 新增 20 条 description 触发评测的固定 60/40 train/validation 划分，正例与近失负例保持平衡。
+- Skill 评测 runner 默认每配置运行 3 次并记录根级协议元数据；聚合器新增声明/磁盘次数、配对评分及耗时/token 可用性审计和 `--strict` 门禁。
+
+### Changed
+
+- 将 Skill 从固定流水线重构为分层工具箱：安全边界约束所有路径，证据门约束主张强度，schema/不可变规则只约束正式制品，Agent 自主选择最小充分证据路径。模糊范围不再机械触发 10,000 条完整采集；适配器、模型项或渲染器的局部失败不再抹去可用证据或阻止阶段性聊天回答。
+- Web 索引不再要求浏览器/CDP 先失败；微博 `ADAPTER_UNAVAILABLE` 与其他专用工具失败统一交还 Agent 的合规公开研究能力。少于 15 条或部分 taxonomy 时仍允许明确限定的探索性观察，但继续禁止账号级泛化、因果和伪称正式 final。
+
+- 将“专用适配器不支持”与“用户任务不可做”彻底分离：小红书、视频号、YouTube 等平台不进入本 Skill 的脚本和不可变流水线，但 Agent 必须恢复使用自身其他公开研究能力；`UNSUPPORTED_PLATFORM` 只终止专用采集，不再作为整项任务拒绝理由。
+
+- 抖音工作流明确禁止临时安装浏览器和一次性爬虫；零有效作品时只能交付失败事实，不能依据账号身份或主页累计计数手写策略报告。
+- 将 `SKILL.md` 精简为约 112 行的运行入口，以用户意图重写 description；完整平台执行和离线验收细节通过明确场景路由渐进加载。
+- B站 `--all` 现受支持，默认预算 10,000 条、硬上限 50,000 条；常规和动态分页分别记录末页与停止条件，只有两者均观察完整才声明穷尽。全量路径跳过逐作品标签请求，避免 O(n) 的非核心补充流量。
+- 通用公开采集 CLI 省略 `--limit` 时默认进入有界完整模式；只有用户明确要求最近 N 条、日期窗口或其他范围时才收窄。评测数据集升级到 `0.3.0` 覆盖该默认行为。
+- 抖音浏览器启动会按稳定顺序尝试系统浏览器与已有 Playwright Chromium 缓存；显式二进制路径保持权威。账号资料的公开计数冲突现在通过 `profile_conflicts` 与 `field_visibility=partial` 披露。
+- 发布节奏按证据范围分级：只有穷尽列表可产生账号级节奏与排播建议，其余结果统一标为样本窗口。
+- 分析改为 evidence-only / light / deep 自主路由；普通确定性报告可直接交付，taxonomy 仅用于明确的主题/策略请求，business 与 comment 仅在用户实际请求时运行。
+- 取得可验证账号资料但作品列表受限时，collection 保留为 `PARTIAL`；complete 编排器选中的 `PARTIAL` 作为可继续使用的结果返回，不再笼统标记任务失败。
+
+### Fixed
+
+- 抖音分页 `has_more` 兼容平台常见的精确整数 `0/1`，同时继续拒绝字符串、浮点数和其他整数；显式日期窗口的完整采集不会在日期下界提前停止。
+- 完整采集编排会转发用户明确请求的评论采样，抖音入口同时转发详情补全；最终终端标签现在与选中 attempt 的真实 `FAILED/PARTIAL` 状态一致。
+- 完整采集的最佳 attempt 优先选择作品证据数量，并在每次 attempt 输出安全的 diagnostic/platform code；B站访问检查阶段的 `-352` 不再丢失。
+
+## [0.6.0] - 2026-07-29
+
 ### Added
 
 - `skill/SKILL.md` 新增「可复现契约断言」章节：把 B 站 `series_name` 必须绑定公开证据（源自 iter-2 eval-3）和抖音 OpenAPI 身份与末页合同（源自 iter-2 eval-4）这两条语义工作与脚本级实现绑定为可重放的 offline 协议，并提供通用的 heredoc 模板和异常消息关键字段前缀断言。
 - `tests/test_series_name_public_evidence_repro.py`：中文 docstring 的离线 pytest，正向断言父作品 `platform_metrics.series_name` 为 null 时分类端猜测值必须被 `validate_classification_results` 拒绝（带 `series_name` + `public evidence` 关键字段前缀），反向断言合法的 null 不得误拒。回归基线 1517 → 1519。
 - `tests/test_openapi_contract_repro.py`：抖音 OpenAPI 协议 #2 六条离线断言（userinfo 逐字回证、token 隔离、_SAFE_ERROR_CODES 白名单、编排层身份二次核验、SKILL.md 文档完整性、frontmatter 结构守护）。回归基线 1519 → 1525。
 - B 站采集器：`BILIBILI_MIN_INTERVAL` 环境变量，允许操作员调大请求间隔（单位秒，范围 0–30，超限忽略），默认 1.2s 不变；`collection_coverage.buvid_established` 字段记录 buvid 是否成功建立，供限流诊断。
+- B 站失败诊断新增受控的 `platform_response_code`，并为置顶发现阶段补充 `BILIBILI_PINNED_DISCOVERY`；终端、采集报告、任务元数据和分析报告均可保留安全诊断。
+- `skill/SKILL.md` 新增无 final 产物时的最小交付模板，把本人授权凭据对、动态-only 遗漏风险、buvid 非因果诊断与公开快照免责声明集中到用户可见答复；Terra/low 隔离评测从旧版 14/16 提升到候选版 16/16。
 
 ### Changed
 
 - B 站采集器 `ensure_buvid`：finger/spi 失败静默处理不变，但现在通过 `_buvid_established` 字段向外暴露，`collection_coverage` 中明确可见。
+- B 站 `-799` 与明确频控文本改为 `RATE_LIMITED`；`-412/-403/-400/-101` 继续使用 `ACCESS_RESTRICTED`。Agent 只有在前者有明确证据时才能称“限流”。当前进程仍在平台保护后断路，但 Agent 可等待 30 秒 / 60 秒后以新目录发起最多两个后续任务；不得轮换身份或转浏览器。
+- B 站常规投稿列表现在先于可选置顶端点采集；若置顶端点随后触发平台保护，任务立即停止但保留已取得的常规投稿，避免可选补充导致零作品结果。
 
 ## [0.5.1] - 2026-07-28
 

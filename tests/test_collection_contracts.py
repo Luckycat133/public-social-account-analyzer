@@ -22,6 +22,7 @@ from collectors.base import BaseCollector
 
 DOUYIN_URL = "https://www.douyin.com/user/example"
 BILIBILI_URL = "https://space.bilibili.com/123"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class RecordingDouyinAdapter(BaseCollector):
@@ -119,6 +120,38 @@ class RecordingBilibiliAdapter(BaseCollector):
         return {}
 
 
+class CompleteBilibiliAdapter(RecordingBilibiliAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.all_request: dict | None = None
+
+    def collect_all_post_list(
+        self,
+        url,
+        date_range=None,
+        max_items=100,
+        max_seconds=1_800.0,
+        max_scrolls=2_000,
+    ):
+        self.all_request = {
+            "max_items": max_items,
+            "max_seconds": max_seconds,
+            "max_scrolls": max_scrolls,
+        }
+        return self.collect_post_list(url, limit=max_items, date_range=date_range)
+
+    def get_collection_coverage(self):
+        return {
+            "requested_all": True,
+            "terminal_page_observed": True,
+            "observed_page_count": 5,
+            "observed_post_count": 1,
+            "stop_condition": "terminal_page",
+            "is_exhaustive": True,
+            "max_items": (self.all_request or {}).get("max_items"),
+        }
+
+
 def _must_not_run(*args, **kwargs):
     pytest.fail("run must not be called for an argparse contract error")
 
@@ -161,6 +194,28 @@ def test_all_accepts_exact_hard_caps_and_persists_one_effective_item_budget(
     }
     assert task["requested_limit"] == 50_000
     assert task["collection_coverage"]["max_items"] == 50_000
+
+
+def test_bilibili_all_uses_bounded_complete_budget_and_accepts_terminal_evidence(
+    monkeypatch, tmp_path
+):
+    adapter = CompleteBilibiliAdapter()
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [adapter])
+    out = tmp_path / "bilibili-all"
+
+    rc = collect.run(BILIBILI_URL, out_dir=str(out), collect_all=True)
+
+    assert rc == 0
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert adapter.all_request["max_items"] == 10_000
+    assert task["requested_limit"] == 10_000
+    assert task["collection_coverage"]["requested_all"] is True
+    assert task["collection_coverage"]["terminal_page_observed"] is True
+    assert task["collection_coverage"]["is_exhaustive"] is True
+    assert task["skill_release"] == (REPO_ROOT / "skill/VERSION").read_text(
+        encoding="utf-8"
+    ).strip()
+    assert len(task["skill_contract_sha256"]) == 64
 
 
 def test_all_access_failure_still_persists_the_accepted_item_budget(
@@ -370,6 +425,36 @@ def test_all_and_explicit_limit_are_mutually_exclusive_at_cli(monkeypatch):
     assert exc_info.value.code == 2
 
 
+@pytest.mark.parametrize(
+    ("extra_args", "expected_all"),
+    [
+        ([], True),
+        (["--date-from", "2026-07-01"], True),
+        (["--limit", "12"], False),
+    ],
+)
+def test_cli_defaults_to_complete_collection_unless_limit_is_explicit(
+    monkeypatch, extra_args, expected_all
+):
+    """A vague account-analysis request must not silently become latest-30."""
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(collect, "run", fake_run)
+    monkeypatch.setattr("sys.argv", ["collect.py", DOUYIN_URL, *extra_args])
+
+    with pytest.raises(SystemExit) as exc_info:
+        collect.main()
+
+    assert exc_info.value.code == 0
+    assert captured["kwargs"]["collect_all"] is expected_all
+    assert captured["args"][1] == (12 if "--limit" in extra_args else 30)
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "101"])
 def test_limited_cli_rejects_out_of_range_limit_without_clamping(
     monkeypatch, value
@@ -418,7 +503,10 @@ def test_resume_out_requires_resume_at_cli(monkeypatch):
 )
 def test_custom_all_budget_requires_all_at_cli(monkeypatch, flag, value):
     monkeypatch.setattr(collect, "_load_adapters", _must_not_load_adapters)
-    monkeypatch.setattr("sys.argv", ["collect.py", BILIBILI_URL, flag, value])
+    monkeypatch.setattr(
+        "sys.argv",
+        ["collect.py", BILIBILI_URL, "--limit", "30", flag, value],
+    )
 
     with pytest.raises(SystemExit) as exc_info:
         collect.main()
@@ -850,6 +938,40 @@ def test_access_failure_still_persists_structured_execution_timing(
     assert task["task_status"] == "FAILED"
     assert task["phase_durations_ms"].keys() >= {"check_access", "persist"}
     assert task["duration_ms"] >= 0
+
+
+def test_profile_evidence_keeps_zero_post_restriction_partial(
+    monkeypatch, tmp_path
+):
+    class ProfileOnlyAdapter(RecordingDouyinAdapter):
+        def collect_post_list(self, url, limit=30, date_range=None):
+            error = RuntimeError("public list unavailable")
+            error.stop_reason = "PARSER_FAILED"
+            raise error
+
+        def collect_profile(self, url):
+            return {
+                "platform": "douyin",
+                "account_id": "verified-profile-id",
+                "account_name": "可核验账号",
+                "profile_url": url,
+                "followers": 123,
+                "field_visibility": {
+                    "account_id": "visible",
+                    "account_name": "visible",
+                    "followers": "visible",
+                },
+            }
+
+    monkeypatch.setattr(collect, "_load_adapters", lambda: [ProfileOnlyAdapter()])
+    out = tmp_path / "profile-only-partial"
+
+    assert collect.run(DOUYIN_URL, out_dir=str(out)) == 0
+
+    task = json.loads((out / "task.json").read_text(encoding="utf-8"))
+    assert task["task_status"] == "PARTIAL"
+    assert task["stop_reason"] == "PARSER_FAILED"
+    assert task["collected_count"] == 0
 
 
 @pytest.mark.parametrize(

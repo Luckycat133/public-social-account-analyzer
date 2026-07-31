@@ -4,8 +4,8 @@
 1. 真实采集样本中无置顶内容 → 置顶排除断言无可验证对象。
    现在用确定性离线 fixture 端到端证明：置顶被单独标记、
    未混入发布节奏统计、未拉偏表现指标。
-2. 最终答复未在分析结论前展示数据质量摘要 → SKILL.md 与
-   evals.json 的契约文本回归锁定（防止再次被削弱/删除）。
+2. 最终答复需要交代证据范围，但不应由 Skill 强制固定段落顺序 →
+   SKILL.md 与 evals.json 的经验性指引保持一致。
 """
 
 from __future__ import annotations
@@ -91,26 +91,24 @@ def test_pinned_metrics_do_not_skew_valid_medians(pipeline_analysis):
 
 
 # ---------------------------------------------------------------------------
-# 数据质量摘要「先摘要后结论」契约回归
+# 证据范围披露与 Agent 自主编排回归
 # ---------------------------------------------------------------------------
 
-def test_skill_md_requires_summary_before_conclusions():
+def test_skill_md_keeps_scope_disclosure_without_forced_order():
     text = SKILL_MD.read_text(encoding="utf-8")
-    assert "最终答复先摘要后结论" in text, (
-        "SKILL.md 必须保留『最终答复先摘要后结论』契约条款"
-    )
-    assert "成功/失败/受限数量与关键字段覆盖率" in text
-    assert "最终答复在分析结论前先展示数据质量摘要" in text, (
-        "输出验证清单必须保留摘要顺序检查项"
-    )
+    assert "先给用户能直接使用的判断" in text
+    assert "最关键的证据范围和不确定性" in text
+    assert "实际顺序和篇幅由用户目标决定" in text
+    assert "最终答复先摘要后结论" not in text
+    assert "最终答复在分析结论前先展示数据质量摘要" not in text
 
 
-def test_eval_assertion_requires_summary_in_final_reply():
+def test_eval_assertion_rewards_useful_answer_and_scope_without_fixed_order():
     data = json.loads(EVALS_JSON.read_text(encoding="utf-8"))
     eval1 = next(e for e in data["evals"] if e["id"] == 1)
-    matched = [a for a in eval1["assertions"] if "最终用户答复" in a]
-    assert matched, "eval1 必须有约束最终答复摘要顺序的断言"
-    assert "不算通过" in matched[0]
+    matched = [a for a in eval1["assertions"] if "证据范围" in a]
+    assert matched, "eval1 应检查结论与证据范围是否都对用户有用"
+    assert "固定顺序" in matched[0]
 
 
 def test_eval_pinned_assertion_is_conditional_with_fixture():

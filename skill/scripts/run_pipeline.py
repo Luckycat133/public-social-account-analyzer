@@ -72,6 +72,15 @@ COLLECTION_OPTIONAL_EVIDENCE = {
     "source/comments.jsonl": "source/comments.jsonl",
     "source/index-evidence.json": "source/index-evidence.json",
 }
+EVIDENCE_DELIVERY_ARTIFACTS = frozenset({
+    "source/profile.json",
+    "source/posts.jsonl",
+    "source/collection-task.json",
+    "source/collection-provenance.json",
+    "task.json",
+    "delivery-summary.json",
+    "final-response.md",
+})
 # 任务级枚举从 task_contract 单一来源导入，避免与 _constants.py / collect.py 漂移。
 
 
@@ -252,6 +261,158 @@ def _json_bytes(value: Any) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise PipelineError("pipeline JSON output is invalid") from exc
+
+
+def _jsonl_record_count(payload: bytes, label: str) -> int:
+    """Validate a JSONL artifact and return its non-blank record count."""
+    _validate_jsonl(payload, label)
+    try:
+        return sum(1 for line in payload.decode("utf-8").splitlines() if line.strip())
+    except UnicodeDecodeError as exc:
+        raise PipelineError(f"{label} is not UTF-8") from exc
+
+
+def _profile_visible_count(profile: dict[str, Any]) -> int:
+    visibility = profile.get("field_visibility")
+    if not isinstance(visibility, dict):
+        return 0
+    return sum(value in {"visible", "partial"} for value in visibility.values())
+
+
+def _evidence_only_response(summary: dict[str, Any]) -> str:
+    sample = summary["sample"]
+    lines = [
+        "## 数据质量摘要",
+        "",
+        "- delivery_kind: evidence_only",
+        "- delivery_ready: true",
+        f"- task_status: {summary['task_status']}",
+        f"- stop_reason: {summary['stop_reason'] or 'none'}",
+        f"- collected: {sample['collected']}",
+        f"- profile_visible_fields: {summary['profile_visible_fields']}",
+        "",
+        "## 本次可交付结果",
+        "",
+        "已保留并核验本次公开采集事实、账号资料和停止原因。",
+    ]
+    if sample["collected"] < 1:
+        lines.append(
+            "由于没有可分析的公开作品，本次未生成账号内容策略结论，也未推测栏目、发布节奏或互动表现。"
+        )
+    else:
+        lines.append(
+            "本交付仅说明采集范围与状态；如需内容分析，可基于同一密封 collection 继续运行轻量或深度分析。"
+        )
+    lines.extend([
+        "",
+        "> 公开页面快照，不代表账号后台真实曝光和转化。",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def run_evidence_delivery(collection_dir: str, output_dir: str) -> PipelineResult:
+    """Commit a fixed evidence-only delivery, including zero-post outcomes."""
+    output = preflight_workspace_target(output_dir)
+    reject_workspace_overlap(collection_dir, output)
+    try:
+        reader_context = VerifiedWorkspaceReader.open(
+            collection_dir, allowed_artifacts=COLLECTION_ARTIFACTS
+        )
+    except WorkspaceError as exc:
+        raise PipelineError(f"collection verification failed: {exc}") from exc
+
+    with reader_context as reader:
+        manifested = {item["path"] for item in reader.manifest.get("artifacts", [])}
+        missing = COLLECTION_REQUIRED_ARTIFACTS - manifested
+        if missing:
+            raise PipelineError(
+                "collection is missing required input: " + ", ".join(sorted(missing))
+            )
+        profile_artifact = reader.read("source/profile.json")
+        posts_artifact = reader.read("source/posts.jsonl")
+        task_artifact = reader.read("task.json")
+        profile = _json_object(profile_artifact.payload, "source/profile.json")
+        source_task = _json_object(task_artifact.payload, "task.json")
+        source_task_id = source_task.get("task_id")
+        if not isinstance(source_task_id, str) or not source_task_id:
+            raise PipelineError("collection task_id is missing")
+        platform = profile.get("platform") or source_task.get("platform")
+        if not isinstance(platform, str) or not platform:
+            raise PipelineError("collection platform is missing")
+        source_status = source_task.get("task_status")
+        if source_status not in {"COMPLETED", "PARTIAL", "FAILED"}:
+            raise PipelineError("collection task status cannot be delivered")
+        collected = source_task.get("collected_count")
+        if type(collected) is not int or collected < 0:
+            raise PipelineError("collection collected_count is invalid")
+        record_count = _jsonl_record_count(
+            posts_artifact.payload, "source/posts.jsonl"
+        )
+        if record_count != collected:
+            raise PipelineError("collection post count does not match task metadata")
+        task_status = safe_task_status_label(source_status)
+        stop_reason = safe_stop_reason_label(source_task.get("stop_reason"))
+        summary = {
+            "schema_version": 1,
+            "delivery_kind": "evidence_only",
+            "delivery_ready": True,
+            "strategy_ready": False,
+            "task_status": task_status,
+            "stop_reason": stop_reason,
+            "sample": {
+                "requested": source_task.get("requested_limit"),
+                "collected": collected,
+                "valid": 0,
+            },
+            "profile_visible_fields": _profile_visible_count(profile),
+            "collection_commit_sha256": reader.source_digest,
+        }
+        derived_task = {
+            "task_id": new_task_id(platform),
+            "platform": platform,
+            "task_status": task_status,
+            "delivery_kind": "evidence_only",
+            "source_task_id": source_task_id,
+            "collection_commit_sha256": reader.source_digest,
+            "phase_results": {
+                "collection_input": "VERIFIED",
+                "evidence_delivery": "COMPLETED",
+            },
+        }
+        provenance = {
+            "source_format": reader.source_format,
+            "source_task_id": source_task_id,
+            "collection_commit_sha256": reader.source_digest,
+        }
+        artifacts = {
+            "source/profile.json": profile_artifact.payload,
+            "source/posts.jsonl": posts_artifact.payload,
+            "source/collection-task.json": task_artifact.payload,
+            "source/collection-provenance.json": _json_bytes(provenance),
+            "task.json": _json_bytes(derived_task),
+            "delivery-summary.json": _json_bytes(summary),
+            "final-response.md": _evidence_only_response(summary).encode("utf-8"),
+        }
+        reader.verify_unchanged()
+        reservation = ImmutableWorkspace.reserve(
+            output, allowed_artifacts=EVIDENCE_DELIVERY_ARTIFACTS
+        )
+        try:
+            for relative in sorted(artifacts):
+                with reservation.open_binary(relative) as handle:
+                    handle.write(artifacts[relative])
+            reader.verify_unchanged()
+            commit_sha256 = reservation.commit()
+        finally:
+            reservation.close()
+
+    return PipelineResult(
+        workspace=os.path.abspath(output),
+        commit_sha256=commit_sha256,
+        task_status=task_status,
+        phase_results=derived_task["phase_results"],
+    )
 
 
 def _phase(name: str, function: Callable, *args, **kwargs):
@@ -458,9 +619,15 @@ def _delivery_summary(
     restriction_scope = None
     if stop_reason in STOP_REASONS:
         diagnostic = meta.get("diagnostic_code") or "task_level"
+        platform_code = meta.get("platform_response_code")
+        platform_suffix = (
+            f"; platform_response_code={platform_code}"
+            if isinstance(platform_code, int) and not isinstance(platform_code, bool)
+            else ""
+        )
         restriction_scope = (
             f"{diagnostic}; item_level_restricted="
-            f"{status_counts.get('RESTRICTED', 0)}"
+            f"{status_counts.get('RESTRICTED', 0)}{platform_suffix}"
         )
     main_metric = (analysis.get("performance_meta") or {}).get("main_metric")
     small_denominator_warning = None
@@ -473,8 +640,32 @@ def _delivery_summary(
             "比率排序受播放分母影响；低播放高比率只能称为互动效率样本，"
             "不能直接称为高触达或爆款。"
         )
+    strategy_ready = bool(
+        analysis.get("classification_status") == "completed"
+        and (
+            analysis.get("business_insight_required") is not True
+            or analysis.get("business_insight_status") == "completed"
+        )
+        and (
+            analysis.get("comment_insight_required") is not True
+            or analysis.get("comment_insight_status") == "completed"
+        )
+    )
+    valid_count = sample.get("valid")
+    light_ready = bool(
+        type(valid_count) is int
+        and valid_count > 0
+        and analysis.get("classification_status") == "pending-model"
+        and analysis.get("business_insight_required") is not True
+        and analysis.get("comment_insight_required") is not True
+    )
+    delivery_kind = "strategy" if strategy_ready else "light"
+    delivery_ready = strategy_ready or light_ready
     return {
         "schema_version": 1,
+        "delivery_kind": delivery_kind,
+        "delivery_ready": delivery_ready,
+        "strategy_ready": strategy_ready,
         "task_status": task_status,
         "stop_reason": stop_reason,
         "restriction_scope": restriction_scope,
@@ -541,6 +732,7 @@ def _final_response(summary: dict[str, Any]) -> str:
     lines = [
         "## 数据质量摘要",
         "",
+        f"- delivery_ready: {str(summary.get('delivery_ready') is True).lower()}",
         f"- task_status: {summary['task_status']}",
         f"- stop_reason: {summary['stop_reason'] or 'none'}",
         f"- requested / collected / valid: {sample['requested']} / {sample['collected']} / {sample['valid']}",
@@ -556,6 +748,11 @@ def _final_response(summary: dict[str, Any]) -> str:
         "结论必须沿用报告的主指标名称，并把比率高组称为互动效率样本，而非自动称为高触达或爆款。",
         "自然语言结论只引用 final 报告和已封存 evidence；单个作品只能称为个案，不能冒充共同点。",
     ]
+    if summary.get("delivery_ready") is not True:
+        lines.extend([
+            "",
+            "> 当前工作区不是可交付 final；不得作为最终策略报告交付。请完成缺失的模型阶段并创建新的 final 工作区。",
+        ])
     warning = (summary.get("performance") or {}).get(
         "small_denominator_warning"
     )
@@ -582,11 +779,26 @@ def validate_pipeline_inputs(
     with_taxonomy_prompt: bool = False,
     business_insight_results_path: str | None = None,
     comment_insight_results_path: str | None = None,
+    require_taxonomy: bool = False,
+    require_business_insights: bool = False,
+    require_comment_insights: bool = False,
 ) -> AnalysisResult:
     """Run authoritative normalization and model-result validation without output."""
     if classification_results_path is not None and not with_taxonomy_prompt:
         raise PipelineError(
             "EXTERNAL_TAXONOMY: classification-results requires --with-llm-tax"
+        )
+    if require_taxonomy and classification_results_path is None:
+        raise PipelineError(
+            "classification results are required for delivery validation"
+        )
+    if require_business_insights and business_insight_results_path is None:
+        raise PipelineError(
+            "business insight results are required for delivery validation"
+        )
+    if require_comment_insights and comment_insight_results_path is None:
+        raise PipelineError(
+            "comment insight results are required for delivery validation"
         )
     classification_payload: bytes | None = None
     classification_results: list[dict[str, Any]] | None = None
@@ -678,12 +890,26 @@ def run_pipeline(
     business_insight_results_path: str | None = None,
     with_comment_insights: bool = False,
     comment_insight_results_path: str | None = None,
+    require_delivery_ready: bool = False,
 ) -> PipelineResult:
     """Verify a sealed collection and commit a separate derived workspace."""
     if classification_results_path is not None and not with_taxonomy_prompt:
         raise PipelineError(
             "EXTERNAL_TAXONOMY: classification-results requires --with-llm-tax"
         )
+    if require_delivery_ready:
+        if classification_results_path is None:
+            raise PipelineError(
+                "classification results are required for final delivery"
+            )
+        if with_business_insights and business_insight_results_path is None:
+            raise PipelineError(
+                "business insight results are required for final delivery"
+            )
+        if with_comment_insights and comment_insight_results_path is None:
+            raise PipelineError(
+                "comment insight results are required for final delivery"
+            )
     execution_timer = ExecutionTimer()
     with execution_timer.phase("collection_input"):
         output = preflight_workspace_target(output_dir)
@@ -831,6 +1057,10 @@ def run_pipeline(
         if (analysis.analysis.get("sample_boundary") or {}).get("valid", 0) < 1:
             raise PipelineError("ANALYZE failed: no analyzable rows")
         analysis_status = _analysis_status(analysis)
+        if require_delivery_ready and analysis_status != "COMPLETED":
+            raise PipelineError(
+                "analysis model stages are incomplete; final delivery refused"
+            )
 
         partial_reasons: list[str] = []
         if upstream_status != "COMPLETED":
@@ -1063,6 +1293,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="只验证模型结果，不渲染或创建分析工作区",
     )
+    parser.add_argument(
+        "--require-delivery-ready",
+        action="store_true",
+        help="拒绝缺失 taxonomy/business/comment 结果或严格分析合同未完成的 final",
+    )
+    parser.add_argument(
+        "--evidence-only",
+        action="store_true",
+        help="从密封 collection 生成固定事实交付；允许 0 条作品且不运行策略分析",
+    )
     parser.add_argument("--template", default=None, help="可选 HTML 模板")
     parser.add_argument(
         "--with-llm-tax",
@@ -1096,6 +1336,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        if args.evidence_only:
+            if args.validate_only:
+                parser.error("--evidence-only cannot be combined with --validate-only")
+            if args.output is None:
+                parser.error("--output is required with --evidence-only")
+            if any((
+                args.with_llm_tax,
+                args.classification_results,
+                args.with_business_insights,
+                args.business_insight_results,
+                args.with_comment_insights,
+                args.comment_insight_results,
+                args.require_delivery_ready,
+            )):
+                parser.error("--evidence-only cannot be combined with model stages")
+            result = run_evidence_delivery(args.input, args.output)
+            print(
+                f"evidence delivery committed: {result.workspace} "
+                f"task_status={result.task_status}"
+            )
+            return 0
         if args.validate_only:
             if args.output is not None:
                 parser.error("--validate-only cannot be combined with --output")
@@ -1105,8 +1366,14 @@ def main(argv: list[str] | None = None) -> int:
                 with_taxonomy_prompt=args.with_llm_tax,
                 business_insight_results_path=args.business_insight_results,
                 comment_insight_results_path=args.comment_insight_results,
+                require_business_insights=args.with_business_insights,
+                require_comment_insights=args.with_comment_insights,
+                require_taxonomy=args.require_delivery_ready,
             )
-            print("model results valid; no analysis workspace created")
+            print(
+                "model results valid; no analysis workspace created; "
+                "delivery readiness checked only with --require-delivery-ready"
+            )
             return 0
         if args.output is None:
             parser.error("--output is required unless --validate-only is used")
@@ -1125,6 +1392,7 @@ def main(argv: list[str] | None = None) -> int:
             business_insight_results_path=args.business_insight_results,
             with_comment_insights=args.with_comment_insights,
             comment_insight_results_path=args.comment_insight_results,
+            require_delivery_ready=args.require_delivery_ready,
         )
     except WorkspaceCommitIndeterminate:
         print("[INDETERMINATE] analysis commit could not be confirmed", file=sys.stderr)

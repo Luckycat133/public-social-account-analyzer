@@ -311,6 +311,7 @@ class DouyinCollector(BaseCollector):
         browser_fallback: bool = True,
         browser_collect=None,
         browser_collect_detail=None,
+        cookie_records: tuple[dict[str, Any], ...] = (),
     ):
         """Configure the optional, dependency-free browser collection fallback."""
         if browser_collect is None or browser_collect_detail is None:
@@ -326,6 +327,7 @@ class DouyinCollector(BaseCollector):
         self.browser_fallback = bool(browser_fallback)
         self._browser_collect = browser_collect
         self._browser_collect_detail = browser_collect_detail
+        self._browser_cookie_records = tuple(cookie_records)
         self._collection_coverage: dict[str, Any] = {}
         self._browser_profile_cache: dict[str, dict[str, Any]] = {}
         self._detail_provenance: dict[
@@ -435,6 +437,12 @@ class DouyinCollector(BaseCollector):
         try:
             html = self._fetch(url)
         except DouyinError as e:
+            if e.stop_reason == STOP_LOGIN and self._browser_cookie_records:
+                return {
+                    "accessible": True,
+                    "reason": "匿名预检命中登录墙，转交用户授权浏览器会话核验",
+                    "stop_reason": None,
+                }
             return {
                 "accessible": False,
                 "reason": e.message,
@@ -442,6 +450,12 @@ class DouyinCollector(BaseCollector):
             }
         reason = _detect_restriction(html)
         if reason:
+            if reason == STOP_LOGIN and self._browser_cookie_records:
+                return {
+                    "accessible": True,
+                    "reason": "匿名预检命中登录墙，转交用户授权浏览器会话核验",
+                    "stop_reason": None,
+                }
             return {
                 "accessible": False,
                 "reason": f"页面命中访问限制标记: {reason}",
@@ -562,25 +576,32 @@ class DouyinCollector(BaseCollector):
         # 先判定任务级限制（优先于解析失败）。
         restriction = _detect_restriction(html)
         if restriction:
+            if restriction == STOP_LOGIN and self._browser_cookie_records:
+                cached = self._browser_profile_cache.get(
+                    canonical_profile_url("douyin", url) or ""
+                )
+                if cached is not None:
+                    return self.normalize_profile(dict(cached))
             raise DouyinError(restriction, f"采集资料时命中访问限制: {restriction}")
 
         data = _extract_render_data(html)
         user = self._find_user(data) if data else None
         if not user:
-            sec_uid = self._extract_sec_uid(url)
-            if sec_uid:
-                fallback = self._fetch_profile_via_iesdouyin_api(sec_uid, url)
-                if fallback:
-                    merged = self._merge_cached_profile(url, fallback)
-                    if merged is not None:
-                        return merged
+            cached = self._browser_profile_cache.get(
+                canonical_profile_url("douyin", url) or ""
+            )
+            if cached is not None:
+                return self.normalize_profile(dict(cached))
+            # 公开页面的唯一恢复路径是同一隔离浏览器会话；Cookie 仅改变该会话
+            # 的访问状态，不另起采集协议。避免再访问不稳定的 iesdouyin 私有旧接口。
+            self._request_browser_result(url, limit=1, date_range=None)
             cached = self._browser_profile_cache.get(
                 canonical_profile_url("douyin", url) or ""
             )
             if cached is not None:
                 return self.normalize_profile(dict(cached))
             raise DouyinError(
-                STOP_PARSER_FAILED, "RENDER_DATA 中未识别到用户结构（可能为 JS 外壳页）"
+                STOP_PARSER_FAILED, "页面未提供可绑定的账号资料"
             )
 
         raw = self._build_profile_raw(url, user)
@@ -658,11 +679,10 @@ class DouyinCollector(BaseCollector):
             )
         self._collection_coverage["browser_fallback_launched"] = True
         try:
-            result = self._browser_collect(
-                url=url,
-                limit=limit,
-                date_range=date_range,
-            )
+            request = {"url": url, "limit": limit, "date_range": date_range}
+            if self._browser_cookie_records:
+                request["cookie_records"] = self._browser_cookie_records
+            result = self._browser_collect(**request)
         except Exception as exc:
             code = (
                 "BROWSER_UNAVAILABLE"
@@ -859,6 +879,7 @@ class DouyinCollector(BaseCollector):
             "repeated_cursor_count",
             "range_match_count",
             "unknown_date_count",
+            "page_context_request_count",
         )
         allowed_stops = {
             "terminal_page",
@@ -878,12 +899,16 @@ class DouyinCollector(BaseCollector):
         for key in (
             "browser_fallback_requested",
             "browser_fallback_launched",
+            "page_context_fallback_used",
         ):
             if type(value.get(key)) is bool:
                 clean[key] = value[key]
         evidence_source = value.get("browser_evidence_source")
         if evidence_source in {"none", "network", "dom", "network+dom"}:
             clean["browser_evidence_source"] = evidence_source
+        evidence_access = value.get("evidence_access")
+        if evidence_access in {"anonymous_public", "user_authorized_session"}:
+            clean["evidence_access"] = evidence_access
         restriction_source = value.get("restriction_source")
         restriction_marker = value.get("restriction_marker")
         if (
@@ -1001,14 +1026,17 @@ class DouyinCollector(BaseCollector):
             )
         self._collection_coverage["browser_fallback_launched"] = True
         try:
-            result = self._browser_collect(
-                url=url,
-                limit=max_items,
-                date_range=date_range,
-                all_posts=True,
-                max_seconds=max_seconds,
-                max_scrolls=max_scrolls,
-            )
+            request = {
+                "url": url,
+                "limit": max_items,
+                "date_range": date_range,
+                "all_posts": True,
+                "max_seconds": max_seconds,
+                "max_scrolls": max_scrolls,
+            }
+            if self._browser_cookie_records:
+                request["cookie_records"] = self._browser_cookie_records
+            result = self._browser_collect(**request)
         except Exception as exc:
             raise DouyinError(
                 STOP_PARSER_FAILED,
@@ -1120,7 +1148,12 @@ class DouyinCollector(BaseCollector):
         html = self._fetch(url)
         restriction = _detect_restriction(html)
         if restriction:
-            raise DouyinError(restriction, f"采集列表时命中访问限制: {restriction}")
+            if not (
+                restriction == STOP_LOGIN and self._browser_cookie_records
+            ):
+                raise DouyinError(
+                    restriction, f"采集列表时命中访问限制: {restriction}"
+                )
 
         data = _extract_render_data(html)
         expected_sec_uid = self._extract_sec_uid(url)
@@ -1298,7 +1331,12 @@ class DouyinCollector(BaseCollector):
         html = self._fetch(canonical_url)
         restriction = _detect_restriction(html)
         if restriction:
-            raise DouyinError(restriction, f"采集作品详情时命中访问限制: {restriction}")
+            if not (
+                restriction == STOP_LOGIN and self._browser_cookie_records
+            ):
+                raise DouyinError(
+                    restriction, f"采集作品详情时命中访问限制: {restriction}"
+                )
 
         data = _extract_render_data(html)
         if data:
@@ -1324,7 +1362,10 @@ class DouyinCollector(BaseCollector):
                 "作品页无可解析单条详情，且浏览器降级已禁用",
             )
         try:
-            result = self._browser_collect_detail(url=canonical_url)
+            request = {"url": canonical_url}
+            if self._browser_cookie_records:
+                request["cookie_records"] = self._browser_cookie_records
+            result = self._browser_collect_detail(**request)
         except Exception as exc:
             raise DouyinError(
                 STOP_PARSER_FAILED,

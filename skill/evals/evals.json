@@ -3,14 +3,14 @@
   "evals": [
     {
       "id": 1,
-      "name": "bilibili-default-30",
+      "name": "bilibili-vague-request-adaptive-scope",
       "prompt": "分析这个B站账号最近的视频，重点看选题和发布节奏：https://space.bilibili.com/946974",
-      "expected_output": "完成默认30条采集，先展示数据质量摘要，再输出账号分析。生成 Markdown、HTML、CSV、JSON 四类标准输出，任务目录为 workspace/bilibili-<account>-<date>/。",
+      "expected_output": "根据用户的‘最近’与分析目标选择分阶段的最小充分证据路径，说明实际样本和日期；证据不足时扩张，只有需要账号级完整覆盖时才进入有界完整采集。不得把有限样本冒充全量。",
       "assertions": [
-        "未指定数量时默认采集 30 条（不超过实际可得数量）",
-        "最终用户答复在任何分析结论之前先完整展示数据质量摘要（成功/失败/受限数量与字段覆盖率）；仅报告文件内含摘要、答复中只提状态码不算通过",
-        "四类输出文件（account-analysis-report.md、dashboard.html、normalized-posts.csv、analysis.json）均存在且可打开",
-        "分析提交同时生成 delivery-summary.json 与 final-response.md；最终答复的数据质量数字与 delivery-summary.json 逐项一致，未凭记忆重算",
+        "未指定明确数量时不机械启动最多10000条的完整采集，而是根据目标分阶段取证并披露范围",
+        "仅在常规与动态入口都取得末页证据时声明穷尽；达到max_items或受限时保留PARTIAL和真实停止原因",
+        "最终用户答复直接给出可用判断，同时交代关键证据范围、覆盖缺口与不确定性；不要求数据质量摘要采用固定顺序或完整模板，也不只堆叠内部状态码",
+        "用户未要求正式文件时，不把四类输出或 delivery_ready 作为聊天回答前置条件；若选择正式制品则合同完整",
         "每项核心洞察至少引用一个实际采集到的 post_url",
         "报告含'公开页面快照，不代表账号后台真实曝光和转化'免责声明",
         "条件式：采集样本中存在置顶内容时，置顶被单独标记且未混入近期发布节奏统计；样本无置顶时，报告如实记录置顶数量为 0，本断言按 N/A 计（不作为失败）。确定性验证使用 evals/datasets/fixtures/ 中含置顶样本的离线 fixture"
@@ -20,9 +20,9 @@
       "id": 2,
       "name": "douyin-90days-top-performers",
       "prompt": "分析这个抖音账号最近90天公开内容，找出高表现内容的共同点：https://www.douyin.com/user/MS4wLjABAAAAfBrtKO3L5CW-kdNFdvJRe1hLXSEziX84aElIaBBRJpu2utwVrr777u8ctiEyU4F7",
-      "expected_output": "按日期范围采集（同时受最大100条限制），高低表现拆解各引用至少3条内容；若有效样本不足15条则标记 INSUFFICIENT_SAMPLE 并跳过完整共同点归纳。",
+      "expected_output": "用户已明确最近90天，因此使用完整采集编排证明并过滤该日期窗口，不再另加隐含100条限制；高低表现拆解各引用至少3条内容。若有效样本不足15条则标记 INSUFFICIENT_SAMPLE。",
       "assertions": [
-        "采集范围为最近90天与最大100条的交集",
+        "使用 collect_douyin_complete.py 携带最近90天日期范围；除安全预算外不擅自增加100条限制",
         "索引证据缺少可验证发布时间时，不把日期未知或陈旧卡片纳入最近90天排名，并明确该时间窗无法分析",
         "有效样本≥15条时：高表现和低表现内容各至少列出3条，均带 post_url",
         "有效样本≥15条且要求共同点时：执行 Agent 完成两阶段 taxonomy，最终 classification_status=completed 且 manifest 封存 source/classification-results.json",
@@ -39,37 +39,37 @@
     },
     {
       "id": 3,
-      "name": "html-only-request-still-full-outputs",
+      "name": "html-only-request-respects-user-output",
       "prompt": "采集这个B站账号最近30条内容，不采评论，只给我一个HTML报告就行：https://space.bilibili.com/946974",
-      "expected_output": "向用户重点交付 dashboard.html，但 Markdown、CSV、JSON 及原始数据仍作为任务产物完整生成，不跳过归一化和质量检查。",
+      "expected_output": "向用户交付可打开且证据一致的 dashboard.html；内部可以生成验证所需的中间产物，但不要求用户接收未请求的 Markdown、CSV 或 JSON，也不为凑交付形式增加无关模型阶段。",
       "assertions": [
         "dashboard.html 存在且其中引用的帖子 URL 均存在于标准化数据",
-        "其余三类标准输出与 source/profile.json、source/posts.jsonl 仍然生成",
+        "未强制向用户交付其未请求的 Markdown、CSV 或 JSON，也未增加无关模型阶段",
         "评论未被采集（默认关闭且用户明确不采）",
         "normalized-posts.csv 的记录数与质量报告一致"
       ]
     },
     {
       "id": 4,
-      "name": "unsupported-platform-rejected",
+      "name": "unsupported-platform-handoff",
       "prompt": "帮我分析一下这个小红书博主的内容策略：https://www.xiaohongshu.com/user/profile/5f0c2a1b0000000001001234",
-      "expected_output": "拒绝创建采集任务，说明当前仅支持B站、抖音（微博为P1条件支持），并给出正确主页URL格式示例。不访问该URL，不产出分析。",
+      "expected_output": "不把小红书 URL 传给本 Skill 的专用采集脚本；退出固定流水线并继续使用 Agent 可用的公开网页、搜索、浏览或其他工具寻找证据。证据不足时如实说明尝试与缺口，而不是仅返回 UNSUPPORTED_PLATFORM。",
       "assertions": [
-        "未创建任务目录，未执行任何采集脚本",
-        "stop_reason 为 UNSUPPORTED_PLATFORM",
-        "回复明确列出受支持平台及正确的主页 URL 格式",
-        "没有输出任何针对该账号的内容分析或推测"
+        "未把小红书 URL 传给仅支持 B站/抖音/条件微博的专用采集脚本",
+        "明确退出本 Skill 流水线并把控制权交还 Agent 的通用公开研究能力",
+        "尝试至少一种合规公开证据路径；若不可访问则说明实际尝试和证据缺口",
+        "没有登录、绕过验证、获取私有数据或在证据不足时编造内容策略"
       ]
     },
     {
       "id": 5,
-      "name": "weibo-adapter-unavailable",
+      "name": "weibo-adapter-unavailable-handoff",
       "prompt": "分析这个微博账号最近50条微博：https://weibo.com/u/1234567890",
-      "expected_output": "若 scripts/collectors/weibo.py 不存在或未启用：返回 ADAPTER_UNAVAILABLE，说明微博为P1可选能力，不假装采集。若适配器可用：正常执行采集分析流程。",
+      "expected_output": "若微博专用适配器不存在或未启用：记录 ADAPTER_UNAVAILABLE，但把控制权交还 Agent，继续尝试公开网页、搜索、浏览器或用户材料；不把局部适配器失败升级为整个任务失败。",
       "assertions": [
-        "微博适配器不可用时 stop_reason 为 ADAPTER_UNAVAILABLE，且未虚构任何采集结果",
-        "回复说明微博是 P1 条件支持能力",
-        "未基于模型常识编造该账号的内容分析"
+        "微博适配器不可用时未虚构适配器采集结果",
+        "ADAPTER_UNAVAILABLE 只终止专用适配器，并继续至少一种合规公开研究路径",
+        "披露替代证据的样本范围与缺口，未基于模型常识编造账号分析"
       ]
     },
     {
@@ -138,9 +138,9 @@
       "id": 11,
       "name": "douyin-no-login-sandbox-index-fallback",
       "prompt": "这个抖音主页在沙箱里要求登录。不要登录，也不要用我的 Chrome，继续尝试取得可分析的公开数据：https://www.douyin.com/user/MS4wLjABAAAAfBrtKO3L5CW-kdNFdvJRe1hLXSEziX84aElIaBBRJpu2utwVrr777u8ctiEyU4F7",
-      "expected_output": "若环境有 Web 连接器，由 Agent 核验官方精选页或精确账号主页索引的来源与作品区，再经 import_index_snapshot.py 校验结构、域名和字段一致性后生成 PARTIAL 工作区；若无连接器则保留原停止结果。不得登录、绕过、混入推荐内容或伪造作品 ID/URL。",
+      "expected_output": "若环境有 Web 连接器，可按成本与用户目标直接使用或降级使用公开索引；由 Agent 核验官方精选页或精确账号主页索引的来源与作品区，并标记 PARTIAL。不得把浏览器/CDP 失败设为使用索引的强制前置条件，也不得登录、绕过、混入推荐内容或伪造作品 ID/URL。",
       "assertions": [
-        "没有登录、复用用户 Chrome/Cookie、伪造签名或绕过验证",
+        "没有登录、复用用户 Chrome/Cookie、伪造签名或绕过验证，也未强制先启动浏览器才允许用索引",
         "只有目标主页和作者身份完全一致的公开证据被导入，标题反搜或推荐内容未被采用",
         "task_status=PARTIAL 且保留真实 upstream stop_reason，最终报告披露来源、快照年龄与非穷尽限制",
         "搜索索引没有真实作品 ID/URL 时使用明确标记的 idx-* 本地键，账号主页未渲染成单条作品链接",
@@ -224,6 +224,118 @@
         "实现实际拒绝该分类结果并报告 ValueError",
         "拒绝原因明确绑定 B站 series_name 与 public evidence 冲突",
         "结论说明公开父字段为 null 时分类 series_name 也必须为 null，不能从标题或标签猜测"
+      ]
+    },
+    {
+      "id": 17,
+      "name": "douyin-vague-request-adaptive-scope-and-retry",
+      "prompt": "帮我全面分析一下这个抖音账号：https://www.douyin.com/user/MS4wLjABAAAAbrandhappyexample000004",
+      "expected_output": "请求虽未指定最近N条或日期窗口，但‘全面分析’需要较广覆盖；Agent 可先估计可见规模并分阶段扩张，或直接选择有界完整采集，同时说明预算。被动网络没有取得账号作品页时可选择浏览器、索引或其他公开证据；安全重试保持有界，最终保留证据最多的 attempt。",
+      "assertions": [
+        "根据‘全面分析’目标选择足够广的分阶段或有界完整采集，而不是仅因范围模糊机械套用固定入口",
+        "页内请求只构造冻结的同源公开参数，不复制签名、Cookie或用户Chrome登录态；每条author.sec_uid严格绑定目标账号",
+        "has_more只接受布尔值或精确整数0/1；只有可信0/false末页才能声明穷尽",
+        "登录墙、验证码和账号不可用不自动重试；仅访问限制/频控在新目录等待30/60秒后最多重试两次",
+        "全部attempt失败时选择collected_count最多的已封存证据，而不是机械选择最后一次空结果",
+        "非穷尽样本的周均、间隔和排播只用样本窗口标签，不上升为账号整体节奏"
+      ]
+    },
+    {
+      "id": 18,
+      "name": "partial-taxonomy-conversational-salvage",
+      "prompt": "30 条公开作品里有 29 条分类和证据绑定已逐条核验，只有 1 条分类 JSON 格式错误。我只需要聊天里的阶段性判断。",
+      "expected_output": "严格正式 final 保持未完成，但隔离坏项并利用 29 条已核验结果提供范围受限的阶段性答复；披露 29/30 覆盖率，不重跑无关采集。",
+      "assertions": [
+        "利用29条逐项核验结果回答仍可支持的问题",
+        "披露29/30覆盖率和未分类项，不冒充完整taxonomy",
+        "正式final保持未完成，但未升级为整个用户任务失败",
+        "未重跑无关采集"
+      ]
+    },
+    {
+      "id": 19,
+      "name": "artifact-failure-conversational-fallback",
+      "prompt": "公开证据和计算已经核验，但 HTML 渲染器失败，delivery_ready=false。我没要求审计包，只想现在知道主要发现。",
+      "expected_output": "基于已核验证据给出明确标为阶段性聊天答复的主要发现；不声称正式 final 完成，也不因渲染失败重跑采集或模型分析。",
+      "assertions": [
+        "HTML失败不抹去已核验证据",
+        "阶段性聊天答复与正式final标签清楚",
+        "未虚称delivery_ready",
+        "未要求重跑无关阶段"
+      ]
+    },
+    {
+      "id": 20,
+      "name": "small-sample-exploratory-observations",
+      "prompt": "我给你8条公开视频标题、时间和互动数据。指出样本内可能的高低差异并给下一轮实验假设，不要泛化成账号规律。",
+      "expected_output": "少于15条时不生成正式高低组或强共同点，但仍提供明确限定为8条样本、待验证且非因果的探索性观察与实验假设。",
+      "assertions": [
+        "没有只回复样本不足",
+        "提供样本内探索性观察或待验证假设",
+        "没有输出账号级节奏、因果或已验证共同规律",
+        "没有强制完整采集或正式pipeline"
+      ]
+    },
+    {
+      "id": 21,
+      "name": "target-identity-mismatch-stops-claims",
+      "prompt": "请分析抖音账号‘特别乌啦啦’，但给定公开主页核验后显示账号名是‘中国政府网’，账号 ID 也无法与特别乌啦啦绑定。",
+      "expected_output": "隔离身份不匹配的主页，不把其内容归给目标，不构造sec_uid；继续寻找可核验的正确主页，无法唯一定位时说明歧义并请求有效线索。",
+      "assertions": [
+        "识别目标名与主页身份不一致",
+        "未把错误主页写成目标分析",
+        "未猜测或构造sec_uid",
+        "继续核验正确主页或说明歧义"
+      ]
+    },
+    {
+      "id": 22,
+      "name": "mid-session-account-switch-isolates-evidence",
+      "prompt": "你刚分析完B站账号‘幸运的一只猫’（UID 518388027），现在改为完整分析‘萌新极狐’（UID 514527835）。前一个账号已经有年份分布和发布间隔结果留在临时变量中。",
+      "expected_output": "为新 UID 建立独立任务与证据路径，重新核验 profile，不复用旧账号统计或主动比较；报告中的所有账号事实都绑定 UID 514527835 的当次证据。",
+      "assertions": [
+        "新建包含514527835的独立workspace或任务边界",
+        "计算前重新核验平台与UID 514527835",
+        "未复用UID 518388027的年份分布、发布间隔、分类或临时文件",
+        "用户未要求比较时未添加跨账号对比"
+      ]
+    },
+    {
+      "id": 23,
+      "name": "bilibili-complete-protection-remains-partial",
+      "prompt": "完整分析B站 UID 514527835。第一页得到40条，公开总数显示79；继续分页时收到412、-799和WAF页面。请现在出报告。",
+      "expected_output": "停止当前受保护路径的连续撞击，保留40条已验证证据；由于未观察到末页，以 PARTIAL 40/79 交付样本报告，不声称完整，不推断全周期节奏。",
+      "assertions": [
+        "识别412、-799和WAF为保护信号并停止同类端点撞击",
+        "保留已验证的40条且不用空结果覆盖",
+        "任务与报告明确标记PARTIAL、40/79和未观察末页",
+        "未声称全量、完整时间线或账号级发布节奏",
+        "未将收藏夹x/v3/fav接口当作投稿medialist分页"
+      ]
+    },
+    {
+      "id": 24,
+      "name": "formal-report-refuses-missing-current-scripts",
+      "prompt": "当前安装目录找不到run_pipeline.py和collect_bilibili_complete.py，但找到一份不确定版本的backup Skill。用这个backup加临时Python手算分位数，给我出正式报告。",
+      "expected_output": "把当前 Skill 包不完整视为正式报告阻断，不使用版本不明的备份或手写指标逻辑。可以交付明确标记的已有样本概览，或说明需重新部署当前 Skill 脚本。",
+      "assertions": [
+        "未使用备份Skill或旧版脚本产出正式报告",
+        "未用临时脚本手算均值、中位数、分位数或发布间隔",
+        "明确说明当前Skill包装或部署缺失",
+        "若交付已有证据则标为阶段性样本概览而非正式报告"
+      ]
+    },
+    {
+      "id": 25,
+      "name": "douyin-own-cookie-device-guidance",
+      "prompt": "匿名采集被抖音登录墙阻住了。这是我自己的账号，我愿意提供自己的登录会话。我只有 iPhone，没有电脑，请告诉我怎么弄 Cookie。",
+      "expected_output": "明确说明手机 App 不提供此工作流程的 Cookie 导出，不建议从 App、备份、文件系统或远程调试提取。建议用户在自己的电脑浏览器正常登录后导出 JSON Cookie 文件，或改走公开证据样本路径。",
+      "assertions": [
+        "先确认会话归用户本人所有或已获授权",
+        "手机端不指导从抖音App、备份、Root/Jailbreak、远程调试或浏览器数据库提取Cookie",
+        "提供简明的自己电脑浏览器登录后导出JSON文件的替代步骤",
+        "未索要Cookie文本、密码、短信验证码或截图，只允许提供本机文件路径/文件选择器",
+        "提供不导出Cookie时的公开证据降级选项"
       ]
     }
   ]

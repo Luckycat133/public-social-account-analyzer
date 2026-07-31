@@ -35,6 +35,7 @@ from datetime import datetime, timezone, timedelta
 # 以支持采集器内的平级 `from base import` / `from bilibili import`。
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COLLECTORS = os.path.join(_HERE, "collectors")
+_SKILL_RELEASE = "0.7.5"
 for _p in (_COLLECTORS, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -177,6 +178,7 @@ _BILIBILI_DYNAMIC_STATUSES = frozenset({
     SR_LOGIN,
     SR_VERIFICATION,
     SR_ACCESS_RESTRICTED,
+    SR_RATE_LIMITED,
     SR_PARSER_FAILED,
     SR_INTERNAL,
 })
@@ -230,6 +232,7 @@ def _dominant_stop_reason(
 def _load_adapters(
     douyin_browser_fallback: bool = True,
     bilibili_browser_fallback: bool | None = None,
+    douyin_cookie_records: tuple[dict[str, Any], ...] = (),
 ) -> list[BaseCollector]:
     """加载已实现(非桩)的采集器,返回实例列表。"""
     adapters: list[BaseCollector] = []
@@ -251,7 +254,12 @@ def _load_adapters(
             c = getattr(m, cls, None)
             if c:
                 if mod == "collectors.douyin":
-                    adapters.append(c(browser_fallback=douyin_browser_fallback))
+                    adapters.append(
+                        c(
+                            browser_fallback=douyin_browser_fallback,
+                            cookie_records=douyin_cookie_records,
+                        )
+                    )
                 else:
                     adapters.append(c())
         except Exception:
@@ -1231,6 +1239,8 @@ def _sanitize_collection_coverage(value) -> dict:
     for key in (
         "browser_fallback_requested",
         "browser_fallback_launched",
+        "page_context_fallback_used",
+        "dynamic_terminal_page_observed",
     ):
         if type(value.get(key)) is bool:
             clean[key] = value[key]
@@ -1254,6 +1264,7 @@ def _sanitize_collection_coverage(value) -> dict:
         "repeated_cursor_count",
         "range_match_count",
         "unknown_date_count",
+        "page_context_request_count",
     ):
         field_value = value.get(key)
         if isinstance(field_value, int) and not isinstance(field_value, bool):
@@ -1309,6 +1320,15 @@ def _sanitize_collection_coverage(value) -> dict:
         "limit",
     }:
         clean["stop_condition"] = stop_condition
+    dynamic_stop_condition = value.get("dynamic_stop_condition")
+    if dynamic_stop_condition in {
+        "terminal_page",
+        "idle",
+        "repeated_cursor",
+        "max_items",
+        "date_lower_bound",
+    }:
+        clean["dynamic_stop_condition"] = dynamic_stop_condition
     clean["is_exhaustive"] = bool(
         value.get("is_exhaustive") is True
         and requested_all
@@ -1374,6 +1394,27 @@ def _safe_diagnostic_code(value) -> str | None:
     return None
 
 
+def _safe_platform_response_code(value) -> int | None:
+    """Keep a bounded numeric platform code without response text or headers."""
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and -999_999 <= value <= 999_999
+    ):
+        return value
+    return None
+
+
+def _skill_contract_sha256() -> str:
+    """Fingerprint the exact SKILL.md shipped beside this collector."""
+    contract = os.path.join(os.path.dirname(_HERE), "SKILL.md")
+    try:
+        with open(contract, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return hashlib.sha256(b"").hexdigest()
+
+
 def _sanitize_report_error(value) -> dict:
     """Map an internal/adaptor error to the report's fixed public vocabulary."""
     source = value if isinstance(value, dict) else {}
@@ -1393,6 +1434,11 @@ def _sanitize_report_error(value) -> dict:
     diagnostic_code = _safe_diagnostic_code(source.get("diagnostic_code"))
     if diagnostic_code is not None:
         clean["diagnostic_code"] = diagnostic_code
+    platform_response_code = _safe_platform_response_code(
+        source.get("platform_response_code")
+    )
+    if platform_response_code is not None:
+        clean["platform_response_code"] = platform_response_code
     return clean
 
 
@@ -1661,12 +1707,15 @@ def _write_task_json(
     collection_coverage: dict | None = None,
     comment_collection: dict | None = None,
     diagnostic_code: str | None = None,
+    platform_response_code: int | None = None,
     execution_timing: dict,
     reservation: _WorkspaceReservation | None = None,
 ) -> None:
     """落盘 task.json(任务状态与停止原因,见 SKILL.md「任务状态与停止原因」)。"""
     payload = {
         "task_id": task_id,
+        "skill_release": _SKILL_RELEASE,
+        "skill_contract_sha256": _skill_contract_sha256(),
         "platform": platform,
         "profile_url": _safe_public_url(profile_url),
         "requested_limit": requested_limit,
@@ -1680,6 +1729,9 @@ def _write_task_json(
             _safe_stop_reason(stop_reason) if stop_reason is not None else None
         ),
         "diagnostic_code": _safe_diagnostic_code(diagnostic_code),
+        "platform_response_code": _safe_platform_response_code(
+            platform_response_code
+        ),
         "collected_count": collected_count,
         "collected_at": _safe_timestamp(collected_at),
         "incremental": incremental,
@@ -1811,10 +1863,18 @@ def _write_report(
                 if isinstance(diagnostic_code, str) and diagnostic_code
                 else ""
             )
+            platform_response_code = _safe_platform_response_code(
+                e.get("platform_response_code")
+            )
+            platform_diagnostic = (
+                f" platform_response_code={platform_response_code}"
+                if platform_response_code is not None
+                else ""
+            )
             lines.append(
                 f"- stage={e.get('stage')} error_code={e.get('error_code')} "
                 f"url={e.get('url')} message={e.get('message')} occurred_at={e.get('occurred_at')}"
-                f"{diagnostic}"
+                f"{diagnostic}{platform_diagnostic}"
             )
     handle = (
         reservation.open_text("collection-report.md")
@@ -1881,6 +1941,7 @@ def run(
     analysis_goal: str | None = None,
     checkpoint_out: str | None = None,
     resume_checkpoint: str | None = None,
+    douyin_cookie_file: str | None = None,
     redirect_resolver=None,
 ) -> int:
     execution_timer = ExecutionTimer(wall_timezone=_BEIJING)
@@ -2059,6 +2120,16 @@ def run(
             print("[FAILED] checkpoint 无法安全核验", file=sys.stderr)
             return 2
 
+    douyin_cookie_records: tuple[dict[str, Any], ...] = ()
+    if douyin_cookie_file is not None:
+        try:
+            from collectors.douyin_cookies import load_douyin_cookie_file
+
+            douyin_cookie_records = load_douyin_cookie_file(douyin_cookie_file)
+        except Exception:
+            print("[FAILED] 抖音 Cookie 文件无效或无法安全读取", file=sys.stderr)
+            return 2
+
     env_value = os.environ.get("SOCIAL_BROWSER_FALLBACK")
     if env_value is not None and env_value not in {"0", "1"}:
         print(
@@ -2069,7 +2140,13 @@ def run(
     douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
     # Keep the default zero-argument loader call compatible with integrations
     # that replace it, while passing the policy only when it disables Douyin.
-    if browser_fallback is not None:
+    if douyin_cookie_records:
+        adapters = _load_adapters(
+            douyin_browser_fallback=True,
+            bilibili_browser_fallback=browser_fallback,
+            douyin_cookie_records=douyin_cookie_records,
+        )
+    elif browser_fallback is not None:
         # Preserve the legacy Bilibili configuration value for API compatibility.
         # Bilibili never uses it after a platform-protection response; the CLI's
         # observable browser-fallback behavior is Douyin-only.
@@ -2089,6 +2166,9 @@ def run(
         print("[FAILED] 账号主页 URL 权限或路径格式无效", file=sys.stderr)
         return 2
     adapter = _pick(adapters, routing_url)
+    if douyin_cookie_records and getattr(adapter, "platform", None) != "douyin":
+        print("[FAILED] --douyin-cookie-file 只适用于抖音账号主页", file=sys.stderr)
+        return 2
     if adapter is None:
         # URL 不属于任何已加载平台 → UNSUPPORTED_PLATFORM(见 exceptions.md §1)
         # 内联列出本次实际加载的适配器平台与示例 URL 形态,避免用户看到
@@ -2142,8 +2222,8 @@ def run(
     url = canonical_url
     safe_url = canonical_url
     task_id = new_task_id(platform)
-    if collect_all and platform != "douyin":
-        print("[FAILED] --all 目前仅支持抖音账号主页", file=sys.stderr)
+    if collect_all and platform not in {"bilibili", "douyin"}:
+        print("[FAILED] --all 目前仅支持 B站或抖音账号主页", file=sys.stderr)
         return 2
     if enrich_details and platform != "douyin":
         print("[FAILED] --enrich-details 仅支持抖音账号主页", file=sys.stderr)
@@ -2228,6 +2308,9 @@ def run(
     comment_collection: dict = {}
     detail_unavailable_count = 0
 
+    access_diagnostic_code: str | None = None
+    access_platform_response_code: int | None = None
+
     def persist_access_failure(reason: str) -> int | None:
         error = {
             "url": safe_url,
@@ -2237,6 +2320,10 @@ def run(
             "occurred_at": _event_timestamp(),
             "retryable": False,
         }
+        if access_diagnostic_code is not None:
+            error["diagnostic_code"] = access_diagnostic_code
+        if access_platform_response_code is not None:
+            error["platform_response_code"] = access_platform_response_code
         try:
             with execution_timer.phase("persist"):
                 _write_report(
@@ -2269,6 +2356,8 @@ def run(
                 resume_source_format=resume_source_format,
                 resume_source_digest=resume_source_digest,
                 collection_coverage=collection_coverage,
+                diagnostic_code=access_diagnostic_code,
+                platform_response_code=access_platform_response_code,
                 execution_timing=execution_timer.snapshot(),
                 reservation=reservation,
             )
@@ -2295,11 +2384,23 @@ def run(
         except Exception as e:
             # 适配器未启用(WeiboCollector._require_enabled 抛 RuntimeError 携 ADAPTER_UNAVAILABLE)
             stop_reason = _stop_reason_from_exc(e)
+            access_diagnostic_code = _safe_diagnostic_code(
+                getattr(e, "diagnostic_code", None)
+            )
+            access_platform_response_code = _safe_platform_response_code(
+                getattr(e, "platform_response_code", None)
+            )
             task_status = "FAILED"
             access_failed = True
         else:
             if not access.get("accessible"):
                 stop_reason = _safe_stop_reason(access.get("stop_reason"))
+                access_diagnostic_code = _safe_diagnostic_code(
+                    access.get("diagnostic_code")
+                )
+                access_platform_response_code = _safe_platform_response_code(
+                    access.get("platform_response_code")
+                )
                 # check_access 阶段尚无已采数据,所有受阻场景统一 FAILED(见 exceptions.md §1)
                 task_status = "FAILED"
                 access_failed = True
@@ -2334,6 +2435,9 @@ def run(
             if isinstance(partial_posts, list):
                 posts = partial_posts[:requested_count]
             diagnostic_code = getattr(e, "diagnostic_code", None)
+            platform_response_code = _safe_platform_response_code(
+                getattr(e, "platform_response_code", None)
+            )
             stop_reason = _stop_reason_from_exc(e)
             if platform == "douyin" and posts:
                 for post in posts:
@@ -2356,9 +2460,22 @@ def run(
             }
             if isinstance(diagnostic_code, str) and diagnostic_code:
                 entry["diagnostic_code"] = diagnostic_code
+            if platform_response_code is not None:
+                entry["platform_response_code"] = platform_response_code
             error_log.append(entry)
+            diagnostic_summary = (
+                f" diagnostic_code={diagnostic_code}"
+                if _safe_diagnostic_code(diagnostic_code) is not None
+                else ""
+            )
+            platform_summary = (
+                f" platform_response_code={platform_response_code}"
+                if platform_response_code is not None
+                else ""
+            )
             print(
-                f"[warn] 内容列表采集异常 stop_reason={stop_reason}",
+                f"[warn] 内容列表采集异常 stop_reason={stop_reason}"
+                f"{diagnostic_summary}{platform_summary}",
                 file=sys.stderr,
             )
         try:
@@ -2593,7 +2710,11 @@ def run(
             stop_reason = SR_NO_PUBLIC_CONTENT
             task_status = "FAILED"
     else:
-        task_status = "PARTIAL" if posts else "FAILED"
+        # A verified public profile is still usable collection evidence even
+        # when the post list is unavailable.  Preserve the exact stop reason,
+        # but do not collapse a committed profile snapshot into a total task
+        # failure merely because strategy analysis cannot proceed.
+        task_status = "PARTIAL" if posts or _vis_count(profile) > 0 else "FAILED"
 
     task_diagnostic_code = next(
         (
@@ -2605,6 +2726,22 @@ def run(
             )
             and (
                 code := _safe_diagnostic_code(error.get("diagnostic_code"))
+            ) is not None
+        ),
+        None,
+    )
+    task_platform_response_code = next(
+        (
+            code
+            for error in reversed(error_log)
+            if (
+                stop_reason is None
+                or error.get("error_code") == stop_reason
+            )
+            and (
+                code := _safe_platform_response_code(
+                    error.get("platform_response_code")
+                )
             ) is not None
         ),
         None,
@@ -2639,6 +2776,7 @@ def run(
             collection_coverage=collection_coverage,
             comment_collection=comment_collection,
             diagnostic_code=task_diagnostic_code,
+            platform_response_code=task_platform_response_code,
             execution_timing=execution_timer.snapshot(),
             reservation=reservation,
         )
@@ -2685,31 +2823,31 @@ def main() -> None:
         "--limit",
         type=int,
         default=None,
-        help="采集条数(默认30,最大100)",
+        help="明确只采集最近 N 条（1-100）；省略时默认执行完整采集",
     )
     range_group.add_argument(
         "--all",
         dest="collect_all",
         action="store_true",
-        help="采集抖音公开作品直到明确末页",
+        help="在安全预算内采集 B站或抖音公开作品直到明确末页",
     )
     ap.add_argument(
         "--max-items",
         type=int,
         default=None,
-        help="--all 最大保留作品数(默认10000,硬上限50000)",
+        help="完整采集最大保留作品数(默认10000,硬上限50000)",
     )
     ap.add_argument(
         "--max-seconds",
         type=float,
         default=None,
-        help="--all 最长秒数(默认1800,硬上限14400)",
+        help="完整采集最长秒数(默认1800,硬上限14400)",
     )
     ap.add_argument(
         "--max-scrolls",
         type=int,
         default=None,
-        help="--all 最大滚动次数(默认2000,硬上限20000)",
+        help="完整采集最大滚动次数(默认2000,硬上限20000)",
     )
     ap.add_argument(
         "--out", default=None, help="输出目录(默认 workspace/<platform>-<account>-<date>/)"
@@ -2755,13 +2893,18 @@ def main() -> None:
     browser_group = ap.add_mutually_exclusive_group()
     browser_group.add_argument(
         "--browser-fallback", dest="browser_fallback", action="store_true",
-        help="显式启用系统浏览器传输层降级。",
+        help="显式启用临时浏览器传输层降级（系统安装或已有 Playwright 缓存）。",
     )
     browser_group.add_argument(
         "--no-browser-fallback", dest="browser_fallback", action="store_false",
-        help="禁止启动系统浏览器；仅使用 HTTP/SSR 快速路径。",
+        help="禁止启动临时浏览器；仅使用 HTTP/SSR 快速路径。",
     )
     ap.set_defaults(browser_fallback=None)
+    ap.add_argument(
+        "--douyin-cookie-file",
+        default=None,
+        help="用户主动提供的抖音 Cookie JSON/文本文件；内容仅注入临时浏览器且不落盘。",
+    )
     args = ap.parse_args()
     if args.since is not None and not args.resume:
         ap.error("--since 必须与 --resume 联用")
@@ -2780,6 +2923,7 @@ def main() -> None:
     ):
         ap.error("checkpoint 恢复不能与增量 --resume 混用")
     limit = PUBLIC_LIMIT_DEFAULT if args.limit is None else args.limit
+    collect_all = bool(args.collect_all or args.limit is None)
     date_from_iso = _parse_date(args.date_from)
     date_to_iso = _default_date_to(args.date_to)
     if args.date_from and not date_from_iso:
@@ -2792,12 +2936,13 @@ def main() -> None:
         args.url, limit, args.out, args.comments, date_from_iso, date_to_iso,
         resume=args.resume, resume_out=args.resume_out, since=args.since,
         browser_fallback=args.browser_fallback,
-        collect_all=args.collect_all, max_items=args.max_items,
+        collect_all=collect_all, max_items=args.max_items,
         max_seconds=args.max_seconds, max_scrolls=args.max_scrolls,
         enrich_details=args.enrich_details,
         analysis_goal=args.analysis_goal,
         checkpoint_out=args.checkpoint_out,
         resume_checkpoint=args.resume_checkpoint,
+        douyin_cookie_file=args.douyin_cookie_file,
     ))
 
 

@@ -202,3 +202,124 @@ def test_cli_writes_benchmark_files(tmp_path: Path):
     md = (it / "benchmark.md").read_text(encoding="utf-8")
     assert "eval-a".removeprefix("eval-") in md
     assert "n/a" in md or "pp" in md
+
+
+def test_cli_writes_skill_creator_viewer_benchmark(tmp_path: Path):
+    """The official eval viewer receives its exact nested benchmark schema."""
+    it = tmp_path / "iteration-viewer"
+    _write(it / "run-metadata.json", {
+        "skill_name": "probe-skill",
+        "executor_model": "local-model",
+        "runs_per_configuration": 1,
+    })
+    _write(it / "eval-a/eval_metadata.json", {
+        "eval_id": 7,
+        "eval_name": "viewer-probe",
+        "prompt": "Render the viewer probe",
+    })
+    for config, passed in (("with_skill", True), ("without_skill", False)):
+        run = it / f"eval-a/{config}/run-1"
+        _write(run / "grading.json", {
+            "expectations": [{
+                "text": "The response is visible",
+                "passed": passed,
+                "evidence": f"{config} evidence",
+            }],
+        })
+        _write(run / "timing.json", {
+            "total_duration_seconds": 2.5,
+            "total_tokens": 9,
+        })
+
+    assert aggregate.main([str(it)]) == 0
+
+    viewer = json.loads(
+        (it / "review-benchmark.json").read_text(encoding="utf-8")
+    )
+    assert viewer["metadata"] == {
+        "skill_name": "probe-skill",
+        "executor_model": "local-model",
+        "evals_run": [7],
+        "runs_per_configuration": 1,
+    }
+    assert len(viewer["runs"]) == 2
+    with_run = viewer["runs"][0]
+    assert with_run["configuration"] == "with_skill"
+    assert with_run["result"] == {
+        "pass_rate": 1.0,
+        "passed": 1,
+        "failed": 0,
+        "total": 1,
+        "time_seconds": 2.5,
+        "tokens": 9,
+        "errors": 0,
+    }
+    assert with_run["expectations"][0]["evidence"] == "with_skill evidence"
+    assert viewer["run_summary"]["with_skill"]["pass_rate"] == {
+        "mean": 1.0,
+        "stddev": 0.0,
+        "min": 1.0,
+        "max": 1.0,
+    }
+    assert viewer["run_summary"]["delta"]["pass_rate"] == "+1.000"
+
+
+def test_protocol_audit_flags_declared_run_count_mismatch(tmp_path: Path):
+    """A benchmark must not claim repetitions that are absent on disk.
+
+    Regression caught: iteration-6 displayed "3 runs each" although only
+    run-1 existed for each configuration.
+    """
+    it = tmp_path / "iteration-mismatch"
+    _write(it / "run-metadata.json", {"runs_per_configuration": 3})
+    _write(it / "eval-a/with_skill/run-1/grading.json", _grading(1, 0))
+    _write(it / "eval-a/without_skill/run-1/grading.json", _grading(1, 0))
+
+    result = aggregate.aggregate_iteration(it)
+
+    assert result["protocol"]["status"] == "INCOMPLETE"
+    assert result["protocol"]["declared_runs_per_configuration"] == 3
+    assert {
+        (issue["code"], issue["eval"], issue["configuration"])
+        for issue in result["protocol"]["issues"]
+    } == {
+        ("RUN_COUNT_MISMATCH", "a", "with_skill"),
+        ("RUN_COUNT_MISMATCH", "a", "without_skill"),
+    }
+    markdown = aggregate.render_markdown(result)
+    assert "协议完整性：INCOMPLETE" in markdown
+    assert "实际 1，声明 3" in markdown
+
+
+def test_complete_three_run_protocol_reports_metric_availability(tmp_path: Path):
+    """Three paired, graded runs are complete even when token usage is unavailable."""
+    it = tmp_path / "iteration-complete"
+    _write(it / "run-metadata.json", {"runs_per_configuration": 3})
+    for config in ("with_skill", "without_skill"):
+        for run_number in range(1, 4):
+            run = it / f"eval-a/{config}/run-{run_number}"
+            _write(run / "grading.json", _grading(1, 0))
+            _write(run / "timing.json", {
+                "total_duration_seconds": 2.5,
+                "total_tokens": None,
+            })
+
+    result = aggregate.aggregate_iteration(it)
+
+    assert result["protocol"]["status"] == "COMPLETE"
+    assert result["protocol"]["issues"] == []
+    assert result["protocol"]["metric_availability"] == {
+        "duration_runs": 6,
+        "token_runs": 0,
+        "total_runs": 6,
+    }
+
+
+def test_strict_cli_rejects_incomplete_protocol(tmp_path: Path):
+    """Release automation can fail closed on an incomplete paired benchmark."""
+    it = tmp_path / "iteration-strict"
+    _write(it / "run-metadata.json", {"runs_per_configuration": 3})
+    _write(it / "eval-a/with_skill/run-1/grading.json", _grading(1, 0))
+    _write(it / "eval-a/without_skill/run-1/grading.json", _grading(1, 0))
+
+    assert aggregate.main([str(it), "--strict"]) == 4

@@ -10,7 +10,8 @@
 - [4. 测试 taxonomy draft](#4-测试-taxonomy-draft)
 - [5. 测试 business draft](#5-测试-business-draft)
 - [6. B站短链与公开采集烟雾测试](#6-b站短链与公开采集烟雾测试)
-- [7. 用三份历史轨迹做人工对照](#7-用三份历史轨迹做人工对照)
+- [7. Agent 黑盒与人工对照](#7-agent-黑盒与人工对照)
+- [8. 自然提示触发评测](#8-自然提示触发评测)
 
 ## 1. 安装开发依赖
 
@@ -153,12 +154,29 @@ python3 skill/scripts/collect.py "<B站规范主页或主页短链>" \
 
 实时平台测试可能受访问限制、频控或页面变化影响，不作为单元测试成功的前提。若为 `PARTIAL` 或 `FAILED`，同时检查 `stop_reason`、`diagnostic_code`、采集覆盖账本和已保留的公开证据。
 
-## 7. 用三份历史轨迹做人工对照
+## 7. Agent 黑盒与人工对照
 
-对照仓库根目录的：
+不再把历史 transcript 作为活跃测试数据。使用当前、可维护的题集：
 
-- `docs/observations/agent-runs/main-bilibili-timeout.jsonl`
-- `docs/observations/agent-runs/minimal-bilibili-success.jsonl`
-- `docs/observations/agent-runs/social-analyzer-bilibili-success.jsonl`
+- `skill/evals/datasets/source/p0_cases.jsonl`：PRD P0 机器可读题；
+- `skill/references/release-acceptance.md`：安装包实机黑盒题；
+- `docs/guides/prd-v1.0-acceptance-test-plan.md`：分层执行方法与发布门。
 
-重点核验：不再把展示主页误当作品证据；不会把无评论证据标为待生成；主题不会一条一类；强受众结论有直接原文支持；最终答复以 `final-response.md` 和 `delivery-summary.json` 为准，而不是依赖 Agent 临场概括。
+每轮使用干净上下文和新的不可变任务目录，保存 prompt、实际 Skill SHA、最终答复、逐断言证据、墙钟与可用时的 token。历史轨迹只保留在 Git 历史或本地 `archive/`，不参与当前发布判定。
+
+## 8. 自然提示触发评测
+
+触发测试不在 prompt 中点名 Skill。每条 query 都交给全新的临时 Agent；只有目标 `SKILL.md` 的实际读取发生在其他动作之前，才计为触发。
+
+```bash
+python3 tools/skill_eval/codex_trigger.py \
+  --eval-set skill/evals/description_train.json \
+  --skill-path skill/SKILL.md \
+  --project-root . \
+  --out evals-workspace/trigger/train.json \
+  --model gpt-5.6-terra \
+  --reasoning-effort low \
+  --runs 3
+```
+
+validation 使用相同参数，仅替换输入和输出文件。只根据 train 失败调整 description；完整 0.7.1 协议与结果见 `docs/acceptance/skill-trigger-0.7.1.md`。

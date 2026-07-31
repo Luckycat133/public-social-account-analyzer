@@ -78,7 +78,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 1. **候选发现**：首选 `ranking/region?rid=<分区>`（**免 wbi、免 cookie、code:0**，按视频热度排，须用 `relation/stat` 二次验证粉丝量）；备选 `search/type?search_type=bili_user`（带 `buvid3`）→ 解析 `result[].mid/fans`，筛粉丝区间。
 2. **区间验证**：`relation/stat?vmid=<mid>` → `follower`（权威粉丝源，免 wbi）。没有平台保护响应的普通解析失败可保留已从 `web-interface/card.fans` 取得的公开值；一旦返回 `-400` 等平台拒绝码，立即停止当前任务，**不写 0**。`post_count` 同理由已成功取得的 `card.archive_count` 或 `acc.info.archive_count` 提供。
 3. **基本资料**：优先 `web-interface/card?mid=<mid>`（**免 wbi、稳定**），作为被风控的 `space/acc/info` 的等效替代。
-4. **投稿列表（三级降级链）**：
+4. **投稿列表（两条路径）**：
    - **首选：`medialist/resource/list`**（T6 实测，免 wbi、免频控、数据中心 IP 稳定 code:0）
      - 端点：`GET /x/v2/medialist/resource/list?mobi_app=web&type=1&biz_id={mid}&oid={last_id}&size=20`
      - **优势**：单次调用即返回完整 `cnt_info`（play/thumb_up/coin/collect/reply/danmaku/share 全有），**无需逐条 view 补全**，大幅减少请求数与 IP 信誉消耗
@@ -86,8 +86,8 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
      - 字段映射：`bv_id`→bvid（注意不是 `bvid`）、`pubtime`→published_at、`tid`→typeid、`copy_right`(1=原创/2=转载)、`cnt_info.{play,thumb_up,coin,collect,reply,danmaku,share}`
    - **降级 A：`space/wbi/arc/search`**（wbi 签名 + web_location=333.1387）
      - vlist 条目字段现实：`comment`（评论数，非 `reply`）、`play`（播放）；**无 `like`/`favorites`/`coin`/`share`/`danmaku`**——这些须逐条用 `web-interface/view?bvid=<BV>`（免 wbi、稳定）补全 `stat`
-     - 仅普通解析或本地传输失败可进入降级 B；一旦收到 `-412/-352/-403` 等平台保护响应，立即停止当前任务
-   - **降级 B：`search/type`** 从 `result[].res[]` 取该用户投稿条目（bvid/title/play 等），逐条 `view` 补全；`card.archive_count` 交叉验证投稿总数。
+     - 仅在主路径没有返回条目且未收到平台保护时启用；一旦收到 `-412/-352/-403` 等平台保护响应，立即停止当前任务。
+   - 不再把 `search/type` 或空间动态 feed 加入默认投稿采集：前者只能给弱列表证据，后者增加额外 WBI 请求与风控面，不能提高常规投稿的确定性。
 5. **置顶视频检测**：`GET /x/space/top/arc?vmid={mid}`（**免 wbi、稳定**）。有置顶时返回完整视频 JSON（含 bvid/title），无置顶时 data 为 null。用于标记 `is_pinned=true`。
 6. **视频标签**：`GET /x/tag/archive/tags?bvid={BV}`（**免 wbi、稳定**）。返回 `data[].tag_name` 列表，比从 title/desc 正则提取更权威完整。
 7. **HTML 降级（不推荐）**：空间页为 Vue SPA，`__INITIAL_STATE__` 不存在，仅 `<title>` 含用户名，无法取结构化数据。
@@ -97,9 +97,9 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 | code | 含义 | 应对 |
 |------|------|------|
 | -412 request was banned | 平台访问限制 / IP 级封禁 | 立即停止当前任务，不换身份、不换端点 |
-| -799 请求过于频繁 | 平台限流 | 立即停止当前任务，不退避重试 |
+| -799 请求过于频繁 | `RATE_LIMITED` | 当前任务立即停止；Agent 可按有界冷却策略新建任务重试 |
 | -401 非法访问 / verify_captcha_level2 | 验证码场景 | 停止，不绕过 |
-| -352 风控校验失败 + v_voucher | 需风险凭证 | 停止，不绕过 |
+| -352 风控校验失败 + v_voucher | WBI 风控失败 | 当前会话停止；外层可按 30/60 秒在新工作区有界重试 |
 | -403 访问权限不足 | 客户端被平台拒绝 | 立即停止当前任务 |
 | -400 请求错误 | 参数错误或平台拒绝 | 按 `ACCESS_RESTRICTED` 立即停止当前任务 |
 
@@ -114,7 +114,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 - **`web_location=333.1007` 是 space wbi 接口的硬性前置**：T3 实测 `space/acc/info`、`space/wbi/arc/search` 若签名不含 `web_location` 必 `-412`，带上即通过签名校验。这是 wbi `enc_wbi` 签名字典的必填项，**仅 space 类接口需要**；ranking/search/card/view 等免 wbi 接口无需。
 - **`arc/search` 的可用性随环境变化**：T3 与 T4 的历史实测结果不同，说明接口可用性受 IP 信誉与账号风险等级影响。当前适配器可在尚未出现平台保护响应时把它作为后备公开端点；一旦收到保护响应，必须停止当前任务。
 - **vlist 字段现实**：`list.vlist[]` 仅含 `comment`（评论数，**不是** `reply`）、`play`（播放）、`video_review`；**不含** `like`/`favorites`/`coin`/`share`/`danmaku`。任何把 vlist 当完整 `stat` 的做法都会产出全 0 指标——必须以 `view` 端点补全。
-- **任务身份固定**：`-412/-799/-401/-352/-403/-400` 均按平台保护响应处理；当前任务立即停止，不刷新 buvid、不更换端点或传输路径。只有未收到平台响应的本地传输失败，才允许同一身份最多重试一次。
+- **任务身份固定**：`-412/-799/-401/-352/-403/-400` 均按平台保护响应处理；当前任务立即停止。外层仅对受控访问限制、频控及明确 `-352` 创建新工作区并有界重试，不切换账号、出口 IP 或登录态；未收到平台响应的本地传输失败仍只允许当前会话重试一次。
 
 ### 补充实证（T5 沙箱直连复采「幸运的一只猫」uid=518388027，粉丝 258）
 
@@ -122,7 +122,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 
 - **`web_location` 必须按子接口区分**：`acc/info` 用 `333.1007`，`arc/search` 用 `333.1387`。原适配器对两者统一用 `333.1007` → `arc/search` 签名被拒、`-799`，退化到 `search/type` 只拿到 3 条。修正为按接口拆分后，探针实测 `arc/search` 第 1 页 50 条、第 2 页 48 条（共 98，与账号真实投稿数一致）。
 - **`arc/search` 翻页复用同一身份**：页间保留节流，但不轮换 buvid；任一页返回 `-412` 等平台保护响应即停止当前任务。
-- **IP 风控具累积性（重要）**：不要在正式采集前反复探测同一端点。当前任务一旦收到平台保护响应就停止；是否在稍后由用户创建新任务重试，应由用户根据环境状态决定，程序不会在同一任务中自动冷却、换身份或转浏览器。
+- **IP 风控具累积性（重要）**：不要在正式采集前反复探测同一端点。当前任务一旦收到平台保护响应就停止；Agent 可等待 30 秒、60 秒后各创建一次新任务，总尝试不超过 3 次。程序不会在同一任务中自动冷却、换身份或转浏览器。
 - **账号等级 `level` 是代码缺陷，非数据缺失**：`acc/info` 返回的等级在**顶层 `level` 字段**（`acc['level']=5`），而旧报告脚本/适配器误读 `level_info.current_level`（该键在 acc/info 响应中不存在）→ 显示 null。本适配器 `_build_profile_raw` 虽算了 `level` 却**未写回输出字典**，故统一模型里完全没有该字段。修复方向：读 `acc.get("level")`（兜底 `card.level_info.current_level`），并纳入 Profile。
 - **分区中文名并非稳定可见**：部分实测响应的 `tname` / `tname_v2` 为空，`arc/search` 也可能只给数值 `typeid`。适配器先接受同一响应明确给出的非空 `tname` / `typename`，否则才查内置静态参考映射；两者都没有时保留整数 `typeid`，中文名写 `null`，不得按标题猜测。
   - 参考映射（⚠️ 属**第 2 层**：独立工作流产出、高置信、待本管线用官方分区表核对；尤其 249/250。完整口径见下方「分区中文名缺口结论」）：
@@ -175,7 +175,7 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 - **WBI 签名 `web_location` 按子接口区分**：`acc/info` 用 `333.1007`，`arc/search` 用 `333.1387`；用错即被拒（`-799`/`-412`/`-403`）。T5 探针实测拆分后 `arc/search` 第 1 页 50 条、第 2 页 48 条（共 98，与真实投稿数一致）。
 - **`arc/search` vlist 评论数字段是 `comment`（非 `reply`）**；vlist **无** `like`/`favorites`/`coin`/`share`/`danmaku`，须由 `web-interface/view` 逐条补全。把 vlist 当完整 `stat` 会产出全 0 指标。
 - **`arc/search` 翻页复用任务身份**：页间约 6 秒节流，但不轮换 buvid。任一页返回 `-412` 等平台保护响应即停止当前任务。
-- **IP 风控具累积性（重要）**：短时间内反复探测同一端点会降低后续可用性。采集前勿做大量探针；一旦出现平台限制，当前任务立即停止，不自动冷却重试、轮换身份或转浏览器。
+- **IP 风控具累积性（重要）**：短时间内反复探测同一端点会降低后续可用性。采集前勿做大量探针；一旦出现平台限制，当前任务立即停止。Agent 可按 30 秒 / 60 秒冷却创建最多两个后续任务；仍不得轮换身份或转浏览器。
 
 ### 第 2 层：独立浏览器工作流已验证、待本管线复现的数据结论（高置信、待本管线复现）
 
@@ -188,8 +188,11 @@ B站风控**不是「全 IP 封禁」，而是按接口/场景分层**：
 
 ### 第 3 层：平台保护停止策略
 
-- `-799`、`-412`、`-403`、`-400`、登录墙或验证页面一经识别，立即保留准确的任务级 `stop_reason` 并打开共享 `Session` 断路器。
-- 同一任务不重试平台保护响应，不轮换 buvid、不更换公开端点，也不启动浏览器；后续详情、标签和评论请求都会在发出网络请求前被断路器拒绝。
+- `-799`、`-412`、`-403`、`-400`、登录墙或验证页面一经识别，立即保留准确的任务级 `stop_reason` 并打开共享 `Session` 断路器。`-799` 记录为 `RATE_LIMITED`；其余访问拒绝按下表分类。
+- 同一任务不重试平台保护响应；Agent 编排层可在 30 秒 / 60 秒后各用新目录重跑一次。三次尝试均复用正常公开身份与默认端点链，不轮换 buvid、不更换出口，也不启动浏览器。
+- 策略分析默认调用 `scripts/collect_bilibili_complete.py`，而不是停在 30 条限量样本。它把上述冷却和新目录规则固化为可执行入口；普通登录或验证不会重试，唯一例外是任务明确记录 `platform_response_code=-352` 的 WBI 风控失败。
+- `medialist` 以相同游标身份逐页读取，记录 `observed_page_count/observed_post_count/terminal_page_observed/stop_condition`。只有常规投稿路径观察到可信末页，才允许总体 `is_exhaustive=true`；达到 `max_items` 预算不是末页证据。
+- 全量路径跳过逐作品标签 API；标题、简介和七项公开计数优先，避免为非核心标签字段额外产生 O(n) 请求。标签未知保持不可见，不写空值冒充“无标签”。
 - 只有完全没有收到平台响应的本地传输失败，才允许同一身份最多重试一次。普通解析错误不会伪装成访问限制。
 - 历史兼容配置字段不会启用 B站平台保护后的浏览器降级；`--browser-fallback` / `--no-browser-fallback` 的实际浏览器行为仅用于抖音。
 
@@ -297,7 +300,8 @@ B站账号层 `platform_metrics` 约定为空对象 `{}`（获赞总量非账号
 |------|-------------|------|
 | 页面 / 接口要求登录（登录墙标记） | `LOGIN_REQUIRED` | 停止采集，保留已得数据 |
 | 验证码 / 滑块（`verify_captcha` / 滑块文案） | `VERIFICATION_REQUIRED` | 立即停止，不破解 |
-| 频控（`-412 request was banned` / `-799 请求过于频繁`） | `ACCESS_RESTRICTED` | 停止，保留已得数据 |
+| 明确频控（`-799` / `too many requests` / `请求过于频繁`） | `RATE_LIMITED` | 停止，保留已得数据 |
+| WAF / 访问拒绝（`-412 request was banned` / `-403` / `-400` / `-101`） | `ACCESS_RESTRICTED` | 停止，保留已得数据 |
 | 账号主页不存在 / 被封（资料阶段 `-404`） | `ACCOUNT_UNAVAILABLE` | 停止账号任务 |
 | 单条作品详情 `-404` | 条目 `DELETED` | 保留列表证据并继续其余作品 |
 | 单条详情普通解析异常 | 条目 `PARTIAL` | 记录 `detail_status` 并继续；不伪装为平台保护 |
@@ -314,4 +318,4 @@ B站账号层 `platform_metrics` 约定为空对象 `{}`（获赞总量非账号
 - **示例 2（生活 vlog 用户）**：`https://space.bilibili.com/87654321`
   - 期望字段同示例 1；重点验证是否存在置顶（`is_pinned`）与转载（`is_repost`）标记。
   - 采集数量：`limit=30`；时间范围：近 90 天。
-  - 若任一请求收到 `-412/-799` 等平台保护响应，立即停止当前任务并保留此前已成功采集的数据；任务级使用准确的 `ACCESS_RESTRICTED`，不得把受限响应伪装成空投稿列表。
+  - 若任一请求收到 `-412/-799` 等平台保护响应，立即停止当前任务并保留此前已成功采集的数据；`-799` 使用 `RATE_LIMITED`，`-412` 使用 `ACCESS_RESTRICTED`，不得把受限响应伪装成空投稿列表。

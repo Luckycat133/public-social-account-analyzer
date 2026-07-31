@@ -4,17 +4,46 @@
 > `exceptions.md`（状态机）配套使用，所有 `stop_reason` 取值严格取自
 > `exceptions.md` §9.2，不新增枚举。
 >
-> 合规边界（最高优先级）：**绝不绕过登录、验证码、滑块或频控**。一旦平台要求登录或
-> 触发验证/频控，立即停止对应请求，如实上抛 `stop_reason`，不得伪造、绕过或自动化
-> 破解任何保护措施。抖音站点是重度 JS 渲染 + 风控（WAF / 滑块 / 签名），标准库
+> 证据边界：匿名模式不把登录墙当作“账号无数据”；用户明确提供其合法会话 Cookie 文件时，
+> 可在隔离的临时浏览器中以该授权会话读取用户本来可见的页面。两种模式都不自动处理验证码、
+> 滑块或频控，不伪造身份，也不把受限页冒充内容证据。抖音站点是重度 JS 渲染 + 风控（WAF / 滑块 / 签名），标准库
 > `urllib` 直连往往只能拿到 JS 外壳或风控页——这是预期内的诚实结果，对应
 > `PARSER_FAILED` / `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `ACCESS_RESTRICTED`，
 > 而非缺陷。
 
-本文件主体描述匿名公开适配器。账号本人提供同次 OAuth access token + `open_id` 时，可使用
+本文件主体描述匿名公开适配器和用户授权会话模式。账号本人提供同次 OAuth access token + `open_id` 时，可使用
 隔离的 `collect_douyin_authorized.py` 官方列表入口；其身份回证、末页、opaque share 与令牌
 边界见 [data-schema.md §3.2/§5](data-schema.md) 和 [exceptions.md §2.1](exceptions.md)。该入口
 不是匿名降级，也不能按第三方账号查询。
+
+## 从账号名发现规范主页
+
+用户只给昵称或抖音号时，先把主页发现与作品采集分开。一个实测有效的低成本入口是抖音
+第一方移动搜索 `https://so.douyin.com/s?keyword=<URL编码关键词>&pd=user`：优先用完整中文
+账号名搜索，核对结果中的昵称、抖音号、认证/主体、简介与粉丝量，再读取卡片链接中的
+`https://www.douyin.com/user/<sec_uid>`。移除搜索来源查询参数后，把规范主页交给采集器。
+
+- 不要把 `unique_id`/抖音号直接拼成 `/user/<unique_id>`；现代主页路径通常需要 `sec_uid`。
+- 拼音搜索可能被语义纠错为同音账号；例如账号拼音不如完整中文名稳定。身份信号不一致时继续查证，不把第一条结果当目标。
+- 搜索页用于发现和身份核对，不证明作品列表完整。作品数量、互动和末页仍由主页列表、作品页或其他绑定证据决定。
+- 若环境没有可交互浏览器，可使用能返回直接账号卡片链接的 Web 连接器或用户提供的分享主页；核心仍是核对身份并取得真实主页，而不是依赖固定工具。
+
+## 用户授权 Cookie 会话
+
+当云端匿名访问只得到登录墙，且用户明确表示拥有或有权使用自己的抖音会话时，才可使用 `--douyin-cookie-file <PATH>`。面向 Windows、macOS、Linux、Firefox 和只有手机用户的傻瓜导出步骤、对话用语与安全边界见 [douyin-cookie-guide.md](douyin-cookie-guide.md)。
+
+- Cookie 值不要粘贴到聊天、URL、命令行参数值、日志或版本库；命令行只传文件路径。
+- 解析器限制文件大小、Cookie 数量和值长度，错误只返回固定说明，不回显秘密。Cookie 仅保存在采集进程内，临时 profile 随会话删除。
+- 平台再次要求验证、限制访问或账号绑定冲突时，保留已有证据并按实际覆盖停止；Cookie 会过期，因此不把离线测试冒充在线成功。
+
+完整采集示例：
+
+```bash
+python3 scripts/collect_douyin_complete.py \
+  "https://www.douyin.com/user/<sec_uid>" \
+  --douyin-cookie-file /secure/path/douyin-cookies.json \
+  --out-prefix workspace/douyin-authorized-session
+```
 
 ## 支持的账号主页
 
@@ -164,14 +193,13 @@
 - 命中上述任一**任务级**限制时，**立即停止**对应请求；`check_access` 返回
   `{"accessible": False, "reason": <说明>, "stop_reason": <上表值>}`；
   `collect_*` 抛 `DouyinError(stop_reason)` 由上层按 `exceptions.md` 决策表降级。
-- **抖音 JS 虚拟机/动态渲染与浏览器降级（实验性）**：
-  1. 当 SSR 缺失或作品列表结构无法识别（例如直连 HTTP 仅获取到 `_$jsvmprt` 打桩页）时，默认自动启动浏览器降级；真正识别到空作品列表时不启动浏览器，返回 `NO_PUBLIC_CONTENT`。`SOCIAL_BROWSER_FALLBACK=0` 可禁用抖音默认降级；`--no-browser-fallback` 优先级最高。这两个开关仅控制抖音浏览器降级；B站的平台保护停止策略不由它们改变。
-  2. 降级不会声称加载“完整 DOM”。实现会先观察来自公开 Douyin/iesdouyin 域名的 CDP XHR/Fetch JSON 响应并提取已验证的作品结构；不足时才从可见的 `/video/<id>` 或 `/note/<id>` 卡片提取最小字段。浏览器不参与签名生成或保护绕过。
-  3. 系统 Chrome、Chromium、Edge 或 Brave 是可选前置条件，可通过 `BROWSER_BIN` / `CHROME_BIN` 指定。未找到浏览器时内部诊断为 `BROWSER_UNAVAILABLE`，对外 `stop_reason` 仍为 `PARSER_FAILED`。
-  4. 浏览器运行不新增 pip 或其他 Python 运行时依赖。每次启动均创建并删除临时用户目录，不附着或复用本机浏览器的登录状态、Cookie 或用户配置；不持久化 Cookie、请求头、带签名 URL、完整响应或媒体。
+- **抖音 JS 虚拟机/动态渲染与浏览器会话**：
+  1. 公开主页只有一条采集协议：先读取同一页面会话中的 SSR；SSR 缺失或作品列表结构无法识别（例如直连 HTTP 仅获取到 `_$jsvmprt` 打桩页）时，默认自动启动浏览器降级来读取该主页。真正识别到空作品列表时不启动浏览器，返回 `NO_PUBLIC_CONTENT`。`SOCIAL_BROWSER_FALLBACK=0` 可禁用浏览器会话；`--no-browser-fallback` 优先级最高，且仅控制抖音。用户 Cookie 只注入该会话，不引入另一条采集路径。
+  2. 浏览器会话只观察目标账号主页的被动 CDP 网络响应与可见 DOM 卡片；不再执行页内 `aweme/post` 请求来扩展列表。所有接纳的作品仍须通过 HTTP/API、owner、作品 ID、作者和分页审计。
+  3. 后端依次探测 `BROWSER_BIN` / `CHROME_BIN`、系统 Chrome/Chromium/Edge/Brave，以及已有的 Playwright Chromium 缓存（含 `PLAYWRIGHT_BROWSERS_PATH` 与平台默认缓存）。显式路径或环境覆盖是唯一候选；自动探测会在同一总启动时限内逐个尝试可用候选，前一个进程启动失败才尝试下一个。缓存探测不导入或启动 Playwright。全部未找到时内部诊断为 `BROWSER_UNAVAILABLE`，对外 `stop_reason` 仍为 `PARSER_FAILED`。
+  4. 浏览器运行不新增 pip、npm 或其他运行时依赖，Agent 不执行 `playwright install`、`npx puppeteer browsers install` 或一次性浏览器爬虫。每次启动均创建并删除临时用户目录，不附着本机浏览器 profile；只有显式 `--douyin-cookie-file` 才向临时会话注入用户授权 Cookie。无论哪种模式都不持久化 Cookie、请求头、带签名 URL、完整响应或媒体。
      临时 profile 只在浏览器真正 `start()` 时创建；仅构造会话不会留下空目录。覆盖账本可选
-     记录浏览器 requested/launched、作品证据来源（无作品证据为 `none`）、滚动轮数和有界
-     预算；这些字段经过三层白名单，不包含 profile 路径或原始传输数据。
+     记录浏览器 requested/launched、作品证据来源（无作品证据为 `none`）、页内请求是否启用与次数、滚动轮数和有界预算；这些字段经过三层白名单，不包含 profile 路径、页内请求 URL/query、请求头或原始响应。
   5. 遇到登录、验证码、滑块、频控或其他限制立即停止；若时间预算尚存，只读取当前
      精确账号路径下已可见的主页标题区（含认证徽章），不再滚动且不查询/接纳 DOM
      作品卡片，原限制状态保持不变。已采集的公开作品可作为部分结果保留。后续
@@ -179,8 +207,7 @@
      数据会在输出预留前失败，不发布空分析。
   6. API、SSR、网络响应和可见账号头只在 `sec_uid` 与规范化主页 URL 均不矛盾时合并；
      任一显式账号绑定冲突都以 `PARSER_FAILED` 关闭，不用请求参数覆盖响应身份，也不以
-     旧缓存掩盖冲突。浏览器缓存按证据强度合并并重新净化，后到的档案片段不会清除已
-     确认的抖音号、获赞数（包括 0）或更强认证证据。
+     旧缓存掩盖冲突。浏览器缓存按证据强度合并并重新净化，后到的档案片段不会清除已确认的抖音号、获赞数（包括 0）或更强认证证据。`followers`、`post_count` 或 `total_likes` 出现不同公开数值时保留先取得的值，同时在 `platform_metrics.profile_conflicts` 保存选中值与最多 16 个不同观测，并将对应 `field_visibility` 降为 `partial`；不得静默 first-wins 后称为确定事实。
   7. 主页网络作品列表以规范主页路径中的 `sec_uid` 为预期账号。候选响应必须具有精确数值
      HTTP 200；顶层 `status_code` / `error_code` 若存在，必须是整数 0。非空列表要求每一条原始项
      都是可映射、数字 ID 且冻结路径 `author.sec_uid` 精确等于预期账号；所有非空
@@ -192,7 +219,7 @@
      作品和分页事实。空列表必须由同一列表容器上的 `sec_uid` / `sec_user_id`，或该冻结
      响应 URL 中唯一、严格解码且精确匹配的同名参数证明归属；缺失、空白、控制字符、重复、冲突、非法编码
      和无关响应都不能证明空页。只有通过这些检查的观测才影响网络作品、页数、游标、
-     terminal 与 `is_exhaustive`。即使较晚响应已给出可信末页，只要任一可能属于目标账号的
+     terminal 与 `is_exhaustive`。`has_more` 只接受 JSON 布尔值或类型精确且值为 `0/1` 的整数，并统一转为布尔；字符串、浮点或其他整数均使候选失去分页证明。即使较晚响应已给出可信末页，只要任一可能属于目标账号的
      列表候选仍未读取、HTTP/API 状态失败、绑定重复/非法而有歧义、加载失败、JSON 解析失败，或合法 JSON 无法
      通过列表结构与作者绑定校验形成分页观测，就只能保留末页已观察事实并将
      `is_exhaustive` 置为 `false`。每个 frozen owner 内 `max_cursor` / `cursor` / `min_cursor`
@@ -229,6 +256,7 @@
       不刷新、不重试响应正文、不生成签名；仍使用同一套零 Python 依赖的系统浏览器
       CDP 传输和临时用户目录。达到边界只返回诚实的空详情/`PARSER_FAILED`，不扩大采集。
 - **绝不**刷新、重试破解、伪造签名或模拟浏览器绕过；`urllib` 直连或浏览器传输层拿到的风控页即如实认定。
+- 模糊范围的完整公开采集使用 `scripts/collect_douyin_complete.py`。每个浏览器进程一旦命中保护立即停止并密封；只有根级 `RATE_LIMITED/ACCESS_RESTRICTED` 才可在 30/60 秒后以相同身份和新目录重试，总尝试最多 3 次。`LOGIN_REQUIRED`、`VERIFICATION_REQUIRED`、`ACCOUNT_UNAVAILABLE`、`BROWSER_UNAVAILABLE` 和一般 `PARSER_FAILED` 不重试。没有成功 attempt 时选取 `collected_count` 最大、状态更强且更早的提交作为后续部分证据。
 - 单条内容级问题（`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE`）只下钻到内容级，
   **不**写入任务级 `stop_reason`（见 `exceptions.md` §1.1）。
 
