@@ -10,6 +10,8 @@ import collect
 
 
 DOUYIN_URL = "https://www.douyin.com/user/example"
+WEIBO_URL = "https://weibo.com/u/123456"
+XIAOHONGSHU_URL = "https://www.xiaohongshu.com/user/profile/5f2a1b3c4d5e6f708192a3b4"
 
 
 def test_social_browser_fallback_whitelist(monkeypatch, tmp_path, capsys):
@@ -92,6 +94,38 @@ def test_cli_forwards_douyin_cookie_file_without_reading_it(monkeypatch):
     assert forwarded["douyin_cookie_file"] == "/run/secrets/douyin-cookies.json"
 
 
+@pytest.mark.parametrize(
+    ("url", "flag", "keyword", "path"),
+    [
+        (WEIBO_URL, "--weibo-cookie-file", "weibo_cookie_file", "/run/secrets/weibo.json"),
+        (
+            XIAOHONGSHU_URL,
+            "--xiaohongshu-cookie-file",
+            "xiaohongshu_cookie_file",
+            "/run/secrets/xiaohongshu.json",
+        ),
+    ],
+)
+def test_cli_forwards_platform_cookie_file_without_reading_it(
+    monkeypatch, url, flag, keyword, path
+):
+    """Secret references must reach run() without the CLI opening their contents."""
+    forwarded = {}
+
+    def fake_run(*args, **kwargs):
+        forwarded.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(collect, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["collect.py", url, "--limit", "1", flag, path])
+
+    with pytest.raises(SystemExit) as exc_info:
+        collect.main()
+
+    assert exc_info.value.code == 0
+    assert forwarded[keyword] == path
+
+
 def test_invalid_douyin_cookie_file_fails_without_loading_adapters_or_leaking(
     monkeypatch, tmp_path, capsys
 ):
@@ -111,6 +145,32 @@ def test_invalid_douyin_cookie_file_fails_without_loading_adapters_or_leaking(
         DOUYIN_URL,
         out_dir=str(tmp_path / "task"),
         douyin_cookie_file=str(cookie_file),
+    ) == 2
+
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert not (tmp_path / "task").exists()
+
+
+def test_invalid_weibo_cookie_file_fails_without_loading_adapters_or_leaking(
+    monkeypatch, tmp_path, capsys
+):
+    secret = "must-not-appear"
+    cookie_file = tmp_path / "cookies.json"
+    cookie_file.write_text(
+        '{"name":"SUB","value":"' + secret + '","domain":"example.com"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        collect,
+        "_load_adapters",
+        lambda *args, **kwargs: pytest.fail("adapter loading must not run"),
+    )
+
+    assert collect.run(
+        WEIBO_URL,
+        out_dir=str(tmp_path / "task"),
+        weibo_cookie_file=str(cookie_file),
     ) == 2
 
     captured = capsys.readouterr()

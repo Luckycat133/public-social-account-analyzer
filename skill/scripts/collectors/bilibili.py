@@ -13,7 +13,7 @@ HTTP 412），而 curl 携带完整浏览器头（Origin / Sec-Fetch / --compres
   - 平台一旦返回保护响应，当前任务立即停止；外层编排可按固定退避在新工作区
     有界重试，但不会轮换账号、出口 IP、登录态或改走浏览器。
 
-合规边界（见 SKILL.md 与 references/platform-bilibili.md）：
+合规边界（见 SKILL.md 与 references/platforms/bilibili.md）：
 - 不登录、不破解验证码；公开列表使用 WBI 签名，遇阻停止当前会话并抛出
   BilibiliError(stop_reason)，由外层决定是否有界重试。
 - 字段不可见写 None（绝不用 0 代替未知）。
@@ -111,7 +111,7 @@ PLATFORM_PROTECTION_REASONS = {
 WEB_LOCATION_SPACE = "333.1007"
 WEB_LOCATION_ARC = "333.1387"
 
-# 分区静态映射（typeid -> 子分区）。来源：references/platform-bilibili.md §分区中文名缺口结论
+# 分区静态映射（typeid -> 子分区）。来源：references/platforms/bilibili.md §分区中文名缺口结论
 # （第 2 层：独立浏览器工作流产出、高置信、待官方分区表核对；尤其 249/250 待核对）。
 # 现实 API 的 tname/tname_v2 已实测为空，故分区只能靠此静态映射，并在输出标注来源。
 TYPENAME_MAP = {

@@ -1,58 +1,58 @@
-# Evaluation Dataset Changelog
+# 评估数据集变更日志（CHANGELOG）
 
-All notable changes to the evaluation dataset are documented in this file.
+本评估数据集的所有重要变更均记录在本文件中。
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and dataset versions use [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
+且数据集版本遵循 [语义化版本控制（Semantic Versioning）](https://semver.org/spec/v2.0.0.html)。
 
 ## [0.3.0] - 2026-07-29
 
-### Changed
+### 变更（Changed）
 
 - 模糊的 B站/抖音账号分析请求现在评测按用户目标与证据充分性自适应路由，不再断言固定最近 30 条或固定完整采集。
 - 明确日期窗口使用完整采集编排证明覆盖，取消抖音日期任务的隐含 100 条上限。
 - B站完整覆盖用例保留默认 10,000 条、硬上限 50,000 条预算；快速模糊请求不机械触发该预算。
 
-### Added
+### 新增（Added）
 
 - 新增抖音模糊请求、无签名同源页内分页、瞬态限制有界重试、最佳部分证据选择与样本节奏标签用例。
 - 新增用例后按固定 seed 42、test ratio 0.30 重新生成 validation/test 分区与 manifest。
 
 ## [0.2.0] - 2026-07-27
 
-### Added
+### 新增（Added）
 
-- Added a machine-readable catalog for all 30 PRD V1.0 P0 requirements: 13 functional requirements, 7 non-functional requirements, and 10 acceptance criteria.
-- Added 30 traceable P0 cases with source references, platform scope, scenario type, verification mode, objective assertions, and semantic leakage groups.
-- Added a generated P0 coverage report that separates dataset coverage from external evidence gates.
-- Added checksum governance for the P0 catalog and coverage report.
+- 新增 30 个 PRD V1.0 P0 需求的机器可读索引：包含 13 个功能需求、7 个非功能需求和 10 个验收标准。
+- 新增 30 个可追溯的 P0 用例，包含来源参考、平台范围、场景类型、验证模式、客观断言与语义泄露分组。
+- 新增自动生成的 P0 覆盖率报告，将数据集覆盖率与外部证据门分离开来。
+- 新增 P0 目录与覆盖率报告的 Checksum 校验机制。
 
-### Changed
+### 变更（Changed）
 
-- Added scenario-group leakage and strict P0 coverage validation.
-- Stratified P0 cases by scenario type and negative triggers by coarse risk category.
-- Preserved validation and test examples for every non-singleton stratum where mathematically possible.
-- Expanded output-contract and conditional Weibo trigger samples so strict distribution validation passes.
+- 新增场景分组泄露检查与严格的 P0 覆盖校验。
+- 按场景类型分层 P0 用例，并按粗粒度风险类别对负向触发用例分类。
+- 在数学上可能的情况下，为每个非单例分层保留验证集与测试集示例。
+- 扩充输出契约与条件式微博触发样本，使严格分布校验顺利通过。
 
-### Security
+### 安全（Security）
 
-- Added explicit P0 cases for credential rejection, private-data exclusion, no-login behavior, and anti-bypass compliance.
+- 新增用于凭据拒绝、私有数据排除、无登录行为与防绕过合规的显式 P0 用例。
 
 ## [0.1.0] - 2026-07-24
 
-### Added
+### 新增（Added）
 
-- Added separate `validation_data` and held-out `test_data` directories derived from a single `source` pool.
-- Added dataset-level, source, validation, and test documentation covering provenance, JSONL schemas, field meanings, split policy, and usage boundaries.
-- Added a path configuration example and an operational guide for reproducible splitting and verification.
-- Added manifest metadata for dataset version, paths, stratification policy, quality checks, counts, distributions, and SHA-256 checksums.
+- 新增独立的 `validation_data` 验证集与留出 `test_data` 测试集目录，均衍生自单个 `source` 数据池。
+- 新增数据集级别、source、validation 及 test 文档，涵盖来源、JSONL Schema、字段含义、切分策略与使用边界。
+- 新增路径配置示例与可复现切分与校验的操作指南。
+- 新增清单元数据（manifest），包含数据集版本、路径、分层策略、质量检查、计数、分布与 SHA-256 校验和。
 
-### Changed
+### 变更（Changed）
 
-- Standardized the default evaluation split at 70% validation and 30% test with seed 42 and dataset-specific stratification fields.
-- Extended verification to detect schema violations, duplicate IDs, cross-partition leakage, incomplete source coverage, count mismatches, and checksum drift.
+- 标准化默认评估切分比例为 70% 验证集与 30% 测试集，固定 random seed 为 42 并使用数据集特定的分层字段。
+- 扩展校验逻辑，以检测 Schema 违规、重复 ID、跨分区泄露、源覆盖不完整、计数不匹配以及校验和漂移。
 
-### Security
+### 安全（Security）
 
-- Documented a local permission baseline of `0750` for directories and `0640` for files.
-- Prohibited credentials, cookies, access tokens, private platform exports, and personal sensitive data in evaluation files.
+- 规范本地权限基线为目录 `0750`、文件 `0640`。
+- 严禁在评估文件中包含凭据、Cookie、Access Token、私有平台导出或个人敏感数据。

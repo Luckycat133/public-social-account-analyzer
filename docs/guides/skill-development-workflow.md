@@ -118,8 +118,8 @@ python3 /Users/jack/.agents/skills/skill-creator/eval-viewer/generate_review.py 
 
 ```bash
 python3 /Users/jack/.agents/skills/skill-creator/scripts/quick_validate.py skill
-python3 skill/scripts/split_dataset.py --verify
-python3 skill/scripts/split_dataset.py --dry-run --strict
+python3 tools/skill_eval/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --dry-run --strict
 python3 -m pytest tests/ -q
 git diff --check
 ```

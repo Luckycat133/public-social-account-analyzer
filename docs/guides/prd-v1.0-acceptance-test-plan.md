@@ -1,10 +1,10 @@
-# PRD V1.0 / Skill 0.7.5 验收测试计划
+# PRD V1.0 / Skill 0.8.0 验收测试计划
 
 ## 1. 目标与判定基线
 
-本计划把 PRD V1.0 的 FR-001～FR-015、§15 七项非功能需求和 AC-01～AC-10 转成可执行测试。PRD 正本是需求来源；`docs/prd/需求实现状态与抖音能力边界.md` 是 0.7.5 的能力与剩余验收说明；二者冲突时必须在记录中显示合同演进，不能静默选一个数字。
+本计划把 PRD V1.0 的 FR-001～FR-015、§15 七项非功能需求和 AC-01～AC-10 转成可执行测试。PRD 正本是需求来源；`docs/prd/需求实现状态与抖音能力边界.md` 是 0.8.0 的能力与剩余验收说明；二者冲突时必须在记录中显示合同演进，不能静默选一个数字。
 
-0.7.5 延续 0.7.4 的用户授权 Cookie、账号发现和 collection 版本回证合同，并新增正式报告的账号隔离、当前脚本完整性、B站投稿列表语义和分位数顺序门禁。匿名登录墙只表示匿名工具受阻，用户可显式提供合法 Cookie 文件继续；证据标记为 `user_authorized_session`，凭据不落盘，验证码和频控仍按实际覆盖结束。PRD 的“明确最近 30 条”和“正常公开条件下 10 分钟内完成”仍是正向验收门。
+0.8.0 延续 0.7.5 的账号隔离、当前脚本完整性、B站投稿列表语义和分位数顺序门禁，并新增默认启用的微博 P1 公开 AJAX 采集器、小红书 P1 直接公开主页采集器，以及两者的用户授权 Cookie 入口。匿名登录墙只表示匿名工具受阻，用户可按指引将合法的对应平台 Cookie 粘贴到对话；Agent 仅临时交接给采集器，凭据不落盘，验证码和频控仍按实际覆盖结束。PRD 的“明确最近 30 条”和“正常公开条件下 10 分钟内完成”仍是正向验收门。
 
 ## 2. 四层测试方法
 
@@ -23,8 +23,8 @@
 
 ```bash
 python3 -m pytest tests/ -q
-python3 skill/scripts/split_dataset.py --verify
-python3 skill/scripts/split_dataset.py --dry-run --strict
+python3 tools/skill_eval/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --dry-run --strict
 python3 /Users/jack/.agents/skills/skill-creator/scripts/quick_validate.py skill
 git diff --check
 ```
@@ -57,7 +57,7 @@ P0 机器可读题集位于 `skill/evals/datasets/source/p0_cases.jsonl`，需�
 | §15 性能 | Q01/Q02 | L3 | 两平台正向显式 30 条全流程各 `<=600000 ms`；受限快速退出不计通过 |
 | §15 可维护性 | 自动合同题 | L1 | 平台适配器接口一致；上层归一化、分析、渲染无平台分叉泄漏 |
 | §15 可观测性 | Q05/Q10 | L1+L2 | task ID、平台、URL、带时区起止、阶段耗时、数量、停止码、覆盖率齐全 |
-| §15 安全隐私 | Q02/Q07/Q11/Q14 | L1+L2+L3 | 可显式读取权限受控的用户 Cookie 文件，但任何密码/Cookie/token 值、私有指标或媒体不进入 URL、argv、日志或产物 |
+| §15 安全隐私 | Q02/Q07/Q11/Q14/Q17 | L1+L2+L3 | 可显式接收用户在对话中粘贴的 Cookie，并只在受限临时文件中交接；任何密码/Cookie/token 值、私有指标或媒体不进入 URL、argv、日志或产物 |
 | §15 合规 | Q05/Q07 | L2+L3 | 当前进程遇保护即停；不绕过；仅允许合同定义的冷却后有界重试 |
 
 ## 5. AC 发布门
@@ -79,7 +79,7 @@ P0 机器可读题集位于 `skill/evals/datasets/source/p0_cases.jsonl`，需�
 
 ## 6. 实机执行与记录
 
-完整黑盒题目见 `skill/references/release-acceptance.md`。建议使用两组不同账号和干净上下文，每题至少运行 3 次；同一题可同时做 with-skill/without-skill 对照，但两边必须使用相同模型、输入、网络条件和时间窗。
+完整黑盒题目见 [release-acceptance.md](../acceptance/release-acceptance.md)。建议使用两组不同账号和干净上下文，每题至少运行 3 次；同一题可同时做 with-skill/without-skill 对照，但两边必须使用相同模型、输入、网络条件和时间窗。
 
 每个 run 保存：
 
@@ -122,7 +122,7 @@ AC-10 使用 `docs/guides/operations-trial-template.md`。只有真实运营人�
 ## 8. 发布前结论模板
 
 ```text
-版本：0.7.5
+版本：0.8.0
 Skill contract SHA-256：
 离线自动化：PASS / FAIL（pytest 数量：）
 数据集完整性：PASS / FAIL

@@ -22,16 +22,16 @@
 
 示例
     # 预览划分（不写文件）
-    python scripts/split_dataset.py --dry-run
+    python3 tools/skill_eval/split_dataset.py --dry-run
 
     # 按默认参数执行划分（test 占 30%，种子 42）
-    python scripts/split_dataset.py
+    python3 tools/skill_eval/split_dataset.py
 
     # 自定义留出比例与种子
-    python scripts/split_dataset.py --test-ratio 0.25 --seed 7
+    python3 tools/skill_eval/split_dataset.py --test-ratio 0.25 --seed 7
 
     # 只校验现有划分是否与 source 一致（不重新划分）
-    python scripts/split_dataset.py --verify
+    python3 tools/skill_eval/split_dataset.py --verify
 """
 from __future__ import annotations
 
@@ -399,7 +399,7 @@ def build_manifest(
         "schema": "public-social-account-analyzer/eval-dataset-manifest@3",
         "dataset_version": DATASET_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "generated_by": "skill/scripts/split_dataset.py",
+        "generated_by": "tools/skill_eval/split_dataset.py",
         "paths": {
             "source": "source",
             "validation": "validation_data",
@@ -760,7 +760,9 @@ def verify(source_dir: str, val_dir: str, test_dir: str, manifest_path: str) -> 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     here = os.path.dirname(os.path.abspath(__file__))
-    datasets_root = os.path.normpath(os.path.join(here, "..", "evals", "datasets"))
+    datasets_root = os.path.normpath(
+        os.path.join(here, "..", "..", "skill", "evals", "datasets")
+    )
     p = argparse.ArgumentParser(
         description="评估数据集的分层随机划分工具（validation / test）。",
         formatter_class=argparse.RawDescriptionHelpFormatter,

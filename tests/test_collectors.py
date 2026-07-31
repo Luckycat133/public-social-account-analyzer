@@ -2,7 +2,7 @@
 
 覆盖：
 - BilibiliCollector.supports 路由正则：拒绝 video/dynamic 等非账号主页 URL。
-- WeiboCollector 未启用 → 任何采集方法抛 ADAPTER_UNAVAILABLE（不伪造数据）。
+- WeiboCollector 显式停用 → 任何采集方法抛 ADAPTER_UNAVAILABLE（不伪造数据）。
 - CASE-006 置顶内容排除 / CASE-007 转载内容排除（默认统计不含标记内容）。
 - CASE-012 高低表现样本不足 → INSUFFICIENT_SAMPLE（不补造结论）。
 - CASE-013 登录墙停止 / CASE-014 验证码停止（stop_reason 语义，保留已采）。
@@ -185,7 +185,7 @@ def test_direct_bilibili_item_methods_reject_untrusted_hosts(
 
 
 # ---------------------------------------------------------------------------
-# WeiboCollector 未启用
+# WeiboCollector 显式停用
 # ---------------------------------------------------------------------------
 def test_weibo_supports_profile():
     c = WeiboCollector()
@@ -202,18 +202,15 @@ def test_weibo_supports_profile():
     assert c.supports("https://weibo.com/") is False
 
 
-def test_weibo_disabled_raises_adapter_unavailable():
-    # P1 可选平台默认 ENABLED=False：调用采集方法必须抛 ADAPTER_UNAVAILABLE，
-    # 且不得伪造任何数据（见 references/exceptions.md §1「适配器未启用」决策表）。
-    assert WeiboCollector.ENABLED is False
-    c = WeiboCollector()
-    try:
-        c.collect_profile("https://weibo.com/u/123456")
-        raised = False
-    except RuntimeError as e:
-        raised = True
-        assert ADAPTER_UNAVAILABLE in str(e)
-    assert raised, "未启用时应抛 ADAPTER_UNAVAILABLE，而非返回空数据"
+def test_explicitly_disabled_weibo_raises_adapter_unavailable(monkeypatch):
+    # P1 正式接入后默认启用；显式停用仍不得伪造任何数据。
+    import collectors.weibo as weibo
+
+    monkeypatch.setattr(weibo, "ENABLED", False)
+    with pytest.raises(RuntimeError) as exc:
+        weibo.WeiboCollector().collect_profile("https://weibo.com/u/123456")
+
+    assert ADAPTER_UNAVAILABLE in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

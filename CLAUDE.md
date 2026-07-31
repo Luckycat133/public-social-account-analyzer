@@ -46,7 +46,7 @@ python3 -m pytest tests/test_douyin.py::test_collect_post_list -q
 python3 -m pytest tests/test_business_insights.py -q -k classification
 
 # dataset integrity
-python3 skill/scripts/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --verify
 
 # local smoke (real network required, public pages only)
 python3 skill/scripts/collect.py "https://space.bilibili.com/123456" --limit 5 --out workspace/smoke
@@ -125,7 +125,7 @@ Key invariants:
 - `data-schema.md` — unified Profile/Post schema, `collection_status` enum.
 - `analysis-rules.md` — engagement-rate four-quadrant, IQR, cadence, semantics.
 - `exceptions.md` — `stop_reason` ↔ adapter mapping.
-- `platform-bilibili.md`, `platform-douyin.md`, `platform-weibo.md` — per-platform constraints.
+- `platforms/` — per-platform constraints.
 - `douyin-index-evidence.md` — Web-index import contract.
 
 ---

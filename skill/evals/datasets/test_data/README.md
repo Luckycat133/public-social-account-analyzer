@@ -24,7 +24,7 @@
 ## 完整性验证
 
 ```bash
-python3 skill/scripts/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --verify
 ```
 
 字段、来源与划分策略见上级 [README](../README.md)，正式运行流程见 [USAGE](../USAGE.md)。

@@ -4,12 +4,21 @@
 
 本文件约束正式制品，不垄断 Agent 的公开研究路径。脚本、适配器、模型阶段或渲染器失败时，不得伪称正式 final 完成；但 Agent 可以改用其他合规公开证据，或基于已核验结果提供明确标记的阶段性聊天答复。
 
-## 1. 输入与任务边界
+## 1. 采样与范围路由
+
+### 1.1 任务意图与取证选择
 
 先记录并核验主页 URL 或账号身份、用户是否明确指定数量或日期范围、分析目标和是否请求评论。明确范围时遵守该范围。范围模糊时由 Agent 根据目标选择分阶段限量、询问或有界完整采集：快速方向性问题通常先取小批样本；账号全貌、完整栏目或长期节奏才优先完整采集。任何路径都必须披露实际范围，有限样本不得冒充全量。评论默认关闭。
 
-所有输出使用 create-only 目录：
+### 1.2 样本门与制品交付路径矩阵
 
+| 有效样本数 | 交付类型 (`delivery_kind`) | `strategy_ready` | 许可交付内容 |
+| --- | --- | --- | --- |
+| 0 条 / 全面风控 | `evidence_only` | `false` | 采集诊断、停止原因、已验证范围、恢复建议 |
+| 1 – 14 条 | `light` | `false` | 数据质量、描述性样本观察（需显式标为小样本） |
+| ≥ 15 条 | `deep`（完成模型阶段） | `true` | 可靠的结构化选题、栏目规律与策略洞察 |
+
+所有输出使用 create-only 目录：
 - 目标的父目录必须存在；可以创建父目录，但不预先创建作为提交目标的叶子目录。
 - 不覆盖、清空、删除或重命名已存在的 collection、checkpoint、draft 或 final。
 - 参数错误、模型结果错误或输出路径冲突后，修正外部输入并换新的目标路径。
@@ -46,7 +55,7 @@ python3 scripts/collect_douyin_complete.py "<DOUYIN_PROFILE_URL>" \
 
 日期范围传给完整入口的 `--date-from/--date-to`；限量或分阶段探索使用 `collect.py --limit N`，证据不足时可扩大 N 或切换完整入口。两平台完整入口都接受 `--max-items`，默认 10,000、硬上限 50,000；抖音另使用 `--max-seconds/--max-scrolls` 控制浏览器预算。用户明确请求评论洞察时把 `--comments` 传给对应完整入口；抖音只在基础公开字段缺失时增加 `--enrich-details`，它只能补充列表中已有作品，不能发现新作品。浏览器、Web 索引和其他公开研究工具由 Agent 按成本与可用性选择；任何替代证据都要核验归属并披露覆盖。
 
-云端抖音匿名页面出现登录墙，而用户愿意提供其合法登录会话时，优先让用户在本地导出 Cookie 到独立文件，再传 `--douyin-cookie-file <PATH>`。不要让用户把 Cookie 粘贴进对话、URL 或 shell 参数值；脚本只在进程内解析并注入临时浏览器，工作区和报告不保存 Cookie。该模式表示 `user_authorized_session`，不是匿名证据，也不赋予后台私有数据访问能力。验证码、滑块或频控仍按当前证据停下，再切换搜索索引、用户导出数据或缩小结论。
+云端平台匿名页面出现登录墙，而用户愿意提供其当前登录会话时，按 [cookie-guide.md](cookie-guide.md) 引导用户在本地导出并将完整 Cookie 粘贴进对话。Agent 将它写入任务期受限临时文件后传给当前采集器的 Cookie 参数；不得回显、转发或把原文放进 URL、shell 参数值、日志、工作区或报告。该模式表示 `user_authorized_session`，不是匿名证据，也不赋予后台私有数据访问能力。验证码、滑块或频控仍按当前证据停下，再切换搜索索引、用户导出数据或缩小结论。
 
 ### 2.2 增量续采
 
@@ -131,7 +140,7 @@ light 与 evidence-only 不加 `--require-delivery-ready`；该参数只用于�
 
 ## 5. 模型协作分析
 
-### 5.1 Taxonomy
+### 5.1 分类标注（Taxonomy）
 
 只有用户明确要求主题、栏目、内容策略或高低表现共同点时才创建 taxonomy draft：
 
@@ -151,7 +160,7 @@ python3 scripts/validate_model_results.py \
   --taxonomy <TAXONOMY_RESULT.json>
 ```
 
-### 5.2 按需 Business 与 comment
+### 5.2 按需 Business 与 Comment
 
 taxonomy 通过后，用户明确要求内容策略判断、行动建议、增长或业务打法时创建 business draft；只有用户明确请求评论洞察且存在有效评论证据时才创建 comment prompt。用户只要栏目盘点或主题分布时可以直接创建 taxonomy final，不为补齐流程而启动额外模型阶段。
 
@@ -170,7 +179,7 @@ python3 scripts/run_pipeline.py \
 - 环境允许且任务确实需要两个语义分支时可以并行；不强制为了 Skill 流程拆出额外 subagent。
 - `validate_model_results.py --business ...` 先批量校验业务结果。comment 结果由 final pipeline 的严格合同校验。
 
-### 5.3 Final
+### 5.3 终产物交付（Final）
 
 ```bash
 python3 scripts/run_pipeline.py \

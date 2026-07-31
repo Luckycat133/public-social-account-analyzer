@@ -1,6 +1,6 @@
 """iter-2 eval-4 / CASE-019 —— 抖音 OpenAPI 源结构的不变量离线复跑。
 
-本测试对应 `skill/references/offline-acceptance.md` 的抖音 OpenAPI 离线协议。
+本测试对应 `docs/acceptance/offline-acceptance.md` 的抖音 OpenAPI 离线协议。
 **不联网、不开浏览器、不调用 OpenAPI**；只检查源文件里仍然持有
 协议 #2 承诺的不变量（userinfo 身份逐字回证、token 只在 form body /
 access-token header、has_more=false 是穷尽唯一来源、`SAFE_ERROR_CODES`
@@ -127,9 +127,9 @@ def test_orchestration_layer_rechecks_identity():
 
 
 def test_offline_acceptance_documents_openapi_protocol_2():
-    """详细离线协议保存在按需参考中，不把主 Skill 写成合同墙。"""
+    """详细离线协议保存在维护文档中，不把运行时 Skill 写成合同墙。"""
     text = (
-        REPO_ROOT / "skill" / "references" / "offline-acceptance.md"
+        REPO_ROOT / "docs" / "acceptance" / "offline-acceptance.md"
     ).read_text(encoding="utf-8")
     assert "抖音 OpenAPI 身份与末页" in text
     assert "douyin_openapi.py" in text, (

@@ -34,7 +34,7 @@ python3 -m pytest tests/test_render_report.py -q
 python3 -m pytest tests/test_render_report.py tests/test_analysis_pipeline.py tests/test_run_pipeline.py -q
 python3 -m pytest tests/ -q
 python3 /Users/jack/.agents/skills/skill-creator/scripts/quick_validate.py skill
-python3 skill/scripts/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --verify
 git diff --check
 ```
 

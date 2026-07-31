@@ -100,9 +100,9 @@ def _json_object(payload: bytes, label: str) -> dict[str, Any]:
     try:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PipelineError(f"{label} is not valid UTF-8 JSON") from exc
+        raise PipelineError(f"{label} 不是有效的 UTF-8 JSON") from exc
     if not isinstance(value, dict):
-        raise PipelineError(f"{label} must be a JSON object")
+        raise PipelineError(f"{label} 必须是 JSON 对象")
     return value
 
 
@@ -116,13 +116,13 @@ def _jsonl_bytes(records: list[dict[str, Any]]) -> bytes:
 
 def _classification_json(payload: bytes) -> list[dict[str, Any]]:
     def reject_constant(value: str):
-        raise ValueError(f"non-standard numeric constant {value}")
+        raise ValueError(f"非标准数值常量 {value}")
 
     def reject_duplicate_pairs(pairs):
         result = {}
         for key, value in pairs:
             if key in result:
-                raise ValueError(f"duplicate key {key}")
+                raise ValueError(f"重复的键名 {key}")
             result[key] = value
         return result
 

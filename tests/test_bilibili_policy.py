@@ -1573,10 +1573,10 @@ def test_authoritative_docs_keep_bilibili_protection_and_comment_contracts_exact
     readme = (root / "README.md").read_text(encoding="utf-8")
     skill = (root / "skill/SKILL.md").read_text(encoding="utf-8")
     bilibili = (
-        root / "skill/references/platform-bilibili.md"
+        root / "skill/references/platforms/bilibili.md"
     ).read_text(encoding="utf-8")
     douyin = (
-        root / "skill/references/platform-douyin.md"
+        root / "skill/references/platforms/douyin.md"
     ).read_text(encoding="utf-8")
     exceptions = (
         root / "skill/references/exceptions.md"
@@ -1589,7 +1589,7 @@ def test_authoritative_docs_keep_bilibili_protection_and_comment_contracts_exact
     assert "BILIBILI_BROWSER_FALLBACK=1" not in bilibili
 
     assert "B站" in readme and "平台保护" in readme and "立即停止" in readme
-    assert "platform-douyin.md" in skill
+    assert "platforms/douyin.md" in skill
     assert "仅控制抖音" in douyin
     assert "第 3 层：平台保护停止策略" in bilibili
     assert "同一任务" in bilibili and "浏览器" in bilibili

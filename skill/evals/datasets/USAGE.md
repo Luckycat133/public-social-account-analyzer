@@ -37,7 +37,7 @@ P0矩阵:     skill/evals/datasets/p0_coverage.json
 ### 2.3 预览随机划分
 
 ```bash
-python3 skill/scripts/split_dataset.py --dry-run --test-ratio 0.30 --seed 42
+python3 tools/skill_eval/split_dataset.py --dry-run --test-ratio 0.30 --seed 42
 ```
 
 脚本按以下字段分层：
@@ -62,7 +62,7 @@ python3 skill/scripts/split_dataset.py --dry-run --test-ratio 0.30 --seed 42
 严格分布诊断：
 
 ```bash
-python3 skill/scripts/split_dataset.py --dry-run --strict
+python3 tools/skill_eval/split_dataset.py --dry-run --strict
 ```
 
 正式快照要求严格模式退出码为0。脚本会尽量保证样本数不少于2的分层同时出现在 validation 和 test；不得通过复制记录消除告警。
@@ -70,7 +70,7 @@ python3 skill/scripts/split_dataset.py --dry-run --strict
 ### 2.5 生成正式快照
 
 ```bash
-python3 skill/scripts/split_dataset.py --test-ratio 0.30 --seed 42
+python3 tools/skill_eval/split_dataset.py --test-ratio 0.30 --seed 42
 ```
 
 该命令重写 `validation_data/*.jsonl`、`test_data/*.jsonl` 和 `manifest.json`。README 不受影响。
@@ -78,7 +78,7 @@ python3 skill/scripts/split_dataset.py --test-ratio 0.30 --seed 42
 ### 2.6 验证快照
 
 ```bash
-python3 skill/scripts/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --verify
 ```
 
 成功标准：退出码为 0，stdout 包含 `"verify": "PASS"`。任何 schema、重复 ID、场景组交叉污染、P0覆盖、数量或 checksum 错误都必须在使用数据前修复。
@@ -132,7 +132,7 @@ cp skill/evals/datasets/config.example.json /path/to/evaluator/dataset-config.js
 若数据根目录迁移，更新 `datasets_root` 和 `paths`，并向脚本传递：
 
 ```bash
-python3 skill/scripts/split_dataset.py \
+python3 tools/skill_eval/split_dataset.py \
   --datasets-root /absolute/path/to/datasets \
   --test-ratio 0.30 \
   --seed 42
@@ -168,7 +168,7 @@ find skill/evals/datasets -maxdepth 2 -printf '%M %p\n'
 3. 使用记录的 seed 与比例生成正式划分。
 4. 运行 `--verify`。
 5. 运行 `python3 -m pytest tests/test_split_dataset.py -q`。
-6. 运行 `python3 skill/scripts/split_dataset.py --dry-run --strict`。
+6. 运行 `python3 tools/skill_eval/split_dataset.py --dry-run --strict`。
 7. 检查 `p0_coverage.json` 中 required 与 covered_by_cases 相等。
 8. 更新 `skill/evals/datasets/CHANGELOG.md`。
 9. 应用并验证本地权限。

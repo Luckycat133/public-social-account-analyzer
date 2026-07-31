@@ -40,7 +40,7 @@ python3 -m pytest tests/test_resolve_profile_url.py -q
 
 ```bash
 python3 -m pytest tests/ -q
-python3 skill/scripts/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --verify
 python3 -m py_compile skill/scripts/*.py skill/scripts/collectors/*.py
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git diff --check
@@ -159,7 +159,7 @@ python3 skill/scripts/collect.py "<B站规范主页或主页短链>" \
 不再把历史 transcript 作为活跃测试数据。使用当前、可维护的题集：
 
 - `skill/evals/datasets/source/p0_cases.jsonl`：PRD P0 机器可读题；
-- `skill/references/release-acceptance.md`：安装包实机黑盒题；
+- `docs/acceptance/release-acceptance.md`：安装包实机黑盒题；
 - `docs/guides/prd-v1.0-acceptance-test-plan.md`：分层执行方法与发布门。
 
 每轮使用干净上下文和新的不可变任务目录，保存 prompt、实际 Skill SHA、最终答复、逐断言证据、墙钟与可用时的 token。历史轨迹只保留在 Git 历史或本地 `archive/`，不参与当前发布判定。

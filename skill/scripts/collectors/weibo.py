@@ -1,17 +1,17 @@
-"""微博公开账号采集适配器（P2 / 正式接入）。
+"""微博公开账号采集适配器。
 
-状态：实现已完成，但默认 `ENABLED = False`（P1/P2 可选平台，不阻塞 MVP 验收）。
-通过环境变量 `WEIBO_COLLECTOR_ENABLED=1` 开启真实采集。
+状态：P1 已接入；默认启用。可通过环境变量
+``WEIBO_COLLECTOR_ENABLED=0`` 临时停用，以便在平台公开页面变化时安全降级。
 
 设计要点（合规边界，与 B站/Douyin 适配器一致）：
 - 仅用标准库（`urllib`）访问微博**公开** AJAX 端点（profile/info、statuses/mymblog、
   statuses/show），绝不绕过登录 / 验证码 / 滑块 / 频控（见 `references/exceptions.md`）。
-- 遇到登录墙 / 验证码（HTTP 401/403/302/405，或返回登录页 HTML）立即上抛
+- 遇到登录墙 / 验证码（HTTP 401/403，或返回登录页 HTML）立即上抛
   `LOGIN_REQUIRED` 并停止，绝不绕过、绝不以空数据假装采集完成。
 - 字段不可见写 `None`（绝不用 `0` 代替未知）；`favorites` 对微博恒为 `None`。
 - 微博时间格式多样（相对时间 / 今天HH:MM / MM-DD / 英文格式），采用 best-effort
   解析，无法解析时 `published_at` 置 `None`（honest null）。
-- 当 `ENABLED = False` 时，所有采集方法抛出携带 `ADAPTER_UNAVAILABLE` 的
+- 当显式停用时，所有采集方法抛出携带 `ADAPTER_UNAVAILABLE` 的
   `WeiboError`，使编排器记入 `stop_reason = ADAPTER_UNAVAILABLE` 并如实停止。
 
 不实现 Bilibili / Douyin（由各自适配器负责）。
@@ -34,8 +34,8 @@ from ._utils import parse_int as _int
 from .base import BaseCollector  # 适配 scripts/collectors 作为 sys.path 入口
 from .url_policy import canonical_item_url, canonical_profile_url
 
-# P2 可选平台：默认关闭，经环境变量开启真实采集，不阻塞 MVP。
-ENABLED = os.environ.get("WEIBO_COLLECTOR_ENABLED", "0") == "1"
+# P1 平台默认启用；环境变量只允许显式关闭，不能让未设置时静默失效。
+ENABLED = os.environ.get("WEIBO_COLLECTOR_ENABLED", "1") != "0"
 
 PLATFORM = "weibo"
 
@@ -99,8 +99,26 @@ class WeiboError(RuntimeError):
 # ---------------------------------------------------------------------------
 # 网络层（best-effort，合规：不绕过登录 / 验证码 / 频控）
 # ---------------------------------------------------------------------------
-def _http_get_text(url: str) -> str:
-    req = urllib.request.Request(url, headers=_HEADERS)
+def _cookie_header(cookie_records: tuple[dict[str, Any], ...]) -> str | None:
+    """Build one in-memory Cookie header without logging credential values."""
+    values = [
+        f"{record['name']}={record['value']}"
+        for record in cookie_records
+        if isinstance(record, dict)
+        and isinstance(record.get("name"), str)
+        and isinstance(record.get("value"), str)
+    ]
+    return "; ".join(values) or None
+
+
+def _http_get_text(
+    url: str, cookie_records: tuple[dict[str, Any], ...] = ()
+) -> str:
+    headers = dict(_HEADERS)
+    cookie_header = _cookie_header(cookie_records)
+    if cookie_header is not None:
+        headers["Cookie"] = cookie_header
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.read().decode("utf-8", "replace")
@@ -116,10 +134,20 @@ def _http_get_text(url: str) -> str:
         raise WeiboError(ACCESS_RESTRICTED, f"微博网络不可达: {e}")
 
 
-def _http_get_json(url: str) -> dict:
-    raw = _http_get_text(url)
+def _parse_json_response(data: dict) -> dict:
+    """Map the platform's explicit JSON login marker before data parsing."""
+    login_url = data.get("url")
+    if data.get("ok") == -100 and isinstance(login_url, str) and "login" in login_url:
+        raise WeiboError(LOGIN_REQUIRED, "微博公开接口要求登录")
+    return data
+
+
+def _http_get_json(
+    url: str, cookie_records: tuple[dict[str, Any], ...] = ()
+) -> dict:
+    raw = _http_get_text(url, cookie_records)
     try:
-        return json.loads(raw)
+        return _parse_json_response(json.loads(raw))
     except json.JSONDecodeError:
         low = raw.lower()
         if "passport" in low or "登录" in raw or "login" in low:
@@ -191,7 +219,7 @@ def _parse_weibo_time(s: Any) -> str | None:
         return None
 
 
-def _resolve_uid(url: str) -> str:
+def _resolve_uid(url: str, fetch_text=None) -> str:
     """从 URL 解析微博 uid；命名主页 best-effort 从主页 HTML 提取。"""
     u = canonical_profile_url("weibo", url)
     if u is None:
@@ -202,7 +230,7 @@ def _resolve_uid(url: str) -> str:
     m = _RE_NAME.match(u)
     if m and m.group(1) not in _RESERVED_SEGMENTS and m.group(1) != "u":
         name = m.group(1)
-        page = _http_get_text(f"https://weibo.com/{name}")
+        page = (fetch_text or _http_get_text)(f"https://weibo.com/{name}")
         uid_m = re.search(r'"uid"\s*:\s*"?(\d+)"?', page) or re.search(r"/u/(\d+)", page)
         if uid_m:
             return uid_m.group(1)
@@ -269,7 +297,24 @@ def _build_post_raw(it: dict, uid: str) -> dict:
 
 class WeiboCollector(BaseCollector):
     platform = PLATFORM
-    # 与模块级 ENABLED 对齐；默认 False（P1/P2 可选，关闭）。
+
+    def __init__(self, cookie_records: tuple[dict[str, Any], ...] = ()):
+        """Use an already-sanitized, user-authorized session only in memory."""
+        self._cookie_records = tuple(cookie_records)
+
+    def _get_text(self, url: str) -> str:
+        if self._cookie_records:
+            return _http_get_text(url, self._cookie_records)
+        return _http_get_text(url)
+
+    def _get_json(self, url: str) -> dict:
+        if self._cookie_records:
+            return _http_get_json(url, self._cookie_records)
+        return _http_get_json(url)
+
+    def _resolve_uid(self, url: str) -> str:
+        return _resolve_uid(url, self._get_text)
+    # 与模块级 ENABLED 对齐；默认启用，可显式安全停用。
     ENABLED = ENABLED
 
     # ------------------------------------------------------------------
@@ -304,12 +349,12 @@ class WeiboCollector(BaseCollector):
         """返回账号可访问状态。遇登录墙 / 验证码立即停止并上抛对应 stop_reason。"""
         if not ENABLED:
             self._require_enabled()
-        uid = _resolve_uid(url)
-        data = _http_get_json(f"https://weibo.com/ajax/profile/info?uid={uid}")
+        uid = self._resolve_uid(url)
+        data = self._get_json(f"https://weibo.com/ajax/profile/info?uid={uid}")
         user = (data.get("data") or {}).get("user")
         if not user:
             raise WeiboError(ACCOUNT_UNAVAILABLE, "微博账号不存在或无公开资料")
-        return {"status": "ok", "stop_reason": None}
+        return {"accessible": True, "status": "ok", "stop_reason": None}
 
     # ------------------------------------------------------------------
     # 账号资料
@@ -321,8 +366,8 @@ class WeiboCollector(BaseCollector):
         canonical_url = canonical_profile_url("weibo", url)
         if canonical_url is None:
             raise WeiboError(ACCOUNT_UNAVAILABLE, "不支持的微博公开账号 URL")
-        uid = _resolve_uid(canonical_url)
-        data = _http_get_json(f"https://weibo.com/ajax/profile/info?uid={uid}")
+        uid = self._resolve_uid(canonical_url)
+        data = self._get_json(f"https://weibo.com/ajax/profile/info?uid={uid}")
         user = (data.get("data") or {}).get("user") or {}
         if not user:
             raise WeiboError(ACCOUNT_UNAVAILABLE, "微博 profile/info 未返回用户信息")
@@ -366,12 +411,12 @@ class WeiboCollector(BaseCollector):
         limit = validate_public_limit(limit)
         if not ENABLED:
             self._require_enabled()
-        uid = _resolve_uid(url)
+        uid = self._resolve_uid(url)
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
         page = 1
         while len(out) < limit and page <= 50:
-            data = _http_get_json(
+            data = self._get_json(
                 f"https://weibo.com/ajax/statuses/mymblog?uid={uid}&page={page}&feature=0"
             )
             items = (data.get("data") or {}).get("list") or []
@@ -410,7 +455,7 @@ class WeiboCollector(BaseCollector):
         if canonical_url is None:
             raise WeiboError(PARSER_FAILED, "无法从公开 URL 解析博文")
         _, uid, bid = canonical_url.rsplit("/", 2)
-        data = _http_get_json(f"https://weibo.com/ajax/statuses/show?id={bid}")
+        data = self._get_json(f"https://weibo.com/ajax/statuses/show?id={bid}")
         it = ((data.get("data") or {}).get("status")) or data.get("status") or {}
         if not it:
             raise WeiboError(ACCESS_RESTRICTED, "微博博文详情未公开")

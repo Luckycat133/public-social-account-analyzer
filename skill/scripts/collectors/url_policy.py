@@ -10,6 +10,9 @@ _WEIBO_RESERVED_SEGMENTS = frozenset({
     "comments", "attitude", "i", "fav", "tv", "u",
 })
 
+_XIAOHONGSHU_NOTE_ID = r"[0-9A-Za-z]{16,32}"
+_XIAOHONGSHU_USER_ID = r"[0-9A-Za-z_-]{16,32}"
+
 
 def sanitize_routing_url(value: object) -> str | None:
     """Remove query/fragment before routing and reject ambiguous authorities."""
@@ -79,6 +82,15 @@ def canonical_profile_url(platform: str, value: object) -> str | None:
         ):
             return None
         return f"https://weibo.com/{name_match.group(1)}"
+    if platform == "xiaohongshu":
+        if host not in {"xiaohongshu.com", "www.xiaohongshu.com"}:
+            return None
+        match = re.fullmatch(
+            rf"/user/profile/({_XIAOHONGSHU_USER_ID})/?", parsed.path
+        )
+        if match is None:
+            return None
+        return f"https://www.xiaohongshu.com/user/profile/{match.group(1)}"
     return None
 
 
@@ -116,4 +128,11 @@ def canonical_item_url(
         if match is None or (expected is not None and match.group(2) != expected):
             return None
         return f"https://weibo.com/{match.group(1)}/{match.group(2)}"
+    if platform == "xiaohongshu":
+        if host not in {"xiaohongshu.com", "www.xiaohongshu.com"}:
+            return None
+        match = re.fullmatch(rf"/explore/({_XIAOHONGSHU_NOTE_ID})/?", parsed.path)
+        if match is None or (expected is not None and match.group(1) != expected):
+            return None
+        return f"https://www.xiaohongshu.com/explore/{match.group(1)}"
     return None

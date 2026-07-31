@@ -1,6 +1,6 @@
 """iter-2 eval-3 / CASE-021 / FR-021 —— B 站 series_name 必须绑定公开证据。
 
-本测试对应 `skill/references/offline-acceptance.md` 的 B站栏目名离线协议。
+本测试对应 `docs/acceptance/offline-acceptance.md` 的 B站栏目名离线协议。
 离线、不联网、不修改产物；只验证实现是否在父作品缺少公开 `series_name`
 时拒绝任何分类端的猜测值。
 

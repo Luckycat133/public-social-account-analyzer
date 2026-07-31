@@ -1,9 +1,13 @@
 """微博适配器（P2 正式接入）单元测试。
 
-默认 ENABLED=False（ADAPTER_UNAVAILABLE 路径由 test_collectors.py 覆盖）。
-本文件验证开启（WEIBO_COLLECTOR_ENABLED）后的真实采集/解析逻辑，
+默认 ENABLED=True；显式停用的 ADAPTER_UNAVAILABLE 路径由 test_collectors.py 覆盖。
+本文件验证公开采集/解析逻辑，
 全程离线：用 monkeypatch 替换模块级 `_http_get_json`，不触网、不绕过登录。
 """
+import os
+import subprocess
+import sys
+
 import pytest
 
 import collectors.weibo as weibo
@@ -13,6 +17,25 @@ from collectors.weibo import (
     LOGIN_REQUIRED,
     ADAPTER_UNAVAILABLE,
 )
+
+
+def test_weibo_is_enabled_by_default(monkeypatch):
+    """A P1 collector must be usable without an opt-in environment switch."""
+    monkeypatch.delenv("WEIBO_COLLECTOR_ENABLED", raising=False)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'skill/scripts'); "
+            "from collectors.weibo import ENABLED; raise SystemExit(not ENABLED)",
+        ],
+        cwd="/Users/jack/Documents/public-social-account-analyzer",
+        env={key: value for key, value in os.environ.items()
+             if key != "WEIBO_COLLECTOR_ENABLED"},
+        check=False,
+    )
+
+    assert result.returncode == 0
 
 
 @pytest.fixture
@@ -60,6 +83,58 @@ def test_enabled_collect_profile_parses(enabled, monkeypatch):
     # field_visibility 据实际字段可见性标注 visible
     assert prof["field_visibility"]["followers"] == "visible"
     assert prof["field_visibility"]["post_count"] == "visible"
+
+
+def test_weibo_public_access_check_reports_accessible(enabled, monkeypatch):
+    """Returning no `accessible` flag makes the orchestration reject public pages."""
+    monkeypatch.setattr(weibo, "_http_get_json", _fake_json)
+
+    assert WeiboCollector().check_access("https://weibo.com/u/123456") == {
+        "accessible": True,
+        "status": "ok",
+        "stop_reason": None,
+    }
+
+
+def test_weibo_authorized_cookie_records_are_passed_to_public_requests(
+    enabled, monkeypatch
+):
+    """A user-provided session must be used in-memory, never serialized by the adapter."""
+    cookie_records = ({
+        "name": "SUB",
+        "value": "test-session-only",
+        "domain": ".weibo.com",
+        "path": "/",
+        "secure": True,
+        "httpOnly": True,
+    },)
+    seen = []
+    original_fake_json = _fake_json
+
+    def _fake_json_with_records(url: str, records=()):
+        seen.append((url, records))
+        return original_fake_json(url)
+
+    monkeypatch.setattr(weibo, "_http_get_json", _fake_json_with_records)
+
+    profile = WeiboCollector(cookie_records=cookie_records).collect_profile(
+        "https://weibo.com/u/123456"
+    )
+
+    assert profile["account_name"] == "测试号"
+    assert seen == [
+        ("https://weibo.com/ajax/profile/info?uid=123456", cookie_records)
+    ]
+
+
+def test_weibo_login_json_response_is_not_misclassified_as_missing_account():
+    """The platform's explicit login marker must surface as LOGIN_REQUIRED."""
+    response = {"ok": -100, "url": "https://weibo.com/login.php?url=example"}
+
+    with pytest.raises(WeiboError) as exc:
+        weibo._parse_json_response(response)
+
+    assert exc.value.stop_reason == LOGIN_REQUIRED
 
 
 def test_enabled_profile_canonicalizes_direct_profile_url(enabled, monkeypatch):

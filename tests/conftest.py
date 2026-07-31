@@ -13,3 +13,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SCRIPTS = os.path.join(REPO_ROOT, "skill", "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
+
+_SKILL_EVAL_TOOLS = os.path.join(REPO_ROOT, "tools", "skill_eval")
+if _SKILL_EVAL_TOOLS not in sys.path:
+    sys.path.insert(0, _SKILL_EVAL_TOOLS)

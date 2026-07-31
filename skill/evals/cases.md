@@ -46,7 +46,7 @@
 | 2 | 抖音90天高表现 | 明确日期窗口的完整采集编排、3+3引用、INSUFFICIENT_SAMPLE |
 | 3 | 只要HTML | 其余输出仍生成，不跳过质量检查 |
 | 4 | 小红书URL | 专用流水线不接收；交还 Agent 使用通用公开研究能力 |
-| 5 | 微博适配器未启用 | ADAPTER_UNAVAILABLE，不虚构 |
+| 5 | 微博适配器显式停用 | ADAPTER_UNAVAILABLE，不虚构 |
 | 6 | 登录墙中途 | PARTIAL + stop_reason 拆分、不绕过、保留已采数据 |
 | 7 | 不可见字段 | null 而非 0、field_visibility |
 | 8 | 数量+日期双约束 | 取交集、执行前回显 |

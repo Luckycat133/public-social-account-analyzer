@@ -10,6 +10,8 @@
 | [`skill-trigger-0.7.1.md`](skill-trigger-0.7.1.md) | 记录 Terra/low 下的自然提示触发协议和 60 次判定结果 | 题目定义保存在 `skill/evals/description_*.json`，运行结果可重跑 |
 | [`human-report-0.7.2.md`](human-report-0.7.2.md) | 记录人类报告与全量审计数据分层的规模验收 | 合同由当前自动化测试持续守护 |
 | [`douyin-live-0.7.4.md`](douyin-live-0.7.4.md) | 记录账号名到真实 `sec_uid` 的发现路径，以及无 Cookie 时主页资料成功、作品登录墙的部分证据语义 | 原始 collection 保留在 Git 忽略的 `workspace/`，文档只保存非敏感摘要与复现命令 |
+| [`offline-acceptance.md`](offline-acceptance.md) | 离线合同与有/无 Skill 评测协议 | 供测试与评测维护使用，不随运行时 Skill 发布 |
+| [`release-acceptance.md`](release-acceptance.md) | 安装包黑盒、联网与外部发布验收题 | 供发布验收使用，不随运行时 Skill 发布 |
 
 本地 `archive/agent-runs/2026-07-29-v0.6.0-user-comparison/` 另保留用户提供的 10 份原始
 有/无 Skill JSONL。该目录受 Git 忽略，其中一份记录包含潜在 Cookie 字段标记，未经逐行脱敏

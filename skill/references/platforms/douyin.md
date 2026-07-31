@@ -1,10 +1,18 @@
 # 抖音适配规则
 
+## 目录
+
+- [账号发现与主页边界](#从账号名发现规范主页)
+- [用户授权 Cookie 会话](#用户授权-cookie-会话)
+- [字段映射与受限识别](#账号字段)
+- [无登录索引降级](#无登录-web-索引证据降级skillagent-层)
+- [平台测试样例](#平台特有测试样例)
+
 > 抖音（douyin.com）平台采集适配规范。本文件与 `data-schema.md`（字段字典）、
 > `exceptions.md`（状态机）配套使用，所有 `stop_reason` 取值严格取自
 > `exceptions.md` §9.2，不新增枚举。
 >
-> 证据边界：匿名模式不把登录墙当作“账号无数据”；用户明确提供其合法会话 Cookie 文件时，
+> 证据边界：匿名模式不把登录墙当作“账号无数据”；用户明确在对话中提供其合法会话 Cookie 时，
 > 可在隔离的临时浏览器中以该授权会话读取用户本来可见的页面。两种模式都不自动处理验证码、
 > 滑块或频控，不伪造身份，也不把受限页冒充内容证据。抖音站点是重度 JS 渲染 + 风控（WAF / 滑块 / 签名），标准库
 > `urllib` 直连往往只能拿到 JS 外壳或风控页——这是预期内的诚实结果，对应
@@ -13,7 +21,7 @@
 
 本文件主体描述匿名公开适配器和用户授权会话模式。账号本人提供同次 OAuth access token + `open_id` 时，可使用
 隔离的 `collect_douyin_authorized.py` 官方列表入口；其身份回证、末页、opaque share 与令牌
-边界见 [data-schema.md §3.2/§5](data-schema.md) 和 [exceptions.md §2.1](exceptions.md)。该入口
+边界见 [data-schema.md §3.2/§5](../data-schema.md) 和 [exceptions.md §2.1](../exceptions.md)。该入口
 不是匿名降级，也不能按第三方账号查询。
 
 ## 从账号名发现规范主页
@@ -30,9 +38,9 @@
 
 ## 用户授权 Cookie 会话
 
-当云端匿名访问只得到登录墙，且用户明确表示拥有或有权使用自己的抖音会话时，才可使用 `--douyin-cookie-file <PATH>`。面向 Windows、macOS、Linux、Firefox 和只有手机用户的傻瓜导出步骤、对话用语与安全边界见 [douyin-cookie-guide.md](douyin-cookie-guide.md)。
+当云端匿名访问只得到登录墙，且用户愿意继续时，按 [cookie-guide.md](../cookie-guide.md) 直接引导其复制浏览器请求头并粘贴到对话。Agent 再以 `--douyin-cookie-file <PATH>` 传入其创建的临时文件；具体参数保持在本平台参考中。
 
-- Cookie 值不要粘贴到聊天、URL、命令行参数值、日志或版本库；命令行只传文件路径。
+- Cookie 可由用户粘贴到当前对话，但 Agent 不得回显、转发、写入日志或版本库；命令行只传 Agent 创建的临时文件路径。
 - 解析器限制文件大小、Cookie 数量和值长度，错误只返回固定说明，不回显秘密。Cookie 仅保存在采集进程内，临时 profile 随会话删除。
 - 平台再次要求验证、限制访问或账号绑定冲突时，保留已有证据并按实际覆盖停止；Cookie 会过期，因此不把离线测试冒充在线成功。
 
@@ -291,7 +299,7 @@ python3 scripts/collect_douyin_complete.py \
   `platform_metrics.douyin_id`；这与直连适配器从页面结构拿到 `unique_id` 时的优先规则不同。
 
 完整取证顺序、JSON 格式、命令和报告语义见
-[douyin-index-evidence.md](douyin-index-evidence.md)。没有 Web 连接器且沙箱不能联网时不可用，
+[douyin-index-evidence.md](../douyin-index-evidence.md)。没有 Web 连接器且沙箱不能联网时不可用，
 不得声称完成新数据采集。
 
 ## 平台特有测试样例

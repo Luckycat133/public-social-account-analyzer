@@ -116,7 +116,7 @@ skill/evals/datasets/
 
 ## 主数据池维护规则
 
-`source/` 是评估数据的唯一事实来源（single source of truth）。维护者只在 `source/` 目录新增或修改评估记录，再通过 `skill/scripts/split_dataset.py` 生成 `validation_data/` 和 `test_data/`。
+`source/` 是评估数据的唯一事实来源（single source of truth）。维护者只在 `source/` 目录新增或修改评估记录，再通过 `tools/skill_eval/split_dataset.py` 生成 `validation_data/` 和 `test_data/`。
 
 1. 每行必须是 UTF-8 JSON 对象，字符串字段不得为空，`assertions` 必须是非空字符串数组。
 2. 每个文件内 `id` 必须唯一且发布后保持稳定。
@@ -143,7 +143,7 @@ skill/evals/datasets/
 
 ## 质量检查
 
-运行 `python3 skill/scripts/split_dataset.py --verify` 会检查：
+运行 `python3 tools/skill_eval/split_dataset.py --verify` 会检查：
 
 1. JSONL 每行是否为对象；
 2. 必需字段、非空字符串和 `assertions` 类型；
@@ -175,13 +175,13 @@ Git 通常只保存可执行位，不可靠保存完整 Unix 权限。克隆、�
 
 ```bash
 # 预览，不写文件
-python3 skill/scripts/split_dataset.py --dry-run
+python3 tools/skill_eval/split_dataset.py --dry-run
 
 # 按默认 seed=42、test_ratio=0.30 重新划分
-python3 skill/scripts/split_dataset.py
+python3 tools/skill_eval/split_dataset.py
 
 # 校验现有快照
-python3 skill/scripts/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --verify
 ```
 
 完整开发、验收和发布流程见 [USAGE.md](USAGE.md)。路径配置示例见 [config.example.json](config.example.json)。

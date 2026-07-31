@@ -230,7 +230,7 @@ def test_docs_describe_zero_python_dependency_browser_fallback():
     root = Path(__file__).resolve().parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     usage = (root / "USAGE.md").read_text(encoding="utf-8")
-    platform = (root / "skill/references/platform-douyin.md").read_text(
+    platform = (root / "skill/references/platforms/douyin.md").read_text(
         encoding="utf-8"
     )
     skill = (root / "skill/SKILL.md").read_text(encoding="utf-8")
@@ -245,7 +245,7 @@ def test_docs_describe_zero_python_dependency_browser_fallback():
     assert "SOCIAL_BROWSER_FALLBACK" in usage
     assert "不新增 pip" in platform
     assert "临时用户目录" in platform
-    assert "platform-douyin.md" in skill
+    assert "platforms/douyin.md" in skill
     assert "仓库脚本擅长 B站和抖音" in skill
     assert "SSR 缺失或作品列表结构无法识别" in platform
     assert "默认自动启动浏览器降级" in platform

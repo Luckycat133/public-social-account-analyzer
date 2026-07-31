@@ -1,33 +1,33 @@
-# Repository Guidelines
+# 仓库指导规范
 
-## Project Structure & Module Organization
+## 项目结构与模块组织
 
-The Agent Skill lives in `skill/`. Its contract is defined by `skill/SKILL.md`; Python entry points are in `skill/scripts/`, platform adapters are in `skill/scripts/collectors/`, domain contracts are in `skill/references/`, and the dashboard template is in `skill/assets/`. Keep offline evaluation fixtures under `skill/evals/datasets/`. Pytest coverage lives in `tests/`, while architecture notes, plans, and acceptance records belong in `docs/`. `workspace/` task directories are generated artifacts, not source.
+Agent Skill 保存在 `skill/` 目录中。其接口契约由 `skill/SKILL.md` 定义；Python 入口脚本位于 `skill/scripts/`，平台适配器位于 `skill/scripts/collectors/`，领域契约位于 `skill/references/`，数据看板模板位于 `skill/assets/`。离线评估测试集保留在 `skill/evals/datasets/` 下。Pytest 测试套件位于 `tests/`，架构说明、计划和验收记录属于 `docs/`。`workspace/` 任务目录为自动生成的运行产物，不属于源码。
 
-## Build, Test, and Development Commands
+## 构建、测试与开发命令
 
-This project has no compiled build step and keeps production code on the Python standard library.
+本项目无编译步骤，生产代码仅依赖 Python 标准库。
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-python3 -m pip install -e ".[dev]"       # install Python 3.9+ project and pytest
-python3 -m pytest tests/ -q              # run the complete regression suite
-python3 -m pytest tests/test_douyin.py -q # run one focused module
-python3 skill/scripts/split_dataset.py --verify
+python3 -m pip install -e ".[dev]"       # 安装 Python 3.9+ 项目与 pytest 开发依赖
+python3 -m pytest tests/ -q              # 运行全量回归测试套件
+python3 -m pytest tests/test_douyin.py -q # 运行单个模块测试
+python3 tools/skill_eval/split_dataset.py --verify # 验证评估数据集切分契约
 ```
 
-For a local smoke test, run `python3 skill/scripts/collect.py <public-profile-url> --limit 5 --out workspace/smoke`. Collection may access public pages; normalization, analysis, and rendering must remain deterministic and offline.
+执行本地冒烟测试命令为 `python3 skill/scripts/collect.py <public-profile-url> --limit 5 --out workspace/smoke`。采集过程可访问公开网页；归一化、分析与渲染阶段必须保持确定性与完全离线运行。
 
-## Coding Style & Naming Conventions
+## 代码风格与命名规范
 
-Use four-space indentation, standard-library-first imports, type hints for public interfaces, and short docstrings that state behavioral contracts. Name modules, functions, and variables with `snake_case`; classes with `PascalCase`; constants with `UPPER_SNAKE_CASE`; and private helpers with a leading underscore. Preserve the one-way dependency flow from entry scripts to adapters to shared helpers. No formatter or linter is configured, so match surrounding code and run `git diff --check` before submitting.
+使用 4 空格缩进，优先导入标准库，为公共接口添加类型提示（Type Hints），并使用简短 docstring 阐明行为契约。模块、函数与变量统一使用 `snake_case`；类使用 `PascalCase`；常量使用 `UPPER_SNAKE_CASE`；私有 Helper 函数使用前导下划线 `_`。保持从入口脚本到适配器、再到共享 Helper 的单向依赖流。项目中未配置 Linter，提交前请与周围已有代码风格保持一致并运行 `git diff --check`。
 
-## Testing Guidelines
+## 测试指导规范
 
-Write pytest files as `tests/test_<area>.py` and test functions as `test_<behavior>()`. Add focused regression tests for every behavior change, especially URL validation, nullable evidence, `stop_reason` semantics, immutable workspace boundaries, and report escaping. Mock platform transport in automated tests; do not make live-network success a unit-test requirement. There is no configured line-coverage threshold, but the full suite must pass before review.
+Pytest 测试文件命名为 `tests/test_<area>.py`，测试函数命名为 `test_<behavior>()`。为每个行为变更添加针对性的回归测试，尤其是 URL 校验、可空证据字段、`stop_reason` 语义、不可变工作区边界以及报告转义。自动化测试中应 Mock 平台网络传输，切勿将真实网络请求成功作为单元测试的通过前提。测试套件在代码提交前必须 100% 绿色通过。
 
-## Commit & Pull Request Guidelines
+## Commit 与 Pull Request 规范
 
-History follows Conventional Commit-style subjects such as `feat(analysis): compare classified content patterns`, `fix(douyin): harden public evidence analysis`, and `docs: publish Douyin capability boundaries`. Keep commits focused and use `feat`, `fix`, `test`, `docs`, `refactor`, or `chore` with an optional scope.
+提交历史遵循 Conventional Commits 格式，例如 `feat(analysis): compare classified content patterns`、`fix(douyin): harden public evidence analysis` 以及 `docs: publish Douyin capability boundaries`。保持提交粒度聚焦，使用 `feat`、`fix`、`test`、`docs`、`refactor` 或 `chore` 并可带 scope。
 
-Pull requests should explain the user-visible change, evidence/security implications, and verification commands; link the relevant issue or design document. Include screenshots when `dashboard.html` output changes. Update `README.md`, `USAGE.md`, contracts, and `CHANGELOG.md` when behavior or configuration changes. Never commit OAuth tokens, signed URLs, raw private data, or generated workspaces.
+Pull Request 应说明用户可见的变更、证据/安全影响以及验证命令；链接相关的 Issue 或设计文档。当 `dashboard.html` 输出发生变化时请提供截图。当行为或配置发生变更时，同步更新 `README.md`、`USAGE.md`、契约规范与 `CHANGELOG.md`。严禁提交 OAuth Token、签名 URL、私有原始数据或生成的临时 workspace。

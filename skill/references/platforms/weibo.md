@@ -1,7 +1,7 @@
 # 微博适配规则
 
-> `status: P1` —— **可选平台（OPTIONAL）**。**不阻塞 MVP 验收**。默认 `weibo.py` 中
-> `ENABLED = False`，未启用时不采集，系统返回 `ADAPTER_UNAVAILABLE`，不得假装已采集。
+> `status: P1 experimental`。**不阻塞 MVP 验收**。`weibo.py` 默认启用；设置
+> `WEIBO_COLLECTOR_ENABLED=0` 时显式停用，系统返回 `ADAPTER_UNAVAILABLE`，不得假装已采集。
 
 ---
 
@@ -77,25 +77,42 @@
 
 ---
 
-## 访问限制识别 + 适配器未启用
+## 访问限制识别与显式停用
 
-- **`ADAPTER_UNAVAILABLE`（当前默认）**：`weibo.py` 存在但 `ENABLED = False`（P1 可选，默认关闭）。
+- **`ADAPTER_UNAVAILABLE`（显式停用）**：`weibo.py` 存在但环境变量令 `ENABLED = False`。
   此时 `collect_profile` / `collect_post_list` / `collect_post_detail` / `check_access`
   一律抛出携带 `ADAPTER_UNAVAILABLE` 的 `RuntimeError`，编排器据此将任务
   `stop_reason = ADAPTER_UNAVAILABLE`、`task_status = FAILED`，**不得**假装已采集、
   不得写入任何空数据行。该状态只属于专用适配器任务；Agent 应把控制权交还公开网页、搜索、浏览器或用户材料等合规路径，不得据此宣布整个用户请求失败。
 - **`weibo.py` 完全不存在**：编排器同样判定为 `ADAPTER_UNAVAILABLE`（平台适配器未实现）。
-- **访问限制（未来启用后）**：若微博要求登录 → `LOGIN_REQUIRED`；出现验证码 / 滑块 →
+- **访问限制**：若微博要求登录 → `LOGIN_REQUIRED`；出现验证码 / 滑块 →
   `VERIFICATION_REQUIRED`；频控 → `ACCESS_RESTRICTED`；账号不存在 / 封禁 →
   `ACCOUNT_UNAVAILABLE`。**任何情况下都不绕过**登录、验证码、滑块或频控（见
   `references/exceptions.md` 第 2 节通用原则）。
-- `collect_comments` 在未启用时返回 `[]`，不影响任务级状态。
+- `collect_comments` 当前返回 `COMMENTS_UNAVAILABLE`；主内容任务仍会如实记录评论不可用。
+
+## 用户授权会话（可选）
+
+匿名公开 AJAX 返回登录标记时，直接引导用户从 `weibo.com` 的 Network 请求头复制完整 `Cookie: ...` 一行并粘贴到对话。JSON 导出只作备用；Agent 将内容写入任务期间的临时文件：
+
+```bash
+python3 scripts/collect.py "https://weibo.com/<name-or-uid>" \
+  --limit 20 \
+  --weibo-cookie-file /run/secrets/weibo-cookies.json \
+  --out <NEW_COLLECTION>
+```
+
+文件仅允许 `weibo.com` 及子域、限制大小和记录数；值只在当前进程请求头中使用，绝不写入
+workspace、报告或日志。Cookie 原文可粘贴到当前对话，但不得回显、转发或放进命令行。授权会话失效、出现验证码或
+频控时仍按对应 stop reason 停止，不尝试生成访客身份或规避验证。
+
+浏览器导出与对话交接的通用指引见 [cookie-guide.md](../cookie-guide.md)。
 
 ---
 
 ## 平台特有测试样例
 
-> 仅用于验证 `supports(url)` 路由与文档示例，不涉及真实采集（默认未启用）。
+> 用于验证 URL 路由与公开字段映射。真实页面仍须完成 P1 实机验收。
 
 1. 央视新闻（昵称主页）：`https://weibo.com/cctvnews`
 2. 数字 UID 主页示例：`https://weibo.com/u/1642909335`
@@ -112,5 +129,5 @@ c.supports("https://weibo.com/cctvnews")        # True（/<name>）
 c.supports("https://weibo.com/")                # False（裸域名）
 c.supports("https://weibo.com/u")               # False（占位路径）
 c.supports("https://weibo.com/search/")          # False（非账号主页）
-c.ENABLED                                        # False（P1 默认关闭）
+c.ENABLED                                        # True（P1 默认启用）
 ```

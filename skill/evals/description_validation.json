@@ -38,5 +38,25 @@
     "id": "trigger-neg-api-ingestion",
     "query": "写一个Python脚本，把某社交平台API返回的JSON逐页存进PostgreSQL，只需要采集程序",
     "should_trigger": false
+  },
+  {
+    "id": "trigger-pos-english-cross-platform-audit",
+    "query": "i'm interviewing for a content strategy role at DJI next week. Compare DJI's public Bilibili and Weibo accounts: what each channel is for, recurring formats, posting rhythm, and visible engagement winners/losers. Please stay with public posts.",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-neg-english-single-item-summary",
+    "query": "Can you summarize this one Bilibili video for our stand-up? I only need a 6-bullet English recap and the main takeaway—don't analyze the creator or the rest of the channel: https://www.bilibili.com/video/BV1xx411c7mD",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-neg-category-trend-no-account",
+    "query": "给增长组做一页宠物智能用品赛道周报：总结最近 30 天抖音上常见选题、热门话术和内容风向，再列 5 个可跟进方向，周五前要。",
+    "should_trigger": false
+  },
+  {
+    "id": "trigger-pos-english-douyin-audit",
+    "query": "I'm putting together Monday's creator brief for Northwind. Please audit the public Douyin account 老爸评测 over the last 90 days—map its recurring content pillars, posting cadence, engagement outliers, and the questions viewers keep asking in comments. Public posts only.",
+    "should_trigger": true
   }
 ]

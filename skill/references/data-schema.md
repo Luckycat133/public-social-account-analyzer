@@ -2,9 +2,21 @@
 
 > 本文件是 **字段字典（field dictionary）**，冻结所有采集、归一化、分析与报告层共享的数据结构。
 > 在字段定义变更前，不得正式实现平台采集器；任何字段增删都须同步更新本文件、归一化脚本、分析脚本和报告模板。
-> 配套规范：`references/exceptions.md`（异常与状态机）、`references/analysis-rules.md`（指标与分类）、各 `references/platform-*.md`（平台字段映射）。
+> 配套规范：`references/exceptions.md`（异常与状态机）、`references/analysis-rules.md`（指标与分类）、各 `references/platforms/*.md`（平台字段映射）。
 >
 > 这些字段与目录约束只适用于本 Skill 生成的正式制品。Agent 的阶段性聊天答复或其他公开研究路径不需要伪造这套目录结构，但仍要遵守身份绑定、未知值、证据范围和不夸大原则。
+
+## 目录
+
+- [设计原则](#1-设计原则)
+- [存储与文件命名约定](#2-存储与文件命名约定)
+- [Task 数据结构与覆盖账本](#3-task-数据结构)
+- [Profile、Post 与 Metrics](#4-profile-数据结构)
+- [Analysis 数据结构](#7-analysis-数据结构)
+- [空值、状态与分类枚举](#8-空值规则field_visibility)
+- [平台字段映射](#10-平台字段映射总表)
+
+按需读取相应章节：采集和续采读取 2–6，渲染或模型结果读取 7–9，新增/核对平台字段读取 10。普通聊天分析不需要加载整份字段合同。
 
 ## 1. 设计原则
 
@@ -194,7 +206,7 @@ manifest 中存在 `source/posts.jsonl` 时只读取该文件：显式空文件�
 | 字段 | 类型 | 必填 | 可空 | 示例 | 说明 |
 |---|---|---:|---:|---|---|
 | task_id | string | 是 | 否 | bilibili-20260723T010203000000Z-a1b2c3d4 | 每个新任务生成的唯一非空标识 |
-| platform | enum | 是 | 否 | bilibili | bilibili / douyin / weibo |
+| platform | enum | 是 | 否 | bilibili | bilibili / douyin / weibo / xiaohongshu |
 | profile_url | string | 是 | 否 | https://space.bilibili.com/123 | 账号主页 URL |
 | requested_limit | integer | 是 | 是 | 10000 | 公开 CLI 省略范围时默认完整采集：B站与抖音均使用接受后的 `max_items`（默认 10,000、硬上限 50,000）；只有显式 `--limit N` 才进入 1–100 的限量模式；授权 OpenAPI `--all` 为 `null` |
 | date_from | datetime | 否 | 是 | 2026-06-01T00:00:00+08:00 | 采集起始时间 |
@@ -414,6 +426,7 @@ boolean、非负 exact integer 与停止枚举进入派生 `analysis.meta.collec
   `profile_conflicts`；
   索引降级还可保存 `collection_source`、`source_url`、`snapshot_crawled_at`
 - 微博：`following`（关注数）
+- 小红书：`following`（关注数）、`red_id`（公开展示的小红书号）
 - B站：一般为空对象 `{}`
 
 `profile_conflicts` 只在多个已验证公开资料来源对 `followers`、`post_count` 或
@@ -429,15 +442,15 @@ boolean、非负 exact integer 与停止枚举进入派生 `analysis.meta.collec
 
 全局账号字段映射：
 
-| 统一字段 | B站 | 抖音 | 微博 |
+| 统一字段 | B站 | 抖音 | 微博 | 小红书 |
 |---|---|---|---|
-| account_id | UID | 抖音号；Web 索引降级使用主页路径 `sec_uid`，可见抖音号另存 `platform_metrics.douyin_id` | UID |
-| followers | 粉丝 | 粉丝 | 粉丝 |
-| post_count | 视频数 | 作品数 | 微博数 |
+| account_id | UID | 抖音号；Web 索引降级使用主页路径 `sec_uid`，可见抖音号另存 `platform_metrics.douyin_id` | UID | 用户 ID |
+| followers | 粉丝 | 粉丝 | 粉丝 | 粉丝 |
+| post_count | 视频数 | 作品数 | 微博数 | 笔记数（仅页面明确展示时） |
 
 报告账号卡在通用字段之外固定显示：B站 `level`；抖音
 `platform_metrics.douyin_id`（缺失时回退 `platform_metrics.unique_id`）与
-`platform_metrics.total_likes`；微博 `platform_metrics.following`。`verified=true/false/null`
+`platform_metrics.total_likes`；微博和小红书 `platform_metrics.following`。`verified=true/false/null`
 分别显示“是/否/—”，认证文本原样显示但必须按报告格式转义；其他 `null`
 字段统一显示“—”。
 
@@ -919,7 +932,7 @@ boolean。样本不足时 groups/features 为空且状态为 `insufficient-sampl
 - `PARSER_FAILED`：页面可访问但解析失败
 - `NO_PUBLIC_CONTENT`：账号确实没有公开内容
 - `UNSUPPORTED_PLATFORM`：URL 不属于本 Skill 专用适配器覆盖的平台；只终止本 Skill 的采集任务，不限制上层 Agent 改用其他合规公开研究路径
-- `ADAPTER_UNAVAILABLE`：平台适配器未实现或未启用（如微博 P1 未启用）
+- `ADAPTER_UNAVAILABLE`：平台适配器未实现或被显式停用
 - `INTERNAL_ERROR`：脚本 / 内部错误
 - `OPENAPI_ERROR`：授权抖音 OpenAPI 请求或响应错误；令牌与服务端原始描述不得进入产物
 - 单条内容级中止原因（用于错误日志，不写入 `task_status`）：`POST_UNAVAILABLE`、`COMMENTS_UNAVAILABLE`

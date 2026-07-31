@@ -20,8 +20,8 @@
 ## 更新方式
 
 ```bash
-python3 skill/scripts/split_dataset.py --test-ratio 0.30 --seed 42
-python3 skill/scripts/split_dataset.py --verify
+python3 tools/skill_eval/split_dataset.py --test-ratio 0.30 --seed 42
+python3 tools/skill_eval/split_dataset.py --verify
 ```
 
 如需改变样本，修改 `../source/`，更新数据 CHANGELOG 后重新生成。本目录的字段和来源说明见上级 [README](../README.md)。

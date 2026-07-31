@@ -58,5 +58,20 @@
     "id": "trigger-neg-trend-research",
     "query": "整理一下本周小红书上流行的露营话题和热门标签，不需要研究具体账号",
     "should_trigger": false
+  },
+  {
+    "id": "trigger-pos-bare-profile-url",
+    "query": "https://space.bilibili.com/946974 看看这个号",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-pos-category-scan-named-accounts",
+    "query": "老板要一版小红书即饮咖啡赛道扫描，具体研究「三顿半」「永璞咖啡」「隅田川咖啡」这 3 个品牌号近 90 天的公开笔记，对比内容定位、固定栏目、更新节奏和高低互动表现。",
+    "should_trigger": true
+  },
+  {
+    "id": "trigger-neg-bulk-account-download",
+    "query": "把这个 B 站号所有公开视频批量下载到 /Volumes/creator-archive/bilibili/，按发布日期重命名就行，不用做内容分析：https://space.bilibili.com/946974",
+    "should_trigger": false
   }
 ]

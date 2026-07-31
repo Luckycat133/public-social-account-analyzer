@@ -1,6 +1,6 @@
 # Roadmap
 
-> 当前版本：0.7.5（2026-07-31）。计划内工程能力已实现并通过离线回归；以下仅保留尚需外部条件的发布验收，不重复记录已完成的开发过程。
+> 当前版本：0.8.1（2026-07-31）。计划内工程能力已实现并通过离线回归；以下仅保留尚需外部条件的发布验收，不重复记录已完成的开发过程。
 
 ## 当前发布门
 
@@ -9,12 +9,13 @@
 - [ ] **AC-06**：人工打开至少 3 条核心洞察的具体作品链接，验证证据覆盖率 100%。
 - [ ] **AC-10**：至少一名真实内容运营人员完成试用，并有一项反馈形成已合并、已回归的修改。
 - [ ] **抖音本人授权**：使用同次 OAuth 返回、具备 `video.list` 权限的真实 `access_token + open_id`，验证 userinfo 身份回证、分页参数和官方末页语义；凭据不得进入命令行、日志或产物。
-- [ ] **抖音用户授权会话**：用权限受控的真实 Cookie 文件完成至少一个第三方账号最近 30 条正向任务，核验 `evidence_access=user_authorized_session`、Cookie 不落盘及过期/验证场景的部分证据交付。
+- [ ] **抖音用户授权会话**：用用户在对话中提供的真实 Cookie 完成至少一个第三方账号最近 30 条正向任务，核验 `evidence_access=user_authorized_session`、临时交接后 Cookie 不落盘及过期/验证场景的部分证据交付。
+- [ ] **微博/小红书用户授权会话**：各用用户在对话中提供的真实 Cookie 完成可见公开内容的正向任务，核验域名隔离、临时交接后 Cookie 不落盘、登录/验证停止语义和字段人工抽查；两条 P1 管线均不得据此声明全量。
 - [ ] **正向性能**：两平台在正常公开条件下，显式最近 30 条的采集、分析和四类报告总耗时分别不超过 10 分钟。受限后快速停止不能替代该项。
 
 ## 后续版本候选
 
-- 微博适配器从条件启用提升为正式支持。
+- 微博与小红书 P1 管线完成实机正向验收后再评估提升为正式支持。
 - 同平台多账号对比、周期对比和内容模式库。
 - 评论公开证据采样的在线稳定性增强。
 - 在独立授权边界下评估账号本人后台数据分析；不扩展为第三方账号私有数据查询。
@@ -23,5 +24,5 @@
 
 - 当前实现与剩余缺口：[`docs/prd/需求实现状态与抖音能力边界.md`](docs/prd/需求实现状态与抖音能力边界.md)
 - PRD 分层验收计划：[`docs/guides/prd-v1.0-acceptance-test-plan.md`](docs/guides/prd-v1.0-acceptance-test-plan.md)
-- 实机黑盒题：[`skill/references/release-acceptance.md`](skill/references/release-acceptance.md)
+- 实机黑盒题：[`docs/acceptance/release-acceptance.md`](docs/acceptance/release-acceptance.md)
 - 运营试用模板：[`docs/guides/operations-trial-template.md`](docs/guides/operations-trial-template.md)

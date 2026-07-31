@@ -2,7 +2,7 @@
   "schema": "public-social-account-analyzer/eval-dataset-manifest@3",
   "dataset_version": "0.3.0",
   "generated_at": "2026-07-29T11:29:22+00:00",
-  "generated_by": "skill/scripts/split_dataset.py",
+  "generated_by": "tools/skill_eval/split_dataset.py",
   "paths": {
     "source": "source",
     "validation": "validation_data",

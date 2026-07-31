@@ -42,7 +42,8 @@ public-social-account-analyzer/
 │   └── skill_eval/                        # Skill 行为聚合与自然提示触发工具
 │       ├── codex_trigger.py               # Terra/low 临时上下文触发评测器
 │       ├── runner.py                      # 有/无 Skill 隔离运行器
-│       └── aggregate.py                   # 重复运行与评分聚合器
+│       ├── aggregate.py                   # 重复运行与评分聚合器
+│       └── split_dataset.py               # 评测数据划分与清单校验（不随 Skill 发布）
 ├── dist/                                  # 当前分发包；Git 忽略，可由 skill/ 再生
 ├── archive/                               # 本地敏感原始对照；Git 忽略，不参与发布
 ├── workspace/                             # 任务执行时按需生成，不属于源码
@@ -65,7 +66,6 @@ public-social-account-analyzer/
     │   ├── execution_timing.py            # 结构化总耗时与阶段耗时
     │   ├── csv_contract.py                # 规范 CSV 合同
     │   ├── task_contract.py               # 任务状态与停止原因合同
-    │   ├── split_dataset.py               # 评估数据集分层随机划分
     │   └── collectors/                    # 平台采集适配器子包
     │       ├── __init__.py                # 包标识（空）
     │       ├── base.py                    # BaseCollector 抽象基类
@@ -78,18 +78,20 @@ public-social-account-analyzer/
     │       ├── _douyin_browser_transport.py # 抖音临时浏览器公开传输
     │       ├── _douyin_detail_contract.py # 抖音作品详情身份合同
     │       ├── url_policy.py              # 跨平台 URL 安全策略
-    │       ├── weibo.py                   # 微博适配器（WeiboCollector，默认禁用）
+    │       ├── weibo.py                   # 微博公开 AJAX 适配器（默认启用）
+    │       ├── xiaohongshu.py             # 小红书直接主页嵌入状态适配器
+    │       ├── platform_cookies.py         # 微博/小红书 Cookie 文件有界解析
     │       └── browser_backend.py         # 标准库 CDP 临时浏览器后端
     ├── references/                        # 领域数据模型与分析规则规范
     │   ├── workflow.md                    # 真实采集、模型分工与 final 交付工作流
-    │   ├── offline-acceptance.md          # 离线合同与有/无 Skill 评测协议
-    │   ├── release-acceptance.md          # 安装包黑盒、联网与外部发布验收题
     │   ├── analysis-rules.md              # 分析规则（§3 节奏 / §4 指标 / §5 分类 / §6 高低表现）
     │   ├── data-schema.md                 # 统一数据模型与字段表
     │   ├── exceptions.md                  # stop_reason 决策表与异常语义
-    │   ├── platform-bilibili.md           # B站平台知识库
-    │   ├── platform-douyin.md             # 抖音平台知识库
-    │   └── platform-weibo.md              # 微博平台知识库
+    │   └── platforms/                     # 按平台按需加载的采集知识库
+    │       ├── bilibili.md
+    │       ├── douyin.md
+    │       ├── weibo.md
+    │       └── xiaohongshu.md
     ├── assets/
     │   └── report-template.html           # HTML 仪表盘模板
     └── evals/                             # 评估与验收测试用例
@@ -119,7 +121,7 @@ public-social-account-analyzer/
                          │ collect.py 加载具体 collectors；其余脚本消费任务产物
 ┌────────────────────────▼────────────────────────────────┐
 │  适配器层（collectors/）                                  │
-│  bilibili.py · douyin.py · douyin_openapi.py · weibo.py │
+│  bilibili.py · douyin.py · douyin_openapi.py · weibo.py · xiaohongshu.py │
 │  _douyin_browser_transport.py · browser_backend.py       │
 └────────────────────────┬────────────────────────────────┘
                          │ from ._constants / ._utils / .base
@@ -132,7 +134,7 @@ public-social-account-analyzer/
                          │
 ┌────────────────────────▼────────────────────────────────┐
 │  规范层（references/ — 文档，非代码）                      │
-│  data-schema · analysis-rules · exceptions · platform-* │
+│  data-schema · analysis-rules · exceptions · platforms/ │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -160,7 +162,6 @@ public-social-account-analyzer/
 | `render_report.py` | 从已校验对象生成同合同的 Markdown 与 HTML 报告 | `render_in_memory()` · `build_metrics_dashboard()` · `build_strategy()` |
 | `immutable_workspace.py` | create-only 工作区、manifest SHA-256、`.complete` 提交与 identity-bound 读取 | `ImmutableWorkspace` · `VerifiedWorkspaceReader` |
 | `execution_timing.py` | 带时区起止时间、monotonic 总耗时和固定阶段累计 | `ExecutionTimer` |
-| `split_dataset.py` | 评估数据集分层随机划分（validation / test），固定种子保证可复现 | `stratified_split()` · `verify()` |
 
 ### 适配器层（skill/scripts/collectors/）
 
@@ -170,7 +171,8 @@ public-social-account-analyzer/
 | `bilibili.py` | B站适配与传输单一实现：公开资料/投稿/动态/合集、WBI、任务级断路器与部分结果保留 | `BilibiliCollector` · `Session` · `BilibiliError` · `enc_wbi()` |
 | `douyin.py` | 抖音适配器：直连解析页面内嵌 `RENDER_DATA`，合并资料时披露公开计数冲突，无明确限制时可选浏览器传输降级；如实上抛风控 stop_reason | `DouyinCollector` · `DouyinError` |
 | `douyin_openapi.py` | 账号本人官方 userinfo / video.list 客户端与严格身份绑定 | `DouyinOpenAPIClient` |
-| `weibo.py` | 微博适配器：默认 `ENABLED=False`，启用后访问公开 AJAX 端点；未启用时抛 `ADAPTER_UNAVAILABLE` | `WeiboCollector` · `WeiboError` |
+| `weibo.py` | 微博适配器：默认启用公开 AJAX 端点；显式停用时抛 `ADAPTER_UNAVAILABLE` | `WeiboCollector` · `WeiboError` |
+| `xiaohongshu.py` | 小红书适配器：只解析直接公开主页的嵌入状态；不调用签名/私有接口，受限时安全停止 | `XiaohongshuCollector` · `XiaohongshuError` |
 | `_douyin_browser_transport.py` | 抖音公开列表/资料/详情的账号绑定、候选验证、被动 CDP、无签名同源页内分页、限制枚举和有界滚动 | `collect_account_page()` · `collect_post_page()` |
 | `browser_backend.py` | 按稳定顺序探测系统及已有 Playwright 缓存浏览器并提供标准库 WebSocket/CDP 会话；隐式候选可在同一总超时内回退，每次使用隔离临时 profile | `BrowserSession` · `find_browsers()` · `find_browser()` |
 
