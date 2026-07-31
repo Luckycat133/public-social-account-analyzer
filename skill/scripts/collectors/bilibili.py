@@ -212,8 +212,13 @@ class Session:
         timeout: int = 10,
         min_interval: float = 1.2,
         browser_fallback: bool | None = None,
+        cookie_records: tuple[dict[str, Any], ...] = (),
     ):
-        self.cookies: dict[str, str] = {}
+        # Cookie records are pre-validated by platform_cookies.py and remain
+        # process-memory only.  Curl needs only the name/value pair.
+        self.cookies: dict[str, str] = {
+            record["name"]: record["value"] for record in cookie_records
+        }
         self.timeout = timeout
         # BILIBILI_MIN_INTERVAL 允许操作员调大请求间隔（单位秒，上限 30）以降低风控概率。
         # 只接受正数；非法值忽略，保留调用方传入的 min_interval。
@@ -1018,8 +1023,13 @@ def _deduplicate_dynamic_cards(cards: list[dict]) -> list[dict]:
 class BilibiliCollector(BaseCollector):
     platform = "bilibili"
 
-    def __init__(self, browser_fallback: bool | None = None):
+    def __init__(
+        self,
+        browser_fallback: bool | None = None,
+        cookie_records: tuple[dict[str, Any], ...] = (),
+    ):
         self.browser_fallback = browser_fallback
+        self._cookie_records = tuple(cookie_records)
         self._task_session: Session | None = None
         self._cached_profile_card: dict | None = None
         self._collection_coverage: dict[str, Any] = {}
@@ -1028,7 +1038,10 @@ class BilibiliCollector(BaseCollector):
     def _new_session(self) -> Session:
         """Return the collector task's single shared session."""
         if self._task_session is None:
-            self._task_session = Session(browser_fallback=self.browser_fallback)
+            self._task_session = Session(
+                browser_fallback=self.browser_fallback,
+                cookie_records=self._cookie_records,
+            )
         return self._task_session
 
     def get_collection_coverage(self) -> dict[str, Any]:

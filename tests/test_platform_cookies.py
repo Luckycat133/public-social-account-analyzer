@@ -88,3 +88,32 @@ def test_platform_cookie_file_rejects_foreign_domain_without_leaking_secret(tmp_
         load_platform_cookie_file(path, "weibo.com")
 
     assert COOKIE_SECRET not in str(exc.value)
+
+
+def test_cookie_loader_routes_bilibili_and_douyin_to_their_contracts(
+    monkeypatch, tmp_path
+):
+    from collectors import cookie_loader
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        cookie_loader,
+        "load_platform_cookie_file",
+        lambda path, domain: calls.append((str(path), domain)) or ({"name": domain},),
+    )
+    monkeypatch.setattr(
+        cookie_loader,
+        "load_douyin_cookie_file",
+        lambda path: calls.append((str(path), "douyin")) or ({"name": "douyin"},),
+    )
+
+    assert cookie_loader.load_cookie_records(tmp_path / "bili.txt", "bilibili") == (
+        {"name": "bilibili.com"},
+    )
+    assert cookie_loader.load_cookie_records(tmp_path / "douyin.txt", "douyin") == (
+        {"name": "douyin"},
+    )
+    assert calls == [
+        (str(tmp_path / "bili.txt"), "bilibili.com"),
+        (str(tmp_path / "douyin.txt"), "douyin"),
+    ]

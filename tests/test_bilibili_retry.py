@@ -193,6 +193,29 @@ def test_forwards_requested_comment_collection(tmp_path):
     assert "--comments" in commands[0]
 
 
+def test_forwards_authorized_cookie_file_to_every_attempt(tmp_path):
+    commands: list[list[str]] = []
+
+    def run_attempt(command: list[str]) -> int:
+        commands.append(command)
+        output = Path(command[command.index("--out") + 1])
+        _write_task(output, status="COMPLETED", reason=None, exhaustive=True)
+        return 0
+
+    result = retry.run_attempts(
+        "https://space.bilibili.com/123",
+        tmp_path / "account",
+        bilibili_cookie_file="/run/secrets/bilibili-cookie.txt",
+        run_command=run_attempt,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result.success is True
+    assert commands[0][commands[0].index("--bilibili-cookie-file") + 1] == (
+        "/run/secrets/bilibili-cookie.txt"
+    )
+
+
 def test_failed_retry_series_selects_attempt_with_most_evidence(tmp_path):
     outcomes = [
         ("PARTIAL", "ACCESS_RESTRICTED", 40),

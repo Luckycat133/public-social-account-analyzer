@@ -232,49 +232,27 @@ def _dominant_stop_reason(
 def _load_adapters(
     douyin_browser_fallback: bool = True,
     bilibili_browser_fallback: bool | None = None,
+    bilibili_cookie_records: tuple[dict[str, Any], ...] = (),
     douyin_cookie_records: tuple[dict[str, Any], ...] = (),
     weibo_cookie_records: tuple[dict[str, Any], ...] = (),
     xiaohongshu_cookie_records: tuple[dict[str, Any], ...] = (),
+    xiaohongshu_browser_fallback: bool = True,
 ) -> list[BaseCollector]:
-    """加载已实现(非桩)的采集器,返回实例列表。"""
-    adapters: list[BaseCollector] = []
-    # B站(P0):平级导入
-    try:
-        from collectors.bilibili import BilibiliCollector
+    """Load registered adapters and emit only safe platform-level failures."""
+    from collectors.adapter_registry import AdapterSettings, load_adapters
 
-        adapters.append(
-            BilibiliCollector(browser_fallback=bilibili_browser_fallback)
-        )
-    except Exception:  # pragma: no cover
-        print("[warn] 加载 bilibili 适配器失败", file=sys.stderr)
-    # 抖音、微博与小红书：独立适配器失败不影响其他公开平台。
-    # 用 importlib.import_module 而非 __import__:后者返回顶层包,取不到子模块的类
-    import importlib
-    for mod, cls in (
-        ("collectors.douyin", "DouyinCollector"),
-        ("collectors.weibo", "WeiboCollector"),
-        ("collectors.xiaohongshu", "XiaohongshuCollector"),
-    ):
-        try:
-            m = importlib.import_module(mod)
-            c = getattr(m, cls, None)
-            if c:
-                if mod == "collectors.douyin":
-                    adapters.append(
-                        c(
-                            browser_fallback=douyin_browser_fallback,
-                            cookie_records=douyin_cookie_records,
-                        )
-                    )
-                elif mod == "collectors.weibo":
-                    adapters.append(c(cookie_records=weibo_cookie_records))
-                elif mod == "collectors.xiaohongshu":
-                    adapters.append(c(cookie_records=xiaohongshu_cookie_records))
-                else:
-                    adapters.append(c())
-        except Exception:
-            pass
-    return adapters
+    result = load_adapters(AdapterSettings(
+        douyin_browser_fallback=douyin_browser_fallback,
+        bilibili_browser_fallback=bilibili_browser_fallback,
+        xiaohongshu_browser_fallback=xiaohongshu_browser_fallback,
+        bilibili_cookie_records=bilibili_cookie_records,
+        douyin_cookie_records=douyin_cookie_records,
+        weibo_cookie_records=weibo_cookie_records,
+        xiaohongshu_cookie_records=xiaohongshu_cookie_records,
+    ))
+    for platform in result.failures:
+        print(f"[warn] 加载 {platform} 适配器失败", file=sys.stderr)
+    return list(result.adapters)
 
 
 def _pick(adapters: list[BaseCollector], url: str) -> BaseCollector | None:
@@ -1952,6 +1930,7 @@ def run(
     checkpoint_out: str | None = None,
     resume_checkpoint: str | None = None,
     douyin_cookie_file: str | None = None,
+    bilibili_cookie_file: str | None = None,
     weibo_cookie_file: str | None = None,
     xiaohongshu_cookie_file: str | None = None,
     redirect_resolver=None,
@@ -2132,37 +2111,33 @@ def run(
             print("[FAILED] checkpoint 无法安全核验", file=sys.stderr)
             return 2
 
-    douyin_cookie_records: tuple[dict[str, Any], ...] = ()
-    if douyin_cookie_file is not None:
-        try:
-            from collectors.douyin_cookies import load_douyin_cookie_file
+    from collectors.cookie_loader import load_cookie_records
 
-            douyin_cookie_records = load_douyin_cookie_file(douyin_cookie_file)
-        except Exception:
-            print("[FAILED] 抖音 Cookie 文件无效或无法安全读取", file=sys.stderr)
-            return 2
-    weibo_cookie_records: tuple[dict[str, Any], ...] = ()
-    if weibo_cookie_file is not None:
+    cookie_files = {
+        "bilibili": (bilibili_cookie_file, "B站"),
+        "douyin": (douyin_cookie_file, "抖音"),
+        "weibo": (weibo_cookie_file, "微博"),
+        "xiaohongshu": (xiaohongshu_cookie_file, "小红书"),
+    }
+    loaded_cookie_records: dict[str, tuple[dict[str, Any], ...]] = {}
+    for platform, (cookie_file, platform_label) in cookie_files.items():
+        if cookie_file is None:
+            loaded_cookie_records[platform] = ()
+            continue
         try:
-            from collectors.platform_cookies import load_platform_cookie_file
-
-            weibo_cookie_records = load_platform_cookie_file(
-                weibo_cookie_file, "weibo.com"
+            loaded_cookie_records[platform] = load_cookie_records(
+                cookie_file, platform
             )
         except Exception:
-            print("[FAILED] 微博 Cookie 文件无效或无法安全读取", file=sys.stderr)
-            return 2
-    xiaohongshu_cookie_records: tuple[dict[str, Any], ...] = ()
-    if xiaohongshu_cookie_file is not None:
-        try:
-            from collectors.platform_cookies import load_platform_cookie_file
-
-            xiaohongshu_cookie_records = load_platform_cookie_file(
-                xiaohongshu_cookie_file, "xiaohongshu.com"
+            print(
+                f"[FAILED] {platform_label} Cookie 文件无效或无法安全读取",
+                file=sys.stderr,
             )
-        except Exception:
-            print("[FAILED] 小红书 Cookie 文件无效或无法安全读取", file=sys.stderr)
             return 2
+    bilibili_cookie_records = loaded_cookie_records["bilibili"]
+    douyin_cookie_records = loaded_cookie_records["douyin"]
+    weibo_cookie_records = loaded_cookie_records["weibo"]
+    xiaohongshu_cookie_records = loaded_cookie_records["xiaohongshu"]
 
     env_value = os.environ.get("SOCIAL_BROWSER_FALLBACK")
     if env_value is not None and env_value not in {"0", "1"}:
@@ -2174,13 +2149,22 @@ def run(
     douyin_enabled = browser_fallback if browser_fallback is not None else env_value != "0"
     # Keep the default zero-argument loader call compatible with integrations
     # that replace it, while passing the policy only when it disables Douyin.
-    if douyin_cookie_records or weibo_cookie_records or xiaohongshu_cookie_records:
+    if (
+        bilibili_cookie_records
+        or douyin_cookie_records
+        or weibo_cookie_records
+        or xiaohongshu_cookie_records
+    ):
         adapters = _load_adapters(
             douyin_browser_fallback=True,
             bilibili_browser_fallback=browser_fallback,
+            bilibili_cookie_records=bilibili_cookie_records,
             douyin_cookie_records=douyin_cookie_records,
             weibo_cookie_records=weibo_cookie_records,
             xiaohongshu_cookie_records=xiaohongshu_cookie_records,
+            xiaohongshu_browser_fallback=(
+                browser_fallback if browser_fallback is not None else env_value != "0"
+            ),
         )
     elif browser_fallback is not None:
         # Preserve the legacy Bilibili configuration value for API compatibility.
@@ -2204,6 +2188,9 @@ def run(
     adapter = _pick(adapters, routing_url)
     if douyin_cookie_records and getattr(adapter, "platform", None) != "douyin":
         print("[FAILED] --douyin-cookie-file 只适用于抖音账号主页", file=sys.stderr)
+        return 2
+    if bilibili_cookie_records and getattr(adapter, "platform", None) != "bilibili":
+        print("[FAILED] --bilibili-cookie-file 只适用于B站账号主页", file=sys.stderr)
         return 2
     if weibo_cookie_records and getattr(adapter, "platform", None) != "weibo":
         print("[FAILED] --weibo-cookie-file 只适用于微博账号主页", file=sys.stderr)
@@ -2954,6 +2941,11 @@ def main() -> None:
         help="用户主动提供的抖音 Cookie JSON/文本文件；内容仅注入临时浏览器且不落盘。",
     )
     ap.add_argument(
+        "--bilibili-cookie-file",
+        default=None,
+        help="用户主动提供的B站 Cookie JSON/文本文件；内容仅在任务内存中使用且不落盘。",
+    )
+    ap.add_argument(
         "--weibo-cookie-file",
         default=None,
         help="用户主动提供的微博 Cookie JSON/文本文件；内容仅在任务内存中使用且不落盘。",
@@ -3001,6 +2993,7 @@ def main() -> None:
         checkpoint_out=args.checkpoint_out,
         resume_checkpoint=args.resume_checkpoint,
         douyin_cookie_file=args.douyin_cookie_file,
+        bilibili_cookie_file=args.bilibili_cookie_file,
         weibo_cookie_file=args.weibo_cookie_file,
         xiaohongshu_cookie_file=args.xiaohongshu_cookie_file,
     ))

@@ -32,9 +32,9 @@ python3 skill/scripts/collect.py <PROFILE_URL> \
 | `--comments` | 默认关闭；每篇最多 20 条公开可见评论。评论失败不阻断主内容。 |
 | `--enrich-details` | 仅补抖音列表中已有作品的缺失字段，不发现新作品。 |
 | `--resume` / `--checkpoint-out` | 分别用于密封提交续采与同次任务恢复；详见 [workflow.md](skill/references/workflow.md)。 |
-| `--no-browser-fallback` | 仅控制抖音临时浏览器；B站平台保护不会转浏览器重试。 |
+| `--no-browser-fallback` | 控制抖音临时浏览器及小红书带 Cookie 时的单次同主页浏览器渲染；B站平台保护不会转浏览器重试。 |
 
-抖音浏览器默认启用：SSR 缺失或作品列表结构无法识别时，读取同一主页的被动网络与可见 DOM。`SOCIAL_BROWSER_FALLBACK=0` 可默认关闭；`--no-browser-fallback` 优先级更高。B站遇到登录、验证、限流或访问限制时始终立即停止。
+抖音浏览器默认启用：SSR 缺失或作品列表结构无法识别时，读取同一主页的被动网络与可见 DOM。小红书仅在已提供 Cookie、直接页面出现登录墙或缺少状态时，对同一主页渲染一次；这不会复制用户本机的网络或设备环境。`SOCIAL_BROWSER_FALLBACK=0` 可默认关闭；`--no-browser-fallback` 优先级更高。B站遇到登录、验证、限流或访问限制时始终立即停止。
 
 ## 正式分析
 
@@ -58,10 +58,11 @@ python3 skill/scripts/run_pipeline.py \
 ```bash
 python3 skill/scripts/collect_bilibili_complete.py \
   "https://space.bilibili.com/<uid>" \
-  --out-prefix workspace/bilibili-collection
+  --out-prefix workspace/bilibili-collection \
+  [--bilibili-cookie-file <temporary-path>]
 ```
 
-从 stdout 的 `selected_workspace` 读取最终 collection，再运行 `run_pipeline.py`。常规投稿首选 `medialist`，必要时才降级 WBI `arc/search`；细节见 [B站规则](skill/references/platforms/bilibili.md)。
+从 stdout 的 `selected_workspace` 读取最终 collection，再运行 `run_pipeline.py`。常规投稿首选 `medialist`，必要时才降级 WBI `arc/search`。当匿名请求已受登录限制，或当前路径需要完整浏览器会话才能稳定读取时，可自愿提供 B站 Cookie；它仅改变当前任务的会话可见性，不会绕过验证码、频控或访问限制。细节见 [B站规则](skill/references/platforms/bilibili.md)。
 
 ### 抖音
 
@@ -73,17 +74,20 @@ python3 skill/scripts/collect_douyin_complete.py \
 
 只有昵称或抖音号时，先从第一方移动搜索核对身份并取得真实 `/user/<sec_uid>`，不要拼接 vanity ID。公开页受限时可降级为公开索引证据，但它始终是 `PARTIAL`。详见 [抖音规则](skill/references/platforms/douyin.md) 与 [索引证据](skill/references/douyin-index-evidence.md)。
 
-### 对话粘贴 Cookie：抖音、微博、小红书
+### 对话粘贴 Cookie：B站、抖音、微博、小红书
 
 首选用户在已登录页面按 `F12` → **Network/网络** → 刷新 → **Headers/标头**，复制完整的 `Cookie: ...` 请求头并直接粘贴到对话。不要让用户改发文件；风险只在首次请求时说明一次。Agent 再将内容临时交给对应参数：
 
 | 平台 | 参数 |
 | --- | --- |
+| B站 | `--bilibili-cookie-file <temporary-path>` |
 | 抖音 | `--douyin-cookie-file <temporary-path>` |
 | 微博 | `--weibo-cookie-file <temporary-path>` |
 | 小红书 | `--xiaohongshu-cookie-file <temporary-path>` |
 
 不要把 Cookie 原文放进命令行。完整的浏览器步骤、JSON 备用路径、移动端替代方案和失败处理见 [Cookie 指引](skill/references/cookie-guide.md)。
+
+小红书 Cookie 不构成云端可访问保证：它只会触发一次同主页的隔离浏览器渲染，仍显示登录墙、验证码或访问限制时立即结束，不会继续尝试搜索或签名接口。
 
 ### 抖音账号本人授权
 

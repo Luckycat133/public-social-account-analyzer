@@ -2,6 +2,7 @@
 
 > `status: P1 experimental`。本适配器只读取直接打开的公开账号主页中已经嵌入的
 > JSON 状态；它不请求签名接口、私有接口或短链跳转，不主动登录，也不绕过验证码、滑块、频控。
+> 带 Cookie 的直接 HTTP 页面出现登录墙或缺少状态时，最多使用一次隔离临时浏览器渲染同一主页；
 > 页面没有给出可核验状态时安全停止，不把空结果写成成功。
 
 ## 用户授权会话（可选）
@@ -15,9 +16,10 @@ python3 scripts/collect.py "https://www.xiaohongshu.com/user/profile/<user_id>" 
   --out <NEW_COLLECTION>
 ```
 
-文件仅允许 `xiaohongshu.com` 及子域、限制大小和记录数；值只在当前进程直接页面请求中使用，绝不
-写入 workspace、报告或日志。Cookie 原文可粘贴到当前对话，但不得回显、转发或放进命令行。会话失效或页面出现验证
-时立即停止；该模式不调用签名或私有接口，也不处理验证码、滑块或短链跳转。
+文件仅允许 `xiaohongshu.com` 及子域、限制大小和记录数；值只在当前进程的直接请求和一次隔离浏览器
+渲染中使用，绝不写入 workspace、报告或日志。Cookie 原文可粘贴到当前对话，但不得回显、转发或放进命令行。
+浏览器渲染仍使用部署环境的网络和临时浏览器状态，因此 Cookie 不能保证云端可访问；会话失效或页面出现验证时
+立即停止。该模式不调用签名或私有接口，也不处理验证码、滑块或短链跳转。
 
 浏览器导出与对话交接的通用指引见 [cookie-guide.md](../cookie-guide.md)。
 
@@ -43,7 +45,8 @@ python3 scripts/collect.py "https://www.xiaohongshu.com/user/profile/<user_id>" 
 
 ## 受限与评论
 
-- 页面出现登录提示：`LOGIN_REQUIRED`；验证码或滑块：`VERIFICATION_REQUIRED`；均立即停止。
+- 页面出现登录提示：`LOGIN_REQUIRED`；带 Cookie 时，只有 `LOGIN_REQUIRED` 或 `PARSER_FAILED` 可对同一
+  主页尝试一次浏览器渲染。验证码或滑块：`VERIFICATION_REQUIRED`，不启动浏览器降级且立即停止。
 - HTTP 404：`ACCOUNT_UNAVAILABLE`；其他 HTTP/网络限制：`ACCESS_RESTRICTED`；没有可核验嵌入状态：`PARSER_FAILED`。
 - `collect_comments` 当前返回 `COMMENTS_UNAVAILABLE`；开启 `--comments` 时主内容任务仍会如实记录评论不可用，不得伪造空评论成功。
 

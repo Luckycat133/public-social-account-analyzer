@@ -34,10 +34,10 @@ description: 只要用户要研究、比较或审计一个或多个具体公开�
 
 | 场景 | 默认路径与按需参考 |
 | --- | --- |
-| B站账号 | 先核验 UID；常规投稿先 `medialist/resource/list`，必要时再 WBI `arc/search`。完整性与保护停止规则见 [references/platforms/bilibili.md](references/platforms/bilibili.md)。 |
+| B站账号 | 先核验 UID；常规投稿先 `medialist/resource/list`，必要时再 WBI `arc/search`。匿名会话受限时，可使用用户自愿提供的当前 B站会话 Cookie；它只改善当前账号可见性，不绕过验证或风控。完整性、Cookie 收益与保护停止规则见 [references/platforms/bilibili.md](references/platforms/bilibili.md)。 |
 | 抖音账号 | 优先直接主页；只有昵称时先核对第一方搜索的真实 `sec_uid`。页面受限时可使用授权会话或受限的公开索引证据；详见 [references/platforms/douyin.md](references/platforms/douyin.md) 与 [references/douyin-index-evidence.md](references/douyin-index-evidence.md)。 |
 | 微博账号 | 默认使用公开 AJAX 适配器；登录或频控立即停止。详见 [references/platforms/weibo.md](references/platforms/weibo.md)。 |
-| 小红书账号 | 只读取直接主页内可核验的公开状态；不能声明全量。详见 [references/platforms/xiaohongshu.md](references/platforms/xiaohongshu.md)。 |
+| 小红书账号 | 只读取直接主页内可核验的公开状态；带 Cookie 时可对同一主页做一次隔离浏览器渲染降级，但不能保证云端可访问或声明全量。详见 [references/platforms/xiaohongshu.md](references/platforms/xiaohongshu.md)。 |
 | 其他平台 | 先找公开列表、RSS/Feed、频道页结构化数据或可信公开统计页，再用直接作品页复核重点样本。 |
 
 ## 正式制品：最轻的可复现路径

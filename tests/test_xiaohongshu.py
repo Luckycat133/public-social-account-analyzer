@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 
 import pytest
 
@@ -127,6 +128,70 @@ def test_xiaohongshu_login_page_stops_without_profile_parse(monkeypatch):
         XiaohongshuCollector().check_access(PROFILE_URL)
 
     assert exc.value.stop_reason == LOGIN_REQUIRED
+
+
+def test_xiaohongshu_script_login_token_does_not_hide_valid_page_state(monkeypatch):
+    """Only visible login-wall text may stop a page that contains public state."""
+    from collectors.xiaohongshu import XiaohongshuCollector
+    import collectors.xiaohongshu as xiaohongshu
+
+    page_state = {"user": {"userId": "u1", "nickname": "测试薯"}, "notes": []}
+    page = (
+        "<script>const login = {enabled: false};</script>"
+        '<script id="__XHS_INITIAL_STATE__">'
+        + json.dumps(page_state)
+        + "</script>"
+    )
+    monkeypatch.setattr(xiaohongshu, "_http_get_text", lambda _url: page)
+
+    assert XiaohongshuCollector().check_access(PROFILE_URL)["accessible"] is True
+
+
+def test_xiaohongshu_cookie_login_wall_uses_one_browser_render_attempt(monkeypatch):
+    """A Cookie session gets one browser-rendered page attempt, never API retries."""
+    from collectors.xiaohongshu import XiaohongshuCollector
+    import collectors.xiaohongshu as xiaohongshu
+
+    cookie_records = ({
+        "name": "web_session",
+        "value": "test-session-only",
+        "domain": ".xiaohongshu.com",
+        "path": "/",
+        "secure": True,
+        "httpOnly": True,
+    },)
+    page_state = {"user": {"userId": "u1", "nickname": "测试薯"}, "notes": []}
+    seen = []
+    monkeypatch.setattr(xiaohongshu, "_http_get_text", lambda _url, _records: "请登录后继续访问")
+
+    def _browser_html(url, records):
+        seen.append((url, records))
+        return '<script id="__XHS_INITIAL_STATE__">' + json.dumps(page_state) + "</script>"
+
+    monkeypatch.setattr(
+        xiaohongshu, "_browser_rendered_html", _browser_html, raising=False
+    )
+
+    result = XiaohongshuCollector(cookie_records=cookie_records).check_access(
+        PROFILE_URL
+    )
+
+    assert result["accessible"] is True
+    assert seen == [(PROFILE_URL, cookie_records)]
+
+
+def test_xiaohongshu_browser_fallback_obeys_collector_policy():
+    """The shared CLI policy must be able to disable XHS browser rendering."""
+    import collect
+
+    parameters = inspect.signature(collect._load_adapters).parameters
+    assert "xiaohongshu_browser_fallback" in parameters
+
+    adapters = collect._load_adapters(xiaohongshu_browser_fallback=False)
+    collector = next(
+        adapter for adapter in adapters if adapter.platform == "xiaohongshu"
+    )
+    assert collector._browser_fallback is False
 
 
 def test_xiaohongshu_verification_page_stops_with_verification_reason(monkeypatch):

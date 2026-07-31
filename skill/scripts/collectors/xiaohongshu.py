@@ -39,6 +39,11 @@ _STATE_SCRIPT = re.compile(
     r"<script[^>]+id=[\"'](?:__XHS_INITIAL_STATE__|__NEXT_DATA__)[\"'][^>]*>(.*?)</script>",
     re.IGNORECASE | re.DOTALL,
 )
+_NON_VISIBLE_BLOCK = re.compile(
+    r"<(?:script|style)\b[^>]*>.*?</(?:script|style)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_TAG = re.compile(r"<[^>]+>")
 
 
 class XiaohongshuError(RuntimeError):
@@ -88,15 +93,32 @@ def _http_get_text(
         raise XiaohongshuError(ACCESS_RESTRICTED, "小红书公开页面网络不可达") from error
 
 
+def _browser_rendered_html(
+    url: str, cookie_records: tuple[dict[str, Any], ...]
+) -> str:
+    """Render one direct page in a temporary browser without API retries."""
+    from .browser_backend import BrowserError, BrowserSession
+
+    try:
+        with BrowserSession() as session:
+            session.set_cookie_records(cookie_records)
+            return session.navigate_and_get_html(url)
+    except BrowserError as error:
+        raise XiaohongshuError(
+            ACCESS_RESTRICTED, "小红书浏览器页面无法加载"
+        ) from error
+
+
 def _page_protection_reason(page: str) -> str | None:
     """Classify visible page protection before attempting any state parsing."""
-    lowered = page.lower()
-    if any(marker in page or marker in lowered for marker in (
+    visible = html.unescape(_TAG.sub(" ", _NON_VISIBLE_BLOCK.sub(" ", page)))
+    lowered = visible.lower()
+    if any(marker in visible or marker in lowered for marker in (
         "验证码", "滑块", "captcha",
     )):
         return VERIFICATION_REQUIRED
-    if any(marker in page or marker in lowered for marker in (
-        "请登录", "登录后", "login",
+    if any(marker in visible or marker in lowered for marker in (
+        "请登录", "登录后", "扫码登录", "sign in", "log in",
     )):
         return LOGIN_REQUIRED
     return None
@@ -140,11 +162,22 @@ def _parse_page_state(page: str) -> dict[str, Any]:
 
 
 def _page_state(
-    profile_url: str, cookie_records: tuple[dict[str, Any], ...] = ()
+    profile_url: str,
+    cookie_records: tuple[dict[str, Any], ...] = (),
+    browser_fallback: bool = True,
 ) -> dict[str, Any]:
-    if cookie_records:
-        return _parse_page_state(_http_get_text(profile_url, cookie_records))
-    return _parse_page_state(_http_get_text(profile_url))
+    try:
+        if cookie_records:
+            return _parse_page_state(_http_get_text(profile_url, cookie_records))
+        return _parse_page_state(_http_get_text(profile_url))
+    except XiaohongshuError as error:
+        if not (
+            cookie_records
+            and browser_fallback
+            and error.stop_reason in {LOGIN_REQUIRED, PARSER_FAILED}
+        ):
+            raise
+    return _parse_page_state(_browser_rendered_html(profile_url, cookie_records))
 
 
 def _note_id(note: dict[str, Any]) -> str | None:
@@ -241,12 +274,21 @@ class XiaohongshuCollector(BaseCollector):
 
     platform = PLATFORM
 
-    def __init__(self, cookie_records: tuple[dict[str, Any], ...] = ()):
+    def __init__(
+        self,
+        cookie_records: tuple[dict[str, Any], ...] = (),
+        browser_fallback: bool = True,
+    ):
         """Use an already-sanitized, user-authorized session only in memory."""
         self._cookie_records = tuple(cookie_records)
+        self._browser_fallback = bool(browser_fallback)
 
     def _page_state(self, profile_url: str) -> dict[str, Any]:
-        return _page_state(profile_url, self._cookie_records)
+        return _page_state(
+            profile_url,
+            self._cookie_records,
+            browser_fallback=self._browser_fallback,
+        )
 
     def _get_text(self, url: str) -> str:
         if self._cookie_records:

@@ -13,6 +13,7 @@
 | `analyze.py` | Legacy 目录的确定性分析与 taxonomy 接口；新任务的完整业务洞察流程由 `run_pipeline.py` 编排。无网络、不直接调用 LLM。 | `--input <任务目录>`、可选 `--with-llm-tax` / `--llm-tax-results` | `analysis.json`、可选 `taxonomy-prompt.md` |
 | `collect_bilibili_complete.py` | B站需要完整覆盖时的采集编排；在默认 10,000、硬上限 50,000 条预算内请求末页，对访问限制、频控和明确的 `-352` WBI 风控失败用新目录做 30/60 秒有界重试。首次运行可安全创建一层缺失的输出父目录。 | `<URL> --out-prefix <PATH>`、可选 `--max-items 1..50000` / 日期 / `--comments` / `--analysis-goal` | 1–3 个不可变 attempt collection；stdout 给出 `selected_workspace` |
 | `collect_douyin_complete.py` | 抖音需要完整覆盖时的有界采集编排；可把用户授权 Cookie 文件传给每个独立 attempt，仅对根级访问限制/频控用新目录做 30/60 秒重试，失败时选择证据最多的密封 attempt。首次运行可安全创建一层缺失的输出父目录。 | `<URL> --out-prefix <PATH>`、可选 `--douyin-cookie-file`、完整预算、日期、评论、详情与分析目标 | 1–3 个不可变 attempt collection；stdout 给出 `selected_workspace` 与安全诊断码 |
+| `bounded_attempt_runner.py` | B站与抖音完整采集共用的不可变 attempt 执行器：只读取已密封任务元数据、固定 30/60 秒退避，并按证据数量选择最佳结果。平台模块只声明命令和重试策略。 | 内部模块 | `AttemptRunResult` |
 | `resolve_profile_url.py` | 在创建工作区前规范化 B站主页；短链只允许跳转到 HTTPS 数字 UID 空间主页。 | `<canonical-or-b23-url>` | stdout 输出规范主页 URL |
 | `render_report.py` | 基于标准化数据和分析结果渲染人类可读的 Markdown/HTML：正文只放代表作品、实际引用和语义结论，全量审计数据继续留在 CSV/JSON。语义分类未完成时标为数据概览。无网络、无 LLM。 | `--input <任务目录>` | `account-analysis-report.md`、`dashboard.html` |
 
@@ -57,10 +58,12 @@ python3 scripts/run_pipeline.py \
 | `bilibili.py` | B站采集、业务编排、原始字段构建与 HTTP/WBI 传输的单一实现；为兼容性 re-export 公共传输符号；平台保护响应立即停止。 |
 | `douyin.py` | 抖音公开页面与内嵌数据解析、资料冲突披露，以及可选浏览器传输降级。 |
 | `douyin_cookies.py` | 严格解析用户授权的抖音 Cookie JSON/Header 文件，限制域名、大小、数量与字段；错误不回显秘密。 |
-| `platform_cookies.py` | 严格解析微博或小红书的用户授权 Cookie JSON/Header 文件，按目标域限制大小、数量与字段；错误不回显秘密。 |
+| `platform_cookies.py` | 严格解析 B站、微博或小红书的用户授权 Cookie JSON/Header 文件，按目标域限制大小、数量与字段；错误不回显秘密。 |
+| `cookie_loader.py` | 把平台名路由至抖音专用或通用域名 Cookie 校验器；不记录任何 Cookie 值。 |
+| `adapter_registry.py` | 以平台声明集中构造可选采集器，并仅按平台名报告加载失败；新增平台无需扩展入口中的导入分支。 |
 | `_douyin_browser_transport.py` | 抖音被动 CDP、无签名同源页内公开分页、可见 DOM 候选及严格账号/作品/分页绑定。 |
 | `weibo.py` | 默认启用的微博公开 AJAX 适配器；可选用户授权会话只在任务内存中作为请求 Cookie 使用；可用 `WEIBO_COLLECTOR_ENABLED=0` 临时安全停用。 |
-| `xiaohongshu.py` | 小红书直接公开主页的嵌入状态适配器；可选用户授权会话只在任务内存中作为请求 Cookie 使用；不调用签名/私有接口，不能声明全量，遇登录或验证立即停止。 |
+| `xiaohongshu.py` | 小红书直接公开主页的嵌入状态适配器；可选用户授权会话先用于直接请求，登录墙或缺少状态时最多以隔离浏览器渲染同一主页一次；不调用签名/私有接口，不能声明全量，验证码或验证立即停止。 |
 | `browser_backend.py` | 仅用于传输降级的 headless 浏览器后端；按稳定顺序尝试系统浏览器或已有 Playwright Chromium 缓存，不安装工具；显式二进制路径不隐式回退。 |
 | `_constants.py` | 北京时区及共享 `STOP_*` 枚举。 |
 | `_utils.py` | 跨采集器复用的时间、数值和话题标签工具。 |

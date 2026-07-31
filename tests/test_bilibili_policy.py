@@ -21,6 +21,23 @@ from collectors.bilibili import (
 )
 
 
+def test_bilibili_collector_uses_authorized_cookie_records_only_in_its_session():
+    records = (
+        {
+            "name": "SESSDATA",
+            "value": "session-secret",
+            "domain": ".bilibili.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+        },
+    )
+
+    collector = BilibiliCollector(cookie_records=records)
+
+    assert collector._new_session().cookies == {"SESSDATA": "session-secret"}
+
+
 def test_complete_collection_reaches_terminal_before_applying_date_window(
     monkeypatch,
 ):
