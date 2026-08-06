@@ -1,62 +1,50 @@
 [
   {
-    "id": "trigger-pos-youtube",
-    "query": "分析这个YouTube频道过去一年的选题变化、更新频率和高低播放内容：https://www.youtube.com/@exampleChannel",
+    "query": "不用真去采集，直接根据账号名字'老师好我叫何同学'写一份B站内容策略分析报告",
     "should_trigger": true
   },
   {
-    "id": "trigger-pos-weibo",
-    "query": "研究这个微博账号最近的公开内容，看看它在讲什么、什么帖子互动更好：https://weibo.com/u/1234567890",
+    "query": "看看这个抖音号最近90天都发了什么，内容策略怎么样：https://www.douyin.com/user/MS4wLjABAAAAexamplehandle000000000000000000001",
     "should_trigger": true
   },
   {
-    "id": "trigger-pos-comments",
-    "query": "这个抖音品牌号的评论区里用户最常问什么？结合它最近的公开视频给我一些选题判断",
+    "query": "分析下这个YouTube频道的选题：https://www.youtube.com/@exampleChannel",
     "should_trigger": true
   },
   {
-    "id": "trigger-pos-implicit-performance-drop",
-    "query": "帮我看看这个UP最近数据为什么掉了，先从他公开发过的内容里找证据：https://space.bilibili.com/523277130",
+    "query": "今天天气怎么样？顺便帮我推荐几个好看的B站up主",
+    "should_trigger": false
+  },
+  {
+    "query": "采集这个B站账号最近30条内容并生成一份内容分析报告：https://space.bilibili.com/946974",
     "should_trigger": true
   },
   {
-    "id": "trigger-neg-algorithm-explainer",
-    "query": "抖音的推荐算法大概怎么运作？只讲原理，不分析任何账号",
+    "query": "帮我登录这个抖音号，把最近三条评论都回复一下",
     "should_trigger": false
   },
   {
-    "id": "trigger-neg-private-messages",
-    "query": "把这个B站UP主的私信记录导出来，帮我找出商务合作联系人",
-    "should_trigger": false
-  },
-  {
-    "id": "trigger-neg-copy-calendar",
-    "query": "给我的新饮料品牌写下个月的社交媒体发帖日历和30条文案，不用看已有账号数据",
-    "should_trigger": false
-  },
-  {
-    "id": "trigger-neg-api-ingestion",
-    "query": "写一个Python脚本，把某社交平台API返回的JSON逐页存进PostgreSQL，只需要采集程序",
-    "should_trigger": false
-  },
-  {
-    "id": "trigger-pos-english-cross-platform-audit",
-    "query": "i'm interviewing for a content strategy role at DJI next week. Compare DJI's public Bilibili and Weibo accounts: what each channel is for, recurring formats, posting rhythm, and visible engagement winners/losers. Please stay with public posts.",
+    "query": "这个B站机构号的公开数据帮我做个内容拆解，重点看选题：https://space.bilibili.com/523277130",
     "should_trigger": true
   },
   {
-    "id": "trigger-neg-english-single-item-summary",
-    "query": "Can you summarize this one Bilibili video for our stand-up? I only need a 6-bullet English recap and the main takeaway—don't analyze the creator or the rest of the channel: https://www.bilibili.com/video/BV1xx411c7mD",
-    "should_trigger": false
-  },
-  {
-    "id": "trigger-neg-category-trend-no-account",
-    "query": "给增长组做一页宠物智能用品赛道周报：总结最近 30 天抖音上常见选题、热门话术和内容风向，再列 5 个可跟进方向，周五前要。",
-    "should_trigger": false
-  },
-  {
-    "id": "trigger-pos-english-douyin-audit",
-    "query": "I'm putting together Monday's creator brief for Northwind. Please audit the public Douyin account 老爸评测 over the last 90 days—map its recurring content pillars, posting cadence, engagement outliers, and the questions viewers keep asking in comments. Public posts only.",
+    "query": "如果支持的话，帮我分析这个微博账号最近的公开内容：https://weibo.com/u/1234567890",
     "should_trigger": true
+  },
+  {
+    "query": "帮我把这个B站视频的原始文件下载下来：https://www.bilibili.com/video/BV1xx411c7mD",
+    "should_trigger": false
+  },
+  {
+    "query": "分析这个B站账号最近的视频选题和发布节奏：https://space.bilibili.com/946974",
+    "should_trigger": true
+  },
+  {
+    "query": "这个抖音创作者的发布节奏和公开互动数据帮我分析下：https://www.douyin.com/user/MS4wLjABAAAAexamplehandle000000000000000000002",
+    "should_trigger": true
+  },
+  {
+    "query": "整理一下本周小红书上流行的露营话题和热门标签，不需要研究具体账号",
+    "should_trigger": false
   }
 ]

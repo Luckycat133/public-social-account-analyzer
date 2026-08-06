@@ -6,10 +6,93 @@
 
 | 制品 | 包含内容 | 用途 |
 | --- | --- | --- |
-| `.skill` | `SKILL.md`、`VERSION`、`agents/`、`scripts/`、`references/`、`assets/` | 安装到 Agent 运行时 |
+| `.skill` | `SKILL.md`、`VERSION`、`agents/`、`scripts/`、`scripts/legacy/`、`references/`、`assets/` | 安装到 Agent 运行时 |
 | 仓库 ZIP | 上述内容加 `tests/`、`skill/evals/`、`docs/`、`tools/` | 回归、审计与维护 |
 
 标准 `.skill` 打包器会排除根级 `evals/`；因此不能把它当作“包含完整测试环境”的发布物。
+
+## 目录结构参考（v0.8.1+）
+
+```
+skill/
+├── SKILL.md
+├── VERSION
+├── agents/
+├── assets/
+├── evals/
+├── references/
+│   ├── data-schema.md
+│   ├── analysis-rules.md
+│   ├── exceptions.md
+│   ├── cookie-guide.md
+│   ├── workflow.md
+│   ├── douyin-index-evidence.md
+│   ├── PLATFORM_COMPARISON.md
+│   ├── metrics-and-sampling.md
+│   ├── model-insights.md
+│   ├── comment-insights.md
+│   ├── collection-schema.md
+│   ├── artifact-contract.md
+│   └── platforms/
+│       ├── bilibili.md
+│       ├── douyin.md
+│       ├── weibo.md
+│       └── xiaohongshu.md
+├── scripts/
+│   ├── collect.py
+│   ├── run_pipeline.py
+│   ├── collect_douyin_authorized.py
+│   ├── import_index_snapshot.py
+│   ├── csv_contract.py
+│   ├── execution_timing.py
+│   ├── immutable_workspace.py
+│   ├── task_contract.py
+│   ├── validate_model_results.py
+│   ├── resolve_profile_url.py
+│   ├── sign_server.py
+│   ├── bounded_attempt_runner.py
+│   ├── field_coverage.py
+│   ├── skill_metadata.py
+│   ├── README.md
+│   ├── collectors/
+│   │   ├── base.py
+│   │   ├── bilibili.py
+│   │   ├── douyin.py
+│   │   ├── douyin_openapi.py
+│   │   ├── weibo.py
+│   │   ├── xiaohongshu.py
+│   │   ├── cookie_loader.py
+│   │   ├── _cookie_storage.py
+│   │   ├── browser_backend.py
+│   │   ├── url_policy.py
+│   │   ├── _constants.py
+│   │   ├── _douyin_browser_transport.py
+│   │   └── _douyin_detail_contract.py
+│   └── legacy/
+│       ├── analyze.py
+│       ├── normalize.py
+│       └── render_report.py
+```
+
+```
+docs/
+├── architecture/
+│   └── STRUCTURE.md
+├── guides/
+│   ├── deployment-package-checklist.md
+│   ├── operations-trial-template.md
+│   ├── prd-v1.0-acceptance-test-plan.md
+│   └── skill-development-workflow.md
+├── prd/
+├── acceptance/
+├── plans/
+└── research/
+    └── platform-methods/
+        ├── bilibili.md
+        ├── douyin.md
+        ├── weibo.md
+        └── xiaohongshu.md
+```
 
 ## 发布前检查
 
