@@ -12,26 +12,26 @@
 
 | Source File | Source Dir | Target File | Target Dir | Action |
 |-------------|------------|-------------|------------|--------|
-| `xiaohongshu.md` | `research-output/github/` | `xiaohongshu.md` | `references/platform-methods/` | **Merge** (primary) |
-| `xiaohongshu.md` | `research-output/clawhub/` | `xiaohongshu.md` | `references/platform-methods/` | **Merge** |
-| `xiaohongshu.md` | `research-output/glama/` | `xiaohongshu.md` | `references/platform-methods/` | **Merge** |
-| `xiaohongshu.md` | `research-output/npm/` | `xiaohongshu.md` | `references/platform-methods/` | **Merge** |
-| `xiaohongshu.md` | `research-output/pypi/` | `xiaohongshu.md` | `references/platform-methods/` | **Merge** |
-| `douyin.md` | `research-output/github/` | `douyin.md` | `references/platform-methods/` | **Merge** (primary) |
-| `douyin.md` | `research-output/clawhub/` | `douyin.md` | `references/platform-methods/` | **Merge** |
-| `douyin.md` | `research-output/glama/` | `douyin.md` | `references/platform-methods/` | **Merge** |
-| `douyin.md` | `research-output/npm/` | `douyin.md` | `references/platform-methods/` | **Merge** |
-| `douyin.md` | `research-output/pypi/` | `douyin.md` | `references/platform-methods/` | **Merge** |
-| `bilibili.md` | `research-output/github/` | `bilibili.md` | `references/platform-methods/` | **Merge** (primary) |
-| `bilibili.md` | `research-output/clawhub/` | `bilibili.md` | `references/platform-methods/` | **Merge** |
-| `bilibili.md` | `research-output/glama/` | `bilibili.md` | `references/platform-methods/` | **Merge** |
-| `bilibili.md` | `research-output/npm/` | `bilibili.md` | `references/platform-methods/` | **Merge** |
-| `bilibili.md` | `research-output/pypi/` | `bilibili.md` | `references/platform-methods/` | **Merge** |
-| `weibo.md` | `research-output/github/` | `weibo.md` | `references/platform-methods/` | **Merge** (primary) |
-| `weibo.md` | `research-output/clawhub/` | `weibo.md` | `references/platform-methods/` | **Merge** |
-| `weibo.md` | `research-output/glama/` | `weibo.md` | `references/platform-methods/` | **Merge** |
-| `weibo.md` | `research-output/npm/` | `weibo.md` | `references/platform-methods/` | **Merge** |
-| `weibo.md` | `research-output/pypi/` | `weibo.md` | `references/platform-methods/` | **Merge** |
+| `xiaohongshu.md` | `research-output/github/` | `xiaohongshu.md` | `docs/research/platform-methods/` | **Merge** (primary) |
+| `xiaohongshu.md` | `research-output/clawhub/` | `xiaohongshu.md` | `docs/research/platform-methods/` | **Merge** |
+| `xiaohongshu.md` | `research-output/glama/` | `xiaohongshu.md` | `docs/research/platform-methods/` | **Merge** |
+| `xiaohongshu.md` | `research-output/npm/` | `xiaohongshu.md` | `docs/research/platform-methods/` | **Merge** |
+| `xiaohongshu.md` | `research-output/pypi/` | `xiaohongshu.md` | `docs/research/platform-methods/` | **Merge** |
+| `douyin.md` | `research-output/github/` | `douyin.md` | `docs/research/platform-methods/` | **Merge** (primary) |
+| `douyin.md` | `research-output/clawhub/` | `douyin.md` | `docs/research/platform-methods/` | **Merge** |
+| `douyin.md` | `research-output/glama/` | `douyin.md` | `docs/research/platform-methods/` | **Merge** |
+| `douyin.md` | `research-output/npm/` | `douyin.md` | `docs/research/platform-methods/` | **Merge** |
+| `douyin.md` | `research-output/pypi/` | `douyin.md` | `docs/research/platform-methods/` | **Merge** |
+| `bilibili.md` | `research-output/github/` | `bilibili.md` | `docs/research/platform-methods/` | **Merge** (primary) |
+| `bilibili.md` | `research-output/clawhub/` | `bilibili.md` | `docs/research/platform-methods/` | **Merge** |
+| `bilibili.md` | `research-output/glama/` | `bilibili.md` | `docs/research/platform-methods/` | **Merge** |
+| `bilibili.md` | `research-output/npm/` | `bilibili.md` | `docs/research/platform-methods/` | **Merge** |
+| `bilibili.md` | `research-output/pypi/` | `bilibili.md` | `docs/research/platform-methods/` | **Merge** |
+| `weibo.md` | `research-output/github/` | `weibo.md` | `docs/research/platform-methods/` | **Merge** (primary) |
+| `weibo.md` | `research-output/clawhub/` | `weibo.md` | `docs/research/platform-methods/` | **Merge** |
+| `weibo.md` | `research-output/glama/` | `weibo.md` | `docs/research/platform-methods/` | **Merge** |
+| `weibo.md` | `research-output/npm/` | `weibo.md` | `docs/research/platform-methods/` | **Merge** |
+| `weibo.md` | `research-output/pypi/` | `weibo.md` | `docs/research/platform-methods/` | **Merge** |
 
 > **Note:** `research-output/glama/` is missing `xiaohongshu.md` — this is expected (no Glama MCP servers found for XHS). The merge will proceed with 4 sources for XHS, 5 for others.
 
@@ -160,7 +160,7 @@ Each `references/platform-methods/{platform}.md` will have this structure:
 
 | Target Path | Source(s) | Decision | Rationale |
 |-------------|-----------|----------|-----------|
-| `references/platform-methods/{platform}.md` | 5 research sites | **MERGE** | New consolidated reference; no existing target |
+| `docs/research/platform-methods/{platform}.md` | 5 research sites | **MERGE** | New consolidated reference; no existing target |
 | `references/PLATFORM_COMPARISON.md` | `glama/SUMMARY.md` | **CREATE** | New cross-platform view; derive if SUMMARY missing |
 | `references/collection-schema.md` | `prd-source/references/` | **OVERWRITE** | PRD is canonical; target may drift |
 | `references/data-schema.md` | `prd-source/references/` | **OVERWRITE** | PRD is canonical |
@@ -177,7 +177,7 @@ Each `references/platform-methods/{platform}.md` will have this structure:
 
 | Directory | Purpose | Created By |
 |-----------|---------|------------|
-| `references/platform-methods/` | Consolidated per-platform method research | Migration Step 1 |
+| `docs/research/platform-methods/` | Consolidated per-platform method research | Migration Step 1 |
 | `docs/` | Migration plan + future documentation | Migration Step 0 (this plan) |
 
 > **Note:** `scripts/` already exists. No new script subdirectories needed.
@@ -190,7 +190,7 @@ Each `references/platform-methods/{platform}.md` will have this structure:
 
 ```bash
 # 0.1 Create target directories
-mkdir -p /Users/jack/Documents/public-social-account-analyzer/skill/references/platform-methods
+mkdir -p /Users/jack/Documents/public-social-account-analyzer/docs/research/platform-methods
 mkdir -p /Users/jack/Documents/public-social-account-analyzer/docs
 
 # 0.2 Backup existing target references (optional but recommended)
@@ -204,7 +204,7 @@ cp -r /Users/jack/Documents/public-social-account-analyzer/skill/references \
 # 1.1 For each platform (xiaohongshu, douyin, bilibili, weibo):
 #     - Read all 5 source files
 #     - Apply merge strategy (§2)
-#     - Write to references/platform-methods/{platform}.md
+#     - Write to docs/research/platform-methods/{platform}.md
 
 # Suggested order (most complex first):
 # 1. xiaohongshu.md (4 sources, most MCP forks)
