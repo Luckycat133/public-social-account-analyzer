@@ -45,6 +45,7 @@
 - 修复分析报告分位数反转、非数值/非有限值进入正式报告；渲染前校验 `p25 ≤ median ≤ p75`。
 - 修复 CSV 亚秒时长截断、JSON 字符串整数类型漂移、阶段耗时之和不等于总耗时。
 - 修复恢复任务跨平台/跨账号/未密封/摘要不一致/重复作品仍可能继续联网；checkpoint 独立密封并绑定账号/参数/作品数/摘要。
+- **修复抖音浏览器回退 DOM 选择器失效**：多重 fallback 选择器覆盖 profile、post list、detail 三层；`visibleText` 支持数组参数顺序尝试；新增 `data-e2e="user-post"`、`data-e2e="aweme-item"`、class 匹配、`[data-aid]`、`.verified-badge` 等兼容当前前端结构。对应测试同步更新（`test_douyin.py::test_dom_expression_requests_only_visible_pin_and_metric_fields`）。
 
 ### Security
 

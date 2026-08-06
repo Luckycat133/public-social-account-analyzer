@@ -72,10 +72,15 @@ ACCOUNT_PAGE_CONTEXT_MAX_BODY_CHARS = 4_000_000
 _ALLOWED_RESPONSE_HOSTS = ("douyin.com", "iesdouyin.com")
 _DOM_PROFILE_HELPERS = r"""
 const isVisible = node => Boolean(node && node.getClientRects().length > 0);
-const visibleText = (root, selector) => {
-  const node = root.querySelector(selector);
-  if (!isVisible(node)) return null;
-  return (node.getAttribute('aria-label') || node.innerText || '').trim() || null;
+const visibleText = (root, selectors) => {
+  const list = Array.isArray(selectors) ? selectors : [selectors];
+  for (const sel of list) {
+    const node = root.querySelector(sel);
+    if (isVisible(node)) {
+      return (node.getAttribute('aria-label') || node.innerText || '').trim() || null;
+    }
+  }
+  return null;
 };
 const boundedText = value => {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
@@ -83,10 +88,18 @@ const boundedText = value => {
 };
 const readProfile = () => {
   const pathMatch = location.pathname.match(/^\/(?:user|share\/user)\/([A-Za-z0-9_-]+)\/?$/);
-  const titleNode = document.querySelector('[data-e2e="user-title"],h1');
-  if (!pathMatch || !isVisible(titleNode)) return null;
+  // Multiple fallback selectors for title
+  const titleSelectors = [
+    '[data-e2e="user-title"]',
+    'h1',
+    '[data-e2e="user-info-title"]',
+    '.user-title',
+    '.profile-title'
+  ];
+  const titleNode = titleSelectors.map(s => document.querySelector(s)).find(isVisible);
+  if (!pathMatch || !titleNode) return null;
   const profileRoot = titleNode.closest(
-    '[data-e2e="user-info"],[data-e2e="user-detail"],header'
+    '[data-e2e="user-info"],[data-e2e="user-detail"],header,[data-e2e="user-profile"],.user-profile,.profile-header'
   ) || (titleNode.parentElement && titleNode.parentElement.parentElement) ||
     titleNode.parentElement;
   if (!profileRoot || !isVisible(profileRoot)) return null;
@@ -95,11 +108,13 @@ const readProfile = () => {
     '[data-e2e="user-info-authentication"]',
     '[aria-label*="认证"]',
     'img[alt*="认证"]',
-    '[title*="认证"]'
+    '[title*="认证"]',
+    '[data-e2e="user-verified"]',
+    '.verified-badge'
   ].join(',');
   const verifiedNode = Array.from(profileRoot.querySelectorAll(badgeSelector)).find(isVisible) || null;
   const authContainer = verifiedNode && verifiedNode.closest(
-    '[data-e2e="user-info-verify"],[data-e2e="user-info-authentication"]'
+    '[data-e2e="user-info-verify"],[data-e2e="user-info-authentication"],[data-e2e="user-verified"]'
   );
   const label = boundedText(
     (authContainer && authContainer.innerText) ||
@@ -115,11 +130,11 @@ const readProfile = () => {
   return {
     profile_url: location.href,
     sec_uid: pathMatch[1],
-    nickname: visibleText(profileRoot, '[data-e2e="user-title"],h1'),
-    signature: visibleText(profileRoot, '[data-e2e="user-signature"]'),
-    follower_count: visibleText(profileRoot, '[data-e2e="user-info-follower"]'),
-    aweme_count: visibleText(profileRoot, '[data-e2e="user-info-post-count"]'),
-    total_favorited: visibleText(profileRoot, '[data-e2e="user-info-like"]'),
+    nickname: visibleText(profileRoot, ['[data-e2e="user-title"]', 'h1', '[data-e2e="user-info-title"]', '.user-title']),
+    signature: visibleText(profileRoot, ['[data-e2e="user-signature"]', '[data-e2e="user-desc"]', '.signature', '.user-desc']),
+    follower_count: visibleText(profileRoot, ['[data-e2e="user-info-follower"]', '[data-e2e="user-follower"]', '.follower-count', '[title*="粉丝"]']),
+    aweme_count: visibleText(profileRoot, ['[data-e2e="user-info-post-count"]', '[data-e2e="user-post-count"]', '.post-count', '[title*="作品"]']),
+    total_favorited: visibleText(profileRoot, ['[data-e2e="user-info-like"]', '[data-e2e="user-like"]', '.like-count', '[title*="获赞"]']),
     dom_verified_badge: verifiedNode
       ? (label && negativeLabels.has(label.toLowerCase())
         ? null
@@ -135,23 +150,40 @@ _DOM_PROFILE_EXPRESSION = (
 
 _DOM_CARDS_EXPRESSION = "(() => {\n" + _DOM_PROFILE_HELPERS + r"""
 const cards = Array.from(
-  document.querySelectorAll('[data-e2e="user-post-item"]')
+  document.querySelectorAll(
+    '[data-e2e="user-post-item"],' +
+    '[data-e2e="user-post"],' +
+    '[data-e2e="aweme-item"],' +
+    '.user-post-item,' +
+    '.aweme-item,' +
+    '[class*="user-post-item"],' +
+    '[class*="aweme-item"],' +
+    'li[data-aid],' +
+    'div[data-aid]'
+  )
 ).filter(isVisible).map(root => {
   const a = Array.from(
-    root.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')
+    root.querySelectorAll('a[href*="/video/"],a[href*="/note/"],a[href*="/aweme/"]')
   ).find(isVisible) || null;
   if (!a) return null;
-  const pinNode = root.querySelector('[data-e2e="video-card-top"],[aria-label="置顶"]');
+  const pinSelectors = [
+    '[data-e2e="video-card-top"]',
+    '[aria-label="置顶"]',
+    '[data-e2e="pinned-badge"]',
+    '.pinned-badge',
+    '[title*="置顶"]'
+  ];
+  const pinNode = pinSelectors.map(s => root.querySelector(s)).find(isVisible);
   const isPinned = pinNode && pinNode.getClientRects().length > 0 ? true : null;
   return {
     href: a.href,
     text: (a.getAttribute('aria-label') || a.getAttribute('title') || a.innerText || '').trim(),
     is_pinned: isPinned,
     statistics: {
-      digg_count: visibleText(root, '[data-e2e="video-like-count"],[aria-label^="点赞"]'),
-      comment_count: visibleText(root, '[data-e2e="video-comment-count"],[aria-label^="评论"]'),
-      collect_count: visibleText(root, '[data-e2e="video-collect-count"],[aria-label^="收藏"]'),
-      share_count: visibleText(root, '[data-e2e="video-share-count"],[aria-label^="分享"]')
+      digg_count: visibleText(root, ['[data-e2e="video-like-count"]', '[aria-label^="点赞"]', '[data-e2e="like-count"]', '.like-count']),
+      comment_count: visibleText(root, ['[data-e2e="video-comment-count"]', '[aria-label^="评论"]', '[data-e2e="comment-count"]', '.comment-count']),
+      collect_count: visibleText(root, ['[data-e2e="video-collect-count"]', '[aria-label^="收藏"]', '[data-e2e="collect-count"]', '.collect-count']),
+      share_count: visibleText(root, ['[data-e2e="video-share-count"]', '[aria-label^="分享"]', '[data-e2e="share-count"]', '.share-count'])
     }
   };
 }).filter(Boolean);
@@ -165,18 +197,29 @@ _DOM_DETAIL_EXPRESSION = r"""(() => {
 const isVisible = node => Boolean(node && node.getClientRects().length > 0);
 const pathMatch = location.pathname.match(/^\/(video|note)\/(\d+)\/?$/);
 if (!pathMatch) return null;
-const detailRoot = Array.from(document.querySelectorAll(
-  '[data-e2e="video-detail"],[data-e2e="note-detail"],main'
-)).find(isVisible) || null;
+const detailRootSelectors = [
+  '[data-e2e="video-detail"]',
+  '[data-e2e="note-detail"]',
+  'main',
+  '[data-e2e="aweme-detail"]',
+  '.video-detail',
+  '.note-detail',
+  '#detail'
+];
+const detailRoot = detailRootSelectors.map(s => document.querySelector(s)).find(isVisible) || null;
 if (!detailRoot) return null;
 const visibleText = selectors => {
-  const node = Array.from(detailRoot.querySelectorAll(selectors)).find(isVisible) || null;
-  return node
-    ? (node.getAttribute('aria-label') || node.getAttribute('title') || node.innerText || '').trim() || null
-    : null;
+  const list = Array.isArray(selectors) ? selectors : [selectors];
+  for (const sel of list) {
+    const node = Array.from(detailRoot.querySelectorAll(sel)).find(isVisible);
+    if (node) {
+      return (node.getAttribute('aria-label') || node.getAttribute('title') || node.innerText || '').trim() || null;
+    }
+  }
+  return null;
 };
 const tagNodes = Array.from(detailRoot.querySelectorAll(
-  '[data-e2e="video-tag"],[data-e2e="note-tag"],a[href*="/hashtag/"]'
+  '[data-e2e="video-tag"],[data-e2e="note-tag"],a[href*="/hashtag/"],[data-e2e="tag-link"],.tag-link'
 )).filter(isVisible);
 const textExtra = tagNodes.map(node => ({
   hashtag_name: (node.innerText || node.getAttribute('aria-label') || '')
@@ -185,13 +228,13 @@ const textExtra = tagNodes.map(node => ({
 return {
   aweme_id: pathMatch[2],
   share_url: location.href,
-  desc: visibleText('[data-e2e="video-desc"],[data-e2e="note-desc"],h1'),
+  desc: visibleText(['[data-e2e="video-desc"]','[data-e2e="note-desc"]','h1','[data-e2e="aweme-desc"]','.desc']),
   text_extra: textExtra,
   statistics: {
-    digg_count: visibleText('[data-e2e="video-digg"],[aria-label^="点赞"]'),
-    comment_count: visibleText('[data-e2e="video-comment"],[aria-label^="评论"]'),
-    collect_count: visibleText('[data-e2e="video-collect"],[aria-label^="收藏"]'),
-    share_count: visibleText('[data-e2e="video-share"],[aria-label^="分享"]')
+    digg_count: visibleText(['[data-e2e="video-digg"]','[aria-label^="点赞"]','[data-e2e="like-count"]','.digg-count']),
+    comment_count: visibleText(['[data-e2e="video-comment"]','[aria-label^="评论"]','[data-e2e="comment-count"]','.comment-count']),
+    collect_count: visibleText(['[data-e2e="video-collect"]','[aria-label^="收藏"]','[data-e2e="collect-count"]','.collect-count']),
+    share_count: visibleText(['[data-e2e="video-share"]','[aria-label^="分享"]','[data-e2e="share-count"]','.share-count'])
   }
 };
 })()"""

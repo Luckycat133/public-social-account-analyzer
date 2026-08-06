@@ -3868,10 +3868,14 @@ def test_dom_expression_requests_only_visible_pin_and_metric_fields():
     assert "statistics" in _DOM_CARDS_EXPRESSION
     assert "digg_count" in _DOM_CARDS_EXPRESSION
     assert "comment_count" in _DOM_CARDS_EXPRESSION
-    assert (
-        "document.querySelectorAll('[data-e2e=\"user-post-item\"]')"
-        in _DOM_CARDS_EXPRESSION
-    )
+    # Updated: now uses multiple fallback selectors
+    assert "data-e2e=\"user-post-item\"" in _DOM_CARDS_EXPRESSION
+    assert "data-e2e=\"user-post\"" in _DOM_CARDS_EXPRESSION
+    assert "data-e2e=\"aweme-item\"" in _DOM_CARDS_EXPRESSION
+    assert "class*=\"user-post-item\"" in _DOM_CARDS_EXPRESSION
+    assert "class*=\"aweme-item\"" in _DOM_CARDS_EXPRESSION
+    assert "li[data-aid]" in _DOM_CARDS_EXPRESSION
+    assert "div[data-aid]" in _DOM_CARDS_EXPRESSION
     assert "document.querySelectorAll('a[href" not in _DOM_CARDS_EXPRESSION
     assert "a.parentElement" not in _DOM_CARDS_EXPRESSION
     assert "[data-e2e=\"user-post-item\"],li" not in _DOM_CARDS_EXPRESSION
