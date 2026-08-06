@@ -191,5 +191,5 @@ ELSE IF multi-platform single vendor:
 | Weibo | `github/weibo.md` | `clawhub/weibo.md` | `glama/weibo.md` | `pypi/weibo.md` | `npm/weibo.md` |
 
 **Research workspace**: `/Users/jack/Documents/public-social-account-analyzer-workspace/research-output/`
-**Output references**: `/Users/jack/Documents/public-social-account-analyzer/skill/references/platform-methods/{xiaohongshu,douyin,bilibili,weibo}.md`
+**Output references**: `/Users/jack/Documents/public-social-account-analyzer/docs/research/platform-methods/{xiaohongshu,douyin,bilibili,weibo}.md`
 **This file**: `/Users/jack/Documents/public-social-account-analyzer/skill/references/PLATFORM_COMPARISON.md`
