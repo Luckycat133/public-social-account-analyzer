@@ -57,12 +57,13 @@ description: Use when user wants to analyze, compare, or audit specific public s
 | 制品字段/状态/不可变目录/续采合同 | [references/data-schema.md](references/data-schema.md) 路由；停止原因 [references/exceptions.md](references/exceptions.md) §1；目录/续采 [references/workflow.md](references/workflow.md) §1、§3 |
 | 正式制品指标/分类/高低表现/评论合同 | [references/analysis-rules.md](references/analysis-rules.md) 路由，仅加载对应模块 |
 | 实际采集/排错某平台 | 对应 [references/platforms/](references/platforms/) 文件 |
+| 跨平台方法对比/选型背景 | [references/PLATFORM_COMPARISON.md](references/PLATFORM_COMPARISON.md)（调研输出，非运行时依赖） |
 | 用户已选交接登录会话 | [references/cookie-guide.md](references/cookie-guide.md) |
 
 ## Gotchas（Top 5 从 stdlib 实现常见坑）
 
 - **签名/请求头不匹配导致静默拒绝** — 平台校验 `web_location`/`User-Agent`/压缩头等字段，缺失或错误直接返回拒绝码而非 4xx。  
-  *Read when: 采集器收到非预期拒绝/空响应 → 对应 [references/platforms/](references/platforms/) 文件的「请求构造与反爬」章节*
+  *Read when: 采集器收到非预期拒绝/空响应 → 对应 [references/platforms/](references/platforms/) 文件的「访问限制识别」或「第 3 层：平台保护停止策略」章节*
 
 - **空值处理不当污染指标** — 页面未展示/解析失败必须写 `null` 并记录字段级错误；禁止用 0/空字符串填充，否则互动效率/覆盖率失真。  
   *Read when: 规范化字段含 null 或需计算覆盖率 → [references/data-schema.md](references/data-schema.md) §字段空值契约；[references/analysis-rules.md](references/analysis-rules.md) §指标分母未知处理*
