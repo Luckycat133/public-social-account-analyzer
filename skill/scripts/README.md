@@ -23,7 +23,11 @@ Cookie 参数按平台分别为 `--bilibili-cookie-file`、`--douyin-cookie-file
 - 0 条有效作品：`run_pipeline.py ... --evidence-only`。
 - 只需数据质量与描述性观察：普通运行生成 `light`。
 - 主题、栏目或策略：按需生成并回填 taxonomy、business、comment 的严格 JSON；全部 requested 阶段与证据门通过后为 `strategy`。
-- Legacy 的 `normalize.py`、`analyze.py`、`render_report.py` 会写回其输入目录，只用于维护旧制品或定位问题；新任务优先使用 create-only 的 `run_pipeline.py`。
+- **Legacy 脚本**（已移至 `legacy/` 目录，通过符号链接保持兼容）：
+  - `legacy/normalize.py` — 规范化 CSV/JSON，原地写回输入目录
+  - `legacy/analyze.py` — 确定性指标计算与报告，原地写回输入目录
+  - `legacy/render_report.py` — Markdown/HTML 报告渲染，原地写回输入目录
+  - **仅用于维护旧制品或定位问题**；新任务优先使用 create-only 的 `run_pipeline.py`。
 
 结果文件只接受 UTF-8 严格 JSON，拒绝重复键、`NaN`/`Infinity`、额外字段和证据错配。只生成 prompt 而未回填结果时，分析目录仍可密封，但业务状态保持 `PARTIAL`。
 
