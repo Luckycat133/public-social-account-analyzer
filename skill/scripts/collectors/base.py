@@ -56,7 +56,7 @@ class BaseCollector(ABC):
         """Canonicalize a raw collection_status string to the unified enum.
 
         Raw builders emit "ok" for a successfully collected post; the unified
-        schema (data-schema.md §9) uses "SUCCESS"/"PARTIAL"/"FAILED"/"DELETED"/
+        schema (collection-schema.md §9.3) uses "SUCCESS"/"PARTIAL"/"FAILED"/"DELETED"/
         "RESTRICTED". Missing or invalid input is untrusted and therefore becomes
         ``PARTIAL`` rather than an invented success.
         """

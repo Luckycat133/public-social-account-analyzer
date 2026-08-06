@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # 分析:确定性指标计算 + 模型分类槽位准备
-# 对应 references/analysis-rules.md §3 发布节奏 / §4 公开表现指标 / §5 模型分类 / §6 高低表现内容
+# 对应 references/metrics-and-sampling.md §3/§4 与 references/model-insights.md §5/§6
 # 纯 Python + 标准库实现,无模型、无网络、无 LLM。所有计算确定性、可复现。
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from collectors.url_policy import (
 # 常量
 # ---------------------------------------------------------------------------
 
-# 统一指标字段(见 data-schema.md §6)
+# 统一指标字段（见 references/collection-schema.md §6）
 METRIC_FIELDS = list(PUBLIC_METRIC_FIELDS)
 VALID_STATUS = {"SUCCESS", "PARTIAL"}  # 参与默认统计的采集状态(§1)
 _PROFILE_OVERLAY_FIELD_KEYS = frozenset({
@@ -364,7 +364,7 @@ def load_posts(task_dir: str) -> List[Dict[str, Any]]:
 
 
 def build_posts(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """将 CSV 行映射为统一 Post 结构(见 data-schema.md §5 / §6)。"""
+    """将 CSV 行映射为统一 Post 结构（见 collection-schema.md §5 / §6）。"""
     posts: List[Dict[str, Any]] = []
     for row in raw_rows:
         collection_status, derived_status_source = parse_collection_status(
@@ -3269,11 +3269,6 @@ def validate_business_claim_support(claim: Dict[str, Any], label: str) -> None:
                 f"business insight {label} demographic claim is unsupported"
             )
     _validate_business_statement_support(statement, evidence, label)
-
-
-def _validate_business_claim_support(claim: Dict[str, Any], label: str) -> None:
-    """Compatibility alias for the public semantic-support validator."""
-    validate_business_claim_support(claim, label)
 
 
 def _validate_business_statement_support(

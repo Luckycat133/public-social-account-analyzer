@@ -134,12 +134,6 @@ def _find_playwright_browsers(platform: str) -> list[str]:
     return found
 
 
-def _find_playwright_browser(platform: str) -> Optional[str]:
-    """Compatibility helper returning the first managed browser."""
-    candidates = _find_playwright_browsers(platform)
-    return candidates[0] if candidates else None
-
-
 def find_browsers(explicit: Optional[str] = None) -> list[str]:
     """Return usable browser candidates in stable preference order.
 

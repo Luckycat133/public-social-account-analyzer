@@ -9,7 +9,7 @@
 - [3. 完整离线回归](#3-完整离线回归)
 - [4. 测试 taxonomy draft](#4-测试-taxonomy-draft)
 - [5. 测试 business draft](#5-测试-business-draft)
-- [6. B站短链与公开采集烟雾测试](#6-b站短链与公开采集烟雾测试)
+- [6. 公开采集烟雾测试](#6-公开采集烟雾测试)
 - [7. Agent 黑盒与人工对照](#7-agent-黑盒与人工对照)
 - [8. 自然提示触发评测](#8-自然提示触发评测)
 
@@ -141,7 +141,7 @@ python3 skill/scripts/run_pipeline.py \
 
 验收 `task.json.task_status`、`analysis.json`、Markdown、HTML、`delivery-summary.json` 与 manifest；不要只看命令退出码。
 
-## 6. B站短链与公开采集烟雾测试
+## 6. 公开采集烟雾测试
 
 `collect.py` 现在会自动把 `b23.tv` 主页短链解析为 `https://space.bilibili.com/<uid>`；跳到视频页、非 HTTPS、非数字 UID 或非白名单主机会在创建输出前失败。
 
@@ -153,6 +153,8 @@ python3 skill/scripts/collect.py "<B站规范主页或主页短链>" \
 ```
 
 实时平台测试可能受访问限制、频控或页面变化影响，不作为单元测试成功的前提。若为 `PARTIAL` 或 `FAILED`，同时检查 `stop_reason`、`diagnostic_code`、采集覆盖账本和已保留的公开证据。
+
+Claude Code 可通过 `.claude/workflows/social-smoke-test.js` 对 B站、抖音、微博和小红书执行同一套真实页面检查：限量采集、`evidence-only` 分析、不可变工作区校验和 Cookie 泄漏扫描。调用方必须显式提供平台与公开主页；可选 Cookie 文件只能来自用户授权会话。工作流使用 `$CLAUDE_PROJECT_DIR` 定位仓库，输出写入调用方指定的 `workspace/` 临时目录，不构成发布验收通过证据。
 
 ## 7. Agent 黑盒与人工对照
 
@@ -174,7 +176,7 @@ python3 tools/skill_eval/codex_trigger.py \
   --skill-path skill/SKILL.md \
   --project-root . \
   --out evals-workspace/trigger/train.json \
-  --model gpt-5.6-terra \
+  --model MODEL_UNDER_TEST \
   --reasoning-effort low \
   --runs 3
 ```

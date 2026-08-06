@@ -1,10 +1,10 @@
-# PRD V1.0 / Skill 0.8.0 验收测试计划
+# PRD V1.0 / Skill 0.8.4 验收测试计划
 
 ## 1. 目标与判定基线
 
-本计划把 PRD V1.0 的 FR-001～FR-015、§15 七项非功能需求和 AC-01～AC-10 转成可执行测试。PRD 正本是需求来源；`docs/prd/需求实现状态与抖音能力边界.md` 是 0.8.0 的能力与剩余验收说明；二者冲突时必须在记录中显示合同演进，不能静默选一个数字。
+本计划把 PRD V1.0 的 FR-001～FR-015、§15 七项非功能需求和 AC-01～AC-10 转成可执行测试。PRD 正本是需求来源；`docs/prd/需求实现状态与抖音能力边界.md` 是 0.8.4 的能力与剩余验收说明；二者冲突时必须在记录中显示合同演进，不能静默选一个数字。
 
-0.8.0 延续 0.7.5 的账号隔离、当前脚本完整性、B站投稿列表语义和分位数顺序门禁，并新增默认启用的微博 P1 公开 AJAX 采集器、小红书 P1 直接公开主页采集器，以及两者的用户授权 Cookie 入口。匿名登录墙只表示匿名工具受阻，用户可按指引将合法的对应平台 Cookie 粘贴到对话；Agent 仅临时交接给采集器，凭据不落盘，验证码和频控仍按实际覆盖结束。PRD 的“明确最近 30 条”和“正常公开条件下 10 分钟内完成”仍是正向验收门。
+0.8.4 延续既有账号隔离、当前脚本完整性、B站投稿列表语义和分位数顺序门禁，并包含默认启用的微博 P1 公开 AJAX 采集器、小红书 P1 新旧主页状态批量采集器，以及四个平台的用户授权 Cookie 入口。小红书匿名卡片缺真实作品 ID 时只以披露的本地键保留 `PARTIAL` 样本；账号名发现由 Agent 统一搜索候选并核验身份，不从昵称拼造 ID。匿名登录墙只表示匿名工具受阻，验证码和频控仍按实际覆盖结束。PRD 的“明确最近 30 条”和“正常公开条件下 10 分钟内完成”仍是正向验收门。
 
 ## 2. 四层测试方法
 
@@ -25,11 +25,10 @@
 python3 -m pytest tests/ -q
 python3 tools/skill_eval/split_dataset.py --verify
 python3 tools/skill_eval/split_dataset.py --dry-run --strict
-python3 /Users/jack/.agents/skills/skill-creator/scripts/quick_validate.py skill
 git diff --check
 ```
 
-通过条件：pytest 退出码 0；数据集输出 `"verify": "PASS"`；严格划分退出码 0；Skill 校验通过；diff check 无空白错误。用例数以当次日志为准，不写死历史数字。
+再按 [部署清单](deployment-package-checklist.md) 把 `skill/` 复制为 `public-social-account-analyzer/` 后执行 Skill 结构校验。通过条件：pytest 退出码 0；数据集输出 `"verify": "PASS"`；严格划分退出码 0；Skill 校验通过；diff check 无空白错误。用例数以当次日志为准，不写死历史数字。
 
 P0 机器可读题集位于 `skill/evals/datasets/source/p0_cases.jsonl`，需求注册表位于 `skill/evals/datasets/p0_requirements.json`，覆盖报告位于 `skill/evals/datasets/p0_coverage.json`。测试/验证划分只能由 `split_dataset.py` 从 source 生成，不得手改 derived 文件。
 
@@ -122,7 +121,7 @@ AC-10 使用 `docs/guides/operations-trial-template.md`。只有真实运营人�
 ## 8. 发布前结论模板
 
 ```text
-版本：0.8.0
+版本：0.8.4
 Skill contract SHA-256：
 离线自动化：PASS / FAIL（pytest 数量：）
 数据集完整性：PASS / FAIL

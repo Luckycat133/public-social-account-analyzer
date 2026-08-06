@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from collectors._constants import STOP_LOGIN, STOP_VERIFICATION
+from collectors._constants import STOP_LOGIN, STOP_RATE_LIMITED, STOP_VERIFICATION
 from collectors.base import BaseCollector
 
 
@@ -1008,7 +1008,7 @@ def test_collect_post_detail_respects_the_browser_fallback_disable_switch(monkey
     [
         (401, "LOGIN_REQUIRED"),
         (403, STOP_ACCESS_RESTRICTED),
-        (429, STOP_ACCESS_RESTRICTED),
+        (429, STOP_RATE_LIMITED),
     ],
     ids=["401-login", "403-access-restricted", "429-rate-limited"],
 )
@@ -3895,7 +3895,7 @@ def test_restriction_priority_and_url_sanitization():
     [
         ("账号不存在，请先登录并完成滑动验证", STOP_VERIFICATION),
         ("访问过于频繁，请先登录", STOP_LOGIN),
-        ("请求频率过高，账号不存在", STOP_ACCESS_RESTRICTED),
+        ("请求频率过高，账号不存在", STOP_RATE_LIMITED),
         ("该账号已注销，暂无作品", STOP_ACCOUNT_UNAVAILABLE),
         ("该账号还没有发布公开作品", STOP_NO_PUBLIC_CONTENT),
     ],
@@ -3974,7 +3974,7 @@ def test_collect_account_page_returns_restriction_with_retained_items():
     [
         ("扫码登录", STOP_LOGIN, "LOGIN_WALL_VISIBLE"),
         ("请完成滑动验证", STOP_VERIFICATION, "VERIFICATION_CHALLENGE_VISIBLE"),
-        ("访问过于频繁", STOP_ACCESS_RESTRICTED, "ACCESS_RESTRICTION_VISIBLE"),
+        ("访问过于频繁", STOP_RATE_LIMITED, "RATE_LIMIT_VISIBLE"),
         ("该账号已注销", STOP_ACCOUNT_UNAVAILABLE, "ACCOUNT_UNAVAILABLE_VISIBLE"),
         ("暂无公开作品", STOP_NO_PUBLIC_CONTENT, "NO_PUBLIC_CONTENT_VISIBLE"),
     ],
@@ -4100,7 +4100,7 @@ def test_restriction_remains_authoritative_when_profile_snapshot_fails():
     [
         ("登录后查看", STOP_LOGIN),
         ("请完成滑动验证", STOP_VERIFICATION),
-        ("访问过于频繁", STOP_ACCESS_RESTRICTED),
+        ("访问过于频繁", STOP_RATE_LIMITED),
     ],
 )
 def test_terminal_page_cannot_bypass_visible_restriction(visible_text, expected):

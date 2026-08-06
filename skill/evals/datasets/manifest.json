@@ -1,7 +1,7 @@
 {
   "schema": "public-social-account-analyzer/eval-dataset-manifest@3",
-  "dataset_version": "0.3.0",
-  "generated_at": "2026-07-29T11:29:22+00:00",
+  "dataset_version": "0.4.0",
+  "generated_at": "2026-08-03T13:37:45+00:00",
   "generated_by": "tools/skill_eval/split_dataset.py",
   "paths": {
     "source": "source",
@@ -37,18 +37,18 @@
     {
       "dataset": "behavior_cases",
       "stratify_field": "category",
-      "total": 25,
-      "validation_count": 17,
+      "total": 26,
+      "validation_count": 18,
       "test_count": 8,
       "max_distribution_deviation": 0.2,
       "strata": [
         {
           "stratum": "boundary",
-          "total": 8,
+          "total": 7,
           "test": 2,
-          "validation": 6,
-          "test_ratio_actual": 0.25,
-          "deviation": 0.05
+          "validation": 5,
+          "test_ratio_actual": 0.2857,
+          "deviation": 0.0143
         },
         {
           "stratum": "compliance",
@@ -68,11 +68,11 @@
         },
         {
           "stratum": "happy_path",
-          "total": 5,
+          "total": 7,
           "test": 2,
-          "validation": 3,
-          "test_ratio_actual": 0.4,
-          "deviation": 0.1
+          "validation": 5,
+          "test_ratio_actual": 0.2857,
+          "deviation": 0.0143
         },
         {
           "stratum": "output_contract",
@@ -91,9 +91,9 @@
           "deviation": 0.2
         }
       ],
-      "validation_sha256": "09dfa38cde8466601ddf9ad79e6c9a43f6a1aebec5206d27926bcb3dae0ca17b",
-      "test_sha256": "747e208ffc0f313136f277de8d3364087b669a34705de353071882214cd5060a",
-      "source_sha256": "1c5cc0305a5889b1287fda2a76895ff5babbad3562579f492a915ae877411612"
+      "validation_sha256": "44c1f141adfda3614bc3707f646892694c34df489a0467b484c0c4766804c4fb",
+      "test_sha256": "4a980aa82a0eeb5893756f63129bc275bb7bc53d5c9e92c0fee2cf42e1814390",
+      "source_sha256": "0a67cfcb3bb19116dfaf5025717a1c92f4510a5488cd7dbb684d557f41e2fcf3"
     },
     {
       "dataset": "p0_cases",
@@ -144,25 +144,25 @@
           "deviation": 0.05
         }
       ],
-      "validation_sha256": "6ac26787a074fb9c781a9529be2726b5722823c38030d43ae68441e311d0ba01",
+      "validation_sha256": "fcfbc10935c9c8aed184190990c14518b73fa0aef53ecf7745e4409488f9ce53",
       "test_sha256": "1e51f1441e2c8104bc932de749327adc6d18a8da07530b0b2e85df1fc04a48a3",
-      "source_sha256": "696cdb965f5c3e6b96c3fc88a70e6ab65f394b71c35d80ca7f7bbec47da517c9"
+      "source_sha256": "79d76526c4311b148cc292e308689e3b4b6b63c257c975696c66e178a8c26e1f"
     },
     {
       "dataset": "trigger_should",
       "stratify_field": "platform",
-      "total": 15,
-      "validation_count": 11,
-      "test_count": 4,
-      "max_distribution_deviation": 0.1333,
+      "total": 20,
+      "validation_count": 14,
+      "test_count": 6,
+      "max_distribution_deviation": 0.2,
       "strata": [
         {
           "stratum": "bilibili",
-          "total": 6,
+          "total": 7,
           "test": 2,
-          "validation": 4,
-          "test_ratio_actual": 0.3333,
-          "deviation": 0.0333
+          "validation": 5,
+          "test_ratio_actual": 0.2857,
+          "deviation": 0.0143
         },
         {
           "stratum": "douyin",
@@ -173,33 +173,49 @@
           "deviation": 0.1333
         },
         {
+          "stratum": "other",
+          "total": 2,
+          "test": 1,
+          "validation": 1,
+          "test_ratio_actual": 0.5,
+          "deviation": 0.2
+        },
+        {
           "stratum": "weibo",
           "total": 3,
           "test": 1,
           "validation": 2,
           "test_ratio_actual": 0.3333,
           "deviation": 0.0333
+        },
+        {
+          "stratum": "xiaohongshu",
+          "total": 2,
+          "test": 1,
+          "validation": 1,
+          "test_ratio_actual": 0.5,
+          "deviation": 0.2
         }
       ],
-      "validation_sha256": "58814aed1b155a2d77e5da0ac981a01d67bbf001ab2581d40088adcd06097434",
-      "test_sha256": "c8057f4b682c5568c0806868125c40802a635a86b12663226280486e62649a01",
-      "source_sha256": "fdb7c1f3bb0d4e3882bd6072ad6181fc78452bd963e578a4f06fbbd5a2060ffb"
+      "validation_sha256": "07ed60b71df74abfa14516ffef011cc998e3eff3c355ae1a4096a0b61b9822c7",
+      "test_sha256": "e6d33626ebc5b0f825eda81fe3eafd1abb0488d35d8bea69b89391491109865b",
+      "source_sha256": "477234dcda847c0ffc2d7c9e5ace238c539e47fd90e0302faaa9826ae7c9fe86"
     },
     {
       "dataset": "trigger_should_not",
       "stratify_field": "category",
-      "total": 12,
-      "validation_count": 8,
-      "test_count": 4,
-      "max_distribution_deviation": 0.2,
+      "total": 10,
+      "validation_count": 7,
+      "test_count": 3,
+      "max_distribution_deviation": 0.05,
       "strata": [
         {
           "stratum": "non_analysis_request",
-          "total": 4,
-          "test": 2,
+          "total": 3,
+          "test": 1,
           "validation": 2,
-          "test_ratio_actual": 0.5,
-          "deviation": 0.2
+          "test_ratio_actual": 0.3333,
+          "deviation": 0.0333
         },
         {
           "stratum": "private_or_control",
@@ -211,22 +227,22 @@
         },
         {
           "stratum": "unsupported_scope",
-          "total": 4,
+          "total": 3,
           "test": 1,
-          "validation": 3,
-          "test_ratio_actual": 0.25,
-          "deviation": 0.05
+          "validation": 2,
+          "test_ratio_actual": 0.3333,
+          "deviation": 0.0333
         }
       ],
-      "validation_sha256": "a900b92acef4f20c53c43527cfb7dd87efc51b30b983236ae51117efdaa0823c",
-      "test_sha256": "2aaad59790914f40445e87b3fbf37dba37666944f78323335684bc29b93328a6",
-      "source_sha256": "f69abe34a18dd6f7ebb95907c728ffd17a9496c3fc0d6d31c7e1b134c07bc59c"
+      "validation_sha256": "bf51e77861e57435fce355bc74b83cceaebcad6ae4acba5521af6f04e6379f4b",
+      "test_sha256": "f8e9080269d4001c247bee8edce25f710f4b19b5aa93af64b508af9bdea7070a",
+      "source_sha256": "f9e8eee76be6615e064012de598d49f51f157313de4fdcbc0984b2747e529f15"
     }
   ],
   "p0_governance": {
     "requirements_path": "p0_requirements.json",
     "requirements_sha256": "44a1a8f2469b02ebec5be1bea02457415fa17209f0881643ec512dcc291b73bf",
     "coverage_path": "p0_coverage.json",
-    "coverage_sha256": "6045d6d479f8c64290496089da43b50b7277ef33bf567f6085eec99a6ddb6047"
+    "coverage_sha256": "4e8c8aed3defc105d9382c85c3a3c13823234855229b8bde2cbb8508a4b993a6"
   }
 }

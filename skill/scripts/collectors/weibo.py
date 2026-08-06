@@ -45,6 +45,7 @@ LOGIN_REQUIRED = "LOGIN_REQUIRED"
 VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
 ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
 ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
+RATE_LIMITED = "RATE_LIMITED"
 PARSER_FAILED = "PARSER_FAILED"
 NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
 UNSUPPORTED_PLATFORM = "UNSUPPORTED_PLATFORM"
@@ -129,6 +130,8 @@ def _http_get_text(
         # would block every name-based URL on the first redirect.
         if e.code in (401, 403):
             raise WeiboError(LOGIN_REQUIRED, f"微博要求登录/验证码 (HTTP {e.code}): {url}")
+        if e.code == 429:
+            raise WeiboError(RATE_LIMITED, f"微博请求频率受限 (HTTP 429): {url}")
         raise WeiboError(ACCESS_RESTRICTED, f"微博访问受限 (HTTP {e.code}): {url}")
     except urllib.error.URLError as e:
         raise WeiboError(ACCESS_RESTRICTED, f"微博网络不可达: {e}")
@@ -219,8 +222,61 @@ def _parse_weibo_time(s: Any) -> str | None:
         return None
 
 
-def _resolve_uid(url: str, fetch_text=None) -> str:
-    """从 URL 解析微博 uid；命名主页 best-effort 从主页 HTML 提取。"""
+def _extract_uid_candidates(page: str, name: str) -> list[str]:
+    """从命名主页 HTML 提取候选 uid，优先 handle 锚定的候选（去重保序）。
+
+    现代微博页面在带登录会话时会在 SSR 数据里先出现**当前浏览者**的 uid，
+    直接抓第一个 ``"uid"`` 会绑定到会话主人而不是目标账号。因此候选先取
+    与请求 handle（如 ``cctvnews``）出现在同一短窗内的 id/uid/u/<id>，
+    再退回通用 ``"uid"`` 候选，交给上层用 ``profile/info`` 回证。
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def push(uid: str) -> None:
+        if uid and uid not in seen:
+            seen.add(uid)
+            candidates.append(uid)
+
+    name_lower = name.lower()
+    # 1) handle 锚定：id/uid/u/<id> 附近 ±160 字符内出现请求的 handle
+    id_pattern = re.compile(r'(?:"(?:id|uid)"\s*:\s*"?(\d+)"?|/u/(\d+))')
+    for m in id_pattern.finditer(page):
+        uid = m.group(1) or m.group(2)
+        window = page[max(0, m.start() - 160): m.end() + 160]
+        if name_lower in window.lower():
+            push(uid)
+    # 2) 通用 "uid" 候选（作为后援；结果仍需回证身份）
+    for m in re.finditer(r'"uid"\s*:\s*"?(\d+)"?', page):
+        push(m.group(1))
+    return candidates
+
+
+def _uid_confirms_handle(cand: str, name: str, fetch_json) -> bool:
+    """profile/info 回证：该 uid 的账号 url/domain 是否就是请求的 handle。
+
+    返回 True 仅当返回用户的 ``domain`` 或 ``url`` 尾部精确等于 handle。
+    会话主人或占位账号不会命中，从而防止把命名主页绑定到错误账号。
+    """
+    data = fetch_json(f"https://weibo.com/ajax/profile/info?uid={cand}")
+    user = (data.get("data") or {}).get("user") or {}
+    if not user:
+        return False
+    domain = (user.get("domain") or "").strip().lower()
+    url = (user.get("url") or "").strip().rstrip("/").lower()
+    if domain == name.lower():
+        return True
+    if url.endswith("/" + name.lower()):
+        return True
+    return False
+
+
+def _resolve_uid(
+    url: str,
+    fetch_text=None,
+    fetch_json=None,
+) -> str:
+    """从 URL 解析微博 uid；命名主页提取候选后经 profile/info 回证身份。"""
     u = canonical_profile_url("weibo", url)
     if u is None:
         raise WeiboError(ACCOUNT_UNAVAILABLE, "不支持的微博公开账号 URL")
@@ -231,10 +287,26 @@ def _resolve_uid(url: str, fetch_text=None) -> str:
     if m and m.group(1) not in _RESERVED_SEGMENTS and m.group(1) != "u":
         name = m.group(1)
         page = (fetch_text or _http_get_text)(f"https://weibo.com/{name}")
-        uid_m = re.search(r'"uid"\s*:\s*"?(\d+)"?', page) or re.search(r"/u/(\d+)", page)
-        if uid_m:
-            return uid_m.group(1)
-        raise WeiboError(ACCOUNT_UNAVAILABLE, f"无法从微博主页解析 uid: {name}")
+        candidates = _extract_uid_candidates(page, name)
+        if not candidates:
+            if "login" in page.lower() or "登录" in page or "passport" in page.lower():
+                raise WeiboError(LOGIN_REQUIRED, f"微博命名主页要求登录，无法解析 uid: {name}")
+            raise WeiboError(ACCOUNT_UNAVAILABLE, f"无法从微博主页解析 uid: {name}")
+        if fetch_json is not None:
+            last_error: WeiboError | None = None
+            for cand in candidates:
+                try:
+                    if _uid_confirms_handle(cand, name, fetch_json):
+                        return cand
+                except WeiboError as exc:  # 回证时登录墙/频控按原 stop_reason 上抛
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
+            raise WeiboError(
+                ACCOUNT_UNAVAILABLE,
+                f"无法将命名主页 {name} 绑定到已解析的账号（身份未回证）",
+            )
+        return candidates[0]
     raise WeiboError(ACCOUNT_UNAVAILABLE, "不支持的微博公开账号 URL")
 
 
@@ -313,7 +385,7 @@ class WeiboCollector(BaseCollector):
         return _http_get_json(url)
 
     def _resolve_uid(self, url: str) -> str:
-        return _resolve_uid(url, self._get_text)
+        return _resolve_uid(url, self._get_text, self._get_json)
     # 与模块级 ENABLED 对齐；默认启用，可显式安全停用。
     ENABLED = ENABLED
 

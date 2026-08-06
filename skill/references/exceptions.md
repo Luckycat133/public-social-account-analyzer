@@ -1,14 +1,14 @@
 # 异常与优雅降级参考（状态机权威）
 
 > 本文件是 **行为语义（behavioral）** 的权威来源：规定在何种场景设置哪个 `task_status` / `stop_reason` / `collection_status`。
-> 枚举取值（名称与值）已冻结于 `data-schema.md` §9，本文件不得新增枚举；凡认为缺失的取值，应写入报告"关注项"而非新增到文档。
-> 本文件配套：`data-schema.md`（字段字典）、`analysis-rules.md`（指标与分类）。
+> 枚举字段见 [collection-schema.md](collection-schema.md) §9；本文件不另造状态值。
+> 字段与分析规则分别从 [data-schema.md](data-schema.md) 和 [analysis-rules.md](analysis-rules.md) 路由。
 
 ---
 
 ## 1. 统一决策表
 
-下表为所有已知异常的处置标准。字段取值严格取自 `data-schema.md` §9。
+下表为所有已知异常的处置标准。
 
 | 场景 | task_status | stop_reason | 是否保留已有数据 | 是否继续 |
 |---|---|---|---|---|
@@ -92,9 +92,9 @@
   数字异 ID 或其他同域页面也按 `INVALID_RESPONSE` 失败关闭。官方页面当前未列 URL 参数表，
   `cursor` / `count` 仍需真实凭据在线确认。
 - 授权入口不得接受已构造、可携带其他账号状态的 client 实例；它必须始终用上述两项环境
-  凭据构造 client，测试缝最多注入无账号状态的 transport。即使 client 层已经校验身份，
-  编排层仍须在请求作品页前再次确认归一化资料的 `account_id` 与输入 `open_id` 逐字一致；
-  不一致时写 `FAILED / OPENAPI_ERROR`、保持非穷尽且不得请求作品页。
+  凭据构造 client，测试缝最多注入无账号状态的 transport。client 在内存中精确回证
+  `open_id`；编排层再核对公开 `account_id` 与规范主页中的 `sec_uid`。任一绑定失败都写
+  `FAILED / OPENAPI_ERROR`、保持非穷尽且不得请求作品页；`open_id` 与 `union_id` 不进入产物。
 - OpenAPI 在第一页前失败时写标准空内容产物并标记 `FAILED / OPENAPI_ERROR`；已完成至少
   一页后失败时保留既有作品并标记 `PARTIAL / OPENAPI_ERROR`。
 - `--all` 遇游标不前进或连续两页没有新增作品时，以 `PARSER_FAILED` 停止；有既有作品为
@@ -167,7 +167,7 @@
 
 - `url`：出错对象的来源 URL（页面或内容详情页）。
 - `stage`：出错阶段，如 `collect_list`、`collect_post_detail`、`parse_profile`、`normalize`。
-- `error_code`：取自 §9.2 / §9.3 的枚举值（任务级或内容级）。
+- `error_code`：取自 [collection-schema.md](collection-schema.md) §9.2 / §9.3 的枚举值（任务级或内容级）。
 - `message`：人类可读的中文说明。
 - `occurred_at`：ISO 8601 带时区时间戳。
 - `retryable`：是否可在当前采集进程内安全重试。`false` 表示当前进程遇保护即断路；不禁止 Agent 按 Skill 规定等待后以新目录创建有界的新任务。

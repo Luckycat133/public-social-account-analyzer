@@ -40,6 +40,8 @@ from task_contract import (
     new_task_id,
     validate_analysis_goal,
 )
+from execution_timing import ExecutionTimer
+from skill_metadata import skill_contract_sha256, skill_release
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -785,6 +787,7 @@ def run(
     profile_collection_dir: str | None = None,
 ) -> dict[str, Any]:
     """Validate an evidence JSON file and write a partial task workspace."""
+    execution_timer = ExecutionTimer(wall_timezone=BEIJING)
     try:
         analysis_goal = validate_analysis_goal(analysis_goal)
     except TaskContractError as exc:
@@ -797,12 +800,13 @@ def run(
     except (OSError, json.JSONDecodeError) as exc:
         raise EvidenceError(f"无法读取 evidence JSON: {exc}") from exc
 
-    result = validate_evidence(
-        payload,
-        limit=limit,
-        date_from=date_from,
-        date_to=date_to,
-    )
+    with execution_timer.phase("validate"):
+        result = validate_evidence(
+            payload,
+            limit=limit,
+            date_from=date_from,
+            date_to=date_to,
+        )
     if profile_collection_dir is not None:
         overlay, overlay_provenance = _profile_overlay(
             profile_collection_dir,
@@ -818,26 +822,30 @@ def run(
         result["task"]["profile_overlay"] = overlay_info
     result["task"]["task_id"] = new_task_id("douyin")
     result["task"]["analysis_goal"] = analysis_goal
+    result["task"]["skill_release"] = skill_release()
+    result["task"]["skill_contract_sha256"] = skill_contract_sha256()
     out = os.path.abspath(out_dir)
     reservation: ImmutableWorkspace | None = None
     try:
-        reservation = ImmutableWorkspace.reserve(
-            out, allowed_artifacts=_INDEX_ARTIFACTS
-        )
-        with reservation.open_text("source/index-evidence.json") as handle:
-            handle.write(_json_text(result["evidence"]))
-        with reservation.open_text("source/profile.json") as handle:
-            handle.write(_json_text(result["profile"]))
-        posts_text = "".join(
-            json.dumps(post, ensure_ascii=False) + "\n"
-            for post in result["posts"]
-        )
-        with reservation.open_text("source/posts.jsonl") as handle:
-            handle.write(posts_text)
+        with execution_timer.phase("persist"):
+            reservation = ImmutableWorkspace.reserve(
+                out, allowed_artifacts=_INDEX_ARTIFACTS
+            )
+            with reservation.open_text("source/index-evidence.json") as handle:
+                handle.write(_json_text(result["evidence"]))
+            with reservation.open_text("source/profile.json") as handle:
+                handle.write(_json_text(result["profile"]))
+            posts_text = "".join(
+                json.dumps(post, ensure_ascii=False) + "\n"
+                for post in result["posts"]
+            )
+            with reservation.open_text("source/posts.jsonl") as handle:
+                handle.write(posts_text)
+            with reservation.open_text("collection-report.md") as handle:
+                handle.write(_report_text(result))
+        result["task"].update(execution_timer.snapshot())
         with reservation.open_text("task.json") as handle:
             handle.write(_json_text(result["task"]))
-        with reservation.open_text("collection-report.md") as handle:
-            handle.write(_report_text(result))
         reservation.commit()
     except WorkspaceCommitIndeterminate:
         raise

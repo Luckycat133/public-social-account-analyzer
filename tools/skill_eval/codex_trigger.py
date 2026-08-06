@@ -251,7 +251,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--skill-path", required=True)
     parser.add_argument("--project-root", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--model", default="gpt-5.6-terra")
+    parser.add_argument("--model", required=True)
     parser.add_argument("--reasoning-effort", default="low")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--workers", type=int, default=3)

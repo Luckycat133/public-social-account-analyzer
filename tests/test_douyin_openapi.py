@@ -42,7 +42,7 @@ def _profile_response(**overrides):
         "union_id": "owner-union-id",
         "nickname": "授权账号",
         "description": "公开简介",
-        "avatar": "https://example.test/avatar.png",
+        "avatar": "https://example.test/avatar.png?signature=private",
     }
     data.update(overrides)
     return {"err_no": 0, "data": data}
@@ -102,10 +102,13 @@ def test_profile_uses_fixed_official_endpoint_and_form_credentials():
         },
         "data": b"access_token=secret-openapi-token-123&open_id=owner-open-id",
     }]
-    assert profile["account_id"] == "owner-open-id"
+    assert profile["account_id"] == SEC_UID
     assert profile["account_name"] == "授权账号"
     assert profile["bio"] == "公开简介"
-    assert profile["platform_metrics"]["union_id"] == "owner-union-id"
+    assert profile["platform_metrics"]["avatar"] == "https://example.test/avatar.png"
+    assert "union_id" not in profile["platform_metrics"]
+    assert OPEN_ID not in json.dumps(profile, ensure_ascii=False)
+    assert "owner-union-id" not in json.dumps(profile, ensure_ascii=False)
     assert TOKEN not in transport.requests[0]["url"]
     assert TOKEN not in json.dumps(profile, ensure_ascii=False)
 
@@ -859,14 +862,21 @@ class _CompletedAuthorizedClient:
     def __init__(self, hook=None):
         self.hook = hook or (lambda stage: None)
         self.calls = []
+        self._verified_open_id = OPEN_ID
+
+    def is_profile_identity_verified(self, open_id):
+        return open_id == self._verified_open_id
 
     def collect_profile(self):
         self.calls.append("profile")
         self.hook("profile")
         return {
             "platform": "douyin",
-            "account_id": OPEN_ID,
+            "account_id": SEC_UID,
             "profile_url": f"https://www.douyin.com/user/{SEC_UID}",
+            "platform_metrics": {
+                "authorization_source": "douyin_openapi_token_owner",
+            },
             "field_visibility": {},
         }
 
@@ -893,6 +903,10 @@ def _completed_transport(hook=None):
 
 
 class _ForeignAuthorizedClient(_CompletedAuthorizedClient):
+    def __init__(self):
+        super().__init__()
+        self._verified_open_id = "foreign-open-id"
+
     def collect_profile(self):
         self.calls.append("profile")
         return {
@@ -1412,6 +1426,10 @@ def test_authorized_task_persists_task_id_and_analysis_goal(tmp_path):
     task = json.loads((out_dir / "task.json").read_text(encoding="utf-8"))
     assert task["analysis_goal"] == "分析授权账号作品节奏"
     assert isinstance(task["task_id"], str) and task["task_id"]
+    assert task["skill_release"] == (
+        Path(__file__).parents[1] / "skill" / "VERSION"
+    ).read_text(encoding="utf-8").strip()
+    assert len(task["skill_contract_sha256"]) == 64
 
 
 @pytest.mark.parametrize(

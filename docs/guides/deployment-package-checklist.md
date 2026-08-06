@@ -18,14 +18,19 @@
 ```bash
 python3 -m pytest tests/ -q
 python3 tools/skill_eval/split_dataset.py --verify
-python3 /Users/jack/.agents/skills/skill-creator/scripts/quick_validate.py skill
 git diff --check
+
+skill_creator_dir="${SKILL_CREATOR_DIR:?set SKILL_CREATOR_DIR to the skill-creator root}"
+validation_root=$(mktemp -d)
+cp -R skill "$validation_root/public-social-account-analyzer"
+python3 "$skill_creator_dir/scripts/quick_validate.py" \
+  "$validation_root/public-social-account-analyzer"
 ```
 
 再确认版本一致：
 
 ```bash
-rg -n 'version =|_SKILL_RELEASE|^0\.' pyproject.toml skill/VERSION skill/scripts/collect.py
+rg -n 'version =|^0\.' pyproject.toml skill/VERSION
 ```
 
 四项检查任一失败即停止发布。线上平台可访问性、字段人工准确率、真实 OAuth 与运营试用是独立外部验收，不能由这些命令替代。
@@ -37,7 +42,8 @@ rg -n 'version =|_SKILL_RELEASE|^0\.' pyproject.toml skill/VERSION skill/scripts
 ```bash
 package_tmp=$(mktemp -d)
 cp -R skill "$package_tmp/public-social-account-analyzer"
-cd /Users/jack/.agents/skills/skill-creator
+skill_creator_dir="${SKILL_CREATOR_DIR:?set SKILL_CREATOR_DIR to the skill-creator root}"
+cd "$skill_creator_dir"
 python3 -m scripts.package_skill \
   "$package_tmp/public-social-account-analyzer" \
   /absolute/path/to/repository/dist
@@ -67,6 +73,6 @@ python3 <installed-skill>/scripts/collect.py --help
 | 现象 | 处理 |
 | --- | --- |
 | CLI 缺参数或引用文件缺失 | 重新安装当前 `.skill` 或修复软链接后再验证。 |
-| 版本不一致 | 以 `pyproject.toml`、`skill/VERSION` 与 `collect.py` 的 `_SKILL_RELEASE` 为同一发布单元同步。 |
+| 版本不一致 | 同步 `pyproject.toml` 与 `skill/VERSION`；采集入口从包内 `VERSION` 读取版本，不保留第二份代码常量。 |
 | 测试失败 | 在仓库修复后重新打包；不在部署副本直接修改。 |
 | 已存在旧 workspace | 保留为历史证据；新任务使用新输出目录，不能覆盖或把旧字节伪装成当前提交。 |

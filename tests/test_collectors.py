@@ -262,7 +262,7 @@ def test_repost_excluded_from_valid():
 
 
 def test_failed_status_excluded_from_valid():
-    # FAILED / DELETED 不参与默认统计（analysis-rules.md §1）
+    # FAILED / DELETED 不参与默认统计（metrics-and-sampling.md §1）
     posts = [
         _post("1"),
         _post("2", collection_status="FAILED"),

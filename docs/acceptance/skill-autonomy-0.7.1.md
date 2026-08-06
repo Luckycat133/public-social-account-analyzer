@@ -51,6 +51,6 @@ YouTube 等平台优先 RSS/Feed；快速任务先争取约 10–20 条同口径
 
 ## 复现入口
 
-当前题目和断言定义位于 `skill/evals/evals.json` 与 `skill/evals/cases.md`；评测执行与严格聚合
+当前题目和断言已合并到 `skill/evals/evals.json`；评测执行与严格聚合
 方法见 `docs/guides/skill-development-workflow.md`。新一轮必须使用干净上下文、保存实际
 `SKILL.md` SHA-256，并把有 Skill 与对照配置在同一批次运行。

@@ -1239,6 +1239,8 @@ class BilibiliCollector(BaseCollector):
         s.ensure_buvid()
         self._collection_coverage = {
             "regular_observed_count": 0,
+            "dynamic_status": "NOT_ATTEMPTED",
+            "dynamic_observed_count": 0,
             "buvid_established": getattr(s, "_buvid_established", None),
         }
 

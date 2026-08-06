@@ -10,12 +10,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [2. Build, test, and common commands](#2-build-test-and-common-commands)
 - [3. Pipeline architecture (the big picture)](#3-pipeline-architecture-the-big-picture)
 - [4. Key modules and contracts](#4-key-modules-and-contracts)
-- [5. Compliance boundaries (always enforce)](#5-compliance-boundaries-always-enforce)
-- [6. Deployment + drift detection](#6-deployment--drift-detection)
-- [7. Acceptance evidence (PRD AC-01…AC-10)](#7-acceptance-evidence-prd-ac-01ac-10)
-- [8. Coding conventions](#8-coding-conventions)
-- [9. Commit conventions](#9-commit-conventions)
-- [10. Useful pointers](#10-useful-pointers)
+- [5. Deployment + drift detection](#5-deployment--drift-detection)
+- [6. Acceptance evidence (PRD AC-01…AC-10)](#6-acceptance-evidence-prd-ac-01ac-10)
+- [7. Coding conventions](#7-coding-conventions)
+- [8. Commit conventions](#8-commit-conventions)
+- [9. Useful pointers](#9-useful-pointers)
 
 ## 1. Project shape
 
@@ -26,7 +25,7 @@ Public social-account content analyzer. Two-tier layout:
 
 Project runs on **Python 3.9+ stdlib only** (no third-party runtime imports). Tests need `pytest`. Production code never calls an LLM; the Agent executes classification/business-insight steps through external JSON files.
 
-If `.agents/skills/`, `.claude/skills/`, or `.workbuddy/skills/` exist in the repo, they are deployment-time symlinks — see [docs/guides/deployment-package-checklist.md](docs/guides/deployment-package-checklist.md) and §6 below.
+If `.agents/skills/`, `.claude/skills/`, or `.workbuddy/skills/` exist in the repo, they are deployment-time symlinks — see [docs/guides/deployment-package-checklist.md](docs/guides/deployment-package-checklist.md) and §5 below.
 
 ---
 
@@ -102,8 +101,8 @@ Key invariants:
 
 | Module | Purpose |
 |---|---|
-| `skill/scripts/collect.py` | CLI router; picks adapter; writes collection workspace. Flags: `--limit`, `--all`, `--enrich-details`, `--resume`, `--resume-out`, `--since`, `--comments`, `--out`, `--no-browser-fallback`, `--date-from`, `--date-to`. |
-| `skill/scripts/run_pipeline.py` | One-shot normalize+analyze+render. Flags: `--input`, `--output`, `--with-llm-tax`, `--classification-results`, `--with-business-insights`, `--business-insight-results`. |
+| `skill/scripts/collect.py` | CLI router; picks adapter and writes a collection workspace. Supports explicit limits/date windows, B站/抖音 bounded-complete mode, resume/checkpoint, platform Cookie files, opt-in private persistence and cache revocation. |
+| `skill/scripts/run_pipeline.py` | One-shot normalize+analyze+render. Supports evidence-only, taxonomy, business, comment and strict delivery-ready gates. |
 | `skill/scripts/collect_douyin_authorized.py` | Authorized OpenAPI path; requires `DOUYIN_OPENAPI_OPEN_ID` + `DOUYIN_OPENAPI_ACCESS_TOKEN` env (token must not enter URLs/logs/artifacts). |
 | `skill/scripts/import_index_snapshot.py` | Imports Web-index evidence (官方精选 / 主页搜索索引) into a `PARTIAL` workspace when direct collection had blocked. |
 | `skill/scripts/csv_contract.py` | CSV field schema; cell-level type/effective checks. |
@@ -112,42 +111,29 @@ Key invariants:
 | `skill/scripts/task_contract.py` | Single source of truth for `TASK_STATUSES`, `STOP_REASONS`, `LABEL_MISSING="null"`, `LABEL_UNKNOWN="INVALID"`, `ANALYZABLE_TASK_STATUSES`, `safe_*_label`, `validate_analysis_goal`, `new_task_id`. **Always import from here; do not redeclare.** |
 | `skill/scripts/collectors/base.py` | `BaseCollector` ABC: `supports`, `check_access`, `collect_profile`, `collect_post_list`, `collect_post_detail`, `collect_comments`, `get_collection_coverage`, `normalize_profile`, `normalize_post`. `_canon_status_with_source` makes missing/invalid `collection_status` → `PARTIAL` (never invented success). |
 | `skill/scripts/collectors/_constants.py` | `STOP_*` single-string constants used by adapters. |
-| `skill/scripts/collectors/bilibili.py` | Bilibili adapter: 3-tier endpoint fallback (`medialist` → `arc/wbi` → `search/type`); platform-protection response aborts the task. |
+| `skill/scripts/collectors/bilibili.py` | Bilibili adapter: `medialist` with WBI `arc/search` fallback; platform-protection responses abort the current task. |
 | `skill/scripts/collectors/douyin.py` | Douyin public adapter: SSR variants + `--all` bounded scrolling + optional browser fallback. |
 | `skill/scripts/collectors/douyin_openapi.py` | Douyin OpenAPI adapter (post-OAuth). |
 | `skill/scripts/collectors/weibo.py` | Weibo adapter, env-gated (`WEIBO_COLLECTOR_ENABLED`). |
+| `skill/scripts/collectors/xiaohongshu.py` | Xiaohongshu adapter for account-bound legacy/modern embedded profile state and partial public cards. |
+| `skill/scripts/collectors/cookie_loader.py` / `_cookie_storage.py` | Platform-isolated Cookie validation plus opt-in atomic `0600` cache storage and revocation. |
 | `skill/scripts/collectors/browser_backend.py` | Headless browser transport — only used by fallback path; never persists cookies/headers/bodies. |
 | `skill/scripts/collectors/url_policy.py` | URL allowlist / canonicalization. |
 | `skill/scripts/collectors/_douyin_browser_transport.py` / `_douyin_detail_contract.py` | Internal helpers for browser fallback and detail contract. |
 
 `skill/references/` holds the per-platform and per-feature rules that `BaseCollector` consumers must satisfy:
 
-- `data-schema.md` — unified Profile/Post schema, `collection_status` enum.
-- `analysis-rules.md` — engagement-rate four-quadrant, IQR, cadence, semantics.
+- `data-schema.md` — router for artifact, collection and analysis schemas.
+- `analysis-rules.md` — router for metrics/sampling, model insights and comment insights.
 - `exceptions.md` — `stop_reason` ↔ adapter mapping.
 - `platforms/` — per-platform constraints.
 - `douyin-index-evidence.md` — Web-index import contract.
 
----
-
-## 5. Compliance boundaries (always enforce)
-
-Non-negotiable; listed in `SKILL.md`, `README.md`, and `docs/prd/需求实现状态与抖音能力边界.md`:
-
-1. **Anonymous path = no login.** Never store credentials, never bypass CAPTCHA/login-wall/rate-limit. Stop on `LOGIN_REQUIRED` / `VERIFICATION_REQUIRED` / `RATE_LIMITED` / `ACCESS_RESTRICTED`.
-2. **No private backend metrics.** Never collect views, conversions, follower demographics, or DMs.
-3. **No account takeover.** No auto-post / reply / DM.
-4. **`null` is not `0`.** Only write `0` when the public page shows zero. Missing/unknown → `null` (rendered as the literal string `"null"`, never collapsed to zero).
-5. **Pinned / repost / promoted** are tri-state: `true` / `false` / `null` based on explicit evidence.
-6. **Single source of truth for enums.** `TASK_STATUSES`, `STOP_REASONS`, `LABEL_MISSING`, `LABEL_UNKNOWN` live in `task_contract.py`. Use `safe_*_label` for messages; bare "null" / "INVALID" must never be treated as a real enum value downstream.
-7. **Tokens never leave the runtime.** OpenAPI access token + `open_id` come from env, never URL/log/artifact. userinfo uses form-encoded body; `video.list` uses JSON `Content-Type` + `access-token` header. userinfo must echo the exact `open_id`.
-8. **Douyin `--all` is bounded.** Budgets (`--max-items`, `--max-seconds`, `--max-scrolls`) and per-candidate owner+item+alias+pagination audits are mandatory. `is_exhaustive=true` only when all candidates agree + a verified terminal page is observed. Any protection stop → `is_exhaustive=false`.
-9. **Douyin browser fallback is experimental.** Triggered only when SSR is missing or unrecognized. Empty list → `NO_PUBLIC_CONTENT` (no browser). Visible protection page → fixed `restriction_source` + `restriction_marker` enum only — no raw page text persisted. `SOCIAL_BROWSER_FALLBACK=0` / `--no-browser-fallback` disables it. Never forges signatures, replays cookies, or bypasses challenge pages.
-10. **Reports must include the disclaimer** "公开页面快照，不代表账号后台真实曝光和转化" for anonymous sources; OpenAPI source uses a dedicated disclaimer instead of the anonymous one.
+Behavior and security policy is defined by `skill/SKILL.md` plus these focused references. Preserve account binding, nullable evidence, protection-stop semantics, credential isolation and immutable output boundaries when changing code; do not duplicate those contracts in this contributor guide.
 
 ---
 
-## 6. Deployment + drift detection
+## 5. Deployment + drift detection
 
 Three known deployment surfaces:
 
@@ -168,7 +154,7 @@ If deploying via symlink, drift is automatic — the checklist still verifies th
 
 ---
 
-## 7. Acceptance evidence (PRD AC-01…AC-10)
+## 6. Acceptance evidence (PRD AC-01…AC-10)
 
 - **AC-01 / AC-02** are demonstrated by `workspace/<platform>-<id>-<date>/` directories with valid `.complete` and `manifest.json`.
 - **AC-03 / AC-06** use `tests/manual_accuracy_check.py prepare` + `verify` subcommands. Both must be bound to two immutable commits (collection + analysis). Source↔CSV self-consistency is **not** a human-truth substitute.
@@ -178,7 +164,7 @@ Do not mark any AC PASS with placeholder evidence or duplicate IDs.
 
 ---
 
-## 8. Coding conventions
+## 7. Coding conventions
 
 - 4-space indent, `snake_case` functions/vars/modules, `PascalCase` classes, `UPPER_SNAKE_CASE` constants, leading underscore for private helpers.
 - Type hints on public interfaces; short docstrings stating the behavioral contract.
@@ -188,7 +174,7 @@ Do not mark any AC PASS with placeholder evidence or duplicate IDs.
 
 ---
 
-## 9. Commit conventions
+## 8. Commit conventions
 
 History uses Conventional Commits with scopes:
 
@@ -208,7 +194,7 @@ chore: ...
 
 ---
 
-## 10. Useful pointers
+## 9. Useful pointers
 
 - PRD: `docs/prd/公开社交媒体账号内容分析Skill-产品需求文档-V1.0.docx`
 - PRD ↔ implementation matrix: `docs/prd/需求实现状态与抖音能力边界.md`

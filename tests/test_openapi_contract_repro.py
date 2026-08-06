@@ -102,27 +102,17 @@ def test_safe_error_codes_whitelist_exists():
         )
 
 
-def test_orchestration_layer_rechecks_identity():
-    """collect_douyin_authorized.py 在请求作品页前必须再次独立校验
-    account_id == expected_open_id,即使 client 层已经校验过。
-    iter-2 / CASE-019: 'client 层已经校验身份,编排层仍须在请求作品页前
-    再次确认归一化资料的 account_id 与输入 open_id 逐字一致'。
-
-    允许 `account_id != expected_open_id` 与 `account_id == expected_open_id`
-    任一顺序(raise/return 配 != ,正向 gate 用 ==)。
-    """
+def test_orchestration_layer_rechecks_private_and_public_identity_bindings():
+    """编排层分别核验私有 OAuth 身份和公开 sec_uid 主页绑定。"""
     src = AUTHORIZED.read_text(encoding="utf-8")
     assert "account_id" in src, "collect_douyin_authorized.py 缺少 account_id"
     assert "expected_open_id" in src, (
         "collect_douyin_authorized.py 缺少 expected_open_id 参数/字段"
     )
-    # 逐字比较: != 或 == 任一
-    has_compare = re.search(
-        r"account_id\s*(!=|==)\s*expected_open_id", src
-    )
-    assert has_compare, (
-        "编排层必须存在 account_id 与 expected_open_id 的逐字比较, "
-        "防止 client 层独断。实际期望的写法: account_id != expected_open_id"
+    assert "identity_checker(expected_open_id)" in src
+    assert 'canonical_profile.rsplit("/", 1)[-1] != account_id' in src
+    assert not re.search(r"account_id\s*(!=|==)\s*expected_open_id", src), (
+        "公开 account_id 是 sec_uid，不得与私有 open_id 混为同一字段"
     )
 
 

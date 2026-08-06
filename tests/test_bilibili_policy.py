@@ -130,6 +130,58 @@ def test_complete_collection_accepts_more_than_limited_mode_ceiling(monkeypatch)
     assert collector.get_collection_coverage()["is_exhaustive"] is True
 
 
+def test_limited_collection_emits_complete_bilibili_coverage_ledger(monkeypatch):
+    """A successful limited collection must remain consumable by analysis."""
+    collector = BilibiliCollector()
+
+    class LimitedSession:
+        _buvid_established = True
+
+        def ensure_buvid(self):
+            return None
+
+        def discover_medialist(self, mid, limit, date_range=None):
+            assert (mid, limit, date_range) == ("123", 1, None)
+            return [
+                {
+                    "bv_id": "BV1limited",
+                    "title": "limited post",
+                    "pubtime": 1_700_000_000,
+                    "cnt_info": {},
+                }
+            ]
+
+        def get_discovery_coverage(self):
+            return {
+                "terminal_page_observed": False,
+                "observed_page_count": 1,
+                "observed_post_count": 1,
+                "stop_condition": "limit",
+            }
+
+        def collect_pinned(self, mid):
+            assert mid == "123"
+            return False, None
+
+        def collect_tags(self, bvid):
+            assert bvid == "BV1limited"
+            return []
+
+    monkeypatch.setattr(collector, "_new_session", LimitedSession)
+
+    posts = collector.collect_post_list(
+        "https://space.bilibili.com/123",
+        limit=1,
+    )
+
+    assert len(posts) == 1
+    coverage = collector.get_collection_coverage()
+    assert coverage["regular_source"] == "medialist"
+    assert coverage["regular_observed_count"] == 1
+    assert coverage["dynamic_status"] == "NOT_ATTEMPTED"
+    assert coverage["dynamic_observed_count"] == 0
+
+
 def test_platform_rate_limit_stops_without_retry_identity_rotation_or_browser(
     monkeypatch,
 ):

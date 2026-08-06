@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         "--douyin-cookie-file",
         type=Path,
         default=None,
-        help="用户授权的抖音 Cookie 文件；仅在进程内读取，不写入采集工作区",
+        help="用户授权的抖音 Cookie 文件；默认仅注入该任务临时浏览器。",
     )
     args = parser.parse_args(argv)
     try:

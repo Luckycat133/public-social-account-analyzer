@@ -7,6 +7,7 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -16,7 +17,11 @@ from collectors.weibo import (
     WeiboError,
     LOGIN_REQUIRED,
     ADAPTER_UNAVAILABLE,
+    ACCOUNT_UNAVAILABLE,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_weibo_is_enabled_by_default(monkeypatch):
@@ -29,7 +34,7 @@ def test_weibo_is_enabled_by_default(monkeypatch):
             "import sys; sys.path.insert(0, 'skill/scripts'); "
             "from collectors.weibo import ENABLED; raise SystemExit(not ENABLED)",
         ],
-        cwd="/Users/jack/Documents/public-social-account-analyzer",
+        cwd=REPO_ROOT,
         env={key: value for key, value in os.environ.items()
              if key != "WEIBO_COLLECTOR_ENABLED"},
         check=False,
@@ -315,3 +320,122 @@ def test_weibo_401_still_triggers_login_required():
         weibo_mod.urllib.request.urlopen = original
 
     assert exc_info.value.stop_reason == "LOGIN_REQUIRED"
+
+
+def test_weibo_429_maps_to_rate_limited(monkeypatch):
+    import urllib.error
+
+    from collectors.weibo import WeiboError, _http_get_text
+
+    def fake_urlopen(_req, timeout=None):
+        raise urllib.error.HTTPError(
+            "https://weibo.com/u/123456",
+            429,
+            "Too Many Requests",
+            None,
+            None,
+        )
+
+    monkeypatch.setattr("collectors.weibo.urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(WeiboError) as exc_info:
+        _http_get_text("https://weibo.com/u/123456")
+
+    assert exc_info.value.stop_reason == "RATE_LIMITED"
+
+
+# ---------------------------------------------------------------------------
+# 命名主页 UID 身份绑定（真实 smoke 发现：带 cookie 页面首个 "uid" 是会话主人）
+# ---------------------------------------------------------------------------
+
+_SESSION_UID_FIRST_PAGE = """
+<script>window.__INITIAL_STATE__={"user":{"id":0,"screen_name":"...","url":"https://weibo.com/u/7962883086"},
+"uid":7962883086,"isLogin":true,"env":{"uid":7962883086}}</script>
+<div class="profile">{"domain":"cctvnews","screen_name":"央视新闻","url":"https://weibo.com/cctvnews","id":1686546714}</div>
+"""
+
+
+def _page_fetcher(page_text):
+    def fetch_text(url):
+        return page_text
+    return fetch_text
+
+
+def _verified_fetch_json(profiles: dict):
+    """profile/info 回证器：按 uid 返回预设 user；未预置则返回空 user。"""
+    def fetch_json(url):
+        for uid, user in profiles.items():
+            if f"uid={uid}" in url:
+                return {"data": {"user": user}}
+        return {"data": {"user": {}}}
+    return fetch_json
+
+
+def test_named_page_skips_session_uid_and_binds_owner_via_verification():
+    """首个 uid 是会话主人时必须通过 profile/info 回证绑定到 handle 主人。"""
+    fetch_text = _page_fetcher(_SESSION_UID_FIRST_PAGE)
+    fetch_json = _verified_fetch_json({
+        "7962883086": {"id": 7962883086, "screen_name": "用户7962883086",
+                       "url": "https://weibo.com/u/7962883086", "domain": ""},
+        "1686546714": {"id": 1686546714, "screen_name": "央视新闻",
+                       "url": "https://weibo.com/cctvnews", "domain": "cctvnews"},
+    })
+    uid = weibo._resolve_uid("https://weibo.com/cctvnews", fetch_text, fetch_json)
+    assert uid == "1686546714"
+
+
+def test_named_page_owner_uid_alone_resolves_when_verified():
+    """只有 handle 锚定的 owner uid 时，回证通过即返回该 uid。"""
+    page = '<div id="profile">{"id":1686546714,"domain":"cctvnews","url":"https://weibo.com/cctvnews"}</div>'
+    fetch_json = _verified_fetch_json({
+        "1686546714": {"id": 1686546714, "domain": "cctvnews",
+                       "url": "https://weibo.com/cctvnews"},
+    })
+    assert weibo._resolve_uid("https://weibo.com/cctvnews", _page_fetcher(page), fetch_json) == "1686546714"
+
+
+def test_named_page_unverified_session_uid_fails_honestly():
+    """页面只有会话主人 uid 且回证不匹配时，绝不返回错误账号，如实失败。"""
+    page = '<script>window.__INITIAL_STATE__={"uid":7962883086,"isLogin":true}</script>'
+    fetch_json = _verified_fetch_json({
+        "7962883086": {"id": 7962883086, "screen_name": "用户7962883086",
+                       "url": "https://weibo.com/u/7962883086", "domain": ""},
+    })
+    with pytest.raises(WeiboError) as exc:
+        weibo._resolve_uid("https://weibo.com/cctvnews", _page_fetcher(page), fetch_json)
+    assert exc.value.stop_reason == ACCOUNT_UNAVAILABLE
+    assert "身份未回证" in str(exc.value)
+
+
+def test_named_page_login_stub_raises_login_required():
+    """匿名访问命名主页拿到登录 stub 时上报 LOGIN_REQUIRED 而非 ACCOUNT_UNAVAILABLE。"""
+    stub = '<html><head><title>登录</title></head><body><script>window.location.href="passport.weibo.com"</script></body></html>'
+    with pytest.raises(WeiboError) as exc:
+        weibo._resolve_uid("https://weibo.com/cctvnews", _page_fetcher(stub), None)
+    assert exc.value.stop_reason == LOGIN_REQUIRED
+
+
+def test_named_page_verification_propagates_login_wall():
+    """回证 profile/info 遇到登录墙时保留 LOGIN_REQUIRED，不降级为找不到账号。"""
+    def fetch_json(url):
+        raise WeiboError(LOGIN_REQUIRED, "微博公开接口要求登录")
+    with pytest.raises(WeiboError) as exc:
+        weibo._resolve_uid("https://weibo.com/cctvnews", _page_fetcher(_SESSION_UID_FIRST_PAGE), fetch_json)
+    assert exc.value.stop_reason == LOGIN_REQUIRED
+
+
+def test_numeric_uid_never_fetches_html():
+    """数字 UID 主页不请求 HTML，也不触发回证。"""
+    calls = []
+
+    def fetch_text(url):
+        calls.append(url)
+        return ""
+
+    def fetch_json(url):
+        calls.append(url)
+        return {}
+
+    uid = weibo._resolve_uid("https://weibo.com/u/123456", fetch_text, fetch_json)
+    assert uid == "123456"
+    assert calls == []

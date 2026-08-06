@@ -35,7 +35,6 @@ from datetime import datetime, timezone, timedelta
 # 以支持采集器内的平级 `from base import` / `from bilibili import`。
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COLLECTORS = os.path.join(_HERE, "collectors")
-_SKILL_RELEASE = "0.8.1"
 for _p in (_COLLECTORS, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -82,7 +81,6 @@ from immutable_workspace import (  # noqa: E402
     ensure_container,
     preflight_backend,
     reject_workspace_overlap,
-    verify_committed_workspace,
 )
 from task_contract import (  # noqa: E402
     TaskContractError,
@@ -93,9 +91,10 @@ from task_contract import (  # noqa: E402
 )
 from csv_contract import deserialize_csv_row, serialize_csv_row  # noqa: E402
 from execution_timing import ExecutionTimer  # noqa: E402
+from skill_metadata import skill_contract_sha256, skill_release  # noqa: E402
 from normalize import dedup_posts, to_bool_flag  # noqa: E402
 
-# 北京时间为中国平台默认时区(见 references/data-schema.md §1)
+# 北京时间为中国平台默认时区（见 references/artifact-contract.md §1）
 _BEIJING = timezone(timedelta(hours=8))
 
 
@@ -122,7 +121,21 @@ def canonicalize_entry_url(value: str, redirect_resolver=None) -> str:
         )
     return value
 
-# 任务级 stop_reason 取值,严格对齐 references/exceptions.md §9.2 / references/data-schema.md §9.2
+
+def _url_defaults_to_complete_collection(value: str) -> bool:
+    """Choose implicit complete mode only for adapters that implement it."""
+    try:
+        host = urllib.parse.urlsplit(value.strip()).hostname
+    except (AttributeError, ValueError):
+        return False
+    return host in {
+        "space.bilibili.com",
+        "b23.tv",
+        "www.douyin.com",
+        "v.douyin.com",
+    }
+
+# 任务级 stop_reason 语义对齐 references/exceptions.md §1；枚举见 collection-schema.md §9.2
 SR_UNSUPPORTED = "UNSUPPORTED_PLATFORM"
 SR_ADAPTER_UNAVAILABLE = "ADAPTER_UNAVAILABLE"
 SR_LOGIN = "LOGIN_REQUIRED"
@@ -267,7 +280,7 @@ def _pick(adapters: list[BaseCollector], url: str) -> BaseCollector | None:
 
 def _vis_count(profile: dict) -> int:
     vis = profile.get("field_visibility") or {}
-    # field_visibility 取值规范为 visible/hidden/partial(见 data-schema.md §8)，做对 "public" 的向下兼容兜底
+    # field_visibility 取值见 collection-schema.md §8；保留对 "public" 的兼容兜底
     return sum(1 for v in vis.values() if v in ("visible", "partial", "public"))
 
 
@@ -424,14 +437,25 @@ def _valid_comment_parent(platform: str, post: dict) -> tuple[str, str] | None:
 
 
 def _canonicalize_post_urls(platform: str, posts: list[dict]) -> None:
-    """Canonicalize valid item evidence and null every untrusted URL value."""
+    """Canonicalize item evidence and disclosed profile-card source anchors."""
     for post in posts:
         post_id = str(post.get("post_id") or "").strip()
         post["post_url"] = canonical_item_url(
             platform, post.get("post_url"), post_id
         )
-        post["source_url"] = canonical_item_url(
+        item_source_url = canonical_item_url(
             platform, post.get("source_url"), post_id
+        )
+        metrics = post.get("platform_metrics")
+        profile_card_anchor = (
+            isinstance(metrics, dict)
+            and metrics.get("local_record_key") is True
+            and metrics.get("item_url_known") is False
+        )
+        post["source_url"] = item_source_url or (
+            canonical_profile_url(platform, post.get("source_url"))
+            if profile_card_anchor
+            else None
         )
 
 
@@ -524,6 +548,20 @@ _CHECKPOINT_STAGE = "POST_LIST_COLLECTED"
 
 def _repository_root() -> str:
     return os.path.dirname(os.path.dirname(_HERE))
+
+
+def _repository_root_cookie_root() -> str | None:
+    """Return the workspace root used as the default Cookie persistence path.
+
+    Returns None when the ``workspace/`` directory cannot be created in the
+    repository root (e.g. read-only deployment), in which case Cookie
+    persistence and auto-load are silently disabled.
+    """
+    try:
+        container = ensure_container(os.path.join(_repository_root(), "workspace"))
+    except WorkspaceError:
+        return None
+    return container
 
 
 def _track_reservation(
@@ -619,12 +657,6 @@ def _reserve_resume_workspace(
     source = os.path.abspath(source_workspace)
     return _reserve_unique_workspace(
         os.path.dirname(source), f"{os.path.basename(source)}-resume-{date}"
-    )
-
-
-def _verify_public_workspace(path: str) -> dict:
-    return verify_committed_workspace(
-        path, allowed_artifacts=_PUBLIC_ARTIFACTS
     )
 
 
@@ -1393,16 +1425,6 @@ def _safe_platform_response_code(value) -> int | None:
     return None
 
 
-def _skill_contract_sha256() -> str:
-    """Fingerprint the exact SKILL.md shipped beside this collector."""
-    contract = os.path.join(os.path.dirname(_HERE), "SKILL.md")
-    try:
-        with open(contract, "rb") as handle:
-            return hashlib.sha256(handle.read()).hexdigest()
-    except OSError:
-        return hashlib.sha256(b"").hexdigest()
-
-
 def _sanitize_report_error(value) -> dict:
     """Map an internal/adaptor error to the report's fixed public vocabulary."""
     source = value if isinstance(value, dict) else {}
@@ -1702,8 +1724,8 @@ def _write_task_json(
     """落盘 task.json(任务状态与停止原因,见 SKILL.md「任务状态与停止原因」)。"""
     payload = {
         "task_id": task_id,
-        "skill_release": _SKILL_RELEASE,
-        "skill_contract_sha256": _skill_contract_sha256(),
+        "skill_release": skill_release(),
+        "skill_contract_sha256": skill_contract_sha256(),
         "platform": platform,
         "profile_url": _safe_public_url(profile_url),
         "requested_limit": requested_limit,
@@ -1933,6 +1955,8 @@ def run(
     bilibili_cookie_file: str | None = None,
     weibo_cookie_file: str | None = None,
     xiaohongshu_cookie_file: str | None = None,
+    persist_cookie: bool = False,
+    cookie_workspace_root: str | None = None,
     redirect_resolver=None,
 ) -> int:
     execution_timer = ExecutionTimer(wall_timezone=_BEIJING)
@@ -2111,7 +2135,12 @@ def run(
             print("[FAILED] checkpoint 无法安全核验", file=sys.stderr)
             return 2
 
-    from collectors.cookie_loader import load_cookie_records
+    from collectors.cookie_loader import (
+        load_cookie_records,
+        load_cached_cookie_records,
+        save_cookie_records,
+        cached_cookie_record_exists,
+    )
 
     cookie_files = {
         "bilibili": (bilibili_cookie_file, "B站"),
@@ -2120,6 +2149,7 @@ def run(
         "xiaohongshu": (xiaohongshu_cookie_file, "小红书"),
     }
     loaded_cookie_records: dict[str, tuple[dict[str, Any], ...]] = {}
+    explicit_cookie_provided: set[str] = set()
     for platform, (cookie_file, platform_label) in cookie_files.items():
         if cookie_file is None:
             loaded_cookie_records[platform] = ()
@@ -2128,12 +2158,34 @@ def run(
             loaded_cookie_records[platform] = load_cookie_records(
                 cookie_file, platform
             )
+            explicit_cookie_provided.add(platform)
         except Exception:
             print(
                 f"[FAILED] {platform_label} Cookie 文件无效或无法安全读取",
                 file=sys.stderr,
             )
             return 2
+    cache_root = cookie_workspace_root or _repository_root_cookie_root()
+    if cache_root is not None:
+        for platform, records in loaded_cookie_records.items():
+            if records:
+                continue
+            cache_path = os.path.join(cache_root, f"{platform}-cookies.json")
+            if not cached_cookie_record_exists(cache_root, platform):
+                continue
+            cached = load_cached_cookie_records(cache_root, platform)
+            if cached:
+                loaded_cookie_records[platform] = cached
+                print(
+                    f"[echo] {platform} Cookie 已从 {cache_path} 自动加载",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[warn] {platform} Cookie 缓存文件 {cache_path} 已存在但无法安全解析,"
+                    f"本次任务忽略。需要时删除该文件并重新提供。",
+                    file=sys.stderr,
+                )
     bilibili_cookie_records = loaded_cookie_records["bilibili"]
     douyin_cookie_records = loaded_cookie_records["douyin"]
     weibo_cookie_records = loaded_cookie_records["weibo"]
@@ -2186,17 +2238,30 @@ def run(
         print("[FAILED] 账号主页 URL 权限或路径格式无效", file=sys.stderr)
         return 2
     adapter = _pick(adapters, routing_url)
-    if douyin_cookie_records and getattr(adapter, "platform", None) != "douyin":
+    if (
+        "douyin" in explicit_cookie_provided
+        and douyin_cookie_records
+        and getattr(adapter, "platform", None) != "douyin"
+    ):
         print("[FAILED] --douyin-cookie-file 只适用于抖音账号主页", file=sys.stderr)
         return 2
-    if bilibili_cookie_records and getattr(adapter, "platform", None) != "bilibili":
+    if (
+        "bilibili" in explicit_cookie_provided
+        and bilibili_cookie_records
+        and getattr(adapter, "platform", None) != "bilibili"
+    ):
         print("[FAILED] --bilibili-cookie-file 只适用于B站账号主页", file=sys.stderr)
         return 2
-    if weibo_cookie_records and getattr(adapter, "platform", None) != "weibo":
+    if (
+        "weibo" in explicit_cookie_provided
+        and weibo_cookie_records
+        and getattr(adapter, "platform", None) != "weibo"
+    ):
         print("[FAILED] --weibo-cookie-file 只适用于微博账号主页", file=sys.stderr)
         return 2
     if (
-        xiaohongshu_cookie_records
+        "xiaohongshu" in explicit_cookie_provided
+        and xiaohongshu_cookie_records
         and getattr(adapter, "platform", None) != "xiaohongshu"
     ):
         print("[FAILED] --xiaohongshu-cookie-file 只适用于小红书账号主页", file=sys.stderr)
@@ -2233,6 +2298,32 @@ def run(
                 file=sys.stderr,
             )
         return 2
+
+    if persist_cookie:
+        if cache_root is None:
+            print("[FAILED] Cookie 缓存目录不可用", file=sys.stderr)
+            return 2
+        for cookie_platform in sorted(explicit_cookie_provided):
+            target = os.path.join(
+                cache_root,
+                f"{cookie_platform}-cookies.json",
+            )
+            try:
+                save_cookie_records(
+                    loaded_cookie_records[cookie_platform],
+                    target,
+                    cookie_platform,
+                )
+            except Exception:
+                print(
+                    f"[FAILED] {cookie_platform} Cookie 无法安全持久化",
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                f"[OK] {cookie_platform} Cookie 已持久化到 {target}",
+                file=sys.stderr,
+            )
 
     platform = adapter.platform
     adapter_canonicalizer = getattr(adapter, "canonicalize_profile_url", None)
@@ -2852,13 +2943,20 @@ def run(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="公开社交媒体账号采集")
-    ap.add_argument("url", help="账号主页 URL,如 https://space.bilibili.com/123")
+    ap.add_argument(
+        "url",
+        nargs="?",
+        help="账号主页 URL,如 https://space.bilibili.com/123",
+    )
     range_group = ap.add_mutually_exclusive_group()
     range_group.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="明确只采集最近 N 条（1-100）；省略时默认执行完整采集",
+        help=(
+            "明确只采集最近 N 条（1-100）；省略时 B站/抖音默认有界完整采集，"
+            "微博/小红书默认最近 30 条"
+        ),
     )
     range_group.add_argument(
         "--all",
@@ -2938,24 +3036,85 @@ def main() -> None:
     ap.add_argument(
         "--douyin-cookie-file",
         default=None,
-        help="用户主动提供的抖音 Cookie JSON/文本文件；内容仅注入临时浏览器且不落盘。",
+        help="用户主动提供的抖音 Cookie JSON/文本文件；默认仅注入该任务临时浏览器。",
     )
     ap.add_argument(
         "--bilibili-cookie-file",
         default=None,
-        help="用户主动提供的B站 Cookie JSON/文本文件；内容仅在任务内存中使用且不落盘。",
+        help="用户主动提供的B站 Cookie JSON/文本文件；默认仅在该任务进程内使用。",
     )
     ap.add_argument(
         "--weibo-cookie-file",
         default=None,
-        help="用户主动提供的微博 Cookie JSON/文本文件；内容仅在任务内存中使用且不落盘。",
+        help="用户主动提供的微博 Cookie JSON/文本文件；默认仅在该任务进程内使用。",
     )
     ap.add_argument(
         "--xiaohongshu-cookie-file",
         default=None,
-        help="用户主动提供的小红书 Cookie JSON/文本文件；内容仅在任务内存中使用且不落盘。",
+        help="用户主动提供的小红书 Cookie JSON/文本文件；默认仅在该任务进程内使用。",
+    )
+    ap.add_argument(
+        "--persist-cookie",
+        action="store_true",
+        help="把本次 --xxx-cookie-file 提供的内容落盘到 workspace/<platform>-cookies.json(权限 0600),供后续同平台任务自动加载。",
+    )
+    ap.add_argument(
+        "--cookie-store-path",
+        default=None,
+        help="覆盖 Cookie 持久化/自动加载根目录(默认仓库 workspace/)。",
+    )
+    ap.add_argument(
+        "--clear-cached-cookie",
+        default=None,
+        choices=("bilibili", "douyin", "weibo", "xiaohongshu"),
+        help="删除 workspace/<platform>-cookies.json 后退出；用于撤回已持久化的 Cookie。",
     )
     args = ap.parse_args()
+    if args.clear_cached_cookie is not None:
+        if args.url is not None:
+            ap.error("--clear-cached-cookie 是独立操作，不接受账号 URL")
+        if args.persist_cookie or any(
+            (
+                args.bilibili_cookie_file,
+                args.douyin_cookie_file,
+                args.weibo_cookie_file,
+                args.xiaohongshu_cookie_file,
+            )
+        ):
+            ap.error("--clear-cached-cookie 不能与 Cookie 导入或持久化参数联用")
+        from collectors.cookie_loader import delete_cached_cookie_records
+
+        cache_root = args.cookie_store_path or _repository_root_cookie_root()
+        if cache_root is None:
+            print("[FAILED] Cookie 缓存目录不可用", file=sys.stderr)
+            raise SystemExit(2)
+        deleted = delete_cached_cookie_records(
+            cache_root,
+            args.clear_cached_cookie,
+        )
+        print(
+            json.dumps(
+                {
+                    "action": "clear_cached_cookie",
+                    "platform": args.clear_cached_cookie,
+                    "deleted": deleted,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(0)
+    if args.url is None:
+        ap.error("采集任务必须提供账号主页 URL")
+    if args.persist_cookie and not any(
+        (
+            args.bilibili_cookie_file,
+            args.douyin_cookie_file,
+            args.weibo_cookie_file,
+            args.xiaohongshu_cookie_file,
+        )
+    ):
+        ap.error("--persist-cookie 必须与一个 --<platform>-cookie-file 联用")
     if args.since is not None and not args.resume:
         ap.error("--since 必须与 --resume 联用")
     if args.resume_out is not None and not args.resume:
@@ -2973,7 +3132,13 @@ def main() -> None:
     ):
         ap.error("checkpoint 恢复不能与增量 --resume 混用")
     limit = PUBLIC_LIMIT_DEFAULT if args.limit is None else args.limit
-    collect_all = bool(args.collect_all or args.limit is None)
+    collect_all = bool(
+        args.collect_all
+        or (
+            args.limit is None
+            and _url_defaults_to_complete_collection(args.url)
+        )
+    )
     date_from_iso = _parse_date(args.date_from)
     date_to_iso = _default_date_to(args.date_to)
     if args.date_from and not date_from_iso:
@@ -2996,6 +3161,8 @@ def main() -> None:
         bilibili_cookie_file=args.bilibili_cookie_file,
         weibo_cookie_file=args.weibo_cookie_file,
         xiaohongshu_cookie_file=args.xiaohongshu_cookie_file,
+        persist_cookie=args.persist_cookie,
+        cookie_workspace_root=args.cookie_store_path,
     ))
 
 

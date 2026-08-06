@@ -10,7 +10,7 @@ CDP 客户端驱动独立临时浏览器，观察页面公开响应并读取可�
   解析不到即 `PARSER_FAILED`，触发登录/验证/频控即对应 `stop_reason`。
 - **绝不绕过**登录、验证码、滑块或频控；不伪造签名、不重试破解，也不复用
   用户日常浏览器登录态。
-- 字段不可见写 `None`（绝不以 `0` 代替未知，见 `data-schema.md` §7/§8）。
+- 字段不可见写 `None`（绝不以 `0` 代替未知，见 `collection-schema.md` §8）。
 - 本适配器只采集、只映射，不分析、不存储（由上层脚本落盘）。
 
 实现要点：
@@ -54,6 +54,7 @@ from ._constants import (
     STOP_LOGIN,
     STOP_NO_PUBLIC_CONTENT,
     STOP_PARSER_FAILED,
+    STOP_RATE_LIMITED,
     STOP_UNSUPPORTED,
     STOP_VERIFICATION,
     validate_public_all_budgets,
@@ -404,7 +405,11 @@ class DouyinCollector(BaseCollector):
                 raise DouyinError(
                     STOP_LOGIN, f"HTTP 401 需登录: {url}"
                 )
-            if e.code in (403, 429):
+            if e.code == 429:
+                raise DouyinError(
+                    STOP_RATE_LIMITED, f"HTTP {e.code} 请求频率受限: {url}"
+                )
+            if e.code == 403:
                 raise DouyinError(
                     STOP_ACCESS_RESTRICTED, f"HTTP {e.code} 访问受限: {url}"
                 )

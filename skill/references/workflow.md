@@ -16,7 +16,10 @@
 | --- | --- | --- | --- |
 | 0 条 / 全面风控 | `evidence_only` | `false` | 采集诊断、停止原因、已验证范围、恢复建议 |
 | 1 – 14 条 | `light` | `false` | 数据质量、描述性样本观察（需显式标为小样本） |
-| ≥ 15 条 | `deep`（完成模型阶段） | `true` | 可靠的结构化选题、栏目规律与策略洞察 |
+| ≥ 1 条 | `light` | `false` | 数据质量与描述性样本观察；不能称为策略结论 |
+| 模型与证据门全部完成 | `strategy` | `true` | taxonomy、证据覆盖及用户请求的 business/comment 均完成后，才交付策略洞察 |
+
+15 条是正式高低表现共同点模块的最低样本门，不会单独令 `strategy_ready=true`。
 
 所有输出使用 create-only 目录：
 - 目标的父目录必须存在；可以创建父目录，但不预先创建作为提交目标的叶子目录。
@@ -47,11 +50,10 @@ python3 scripts/collect_douyin_complete.py "<DOUYIN_PROFILE_URL>" \
 
 两个入口都使用公开身份和平台分页；每个进程遇保护立即停止。`RATE_LIMITED/ACCESS_RESTRICTED`，以及 B站明确记录 `platform_response_code=-352` 的 WBI 风控失败，会在 30/60 秒后创建新 attempt 目录，总计最多 3 次；不切换账号、出口 IP 或登录态。成功输出中的 `selected_workspace` 是后续 collection；全部失败时它指向已封存且 `collected_count` 最大的 attempt。达到预算但未见末页不是穷尽。
 
-若任务目标是报告、策略、栏目或长期节奏，在启动上述重试或任何 pipeline 前，Agent 先向用户说明
-`stop_reason`、已验证作品数、不能成立的结论、最多三次 attempt 与 30/60 秒等待成本；抖音还要
-说明默认浏览器预算最多 1,800 秒/2,000 次滚动。用户明确选择“继续完整采集”后才运行 complete
-入口；明确选择“接受当前样本”后才可继续 light/evidence-only。未得到选择时，保存 collection 后
-暂停，不生成报告。
+若任务目标是完整报告、策略、栏目或长期节奏，在启动 complete wrapper 前先说明完整采集预算、
+最多三次 attempt 与 30/60 秒自动退避；抖音还要说明浏览器最长 1,800 秒/2,000 次滚动。用户选择
+完整采集后才运行 wrapper。若最终仍为 `PARTIAL`，再说明实际 `stop_reason`、已验证作品数及不能成立
+的结论，由用户选择接受当前样本或另起重试任务。
 
 日期范围传给完整入口的 `--date-from/--date-to`；限量或分阶段探索使用 `collect.py --limit N`，证据不足时可扩大 N 或切换完整入口。两平台完整入口都接受 `--max-items`，默认 10,000、硬上限 50,000；抖音另使用 `--max-seconds/--max-scrolls` 控制浏览器预算。用户明确请求评论洞察时把 `--comments` 传给对应完整入口；抖音只在基础公开字段缺失时增加 `--enrich-details`，它只能补充列表中已有作品，不能发现新作品。浏览器、Web 索引和其他公开研究工具由 Agent 按成本与可用性选择；任何替代证据都要核验归属并披露覆盖。
 
@@ -95,7 +97,7 @@ python3 scripts/collect_douyin_authorized.py --all --out <NEW_COLLECTION>
 
 1. 核对任务状态、停止原因、请求数、采集数和作品状态计数。
 2. 核对平台覆盖账本：B站常规/动态入口；抖音分页、末页、候选绑定或索引来源；评论请求、有效父作品、空结果和失败数。
-3. 抖音若记录 `page_context_fallback_used=true`，只核对请求次数和最终覆盖；产物不得含页内请求 URL、query、响应体或请求头。主页计数出现冲突时读取 `platform_metrics.profile_conflicts`，不得静默选择后当作确定值。
+3. 抖音主页计数出现冲突时读取 `platform_metrics.profile_conflicts`，不得静默选择后当作确定值；`page_context_*` 仅是旧产物兼容字段，当前传输不发起页内 API 请求。
 4. 不把作品级 `RESTRICTED=0` 解释成任务没有受限。
 5. 不从 stdout、文件行数或手工统计覆盖产物中的权威状态。
 6. `valid_count == 0` 时停止策略分析，但继续创建正式 evidence-only 交付；不得向 collection 写入手工报告，也不得用主页累计计数推断栏目、节奏或互动策略。
@@ -108,7 +110,7 @@ python3 scripts/collect_douyin_authorized.py --all --out <NEW_COLLECTION>
 | --- | --- | --- | --- |
 | evidence_only | 0 条有效作品，或用户明确接受风控后的采集诊断 | collection → 固定事实交付 | 状态、停止原因、账号资料覆盖、恢复建议 |
 | light | 至少 1 条有效作品，且用户原本只要快速样本观察或已明确接受当前样本 | collection → deterministic pipeline | 数据质量、描述性指标、明确标为样本的观察 |
-| deep | 用户明确要求主题/栏目、策略或高低表现共同点，且样本门满足 | light → taxonomy；按需 business/comment | 通过证据门的语义或策略结论 |
+| strategy | 用户明确要求主题/栏目、策略或高低表现共同点，且样本门满足 | light → taxonomy；按需 business/comment | 通过证据门的语义或策略结论 |
 
 0 条作品时运行：
 
@@ -135,7 +137,7 @@ python3 scripts/run_pipeline.py \
 
 普通确定性 final 的 `delivery_kind=light`。它可以交付，但
 `strategy_ready=false`，因此不得把描述性样本指标改写成栏目规律、因果判断或增长建议。
-light 与 evidence-only 不加 `--require-delivery-ready`；该参数只用于要求模型阶段完整的 deep 策略 final。
+light 与 evidence-only 不加 `--require-delivery-ready`；该参数只用于要求模型阶段与证据门完整的 strategy final。
 当 taxonomy 尚未完成时，人类可读文件标题必须标为“公开账号数据概览”，并显著说明它不能作为深度内容策略报告。
 
 ## 5. 模型协作分析
@@ -211,7 +213,7 @@ final 完成后，以下规则用于宣称该正式制品已交付；它们不�
 
 1. 核验 `task.json`、`analysis.json`、`delivery-summary.json`、`final-response.md` 和 manifest 的摘要一致，且 `delivery_ready=true`。
 2. 先向用户展示完整数据质量摘要，再给结论。
-3. `task_status=PARTIAL` 时同时说明 `stop_reason`、停止阶段和影响范围，并记录用户已明确接受当前样本；没有该选择时不创建 final。
+3. `task_status=PARTIAL` 时按 `partial_reasons` 分型说明影响。只有平台采集受限时才要求同时说明非空 `stop_reason` 与停止阶段；模型 pending、归一化损失等情况不得伪造停止原因。
 4. 区分任务级限制与作品级 `status_counts`；评论 `unavailable` 表述为“未取得评论”。
 5. 数字、状态和限制与 `final-response.md` 保持一致；可按用户需要重新组织或解释，不得产生数字漂移。
 6. `delivery_kind=evidence_only/light` 可交付事实与限制，但只有 `strategy_ready=true` 才交付策略结论；核心洞察证据 URL 覆盖必须为 100%。

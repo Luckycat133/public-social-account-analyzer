@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 from collectors.douyin_openapi import DouyinOpenAPIClient, DouyinOpenAPIError
+from collectors.url_policy import canonical_profile_url
 from immutable_workspace import (
     ImmutableWorkspace,
     WorkspaceCapabilityError,
@@ -24,7 +25,6 @@ from immutable_workspace import (
     WorkspaceWriteError,
     ensure_container,
     preflight_backend,
-    verify_committed_workspace,
 )
 from task_contract import (
     AUTHORIZED_DISCLAIMER,
@@ -34,6 +34,7 @@ from task_contract import (
 )
 from csv_contract import serialize_csv_row
 from execution_timing import ExecutionTimer
+from skill_metadata import skill_contract_sha256, skill_release
 
 
 _BEIJING = timezone(timedelta(hours=8))
@@ -110,6 +111,8 @@ def _serialize_artifacts(
     collected_at = datetime.now(_BEIJING).isoformat()
     task = {
         "task_id": task_id,
+        "skill_release": skill_release(),
+        "skill_contract_sha256": skill_contract_sha256(),
         "platform": "douyin",
         "profile_url": profile.get("profile_url"),
         "requested_limit": requested_limit,
@@ -203,12 +206,6 @@ def _reserve_authorized_output(
     raise WorkspaceWriteError("no collision-free output directory is available")
 
 
-def _verify_authorized_workspace(path: str) -> dict:
-    return verify_committed_workspace(
-        path, allowed_artifacts=_AUTHORIZED_ARTIFACTS
-    )
-
-
 def _run_reserved_collection(
     reservation: ImmutableWorkspace,
     *,
@@ -242,10 +239,20 @@ def _run_reserved_collection(
             if isinstance(candidate_profile, dict)
             else None
         )
+        profile_url = (
+            candidate_profile.get("profile_url")
+            if isinstance(candidate_profile, dict)
+            else None
+        )
+        canonical_profile = canonical_profile_url("douyin", profile_url)
+        identity_checker = getattr(api, "is_profile_identity_verified", None)
         if (
             not isinstance(candidate_profile, dict)
             or type(account_id) is not str
-            or account_id != expected_open_id
+            or canonical_profile is None
+            or canonical_profile.rsplit("/", 1)[-1] != account_id
+            or not callable(identity_checker)
+            or not identity_checker(expected_open_id)
         ):
             raise DouyinOpenAPIError(
                 "INVALID_RESPONSE",
@@ -424,13 +431,26 @@ def main() -> None:
         description="采集 Douyin OpenAPI 同次 OAuth 凭据对应的授权账号"
     )
     range_group = parser.add_mutually_exclusive_group()
-    range_group.add_argument("--all", dest="collect_all", action="store_true")
+    range_group.add_argument(
+        "--all",
+        dest="collect_all",
+        action="store_true",
+        help="遍历至官方 video.list 明确返回末页；与 --limit 互斥",
+    )
     range_group.add_argument(
         "--limit", type=int, default=30,
         help="采集条数（默认 30，范围 1–100）",
     )
-    parser.add_argument("--out", default=None)
-    parser.add_argument("--analysis-goal", default=None)
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="尚不存在的 collection 目录；省略时写入仓库 workspace/ 的新目录",
+    )
+    parser.add_argument(
+        "--analysis-goal",
+        default=None,
+        help="可选分析目标（最多 500 UTF-8 字节，不得包含凭据）",
+    )
     args = parser.parse_args()
     raise SystemExit(
         run(

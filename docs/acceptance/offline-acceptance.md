@@ -69,4 +69,4 @@ python3 tools/skill_eval/aggregate.py <ITERATION_DIR> --strict
 
 7. 用 skill-creator 的 `eval-viewer/generate_review.py --static` 生成人工审阅页，检查实际输出和 grader 证据；反馈保存到 iteration。
 
-触发描述使用固定 60/40 train/validation 划分和每题 3 次运行。只允许根据 train 失败修改描述，validation 只用于选择泛化更好的版本。
+触发描述使用固定 train/validation 分组和每题 3 次运行。只允许根据 train 失败修改描述，validation 只用于选择泛化更好的版本。

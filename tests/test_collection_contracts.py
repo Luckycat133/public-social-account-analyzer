@@ -455,6 +455,58 @@ def test_cli_defaults_to_complete_collection_unless_limit_is_explicit(
     assert captured["args"][1] == (12 if "--limit" in extra_args else 30)
 
 
+@pytest.mark.parametrize(
+    "profile_url",
+    [
+        "https://weibo.com/u/123456",
+        "https://www.xiaohongshu.com/user/profile/5f2a1b3c4d5e6f708192a3b4",
+    ],
+)
+def test_cli_uses_bounded_default_for_platforms_without_complete_collection(
+    monkeypatch, profile_url
+):
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(collect, "run", fake_run)
+    monkeypatch.setattr("sys.argv", ["collect.py", profile_url])
+
+    with pytest.raises(SystemExit) as exc_info:
+        collect.main()
+
+    assert exc_info.value.code == 0
+    assert captured["args"][1] == 30
+    assert captured["kwargs"]["collect_all"] is False
+
+
+@pytest.mark.parametrize(
+    "profile_url",
+    [
+        "https://weibo.com/u/123456",
+        "https://www.xiaohongshu.com/user/profile/5f2a1b3c4d5e6f708192a3b4",
+    ],
+)
+def test_cli_preserves_explicit_all_for_capability_error(monkeypatch, profile_url):
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return 2
+
+    monkeypatch.setattr(collect, "run", fake_run)
+    monkeypatch.setattr("sys.argv", ["collect.py", profile_url, "--all"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        collect.main()
+
+    assert exc_info.value.code == 2
+    assert captured["collect_all"] is True
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "101"])
 def test_limited_cli_rejects_out_of_range_limit_without_clamping(
     monkeypatch, value
@@ -1177,10 +1229,13 @@ class AuthorizedClient:
     def collect_profile(self):
         return {
             "platform": "douyin",
-            "account_id": "test-open-id",
-            "profile_url": "https://open.douyin.com/oauth/userinfo/",
+            "account_id": "test-public-sec-uid",
+            "profile_url": "https://www.douyin.com/user/test-public-sec-uid",
             "field_visibility": {},
         }
+
+    def is_profile_identity_verified(self, open_id):
+        return open_id == "test-open-id"
 
     def collect_video_pages(self, *, limit, page_size):
         return [], {
@@ -1223,8 +1278,12 @@ def test_authorized_default_output_uses_repository_workspace(
 
 def test_schema_states_exact_budget_and_output_contracts():
     root = Path(__file__).resolve().parents[1]
-    schema = (root / "skill/references/data-schema.md").read_text(encoding="utf-8")
+    router = (root / "skill/references/data-schema.md").read_text(encoding="utf-8")
+    schema = (root / "skill/references/artifact-contract.md").read_text(
+        encoding="utf-8"
+    )
 
+    assert "artifact-contract.md" in router
     for value in ("50,000", "14,400", "20,000"):
         assert value in schema
     assert "仓库根目录" in schema

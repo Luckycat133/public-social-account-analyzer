@@ -6,6 +6,7 @@ no share redirects, and stops when the page requires login or verification.
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import re
@@ -25,6 +26,7 @@ LOGIN_REQUIRED = "LOGIN_REQUIRED"
 VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
 ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
 ACCESS_RESTRICTED = "ACCESS_RESTRICTED"
+RATE_LIMITED = "RATE_LIMITED"
 PARSER_FAILED = "PARSER_FAILED"
 NO_PUBLIC_CONTENT = "NO_PUBLIC_CONTENT"
 
@@ -37,6 +39,10 @@ _HEADERS = {
 }
 _STATE_SCRIPT = re.compile(
     r"<script[^>]+id=[\"'](?:__XHS_INITIAL_STATE__|__NEXT_DATA__)[\"'][^>]*>(.*?)</script>",
+    re.IGNORECASE | re.DOTALL,
+)
+_MODERN_STATE_SCRIPT = re.compile(
+    r"<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*(.*?)</script>",
     re.IGNORECASE | re.DOTALL,
 )
 _NON_VISIBLE_BLOCK = re.compile(
@@ -77,6 +83,17 @@ def _http_get_text(
     request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
+            requested_profile = canonical_profile_url(PLATFORM, url)
+            final_url = getattr(response, "geturl", lambda: url)()
+            if (
+                requested_profile is not None
+                and canonical_profile_url(PLATFORM, final_url)
+                != requested_profile
+            ):
+                raise XiaohongshuError(
+                    ACCOUNT_UNAVAILABLE,
+                    "小红书公开主页跳转后不再绑定目标账号",
+                )
             return response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
@@ -85,6 +102,8 @@ def _http_get_text(
             ) from error
         if error.code == 404:
             raise XiaohongshuError(ACCOUNT_UNAVAILABLE, "小红书账号或笔记不存在") from error
+        if error.code == 429:
+            raise XiaohongshuError(RATE_LIMITED, "小红书公开页面请求频率受限") from error
         raise XiaohongshuError(
             ACCESS_RESTRICTED,
             f"小红书公开页面访问受限 (HTTP {error.code})",
@@ -144,16 +163,226 @@ def _find_state(value: Any) -> dict[str, Any] | None:
     return None
 
 
-def _parse_page_state(page: str) -> dict[str, Any]:
+def _replace_js_undefined(value: str) -> str:
+    """Replace JavaScript undefined tokens outside strings with JSON null."""
+    output: list[str] = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(value):
+        char = value[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+            continue
+        if value.startswith("undefined", index):
+            before = value[index - 1] if index else ""
+            end = index + len("undefined")
+            after = value[end] if end < len(value) else ""
+            if not (before.isalnum() or before in "_$") and not (
+                after.isalnum() or after in "_$"
+            ):
+                output.append("null")
+                index = end
+                continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _decode_script_state(value: str, *, allow_undefined: bool = False) -> Any:
+    payload = html.unescape(value).strip()
+    if payload.endswith(";"):
+        payload = payload[:-1].rstrip()
+    if allow_undefined:
+        payload = _replace_js_undefined(payload)
+    return json.loads(payload)
+
+
+def _find_modern_user_store(value: Any) -> dict[str, Any] | None:
+    """Find the modern user store without treating viewer identity as the target."""
+    if isinstance(value, dict):
+        if (
+            isinstance(value.get("userPageData"), dict)
+            and isinstance(value.get("notes"), list)
+        ):
+            return value
+        for child in value.values():
+            store = _find_modern_user_store(child)
+            if store is not None:
+                return store
+    elif isinstance(value, list):
+        for child in value:
+            store = _find_modern_user_store(child)
+            if store is not None:
+                return store
+    return None
+
+
+def _interaction_counts(value: Any) -> dict[str, Any]:
+    if not isinstance(value, list):
+        return {}
+    counts: dict[str, Any] = {}
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+            continue
+        counts[item["type"]] = item.get("count")
+    return counts
+
+
+def _modern_note_owner_ids(value: Any) -> set[str]:
+    """Return explicit owner IDs from modern profile-card wrappers."""
+    if not isinstance(value, list):
+        return set()
+    owner_ids: set[str] = set()
+    for bucket in value:
+        wrappers = bucket if isinstance(bucket, list) else [bucket]
+        for wrapper in wrappers:
+            if not isinstance(wrapper, dict):
+                continue
+            card = wrapper.get("noteCard")
+            owner = card.get("user") if isinstance(card, dict) else None
+            owner_id = owner.get("userId") if isinstance(owner, dict) else None
+            if isinstance(owner_id, str) and owner_id:
+                owner_ids.add(owner_id)
+    return owner_ids
+
+
+def _modern_note_records(
+    value: Any,
+    target_id: str,
+    profile_url: str,
+    *,
+    allow_ownerless: bool,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    wrappers: list[Any] = []
+    for bucket in value:
+        if isinstance(bucket, list):
+            wrappers.extend(bucket)
+        else:
+            wrappers.append(bucket)
+    notes: list[dict[str, Any]] = []
+    for source_rank, wrapper in enumerate(wrappers, 1):
+        if not isinstance(wrapper, dict):
+            continue
+        card = wrapper.get("noteCard")
+        if not isinstance(card, dict):
+            continue
+        owner = card.get("user")
+        owner_id = owner.get("userId") if isinstance(owner, dict) else None
+        if isinstance(owner_id, str) and owner_id and owner_id != target_id:
+            continue
+        if not owner_id and not allow_ownerless:
+            continue
+        interaction = card.get("interactInfo")
+        interaction = interaction if isinstance(interaction, dict) else {}
+        note_id = card.get("noteId") or wrapper.get("id")
+        local_record_key = not isinstance(note_id, (str, int)) or not str(
+            note_id
+        ).strip()
+        if local_record_key:
+            title = card.get("displayTitle")
+            if not isinstance(title, str) or not title.strip():
+                continue
+            material = f"{profile_url}\0{title}\0{source_rank}".encode("utf-8")
+            note_id = "xhs-card-" + hashlib.sha256(material).hexdigest()[:20]
+        notes.append({
+            "noteId": note_id,
+            "title": card.get("displayTitle"),
+            "type": card.get("type"),
+            "likedCount": interaction.get("likedCount"),
+            "isTop": interaction.get("sticky"),
+            "_localRecordKey": local_record_key,
+            "_sourceRank": source_rank,
+            "_sourceUrl": profile_url,
+        })
+    return notes
+
+
+def _modern_profile_state(
+    parsed: Any, profile_url: str | None
+) -> dict[str, Any] | None:
+    canonical = canonical_profile_url(PLATFORM, profile_url)
+    if canonical is None:
+        return None
+    store = _find_modern_user_store(parsed)
+    if store is None:
+        return None
+    page_data = store.get("userPageData")
+    basic = page_data.get("basicInfo") if isinstance(page_data, dict) else None
+    if not isinstance(basic, dict):
+        return None
+    target_id = canonical.rsplit("/", 1)[-1]
+    result = page_data.get("result")
+    if isinstance(result, dict):
+        if result.get("success") is False:
+            return None
+        result_code = result.get("code")
+        if result_code not in (None, 0, "0"):
+            return None
+    explicit_target_id = basic.get("userId", page_data.get("userId"))
+    if explicit_target_id is not None:
+        if not isinstance(explicit_target_id, str) or explicit_target_id != target_id:
+            return None
+        identity_binding = "profile_user_id"
+    elif target_id in _modern_note_owner_ids(store.get("notes")):
+        identity_binding = "target_owned_card"
+    else:
+        return None
+    counts = _interaction_counts(page_data.get("interactions"))
+    return {
+        "user": {
+            "userId": target_id,
+            "_identityBinding": identity_binding,
+            "nickname": basic.get("nickname"),
+            "desc": basic.get("desc"),
+            "redId": basic.get("redId"),
+            "follows": counts.get("follows"),
+            "fans": counts.get("fans"),
+            "likesAndFavorites": counts.get("interaction"),
+        },
+        "notes": _modern_note_records(
+            store.get("notes"),
+            target_id,
+            canonical,
+            allow_ownerless=identity_binding == "profile_user_id",
+        ),
+    }
+
+
+def _parse_page_state(
+    page: str, profile_url: str | None = None
+) -> dict[str, Any]:
     protection_reason = _page_protection_reason(page)
     if protection_reason is not None:
         raise XiaohongshuError(protection_reason, "小红书页面要求登录或验证")
     for match in _STATE_SCRIPT.finditer(page):
         try:
-            parsed = json.loads(html.unescape(match.group(1)).strip())
+            parsed = _decode_script_state(match.group(1))
         except json.JSONDecodeError:
             continue
         state = _find_state(parsed)
+        if state is not None:
+            return state
+    for match in _MODERN_STATE_SCRIPT.finditer(page):
+        try:
+            parsed = _decode_script_state(match.group(1), allow_undefined=True)
+        except json.JSONDecodeError:
+            continue
+        state = _modern_profile_state(parsed, profile_url)
         if state is not None:
             return state
     raise XiaohongshuError(
@@ -168,8 +397,10 @@ def _page_state(
 ) -> dict[str, Any]:
     try:
         if cookie_records:
-            return _parse_page_state(_http_get_text(profile_url, cookie_records))
-        return _parse_page_state(_http_get_text(profile_url))
+            return _parse_page_state(
+                _http_get_text(profile_url, cookie_records), profile_url
+            )
+        return _parse_page_state(_http_get_text(profile_url), profile_url)
     except XiaohongshuError as error:
         if not (
             cookie_records
@@ -177,7 +408,9 @@ def _page_state(
             and error.stop_reason in {LOGIN_REQUIRED, PARSER_FAILED}
         ):
             raise
-    return _parse_page_state(_browser_rendered_html(profile_url, cookie_records))
+    return _parse_page_state(
+        _browser_rendered_html(profile_url, cookie_records), profile_url
+    )
 
 
 def _note_id(note: dict[str, Any]) -> str | None:
@@ -220,11 +453,19 @@ def _raw_note(note: dict[str, Any]) -> dict[str, Any] | None:
     note_id = _note_id(note)
     if note_id is None:
         return None
-    note_url = canonical_item_url(
-        PLATFORM, f"https://www.xiaohongshu.com/explore/{note_id}", note_id
-    )
-    if note_url is None:
-        return None
+    local_record_key = note.get("_localRecordKey") is True
+    if local_record_key:
+        note_url = None
+        source_url = canonical_profile_url(PLATFORM, note.get("_sourceUrl"))
+        if source_url is None:
+            return None
+    else:
+        note_url = canonical_item_url(
+            PLATFORM, f"https://www.xiaohongshu.com/explore/{note_id}", note_id
+        )
+        if note_url is None:
+            return None
+        source_url = note_url
     title = note.get("title") if isinstance(note.get("title"), str) else None
     text = note.get("desc", note.get("content"))
     text = text if isinstance(text, str) else None
@@ -255,9 +496,9 @@ def _raw_note(note: dict[str, Any]) -> dict[str, Any] | None:
         "shares": shares,
         "coins": None,
         "danmaku": None,
-        "collection_status": "SUCCESS",
+        "collection_status": "PARTIAL" if local_record_key else "SUCCESS",
         "collected_at": now_iso(),
-        "source_url": note_url,
+        "source_url": source_url,
         "field_visibility": {
             "views": "visible" if views is not None else "hidden",
             "likes": "visible" if likes is not None else "hidden",
@@ -265,7 +506,18 @@ def _raw_note(note: dict[str, Any]) -> dict[str, Any] | None:
             "favorites": "visible" if favorites is not None else "hidden",
             "shares": "visible" if shares is not None else "hidden",
         },
-        "platform_metrics": {"note_type": note_type},
+        "platform_metrics": (
+            {
+                "note_type": note_type,
+                "collection_source": "xiaohongshu_profile_cards",
+                "platform_post_id_known": False,
+                "local_record_key": True,
+                "item_url_known": False,
+                "source_rank": note.get("_sourceRank"),
+            }
+            if local_record_key
+            else {"note_type": note_type}
+        ),
     }
 
 
@@ -282,13 +534,19 @@ class XiaohongshuCollector(BaseCollector):
         """Use an already-sanitized, user-authorized session only in memory."""
         self._cookie_records = tuple(cookie_records)
         self._browser_fallback = bool(browser_fallback)
+        self._profile_state_cache: dict[str, dict[str, Any]] = {}
 
     def _page_state(self, profile_url: str) -> dict[str, Any]:
-        return _page_state(
+        cached = self._profile_state_cache.get(profile_url)
+        if cached is not None:
+            return cached
+        state = _page_state(
             profile_url,
             self._cookie_records,
             browser_fallback=self._browser_fallback,
         )
+        self._profile_state_cache[profile_url] = state
+        return state
 
     def _get_text(self, url: str) -> str:
         if self._cookie_records:
@@ -316,9 +574,10 @@ class XiaohongshuCollector(BaseCollector):
             raise XiaohongshuError(ACCOUNT_UNAVAILABLE, "小红书公开页面未提供账号资料")
         followers = parse_int(user.get("fans", user.get("followerCount")))
         post_count = parse_int(user.get("noteCount", user.get("notesCount")))
+        target_id = canonical.rsplit("/", 1)[-1]
         return self.normalize_profile({
             "platform": PLATFORM,
-            "account_id": str(user.get("userId") or user.get("id") or "") or None,
+            "account_id": target_id,
             "account_name": user.get("nickname", user.get("name")),
             "profile_url": canonical,
             "bio": user.get("desc", user.get("description")),
@@ -330,6 +589,8 @@ class XiaohongshuCollector(BaseCollector):
                     user.get("follows", user.get("followingCount"))
                 ),
                 "red_id": user.get("redId"),
+                "likes_and_favorites": parse_int(user.get("likesAndFavorites")),
+                "identity_binding": user.get("_identityBinding"),
             },
             "field_visibility": {
                 "followers": "visible" if followers is not None else "hidden",

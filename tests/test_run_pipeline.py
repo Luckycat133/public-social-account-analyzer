@@ -193,6 +193,24 @@ def test_partial_model_workspace_is_not_delivery_ready():
     assert "不得作为最终策略报告交付" in pipeline._final_response(summary)
 
 
+def test_incomplete_evidence_cannot_be_labeled_strategy_ready():
+    summary = pipeline._delivery_summary(
+        {
+            "meta": {},
+            "sample_boundary": {"valid": 20},
+            "classification_status": "completed",
+            "business_insight_required": False,
+            "comment_insight_required": False,
+            "evidence_coverage": {"status": "PARTIAL_EVIDENCE"},
+        },
+        task_status="PARTIAL",
+    )
+
+    assert summary["delivery_kind"] == "light"
+    assert summary["delivery_ready"] is False
+    assert summary["strategy_ready"] is False
+
+
 def test_deterministic_analysis_is_a_delivery_ready_light_report():
     summary = pipeline._delivery_summary(
         {

@@ -473,6 +473,17 @@ def test_index_task_persists_task_id_goal_and_committed_manifest(tmp_path):
     task = json.loads((out / "task.json").read_text(encoding="utf-8"))
     assert task["analysis_goal"] == "分析公开索引选题"
     assert isinstance(task["task_id"], str) and task["task_id"]
+    assert task["skill_release"] == (
+        Path(__file__).parents[1] / "skill" / "VERSION"
+    ).read_text(encoding="utf-8").strip()
+    assert len(task["skill_contract_sha256"]) == 64
+    started_at = datetime.fromisoformat(task["started_at"])
+    ended_at = datetime.fromisoformat(task["ended_at"])
+    assert started_at.tzinfo is not None
+    assert ended_at.tzinfo is not None
+    assert ended_at >= started_at
+    assert isinstance(task["duration_ms"], int) and task["duration_ms"] >= 0
+    assert set(task["phase_durations_ms"]) == {"validate", "persist"}
     assert (out / "manifest.json").is_file()
     assert (out / ".complete").is_file()
     immutable.verify_committed_workspace(

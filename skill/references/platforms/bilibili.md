@@ -29,8 +29,8 @@
 
 - 默认仍使用匿名公开路径。用户自愿提供其当前 B站网页会话 Cookie 后，采集器把它仅注入该任务的内存会话，可在匿名请求被要求登录、会话资格不足或 WBI/搜索路径对 Cookie 有要求时，提高可读取性和列表/详情字段的稳定性。
 - Cookie 不会扩大研究范围：只能读取该用户在浏览器中本来可见的内容；不读取私信、后台数据或其他非公开账号能力，也不保证能拿到更多公开字段。
-- 登录墙、验证码、滑块、`-799`、`-412`、WAF 或其他平台保护仍按下表立即停止。不得用 Cookie 轮换身份、规避频控或重新尝试等价端点。
-- 交接格式、临时文件、脱敏和销毁规则见 [cookie-guide.md](../cookie-guide.md)；CLI 使用 `--bilibili-cookie-file <temporary-path>`，完整采集入口也会把同一路径传给每个独立 attempt。
+- 登录墙、验证码、滑块、`-799`、`-412`、WAF 或其他平台保护仍按下表立即停止。
+- 显式 `--persist-cookie` 时，Cookie 会落盘到 `workspace/bilibili-cookies.json`（权限 `0600`），后续同平台任务自动加载。交接格式、自动加载与销毁规则见 [cookie-guide.md](../cookie-guide.md)；CLI 使用 `--bilibili-cookie-file <temporary-path>`，完整采集入口也会把同一路径传给每个独立 attempt。
 
 ## 第 3 层：平台保护停止策略
 

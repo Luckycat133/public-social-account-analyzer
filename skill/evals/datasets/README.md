@@ -1,205 +1,104 @@
-# 公开社交媒体账号分析 Skill 评估数据集
+# 离线评估数据集
 
-![Dataset Version](https://img.shields.io/badge/dataset-v0.3.0-blue)
-![Format](https://img.shields.io/badge/format-JSONL-green)
-![Split](https://img.shields.io/badge/split-stratified%20seed%2042-orange)
+本目录保存行为、P0 追踪和触发边界数据。`source/` 是唯一可手工维护的数据源；`validation_data/`、`test_data/` 与 `manifest.json` 均由固定脚本生成。
 
-本目录保存 `public-social-account-analyzer` Skill 的离线评估数据。数据按用途划分为开发验证集和最终留出测试集，并通过固定随机种子、分层规则、SHA-256 与分区完整性检查保证可复现和可审计。
+数据是合成提示与断言，不来自用户聊天、私信、私有后台或购买数据。示例公开 URL 只表达场景，不表示离线评估会访问网络。
 
 ## 目录
 
-- [数据来源](#数据来源)
-- [目录结构](#目录结构)
-- [数据格式](#数据格式)
-- [字段说明](#字段说明)
-- [划分策略](#划分策略)
-- [质量检查](#质量检查)
-- [安全与权限](#安全与权限)
-- [使用方法](#使用方法)
-- [版本管理](#版本管理)
-- [维护与许可](#维护与许可)
-
-## 数据来源
-
-当前数据由项目维护者根据以下仓库内契约人工整理：
-
-- `skill/SKILL.md` 中的触发条件与合规边界，以及 `skill/references/workflow.md` 中的执行和输出契约；
-- `skill/evals/evals.json` 中的端到端评估用例；
-- `skill/evals/cases.md` 中的确定性验收场景；
-- `skill/references/` 中的数据模型、异常和平台规则。
-
-数据为评估用合成提示与断言，不来自用户聊天日志、账号私信、平台私有后台导出或购买的数据集。公开 URL 仅用于表达评估场景，不表示划分或验证阶段会访问网络。
-
-## 目录结构
-
 ```text
-skill/evals/datasets/
-├── README.md                         # 数据集总览与字段契约
-├── USAGE.md                          # 划分、验证、使用和发布流程
-├── config.example.json               # 数据路径与划分参数示例
-├── CHANGELOG.md                      # 数据版本更新历史
-├── manifest.json                     # 版本、策略、分布、数量与 SHA-256
-├── p0_requirements.json              # PRD V1.0 的30项P0官方需求目录
-├── p0_coverage.json                  # 需求到用例的机器可读追踪矩阵
+datasets/
+├── README.md
+├── CHANGELOG.md
+├── config.example.json
+├── manifest.json
+├── p0_requirements.json
+├── p0_coverage.json
 ├── source/
-│   ├── README.md                     # 主数据池维护规则
 │   ├── behavior_cases.jsonl
 │   ├── p0_cases.jsonl
 │   ├── trigger_should.jsonl
 │   └── trigger_should_not.jsonl
-├── validation_data/
-│   ├── README.md                     # 开发验证集使用边界
-│   └── *.jsonl
-└── test_data/
-    ├── README.md                     # 留出测试集使用边界
-    └── *.jsonl
+├── validation_data/*.jsonl
+└── test_data/*.jsonl
 ```
 
-目录名固定为 `source`、`validation_data` 和 `test_data`。脚本、CI 与文档不得使用 `valid`、`validation`、`testing` 等替代名称。
+## 记录合同
 
-## 数据格式
+所有文件为 UTF-8 JSONL，每行一个对象，文件末尾保留换行。每个文件内 `id` 唯一且发布后稳定；字符串不得为空，`assertions` 必须是非空字符串数组。
 
-- 编码：UTF-8。
-- 容器：JSON Lines（`.jsonl`）。
-- 记录：每行一个 JSON 对象，空行忽略。
-- 行尾：文件末尾保留换行符。
-- 主键：每个文件内 `id` 唯一；划分后保留 source 中的原始 ID。
-- 可追溯性：`manifest.json` 记录 source、validation 和 test 文件的 SHA-256。
+`behavior_cases.jsonl`：
 
-## 字段说明
+| 字段 | 含义 |
+| --- | --- |
+| `id`, `name` | 稳定 ID 与场景名 |
+| `platform`, `category`, `account_type` | 平台与分层字段 |
+| `prompt`, `expected_output`, `assertions` | 用户任务、预期与原子断言 |
 
-### `behavior_cases.jsonl`
+`p0_cases.jsonl`：
 
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `id` | string | 稳定用例 ID，格式如 `bhv-001` |
-| `name` | string | 机器可读的场景名称 |
-| `platform` | string | 目标平台或边界类别 |
-| `category` | string | 分层字段，如 `happy_path`、`boundary`、`compliance` |
-| `account_type` | string | 账号类型，如 `creator`、`brand` |
-| `prompt` | string | 发送给 Agent 的评估提示 |
-| `expected_output` | string | 预期行为与结果摘要 |
-| `assertions` | string[] | 必须逐项满足的验收断言 |
+| 字段 | 含义 |
+| --- | --- |
+| `primary_p0_id`, `p0_ids`, `source_ref` | 需求来源与覆盖编号 |
+| `platform`, `scenario_type`, `scenario_group` | 平台、场景类型与防近重复泄漏分组 |
+| `verification_type` | `automated`、`agent_eval`、`external_live` 或 `external_manual` |
+| `prompt`, `expected_output`, `assertions` | 测试任务与逐项断言 |
 
-### `p0_cases.jsonl`
+触发记录：
 
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `primary_p0_id` | string | 用例主要验证的 FR、NFR 或 AC 编号 |
-| `p0_ids` | string[] | 用例同时覆盖的全部 P0 编号 |
-| `source_ref` | string | PRD 中的来源章节和编号 |
-| `platform` | string | 平台或 `cross_platform` 边界类别 |
-| `scenario_type` | string | 正向、边界、失败、合同或外部验收场景 |
-| `scenario_group` | string | 近重复样本的防泄漏分组键 |
-| `verification_type` | string | 自动化、Agent、在线或人工验收方式 |
-| `prompt` | string | 可执行的测试任务 |
-| `expected_output` | string | 预期行为与产物摘要 |
-| `assertions` | string[] | 可客观复核的逐项断言 |
+| 文件 | 必需字段 |
+| --- | --- |
+| `trigger_should.jsonl` | `id`, `label=should_trigger`, `platform`, `query` |
+| `trigger_should_not.jsonl` | `id`, `label=should_not_trigger`, `category`, `reason`, `query` |
 
-### `trigger_should.jsonl`
+不得把凭据、Cookie、Token、私有指标或个人敏感信息写入任何记录。
 
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `id` | string | 稳定正例 ID，格式如 `trg-pos-001` |
-| `label` | string | 固定为 `should_trigger` |
-| `platform` | string | 分层字段：`bilibili`、`douyin` 或条件支持平台 |
-| `query` | string | 应触发本 Skill 的用户请求 |
+## 划分
 
-### `trigger_should_not.jsonl`
+- `source/`：100% 主数据池，不直接作为运行期分区。
+- `validation_data/`：默认 70%，用于日常开发与失败分析。
+- `test_data/`：默认 30%，仅用于版本候选或里程碑。
+- 固定 seed：`42`；配额采用最大余数法。
+- 分层字段：behavior 的 `category`、P0 的 `scenario_type`、正触发的 `platform`、负触发的 `category`。
+- 同一 `scenario_group` 不得跨 validation/test；单样本分层无法两边覆盖时，在 manifest 披露偏差，不能复制样本凑数。
 
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `id` | string | 稳定负例 ID，格式如 `trg-neg-001` |
-| `label` | string | 固定为 `should_not_trigger` |
-| `reason` | string | 分层字段和拒绝原因 |
-| `query` | string | 不应触发本 Skill 的用户请求 |
+description 触发优化单独使用 `../description_train.json` 与 `../description_validation.json`，不复用本目录 70/30 划分。只根据 train 修改描述，validation 只用于候选选择。
 
-## 主数据池维护规则
+## 命令
 
-`source/` 是评估数据的唯一事实来源（single source of truth）。维护者只在 `source/` 目录新增或修改评估记录，再通过 `tools/skill_eval/split_dataset.py` 生成 `validation_data/` 和 `test_data/`。
-
-1. 每行必须是 UTF-8 JSON 对象，字符串字段不得为空，`assertions` 必须是非空字符串数组。
-2. 每个文件内 `id` 必须唯一且发布后保持稳定。
-3. 新场景必须能追溯到明确的产品、技能或合规要求；每个官方 P0 编号必须存在于 `p0_requirements.json`。
-4. 禁止复制记录以调整比例；关键稀有类别应新增独立场景。
-5. 禁止把密码、Cookie、令牌、私有后台指标或个人敏感信息写入任何数据文件。
-6. 禁止直接修补 derived partitions；修改后必须重新运行划分和验证。
-
-## 划分策略
-
-本仓库评估数据的默认策略是：
-
-- 主数据池：`source/`，唯一可直接维护的数据来源；
-- 测试集：30%，用于版本或发布验收；
-- 验证集：70%，用于日常开发回归；
-- 随机方法：分层伪随机划分；
-- 配额方法：最大余数法；
-- 固定种子：`42`；
-- 分层字段：`behavior_cases.category`、`p0_cases.scenario_type`、`trigger_should.platform`、`trigger_should_not.category`。
-
-对于通用模型开发流程，建议从训练数据中留出 15–20% 作为验证集，并从独立数据中保留 20–30% 作为测试集。这两个建议使用不同分母；本仓库当前 70/30 是小规模 Agent 评估池的开发/留出划分，不应解释为训练数据三分法。
-
-当某个分层只有一个样本时，无法同时覆盖 validation 和 test。`manifest.json` 会记录实际比例和偏差；关键类别必须先增加经过评审的同类样本，再重新划分，不能复制同一记录凑数。
-
-## 质量检查
-
-运行 `python3 tools/skill_eval/split_dataset.py --verify` 会检查：
-
-1. JSONL 每行是否为对象；
-2. 必需字段、非空字符串和 `assertions` 类型；
-3. 每个文件内 ID 是否唯一；
-4. validation/test 是否存在 ID 交叉污染；
-5. validation 与 test 的并集是否完整覆盖 source；
-6. manifest 记录数量是否与文件一致；
-7. source、validation、test 的 SHA-256 是否匹配。
-8. PRD 30项 P0 是否全部有用例，且满足平台和场景门槛；
-9. 同一 `scenario_group` 是否跨入 validation 和 test；
-10. P0需求目录、追踪矩阵及其 SHA-256 是否一致。
-
-分布偏差是小样本诊断指标，不等同于数据泄漏。使用 `--strict` 时，偏差超过 `0.20` 会返回非零退出码。正式发布必须同时通过普通验证和严格分布检查。
-
-`p0_coverage.json` 的 100% 表示“每项需求均有测试定义”，不表示所有测试已经运行通过。`external_evidence_required` 项必须依靠真实公开页面、人工真值或运营试用证据。
-
-## 安全与权限
-
-本地推荐最小权限：
-
-- 目录：`0750`（owner 可读写执行，group 可读执行）；
-- 数据与文档：`0640`（owner 可读写，group 只读）；
-- 禁止 world-readable 和 world-writable 权限；
-- 禁止将凭证或真实私有数据加入版本控制。
-
-Git 通常只保存可执行位，不可靠保存完整 Unix 权限。克隆、解压或部署后，应按照 [USAGE.md](USAGE.md) 重新应用权限。
-
-## 使用方法
+从仓库根目录运行：
 
 ```bash
 # 预览，不写文件
 python3 tools/skill_eval/split_dataset.py --dry-run
 
-# 按默认 seed=42、test_ratio=0.30 重新划分
-python3 tools/skill_eval/split_dataset.py
+# 以固定参数重新生成 derived partitions 与 manifest
+python3 tools/skill_eval/split_dataset.py --test-ratio 0.30 --seed 42
 
-# 校验现有快照
+# 核验现有快照
 python3 tools/skill_eval/split_dataset.py --verify
+
+# 发布前检查小样本分布偏差
+python3 tools/skill_eval/split_dataset.py --dry-run --strict
 ```
 
-完整开发、验收和发布流程见 [USAGE.md](USAGE.md)。路径配置示例见 [config.example.json](config.example.json)。
+迁移数据根时传 `--datasets-root <PATH>`；`config.example.json` 只供外部工具复制，脚本不会自动读取。
 
-Skill description 另使用 `skill/evals/description_train.json` 与
-`skill/evals/description_validation.json` 的固定 60/40 划分：共 20 条现实正例和近失负例，
-每题重复 3 次；只允许根据 train 失败修改 description。
+`--verify` 检查 schema、ID、分区交集/并集、SHA-256、manifest 数量、P0 目录与追踪矩阵，以及 `scenario_group` 防泄漏。`p0_coverage.json` 的 100% 只表示已有测试定义；`external_evidence_required` 仍须真实页面、人工真值或运营试用。
 
-## 版本管理
+## 使用边界
 
-数据版本采用语义化版本：
+- validation 可重复运行并用于修改实现，但结果不能称为留出泛化性能。
+- test 日常开发不得逐题调参；失败后把根因抽象成新的 source 场景，再重新划分。
+- Agent 基准各次使用干净上下文，旧版与新版使用同一 prompt、模型与运行条件；重复次数、耗时和可得 token 必须真实记录。
+- 自动化夹具不能替代在线可用性、字段人工准确率或真实运营反馈。
 
-- PATCH：修正文案、断言或元数据，不改变场景覆盖范围；
-- MINOR：新增向后兼容的场景、平台或边界类别；
-- MAJOR：字段契约、标签语义或划分策略发生不兼容变更。
+## 更新清单
 
-每次修改 `source/*.jsonl` 后必须重新划分、刷新 `manifest.json`、运行 `--verify`，并更新 [CHANGELOG.md](CHANGELOG.md)。不得直接修改 derived partition 后仅更新 checksum。
+1. 只编辑 `source/*.jsonl`，为新场景记录明确的 Skill、PRD、平台或合规依据。
+2. 运行 dry-run，检查分层与近重复分组。
+3. 用固定 seed/比例生成快照并执行 `--verify` 与 `--strict`。
+4. 运行 `python3 -m pytest tests/test_split_dataset.py -q`。
+5. 更新 `CHANGELOG.md`，复核 derived diff 与 manifest SHA。
 
-## 维护与许可
-
-维护责任归属本仓库维护者。数据与文档沿用项目根目录声明的 MIT License；如引入外部数据，必须在合并前补充来源、授权和隐私审查记录。
+数据版本采用语义化版本：PATCH 修正文案/断言；MINOR 增加兼容场景；MAJOR 改变字段或标签语义。仓库当前没有声明许可证，不得自行标注 MIT 或引入来源不明的数据。

@@ -13,6 +13,23 @@
 > 仅接受账号主页；搜索页、话题页、单条博文页、登录页等不属于适配器支持范围，
 > 由编排器路由拒绝（`UNSUPPORTED_PLATFORM`）。`supports(url)` 已实现上述两种主页识别。
 
+### 命名主页 → UID 身份绑定（必须回证）
+
+数字 UID 主页（`/u/<uid>`）直接使用 URL 中的 uid，不解析 HTML。命名主页
+（`weibo.com/<name>`）必须从主页 HTML 提取**目标账号**的 uid，并做两步防误绑：
+
+1. **候选锚定**：带登录会话的现代页面会在 SSR 数据里先出现**当前浏览者**的 uid
+   （等同于小红书"浏览者 `userInfo.userId`"陷阱）。采集器先取与请求 handle 出现在
+   同一短窗（±160 字符）内的 `id`/`uid`/`u/<id>` 作为候选，通用 `"uid"` 只作后援。
+2. **`profile/info` 回证**：对每个候选调用 `profile/info?uid=<cand>`，仅当返回用户的
+   `domain` 或 `url` 尾部**精确等于请求的 handle**（如 `cctvnews`）才接受。会话主人、
+   占位账号或不存在账号都因 url/domain 不匹配而被拒绝。
+
+任何候选都未回证时，任务以 `ACCOUNT_UNAVAILABLE`（身份未回证）如实失败，
+**绝不采集回证失败的账号**；回证请求本身遇到登录墙则保留 `LOGIN_REQUIRED`。
+匿名访问命名主页拿到登录 stub（无任何 uid 数据）时上报 `LOGIN_REQUIRED`，
+而不是误报"找不到账号"。
+
 ---
 
 ## 账号字段
@@ -29,7 +46,7 @@
 | `post_count` | 微博数 | 微博发布总数 |
 | `platform_metrics.following` | 关注 | 关注数（微博特有，置于 `platform_metrics`） |
 
-> `platform_metrics` 账号层微博键：`{ "following": <关注数> }`（与 `data-schema.md` §4 一致）。
+> `platform_metrics` 账号层微博键：`{ "following": <关注数> }`（与 [collection-schema.md](../collection-schema.md) §4 一致）。
 
 ---
 
@@ -102,9 +119,7 @@ python3 scripts/collect.py "https://weibo.com/<name-or-uid>" \
   --out <NEW_COLLECTION>
 ```
 
-文件仅允许 `weibo.com` 及子域、限制大小和记录数；值只在当前进程请求头中使用，绝不写入
-workspace、报告或日志。Cookie 原文可粘贴到当前对话，但不得回显、转发或放进命令行。授权会话失效、出现验证码或
-频控时仍按对应 stop reason 停止，不尝试生成访客身份或规避验证。
+文件仅允许 `weibo.com` 及子域、限制大小和记录数；值只在当前进程请求头中使用，绝不写入 task.json、报告或日志。Cookie 原文可粘贴到当前对话，但不得回显、转发或放进命令行。显式 `--persist-cookie` 时，Cookie 会落盘到 `workspace/weibo-cookies.json`（权限 `0600`），后续同平台任务自动加载。授权会话失效、出现验证码或频控时仍按对应 stop reason 停止，不尝试生成访客身份或规避验证。
 
 浏览器导出与对话交接的通用指引见 [cookie-guide.md](../cookie-guide.md)。
 

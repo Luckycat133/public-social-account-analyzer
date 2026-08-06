@@ -26,6 +26,8 @@ public-social-account-analyzer/
 ├── ROADMAP.md                             # 历史路线图与当前能力状态
 ├── pyproject.toml                         # Python 项目与 pytest 配置
 ├── TESTING.md                             # 分层测试与发布前验证方法
+├── .claude/workflows/                     # Claude Code 本地开发工作流
+│   └── social-smoke-test.js               # 四平台公开采集、事实交付与泄漏检查
 ├── docs/                                  # 文档总目录（导航见 docs/README.md）
 │   ├── README.md                         # 文档地图与命名规范
 │   ├── architecture/                     # 架构、模块与依赖
@@ -53,7 +55,8 @@ public-social-account-analyzer/
     ├── agents/openai.yaml                 # Codex UI 元数据与默认调用提示
     ├── scripts/                           # Python 执行脚本
     │   ├── README.md                       # 脚本入口、模块边界与依赖说明
-    │   ├── collect.py                     # 通用采集入口；省略范围时默认完整模式
+    │   ├── collect.py                     # 通用采集入口；平台级范围默认值
+    │   ├── bounded_attempt_runner.py      # 完整模式的有界重试与最佳证据选择
     │   ├── collect_bilibili_complete.py  # B站完整采集与有界重试编排
     │   ├── collect_douyin_complete.py    # 抖音完整采集与有界重试编排
     │   ├── collect_douyin_authorized.py   # 抖音账号本人 OpenAPI 入口
@@ -64,13 +67,17 @@ public-social-account-analyzer/
     │   ├── run_pipeline.py                # 推荐的不可变分析编排入口
     │   ├── immutable_workspace.py         # create-only 提交与核验协议
     │   ├── execution_timing.py            # 结构化总耗时与阶段耗时
+    │   ├── skill_metadata.py              # 包内 VERSION 与 SKILL.md 摘要
     │   ├── csv_contract.py                # 规范 CSV 合同
     │   ├── task_contract.py               # 任务状态与停止原因合同
     │   └── collectors/                    # 平台采集适配器子包
     │       ├── __init__.py                # 包标识（空）
     │       ├── base.py                    # BaseCollector 抽象基类
     │       ├── _constants.py              # 共享常量（时区 + stop_reason 枚举）
-    │       ├── _utils.py                  # 共享工具函数（now_iso / parse_int / ts_to_iso / extract_hashtags）
+    │       ├── _utils.py                  # 共享纯函数
+    │       ├── _cookie_storage.py         # Cookie 缓存的原子私有写入
+    │       ├── adapter_registry.py        # 可选平台适配器注册
+    │       ├── cookie_loader.py           # 平台 Cookie 路由
     │       ├── bilibili.py                # B站业务层（BilibiliCollector + 字段构建）
     │       ├── douyin.py                  # 抖音适配器（DouyinCollector）
     │       ├── douyin_cookies.py          # 用户授权 Cookie 文件的有界解析与净化
@@ -79,13 +86,19 @@ public-social-account-analyzer/
     │       ├── _douyin_detail_contract.py # 抖音作品详情身份合同
     │       ├── url_policy.py              # 跨平台 URL 安全策略
     │       ├── weibo.py                   # 微博公开 AJAX 适配器（默认启用）
-    │       ├── xiaohongshu.py             # 小红书直接主页嵌入状态适配器
+    │       ├── xiaohongshu.py             # 小红书新旧主页状态与批量卡片适配器
     │       ├── platform_cookies.py         # 微博/小红书 Cookie 文件有界解析
     │       └── browser_backend.py         # 标准库 CDP 临时浏览器后端
     ├── references/                        # 领域数据模型与分析规则规范
     │   ├── workflow.md                    # 真实采集、模型分工与 final 交付工作流
-    │   ├── analysis-rules.md              # 分析规则（§3 节奏 / §4 指标 / §5 分类 / §6 高低表现）
-    │   ├── data-schema.md                 # 统一数据模型与字段表
+    │   ├── analysis-rules.md              # 分析规则路由
+    │   ├── metrics-and-sampling.md        # 样本、节奏与指标
+    │   ├── model-insights.md              # 分类、高低表现与业务洞察
+    │   ├── comment-insights.md            # 评论证据与语义
+    │   ├── data-schema.md                 # 数据合同路由
+    │   ├── artifact-contract.md           # 工作区、Task 与覆盖账本
+    │   ├── collection-schema.md           # Profile/Post/Metrics/枚举
+    │   ├── analysis-schema.md             # 分析输出 JSON 合同
     │   ├── exceptions.md                  # stop_reason 决策表与异常语义
     │   └── platforms/                     # 按平台按需加载的采集知识库
     │       ├── bilibili.md
@@ -95,13 +108,13 @@ public-social-account-analyzer/
     ├── assets/
     │   └── report-template.html           # HTML 仪表盘模板
     └── evals/                             # 评估与验收测试用例
-        ├── cases.md                       # 评估用例文档
+        ├── README.md                      # 评估分层与运行边界
         ├── evals.json                     # 评估配置
         ├── description_train.json         # 描述优化训练集（60%，仅此集驱动修改）
         ├── description_validation.json    # 描述优化留出验证集（40%）
         └── datasets/                      # 分层随机划分的数据集与使用规范
             ├── README.md                  # 数据集说明与治理边界
-            ├── USAGE.md                   # 数据集使用规范
+            ├── CHANGELOG.md               # 数据集语义版本记录
             ├── config.example.json        # 路径配置示例
             ├── source/                    # 主数据池
             ├── test_data/                 # held-out 留出验收集
@@ -134,7 +147,7 @@ public-social-account-analyzer/
                          │
 ┌────────────────────────▼────────────────────────────────┐
 │  规范层（references/ — 文档，非代码）                      │
-│  data-schema · analysis-rules · exceptions · platforms/ │
+│  schema/rule routers · focused contracts · platforms/   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -151,7 +164,7 @@ public-social-account-analyzer/
 
 | 模块 | 职责 | 关键符号 |
 |:---|:---|:---|
-| `collect.py` | 采集入口：根据 URL 路由到适配器，采集资料与内容列表/详情；省略 `--limit` 时默认有界完整采集，只有显式 `--limit N` 才收窄；支持增量续采、密封中断 checkpoint 与日期过滤 | `run()` · `main()` · `_load_adapters()` · `_write_collection_checkpoint()` · `_merge_incremental()` |
+| `collect.py` | 采集入口：根据 URL 路由到适配器，采集资料与内容列表/详情；省略范围时 B站/抖音使用有界完整模式，微博/小红书默认 30 条；支持增量续采、密封中断 checkpoint 与日期过滤 | `run()` · `main()` · `_load_adapters()` · `_write_collection_checkpoint()` · `_merge_incremental()` |
 | `collect_bilibili_complete.py` | B站默认完整采集编排；每个 attempt 新建不可变工作区，对受控平台保护结果执行 30/60 秒重试并选择最佳证据 | `run_attempts()` · `main()` |
 | `collect_douyin_complete.py` | 抖音默认完整采集编排；支持用户授权 Cookie 文件，仅对根级频控/访问限制执行有界重试 | `run_attempts()` · `main()` |
 | `collect_douyin_authorized.py` | 账号本人授权入口：同次 OAuth 的 token + open_id 身份回证与官方公开视频分页 | `run()` · `main()` |
@@ -172,15 +185,16 @@ public-social-account-analyzer/
 | `douyin.py` | 抖音适配器：直连解析页面内嵌 `RENDER_DATA`，合并资料时披露公开计数冲突，无明确限制时可选浏览器传输降级；如实上抛风控 stop_reason | `DouyinCollector` · `DouyinError` |
 | `douyin_openapi.py` | 账号本人官方 userinfo / video.list 客户端与严格身份绑定 | `DouyinOpenAPIClient` |
 | `weibo.py` | 微博适配器：默认启用公开 AJAX 端点；显式停用时抛 `ADAPTER_UNAVAILABLE` | `WeiboCollector` · `WeiboError` |
-| `xiaohongshu.py` | 小红书适配器：只解析直接公开主页的嵌入状态；不调用签名/私有接口，受限时安全停止 | `XiaohongshuCollector` · `XiaohongshuError` |
-| `_douyin_browser_transport.py` | 抖音公开列表/资料/详情的账号绑定、候选验证、被动 CDP、无签名同源页内分页、限制枚举和有界滚动 | `collect_account_page()` · `collect_post_page()` |
+| `xiaohongshu.py` | 小红书适配器：解析直接公开主页的新旧状态；批量卡片缺真实 ID 时保留为披露的 `PARTIAL` 本地记录；受限时安全停止 | `XiaohongshuCollector` · `XiaohongshuError` |
+| `_douyin_browser_transport.py` | 抖音公开列表/资料/详情的账号绑定、候选验证、被动 CDP、限制枚举和有界滚动；不主动发起页内列表请求 | `collect_account_page()` · `collect_post_page()` |
 | `browser_backend.py` | 按稳定顺序探测系统及已有 Playwright 缓存浏览器并提供标准库 WebSocket/CDP 会话；隐式候选可在同一总超时内回退，每次使用隔离临时 profile | `BrowserSession` · `find_browsers()` · `find_browser()` |
 
 ### 共享层（skill/scripts/collectors/_*）
 
 | 模块 | 职责 | 关键符号 |
 |:---|:---|:---|
-| `_constants.py` | 跨采集器共享常量：`BEIJING_TZ` 时区 + `STOP_*` stop_reason 枚举 + `KNOWN_STOP_REASONS` 集合 | `BEIJING_TZ` · `STOP_LOGIN` · `STOP_VERIFICATION` · `STOP_ACCESS_RESTRICTED` |
+| `_constants.py` | 跨采集器共享常量：时区、停止原因枚举与已知集合 | `BEIJING_TZ` · `STOP_LOGIN` · `STOP_VERIFICATION` · `STOP_RATE_LIMITED` · `STOP_ACCESS_RESTRICTED` |
+| `_cookie_storage.py` | 以临时文件、`0600`、`fsync` 和原子替换保存本地 Cookie 缓存 | `write_private_json()` |
 | `_utils.py` | 跨采集器共享工具函数：`now_iso` / `parse_int`（支持「万/亿/+」后缀）/ `ts_to_iso` / `extract_hashtags` | `now_iso()` · `parse_int()` · `ts_to_iso()` · `extract_hashtags()` |
 
 ## 命名规范
@@ -191,7 +205,7 @@ public-social-account-analyzer/
 | 类 | `PascalCase` | `BilibiliCollector` · `BaseCollector` · `BrowserSession` |
 | 函数/变量 | `snake_case`；私有以 `_` 前缀 | `collect_post_list()` · `_build_profile_raw()` |
 | 常量 | `UPPER_SNAKE_CASE`；stop_reason 枚举以 `STOP_` 前缀 | `BEIJING_TZ` · `STOP_LOGIN` · `MIXIN_KEY_ENC_TAB` |
-| stop_reason 值 | `UPPER_SNAKE_CASE` 字符串，对齐 [`references/exceptions.md`](../../skill/references/exceptions.md) §9.2 | `"LOGIN_REQUIRED"` · `"ACCESS_RESTRICTED"` |
+| stop_reason 值 | `UPPER_SNAKE_CASE` 字符串，迁移语义见 [`references/exceptions.md`](../../skill/references/exceptions.md) §1，枚举见 `collection-schema.md` §9.2 | `"LOGIN_REQUIRED"` · `"RATE_LIMITED"` · `"ACCESS_RESTRICTED"` |
 
 ## 采集流水线
 
@@ -215,7 +229,7 @@ run_pipeline.py ─→ normalize ─→ deterministic analysis ─→ render ─
 - **双工作区隔离**：采集工作区与分析工作区分别提交；`run_pipeline.py` 只读核验采集提交，再创建独立的分析工作区，二者不混写。
 - **离线确定性分析**：`normalize.py`、`analyze.py`、`render_report.py` 与 `run_pipeline.py` 不访问网络，也不在脚本内部调用 LLM；确定性指标与分析离线执行。
 - **公开与本人授权隔离**：匿名公开路径只采集无需登录即可查看的内容；抖音本人授权路径使用同次 OAuth 的 `access_token` + `open_id`，不读取登录态 / Cookie，也不以登录态抓取冒充公开采集。
-- **浏览器降级仅实验性**：抖音公开浏览器传输（`_douyin_browser_transport.py`）为隔离临时 profile 的实验性降级，仅在 SSR 不足且无明确限制时启用；被动网络不足且页面无保护提示时可发起固定、无签名的同源页内公开分页，仍执行完整证据绑定且不保存请求秘密。B站平台保护响应不会触发浏览器降级。
+- **浏览器降级仅实验性**：抖音公开浏览器传输（`_douyin_browser_transport.py`）为隔离临时 profile 的实验性降级，仅在 SSR 不足且无明确限制时启用；只观察目标主页已发生的响应与可见 DOM，不主动调用页内作品列表接口。B站平台保护响应不会触发浏览器降级。
 - **LLM 内容在提交目录外生成**：taxonomy、business-insight 与 comment-insight 的语义输入由执行 Agent 在已提交目录外填写严格 JSON，脚本只负责校验、摘要绑定与封存，不生成语义结论。
 - **合规产物合约**：仅含 `.complete` 与 `manifest.json`（含 SHA-256）的提交视为已提交采集；legacy 产物（无 `.complete` / `manifest.json`）不可作为 `--resume` 输入。
 
@@ -232,6 +246,6 @@ python3 -m pytest tests/test_douyin.py -q
 
 - [`../README.md`](../README.md) — 文档地图与命名规范。
 - [`../prd/需求实现状态与抖音能力边界.md`](../prd/需求实现状态与抖音能力边界.md) — 当前实现审计与抖音能力边界。
-- [`../../skill/references/data-schema.md`](../../skill/references/data-schema.md) — 统一数据模型与字段表。
+- [`../../skill/references/data-schema.md`](../../skill/references/data-schema.md) — 按问题路由制品、采集和分析合同。
 - [`../../skill/references/exceptions.md`](../../skill/references/exceptions.md) — `stop_reason` 决策表与异常语义。
-- [`../../skill/references/analysis-rules.md`](../../skill/references/analysis-rules.md) — 分析规则（节奏 / 指标 / 分类 / 高低表现）。
+- [`../../skill/references/analysis-rules.md`](../../skill/references/analysis-rules.md) — 按问题路由指标、模型和评论规则。

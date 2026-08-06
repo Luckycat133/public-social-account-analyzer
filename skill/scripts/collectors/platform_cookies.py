@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ._cookie_storage import atomic_write_private_text
+
 
 _MAX_COOKIE_FILE_BYTES = 64 * 1024
 _MAX_COOKIE_COUNT = 128
@@ -123,3 +125,41 @@ def load_platform_cookie_file(
         names.add(record["name"])
         clean.append(record)
     return tuple(clean)
+
+
+def save_platform_cookie_file(
+    records: tuple[dict[str, Any], ...],
+    path: str | os.PathLike[str],
+    *,
+    allowed_domain: str,
+) -> None:
+    """Persist a sanitized Cookie record tuple to ``path`` with mode 0600.
+
+    Re-runs the same domain/size/count guards as the loader so a saved file
+    always round-trips back through :func:`load_platform_cookie_file`.
+    """
+    if not records:
+        raise PlatformCookieError("Cookie 记录为空")
+    if len(records) > _MAX_COOKIE_COUNT:
+        raise PlatformCookieError("Cookie 记录数量无效")
+    payload = [
+        _clean_record(
+            {
+                "name": record["name"],
+                "value": record["value"],
+                "domain": record.get("domain", f".{allowed_domain}"),
+                "path": record.get("path", "/"),
+                "secure": record.get("secure", True),
+                "httpOnly": record.get("httpOnly", False),
+            },
+            allowed_domain,
+        )
+        for record in records
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+    atomic_write_private_text(
+        path,
+        encoded,
+        error_type=PlatformCookieError,
+        error_message="无法安全写入 Cookie 文件",
+    )

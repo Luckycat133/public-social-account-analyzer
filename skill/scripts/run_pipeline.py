@@ -642,6 +642,8 @@ def _delivery_summary(
         )
     strategy_ready = bool(
         analysis.get("classification_status") == "completed"
+        and (analysis.get("evidence_coverage") or {}).get("status")
+        == "COMPLETE"
         and (
             analysis.get("business_insight_required") is not True
             or analysis.get("business_insight_status") == "completed"

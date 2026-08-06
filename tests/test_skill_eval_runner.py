@@ -96,6 +96,95 @@ def test_runner_records_declared_protocol_before_execution(
     }
 
 
+def test_runner_selects_string_eval_ids(tmp_path: Path, monkeypatch):
+    evals, skill = _prepare_inputs(tmp_path)
+    evals.write_text(
+        json.dumps(
+            {
+                "evals": [
+                    {
+                        "id": "real-user-task",
+                        "name": "selected",
+                        "prompt": "Selected prompt",
+                        "expected_output": "Selected output",
+                        "assertions": ["Selected assertion"],
+                    },
+                    {
+                        "id": "other-task",
+                        "name": "other",
+                        "prompt": "Other prompt",
+                        "expected_output": "Other output",
+                        "assertions": ["Other assertion"],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    selected = []
+
+    def fake_execute(eval_def, *args, **kwargs):
+        selected.append(eval_def["id"])
+
+    monkeypatch.setattr(runner, "execute_run", fake_execute)
+
+    assert runner.main(
+        [
+            "--evals",
+            str(evals),
+            "--ids",
+            "real-user-task",
+            "--iteration",
+            str(tmp_path / "iteration-strings"),
+            "--skill-dir",
+            str(skill),
+            "--runs",
+            "1",
+            "--skip-preflight",
+        ]
+    ) == 0
+    assert selected == ["real-user-task", "real-user-task"]
+
+
+def test_runner_can_install_previous_skill_as_the_baseline(
+    tmp_path: Path, monkeypatch,
+):
+    evals, skill = _prepare_inputs(tmp_path)
+    previous = tmp_path / "previous-skill"
+    previous.mkdir()
+    (previous / "SKILL.md").write_text(
+        "---\nname: probe\ndescription: Old probe.\n---\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_execute(eval_def, config, run_dir, skill_dir, model, timeout):
+        calls.append((config, skill_dir))
+
+    monkeypatch.setattr(runner, "execute_run", fake_execute)
+    iteration = tmp_path / "iteration-old-baseline"
+
+    assert runner.main([
+        "--evals", str(evals),
+        "--iteration", str(iteration),
+        "--skill-dir", str(skill),
+        "--baseline-skill-dir", str(previous),
+        "--runs", "1",
+        "--skip-preflight",
+    ]) == 0
+    assert calls == [
+        ("with_skill", skill.resolve()),
+        ("without_skill", previous.resolve()),
+    ]
+    metadata = json.loads(
+        (iteration / "run-metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["baseline_kind"] == "previous_skill_snapshot"
+    assert metadata["baseline_skill_contract_sha256"] == hashlib.sha256(
+        (previous / "SKILL.md").read_bytes()
+    ).hexdigest()
+
+
 def test_execute_run_emits_skill_creator_viewer_layout(
     tmp_path: Path, monkeypatch,
 ):

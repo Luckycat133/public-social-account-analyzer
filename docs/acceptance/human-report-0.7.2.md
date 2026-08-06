@@ -33,7 +33,8 @@
 python3 -m pytest tests/test_render_report.py -q
 python3 -m pytest tests/test_render_report.py tests/test_analysis_pipeline.py tests/test_run_pipeline.py -q
 python3 -m pytest tests/ -q
-python3 /Users/jack/.agents/skills/skill-creator/scripts/quick_validate.py skill
+skill_creator_dir="${SKILL_CREATOR_DIR:?set SKILL_CREATOR_DIR to the skill-creator root}"
+python3 "$skill_creator_dir/scripts/quick_validate.py" skill
 python3 tools/skill_eval/split_dataset.py --verify
 git diff --check
 ```

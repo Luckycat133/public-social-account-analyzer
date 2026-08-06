@@ -7,7 +7,7 @@
   3. 去重、覆盖率统计、字段可见性判定（visible/hidden/partial）。
 
 契约（冻结，不得偏离）：
-  - references/data-schema.md  —— Profile/Post/Metrics 字段表、空值规则、枚举。
+  - references/collection-schema.md —— Profile/Post/Metrics、空值与采集枚举。
   - references/exceptions.md   —— field_visibility 语义（visible/hidden/partial）。
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from csv_contract import canonical_json, normalize_hashtags, serialize_csv_row
 # 中国平台默认时区（无 tz 时区信息时标注 +08:00）。
 CST = timezone(timedelta(hours=8))
 
-# 统一指标字段（data-schema.md §6），顺序即 CSV 顺序。
+# 统一指标字段（collection-schema.md §6），顺序即 CSV 顺序。
 METRIC_FIELDS = [
     "views",
     "likes",
@@ -42,7 +42,7 @@ METRIC_FIELDS = [
     "danmaku",
 ]
 
-# Post 顶层字段（data-schema.md §5），顺序即 CSV 顺序。
+# Post 顶层字段（collection-schema.md §5），顺序即 CSV 顺序。
 POST_FIELDS = [
     "platform",
     "post_id",
@@ -75,7 +75,7 @@ PROVENANCE_FIELDS = [
 
 STRUCTURED_FIELDS = ["platform_metrics", "field_visibility"]
 
-# 分析阶段占位的空列（data-schema.md §7），交由 analyze 阶段填充。
+# 分析阶段占位空列（analysis-schema.md §7），交由 analyze 阶段填充。
 ANALYSIS_FIELDS = [
     "topic",
     "format",
@@ -96,7 +96,7 @@ CSV_COLUMNS = (
     + ANALYSIS_FIELDS
 )
 
-# content_type 有效枚举（data-schema.md §9.4）。
+# content_type 有效枚举（collection-schema.md §9.4）。
 CONTENT_TYPES = {
     "video",
     "image_text",
@@ -106,7 +106,7 @@ CONTENT_TYPES = {
     "other",
 }
 
-# collection_status 已知取值（data-schema.md §9.3）+ 采集器曾用同义的规范化映射。
+# collection_status 已知取值（collection-schema.md §9.3）+ 采集器曾用同义的规范化映射。
 COLLECTION_STATUS_CANON = {
     "success": "SUCCESS",
     "ok": "SUCCESS",

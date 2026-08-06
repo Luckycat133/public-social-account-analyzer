@@ -1,5 +1,5 @@
 """CASE-008（中位数）、CASE-009（分位数 p25/p75）、CASE-010（分母为零互动率 null）、
-以及相对中位数表现在 median 为 0/null 时跳过（analysis-rules.md §4）。
+以及相对中位数表现在 median 为 0/null 时跳过（metrics-and-sampling.md §4）。
 
 离线、确定性，直接调用 analyze 纯函数。
 """

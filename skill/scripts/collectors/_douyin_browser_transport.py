@@ -1,10 +1,8 @@
-"""Bounded, zero-Python-dependency collection of public Douyin page data.
+"""Bounded, standard-library observation of public Douyin page data.
 
 The browser follows the public page normally.  This module observes eligible
-CDP responses and, if no account-list response appears, may issue a frozen,
-unsigned same-origin public list fetch from that page context.  It then falls
-back to visible DOM-card fields.  It never copies signatures or handles
-challenges.
+CDP responses and falls back to visible DOM-card fields.  It does not issue
+page-context API requests, copy signatures, or handle challenges.
 """
 
 from __future__ import annotations
@@ -1522,24 +1520,6 @@ def _date_relation(
     return "in_range"
 
 
-def _page_context_post_list_url(sec_uid: str, cursor: Any) -> str:
-    """Build one unsigned, same-origin public list request from frozen fields."""
-    if _ACCOUNT_ID.fullmatch(sec_uid) is None:
-        raise ValueError("invalid Douyin account identifier")
-    normalized_cursor = cursor if _is_valid_pagination_cursor(cursor) else 0
-    query = urllib.parse.urlencode({
-        "device_platform": "webapp",
-        "aid": "6383",
-        "channel": "channel_pc_web",
-        "publish_video_strategy_type": "2",
-        "source": "channel_tab_feed",
-        "sec_user_id": sec_uid,
-        "max_cursor": str(normalized_cursor),
-        "count": "20",
-    })
-    return f"https://www.douyin.com/aweme/v1/web/aweme/post/?{query}"
-
-
 @contextmanager
 def _collection_session(session_factory, cleanup_state: dict[str, Any]):
     """Retain collection state when a normal context exit reports cleanup failure."""
@@ -1620,12 +1600,6 @@ def collect_account_page(
     cursor_fingerprints: set[str] = set()
     repeated_cursor_count = 0
     profile_raw: Optional[dict[str, Any]] = None
-    page_context_fallback_used = False
-    page_context_request_count = 0
-    page_context_next_cursor: Any = 0
-    page_context_disabled = False
-    page_context_request_urls: set[str] = set()
-    page_context_request_ids: set[str] = set()
 
     def remaining() -> float:
         return max(0.0, deadline - monotonic())
@@ -1784,22 +1758,6 @@ def collect_account_page(
         method = event.get("method") if isinstance(event, dict) else None
         params = event.get("params") if isinstance(event, dict) else None
         params = params if isinstance(params, dict) else {}
-        if method == "Network.responseReceived":
-            response = params.get("response")
-            response_url = response.get("url") if isinstance(response, dict) else None
-            request_id = params.get("requestId")
-            if (
-                isinstance(response_url, str)
-                and response_url in page_context_request_urls
-                and isinstance(request_id, str)
-            ):
-                page_context_request_ids.add(request_id)
-                return
-        if method in {"Network.loadingFinished", "Network.loadingFailed"}:
-            request_id = params.get("requestId")
-            if isinstance(request_id, str) and request_id in page_context_request_ids:
-                page_context_request_ids.discard(request_id)
-                return
         candidate = _allowed_response(event or {})
         if candidate:
             candidate_response_count += 1
@@ -1863,11 +1821,6 @@ def collect_account_page(
             if remaining() <= 0:
                 break
         return attempted
-
-    def fetch_page_context_candidate(session: BrowserSession) -> bool:
-        """Keep collection passive; page-context requests are not a recovery path."""
-        del session
-        return False
 
     def drain_terminal_until_quiet(session: BrowserSession) -> None:
         """Finish terminal collection only after a command-free quiet poll."""
@@ -1961,16 +1914,6 @@ def collect_account_page(
             if restriction:
                 stop_condition = restriction
                 break
-            if event is None and fetch_page_context_candidate(session):
-                if all_posts and stop_condition in {
-                    "terminal_page",
-                    "repeated_cursor",
-                }:
-                    break
-                if target_count() >= requested:
-                    stop_condition = "max_items" if all_posts else "limit"
-                    break
-                continue
             if all_posts and stop_condition in {
                 "terminal_page",
                 "repeated_cursor",
@@ -2154,8 +2097,8 @@ def collect_account_page(
             "pending_response_count": len(pending),
             "unresolved_account_post_count": unresolved_account_post_count,
             "failed_account_post_count": failed_account_post_count,
-            "page_context_fallback_used": page_context_fallback_used,
-            "page_context_request_count": page_context_request_count,
+            "page_context_fallback_used": False,
+            "page_context_request_count": 0,
             "stop_condition": stop_condition,
             **(
                 {"cleanup_codes": cleanup_state["cleanup_codes"]}
@@ -2171,8 +2114,8 @@ def collect_account_page(
             "browser_fallback_requested": True,
             "browser_fallback_launched": True,
             "browser_evidence_source": source,
-            "page_context_fallback_used": page_context_fallback_used,
-            "page_context_request_count": page_context_request_count,
+            "page_context_fallback_used": False,
+            "page_context_request_count": 0,
             **(
                 {
                     "restriction_source": (

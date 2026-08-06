@@ -1,73 +1,48 @@
-# 脚本层说明
+# CLI 路由
 
-本目录包含 Skill 的可执行流水线。除采集外，脚本只使用 Python 标准库，且不在脚本内部调用 LLM。
+从 Skill 根目录运行脚本。先执行目标脚本的 `--help`；除诊断实现问题外，不要读取数千行源码。采集可联网，其余规范化、分析、校验和渲染必须离线且确定性运行。
 
-## 入口脚本
+## 用户入口
 
-| 脚本 | 用途 | 主要输入 | 主要输出 |
-|---|---|---|---|
-| `collect.py` | 根据账号主页 URL 选择适配器，采集公开资料和内容；省略 `--limit` 时默认有界完整采集，只有显式 `--limit N` 才收窄为最近 N 条。支持日期过滤、增量续采、密封中断 checkpoint、可选浏览器传输降级，以及抖音、微博和小红书的用户授权 Cookie 文件。未指定 `--out` 时写入仓库根 `workspace/`。 | 账号 URL、可选 `--limit`、`--out`；可选 `--douyin-cookie-file`、`--weibo-cookie-file`、`--xiaohongshu-cookie-file`、`--resume` 或 checkpoint 参数 | `source/profile.json`、`source/posts.jsonl`、`task.json`、`collection-report.md`；checkpoint 模式另建只含列表证据的密封工作区 |
-| `run_pipeline.py` | 推荐的不可变交付入口；0 作品可用 `--evidence-only` 生成固定事实交付，普通运行生成 light 报告，只有按需提供 taxonomy/business/comment 结果时才进入 deep。无网络、不直接调用 LLM。 | `--input <collection>`、`--output <analysis>`；可选 `--evidence-only` 或三类 prompt/result 参数 | evidence-only 的摘要/final response，或完整报告、`analysis.json`、阶段 prompt、模型输入与 `task.json` |
-| `validate_model_results.py` | 一次汇总外部 taxonomy/business 结果中可检测的错误；传 `--collection` 后同时校验原文绑定、控制字符、表现组和 caption lead。 | `--analysis <draft>/analysis.json`、`--collection <collection>`、`--taxonomy` 或 `--business` | JSON 诊断；合法返回 0，非法返回 2 |
-| `normalize.py` | 将原始内容映射为统一数据模型，去重并计算字段覆盖率。无网络、无 LLM。 | `--input <任务目录>` | `normalized-posts.csv`、覆盖率 JSON |
-| `analyze.py` | Legacy 目录的确定性分析与 taxonomy 接口；新任务的完整业务洞察流程由 `run_pipeline.py` 编排。无网络、不直接调用 LLM。 | `--input <任务目录>`、可选 `--with-llm-tax` / `--llm-tax-results` | `analysis.json`、可选 `taxonomy-prompt.md` |
-| `collect_bilibili_complete.py` | B站需要完整覆盖时的采集编排；在默认 10,000、硬上限 50,000 条预算内请求末页，对访问限制、频控和明确的 `-352` WBI 风控失败用新目录做 30/60 秒有界重试。首次运行可安全创建一层缺失的输出父目录。 | `<URL> --out-prefix <PATH>`、可选 `--max-items 1..50000` / 日期 / `--comments` / `--analysis-goal` | 1–3 个不可变 attempt collection；stdout 给出 `selected_workspace` |
-| `collect_douyin_complete.py` | 抖音需要完整覆盖时的有界采集编排；可把用户授权 Cookie 文件传给每个独立 attempt，仅对根级访问限制/频控用新目录做 30/60 秒重试，失败时选择证据最多的密封 attempt。首次运行可安全创建一层缺失的输出父目录。 | `<URL> --out-prefix <PATH>`、可选 `--douyin-cookie-file`、完整预算、日期、评论、详情与分析目标 | 1–3 个不可变 attempt collection；stdout 给出 `selected_workspace` 与安全诊断码 |
-| `bounded_attempt_runner.py` | B站与抖音完整采集共用的不可变 attempt 执行器：只读取已密封任务元数据、固定 30/60 秒退避，并按证据数量选择最佳结果。平台模块只声明命令和重试策略。 | 内部模块 | `AttemptRunResult` |
-| `resolve_profile_url.py` | 在创建工作区前规范化 B站主页；短链只允许跳转到 HTTPS 数字 UID 空间主页。 | `<canonical-or-b23-url>` | stdout 输出规范主页 URL |
-| `render_report.py` | 基于标准化数据和分析结果渲染人类可读的 Markdown/HTML：正文只放代表作品、实际引用和语义结论，全量审计数据继续留在 CSV/JSON。语义分类未完成时标为数据概览。无网络、无 LLM。 | `--input <任务目录>` | `account-analysis-report.md`、`dashboard.html` |
+| 目标 | 命令 |
+| --- | --- |
+| 明确范围的公开采集 | `python3 scripts/collect.py <PROFILE_URL> --limit N --out <NEW_COLLECTION>` |
+| B站完整分页与有界重试 | `python3 scripts/collect_bilibili_complete.py <URL> --out-prefix <NEW_PREFIX>` |
+| 抖音完整分页与有界重试 | `python3 scripts/collect_douyin_complete.py <URL> --out-prefix <NEW_PREFIX>` |
+| 抖音账号本人 OpenAPI | `python3 scripts/collect_douyin_authorized.py --all --out <NEW_COLLECTION>` |
+| 导入公开索引证据 | `python3 scripts/import_index_snapshot.py --evidence <EVIDENCE_JSON> --out <NEW_COLLECTION>` |
+| 密封 collection 生成正式交付 | `python3 scripts/run_pipeline.py --input <COLLECTION> --output <NEW_ANALYSIS>` |
+| 校验 taxonomy/business 结果 | `python3 scripts/validate_model_results.py --analysis <ANALYSIS_JSON> ...` |
 
-Skill 入口、触发边界和安全门见 [`../SKILL.md`](../SKILL.md)；完整采集、taxonomy、business、comment 与 final 编排见 [`../references/workflow.md`](../references/workflow.md)。脚本只生成提示、校验输入并绑定冻结证据，不会自行调用 LLM。通用使用示例见 [`../../USAGE.md`](../../USAGE.md)，字段与文件 API 见 [`../references/data-schema.md`](../references/data-schema.md)。
+`collect.py` 省略范围时，B站和抖音进入有界完整模式；微博和小红书默认最近 30 条。只有 B站/抖音接受显式 `--all`。所有平台都可显式使用 `--limit 1..100`。
 
-## 稳定 CLI 合同
+Cookie 参数按平台分别为 `--bilibili-cookie-file`、`--douyin-cookie-file`、`--weibo-cookie-file`、`--xiaohongshu-cookie-file`。默认只在当前进程使用；持久化、自动加载和撤回见 [cookie-guide.md](../references/cookie-guide.md)。
 
-### 采集 checkpoint
+## 正式交付
 
-首次运行用 `--checkpoint-out <NEW_CHECKPOINT>`。作品列表完成后，脚本提交一个仅含 `checkpoint.json` 与 `source/posts.jsonl` 的独立工作区；后续阶段即使异常中断，该 checkpoint 也不被修改。恢复必须同时指定新的 `--out` 与 `--resume-checkpoint <SEALED_CHECKPOINT>`，且不得与增量 `--resume` 或新的 `--checkpoint-out` 联用。
+- 0 条有效作品：`run_pipeline.py ... --evidence-only`。
+- 只需数据质量与描述性观察：普通运行生成 `light`。
+- 主题、栏目或策略：按需生成并回填 taxonomy、business、comment 的严格 JSON；全部 requested 阶段与证据门通过后为 `strategy`。
+- Legacy 的 `normalize.py`、`analyze.py`、`render_report.py` 会写回其输入目录，只用于维护旧制品或定位问题；新任务优先使用 create-only 的 `run_pipeline.py`。
 
-恢复前会校验 `.complete`、manifest、精确文件清单、账号、平台、全部影响列表结果的参数、作品数量、唯一键和 SHA-256。任何不一致都会在适配器加载、联网和输出预留前失败。恢复只跳过访问检查和作品列表采集；资料、可选详情、评论及最终不可变提交仍按正常流程执行。
+结果文件只接受 UTF-8 严格 JSON，拒绝重复键、`NaN`/`Infinity`、额外字段和证据错配。只生成 prompt 而未回填结果时，分析目录仍可密封，但业务状态保持 `PARTIAL`。
 
-### 外部模型结果
+## 不可变工作区
 
-没有可分析作品时，不要手写替代报告：
+- `--out`、`--output` 和 `--out-prefix` 必须指向新的叶子目录或前缀；不覆盖已有路径。
+- 增量续采用 `collect.py <URL> --resume --out <SEALED_COLLECTION> --resume-out <NEW_COLLECTION>`。
+- 列表 checkpoint 首次使用 `--checkpoint-out <NEW_CHECKPOINT>`；恢复时换新 `--out` 并传 `--resume-checkpoint <SEALED_CHECKPOINT>`。
+- 只有通过 manifest 与 `.complete` 核验的目录可作为下游输入。
 
-```bash
-python3 scripts/run_pipeline.py \
-  --input <collection> \
-  --output <evidence-delivery> \
-  --evidence-only
-```
+## 输出与退出码
 
-普通运行生成可交付的 `light` 报告；`strategy_ready=false` 时只交付事实、限制和描述性样本观察。只有完整 taxonomy，以及用户实际请求的 business/comment 阶段全部通过证据门后，才交付策略结论。
+不要从 stdout/stderr 文本或日志行数推断业务状态；读取密封目录中的 `task.json`、`delivery-summary.json`，或 wrapper 明确声明的最终摘要。诊断信息不得包含凭据或远端响应正文。
 
-`run_pipeline.py` 提供三组“生成 prompt / 回填严格结果”参数：
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 命令成功；采集仍可能是可交付的 `PARTIAL`，须读 `task.json` |
+| `2` | 参数、输入或工作区前置条件无效，通常未联网、未提交输出 |
+| `3` | 任务或产物生成失败；若目录已密封，按其中状态处理 |
+| `4` | 提交结果不确定；保留目录并重新核验，禁止覆盖重跑 |
 
-- taxonomy：`--with-llm-tax` / `--classification-results`；
-- 业务洞察：`--with-business-insights` / `--business-insight-results`；
-- 评论洞察：`--with-comment-insights` / `--comment-insight-results`。
-
-结果文件只接受 UTF-8 严格 JSON，拒绝重复键、非标准数值、额外字段和证据错配。验证后的原始字节复制到分析工作区 `source/` 并写入 manifest；本地输入路径不会进入产物。只请求 prompt 而未提供结果时，分析工作区仍可密封提交，但业务状态为 `PARTIAL`，并在 `task.json.partial_reasons` 中给出对应的 pending 原因。
-
-## `collectors/` 子包
-
-`collectors/base.py` 定义 `BaseCollector` 抽象接口。每个适配器实现平台识别、公开访问检查、资料/内容/详情采集和评论采样；访问受限时必须返回或抛出与 `references/exceptions.md` 对齐的 `stop_reason`，不得尝试登录、验证或规避风控。
-
-| 模块 | 职责 |
-|---|---|
-| `base.py` | 统一采集器接口。 |
-| `bilibili.py` | B站采集、业务编排、原始字段构建与 HTTP/WBI 传输的单一实现；为兼容性 re-export 公共传输符号；平台保护响应立即停止。 |
-| `douyin.py` | 抖音公开页面与内嵌数据解析、资料冲突披露，以及可选浏览器传输降级。 |
-| `douyin_cookies.py` | 严格解析用户授权的抖音 Cookie JSON/Header 文件，限制域名、大小、数量与字段；错误不回显秘密。 |
-| `platform_cookies.py` | 严格解析 B站、微博或小红书的用户授权 Cookie JSON/Header 文件，按目标域限制大小、数量与字段；错误不回显秘密。 |
-| `cookie_loader.py` | 把平台名路由至抖音专用或通用域名 Cookie 校验器；不记录任何 Cookie 值。 |
-| `adapter_registry.py` | 以平台声明集中构造可选采集器，并仅按平台名报告加载失败；新增平台无需扩展入口中的导入分支。 |
-| `_douyin_browser_transport.py` | 抖音被动 CDP、无签名同源页内公开分页、可见 DOM 候选及严格账号/作品/分页绑定。 |
-| `weibo.py` | 默认启用的微博公开 AJAX 适配器；可选用户授权会话只在任务内存中作为请求 Cookie 使用；可用 `WEIBO_COLLECTOR_ENABLED=0` 临时安全停用。 |
-| `xiaohongshu.py` | 小红书直接公开主页的嵌入状态适配器；可选用户授权会话先用于直接请求，登录墙或缺少状态时最多以隔离浏览器渲染同一主页一次；不调用签名/私有接口，不能声明全量，验证码或验证立即停止。 |
-| `browser_backend.py` | 仅用于传输降级的 headless 浏览器后端；按稳定顺序尝试系统浏览器或已有 Playwright Chromium 缓存，不安装工具；显式二进制路径不隐式回退。 |
-| `_constants.py` | 北京时区及共享 `STOP_*` 枚举。 |
-| `_utils.py` | 跨采集器复用的时间、数值和话题标签工具。 |
-
-## 依赖方向
-
-`collect.py` 负责加载具体适配器；其他三个主流水线脚本彼此独立地消费前一步产物。采集器依赖 `base.py`、`_constants.py` 与 `_utils.py`；B站传输模块在导入时依赖 `browser_backend.py` 的 `BrowserError` 类型，但只有显式启用传输降级时才会创建浏览器会话或探测二进制；抖音适配器则在启用降级时导入后端。私有辅助模块以 `_` 前缀命名，不构成稳定的外部 API。
+字段问题先按 [data-schema.md](../references/data-schema.md) 路由；状态迁移见 [exceptions.md](../references/exceptions.md)，正式阶段决策见 [workflow.md](../references/workflow.md)。

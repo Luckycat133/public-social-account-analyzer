@@ -6,9 +6,99 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-06
+
+### Added
+
+- 参考文档模块化拆分：`data-schema.md` → `artifact-contract.md` / `collection-schema.md` / `analysis-schema.md`；`analysis-rules.md` → `metrics-and-sampling.md` / `model-insights.md` / `comment-insights.md`。入口文件仅保留路由表，按需加载单份契约。
+- 新增 `skill/scripts/skill_metadata.py`：运行时读取包内 `VERSION` 与 `SKILL.md` SHA-256，供 `task.json.skill_release` 与 `skill_contract_sha256` 字段使用，版本指纹可追溯。
+- 新增 `skill/scripts/collectors/_cookie_storage.py`：原子化、同目录临时文件、`0600` 权限、`fsync` 与 `os.replace` 替换的私有 Cookie 落盘原语，拒绝符号链接、非普通文件、错误所有者与过宽权限。
+- 新增 `skill/scripts/collectors/platform_cookies.py`：平台无关的 Cookie 解析/校验/持久化，统一 64 KiB 文件上限、128 条记录上限、4096 字符值上限、域名后缀匹配，支持 JSON 数组/对象与 `Cookie:` 头文本双格式；错误不回显凭据值。
+- 新增 `skill/scripts/collectors/douyin_cookies.py`：抖音专用 Cookie 入口，复用通用原语并保留既有行为兼容。
+- 更新 `skill/scripts/collectors/cookie_loader.py`：四平台 Cookie 路由统一入口，内存加载与工作区缓存（`{platform}-cookies.json`）自动校验模式/UID/权限/过期，`--clear-cached-cookie` 真正生效。
+- 小红书采集器大幅增强：兼容现代 `window.__INITIAL_STATE__` 与 JS `undefined`，一次复用主页响应完成访问检查/资料/批量卡片；匿名卡片缺真实 `noteId` 时以 `xhs-card-*` 本地键、`post_url=null`、`PARTIAL` 保留；页面令牌不入产物；登录墙识别仅检查可见文本。
+- 新增 `skill/scripts/sign_server.py`：B站 WBI 签名服务端点，供采集器 subprocess 调用规避 412 WAF。
+- 评测数据集升级 0.4.0：删除重复的 `cases.md`、`USAGE.md`、`test_data/README.md`、`validation_data/README.md`；触发集修正 YouTube/Instagram/名称输入语义；行为/触发/基线数据集同步扩充。
+- 新增 `tests/test_cookie_persistence.py`：Cookie 缓存加载/保存/清除/跨平台隔离/符号链接拒绝/权限拒绝/所有者不匹配/过期回退的全覆盖回归。
+- 微博/小红书测试扩充：`test_weibo.py` +126 行、`test_xiaohongshu.py` +323 行，覆盖公开 AJAX、Cookie 会话、现代主页状态、卡片批量采集等合同。
+
+### Changed
+
+- 版本号升至 0.9.0（`skill/VERSION`），接近 1.0 里程碑。
+- 抖音公开路径与完整采集统一使用会话感知滚动：`bounded_attempt_runner.py` 复用于 B站/抖音，统一不可变 attempt、密封元数据读取、固定退避、证据优先选择与安全诊断回调。
+- 采集器注册表声明式构造（`adapter_registry.py`），平台级加载失败显式报错不再静默忽略；子命令启动失败返回固定错误不泄露路径细节。
+- `collect.py` 省略 `--limit` 时默认进入有界完整模式；仅显式要求最近 N 条/日期窗口时才收窄。
+- 报告产物精简：`account-analysis-report.md`/`dashboard.html` 高低组各仅展示 5 条代表作品，业务洞察正文最多 3 条去重证据，完整数据保留审计层。
+- `task.json` 新增 `skill_release` 与 `skill_contract_sha256` 逐字绑定包内语义版本与 SKILL.md 字节。
+- 微博 P1 适配器默认启用（`WEIBO_COLLECTOR_ENABLED=1`），公开 AJAX `ok=-100` 记为 `LOGIN_REQUIRED` 不误判账号不可用。
+- 抖音 OpenAPI 编排：`collect_douyin_authorized.py` 先用同次 OAuth `access_token + open_id` 完成 userinfo 精确身份回证，再用官方 `/video/list/` 分页；凭据不入 URL/命令行/日志/产物。
+- 文档同步更新：`CLAUDE.md`、`ROADMAP.md`、`USAGE.md`、`README.md`、`docs/architecture/STRUCTURE.md`、`docs/guides/deployment-package-checklist.md`、`docs/guides/skill-development-workflow.md`、PRD 实现状态表、`docs/acceptance/*` 验收文档。
+
+### Fixed
+
+- 修复 Cookie 缓存跨平台误阻断、`--clear-cached-cookie` 不生效、不安全落盘（临时文件/原子替换/fsync/0600/拒绝 symlink/UID 校验）。
+- 修复 B站限量采集缺少动态覆盖账本、平台频控误报访问限制、WBI `web_location` 字典缺失导致 -799 拒绝。
+- 修复小红书现代主页身份绑定不足（以主页路径绑定目标账号，拒绝当前浏览者 `userInfo.userId`）、页面 `login` 文本误判登录墙。
+- 修复抖音 OpenAPI 把 OAuth 标识写入公开账号字段；授权资料失败时不再把 userinfo endpoint 写入 `profile_url`。
+- 修复 `collect_bilibili_complete.py` / `collect_douyin_complete.py` 在 `workspace/` 根目录不存在时误报输出目录不安全；编排器安全创建一层缺失父目录。
+- 修复大样本报告随采集规模线性膨胀（782 条从 ~1700 行/281 KB 降为 ~180 行/7.7 KB），审计层仍保留全部记录。
+- 修复分析报告分位数反转、非数值/非有限值进入正式报告；渲染前校验 `p25 ≤ median ≤ p75`。
+- 修复 CSV 亚秒时长截断、JSON 字符串整数类型漂移、阶段耗时之和不等于总耗时。
+- 修复恢复任务跨平台/跨账号/未密封/摘要不一致/重复作品仍可能继续联网；checkpoint 独立密封并绑定账号/参数/作品数/摘要。
+
+### Security
+
+- Cookie 持久化全链路 `0600`、原子替换、`fsync`、同目录临时文件、拒绝符号链接/非普通文件/错误所有者/过宽权限；凭据继续排除在任务产物、日志、报告、错误信息之外。
+- 浏览器后端失败诊断改用稳定 `BrowserError.diagnostic_code`，避免持久化不受控错误文本。
+- 授权失败、网络层错误、默认输出路径不再暴露 OAuth 路由、代理错误原文、原始账号标识。
+- 抖音公开页遇登录墙时不再视为最终失败：用户提供合法 Cookie 后可继续；Cookie 过期/验证码/频控/绑定冲突保留已有证据按真实覆盖结束。
+
+### Removed
+
+- 删除重复的 `skill/evals/cases.md`、`skill/evals/datasets/USAGE.md`、`skill/evals/datasets/test_data/README.md`、`skill/evals/datasets/validation_data/README.md`。
+- 移除已停用的抖音页内主动分页说明与断言。
+- 旧版单体 `data-schema.md` 与 `analysis-rules.md` 内容已迁移至模块化文件，入口仅保留路由表。
+
+## [0.8.4] - 2026-08-03
+
+### Added
+
+- 将数据合同拆为制品、采集、分析三份按需参考，将分析规则拆为指标、模型洞察和评论洞察三份按需参考；原入口文件只保留路由。
+- 新增可移植的四平台真实账号 smoke-test 工作流，以及 Cookie 清除、权限、符号链接、平台隔离和账号绑定的回归测试。
+
+### Changed
+
+- 主行为评估收敛为 4 个真实端到端任务；触发集修正 YouTube、Instagram 与名称输入的触发语义，派生数据集升级为 0.4.0。
+- B站/抖音省略范围时使用有界完整模式；微博/小红书默认最近 30 条。Skill 源目录在打包校验前复制为 frontmatter `name`。
+- Skill 入口和 CLI 说明采用渐进披露：普通聊天只加载最小决策流，正式制品、平台采集和字段合同按任务需要读取；评测 runner 支持旧 Skill 快照基线并记录精确版本指纹。
+
+### Fixed
+
+- 修复 B站限量采集缺少动态覆盖账本、平台频控误报访问限制、小红书现代主页身份绑定不足，以及抖音 OpenAPI 把 OAuth 标识写入公开账号字段的问题。
+- 修复 Cookie 缓存跨平台误阻断、`--clear-cached-cookie` 不生效及不安全落盘；正式策略交付现在同时要求作品证据覆盖完整。
+
+### Security
+
+- Cookie 持久化改为同目录临时文件、`0600` 权限、`fsync` 和原子替换；自动加载拒绝符号链接、非普通文件、错误所有者和过宽权限，凭据继续排除在任务产物、日志与报告之外。
+
+### Removed
+
+- 删除与机器评估重复的 `skill/evals/cases.md` 及重复的数据集 `USAGE.md`；移除已经停用的抖音页内主动分页说明和断言。
+
+## [0.8.3] - 2026-08-01
+
+### Changed
+
+- Skill 入口收束为四步决策流，平台实现细节改为按需路由至参考文档；补回微博入口，并消除重复的状态枚举与抖音索引说明。
+- 触发边界明确排除媒体/作品下载和账号内容归档；评估文档按实际 15 条训练、12 条独立验证数据集更新。
+- 统一当前文档中的 Cookie 会话语义：默认仅当前任务使用；显式 `--persist-cookie` 时才以 `0600` 本地缓存并供后续同平台任务自动加载。
+
+## [0.8.2] - 2026-07-31
+
 ### Added
 
 - B站采集新增可选 `--bilibili-cookie-file`，通用采集和完整采集编排均可接收用户主动提供的当前网页会话。Cookie 仅在任务内存中用于直接请求，并沿用域名、大小、数量与不落盘/不回显的统一安全校验；它可改善登录态下的可读取性，不绕过验证码、频控或平台访问限制。
+- 四个平台统一采用账号名发现规则：先搜索候选并核验公开身份，再把规范主页交给采集器；唯一强匹配自动继续，有歧义时只做一次最小选择，不从昵称拼造账号 ID，也不要求用户逐条提供作品链接。
 
 ### Changed
 
@@ -16,10 +106,12 @@
 - 通用采集入口通过 `collectors/cookie_loader.py` 统一路由四个平台的 Cookie 验证器，消除重复的文件读取分支，并继续只输出不含凭据的固定错误信息。
 - 可选采集器改由 `collectors/adapter_registry.py` 的声明式注册表构造。入口现在会显示安全的平台级加载失败，而不再静默忽略；子采集命令无法启动时也会返回固定错误，不泄露命令或本地路径细节。
 - 小红书带 Cookie 的直接主页在登录墙或缺少嵌入状态时，最多使用一次隔离临时浏览器渲染同一 URL；它不尝试搜索或签名接口，并明确不保证云端环境可访问。
+- 小红书采集器兼容现代 `window.__INITIAL_STATE__` 与其中的 JavaScript `undefined`，一次复用主页状态完成访问检查、资料和批量卡片采集。匿名页面隐藏作品 ID 时，用披露的 `xhs-card-*` 本地键保留 `PARTIAL` 主页样本，不伪造单篇 URL。
 
 ### Fixed
 
 - 小红书页面保护识别改为只检查可见页面文本，不再把脚本中的普通 `login` 标识误判为登录墙。
+- 小红书现代状态以主页路径绑定目标账号，避免把当前浏览者 `userInfo.userId` 当成被分析账号；明确属于其他账号的卡片会被拒绝，页面令牌不进入产物。
 
 ## [0.8.1] - 2026-07-31
 

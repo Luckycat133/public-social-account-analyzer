@@ -103,27 +103,26 @@ def test_skill_md_keeps_scope_disclosure_without_forced_order():
     assert "最终答复在分析结论前先展示数据质量摘要" not in text
 
 
-def test_eval_assertion_rewards_useful_answer_and_scope_without_fixed_order():
+def test_primary_eval_rewards_useful_answer_and_scope_without_fixed_order():
     data = json.loads(EVALS_JSON.read_text(encoding="utf-8"))
-    eval1 = next(e for e in data["evals"] if e["id"] == 1)
-    matched = [a for a in eval1["assertions"] if "证据范围" in a]
-    assert matched, "eval1 应检查结论与证据范围是否都对用户有用"
-    assert "固定顺序" in matched[0]
-
-
-def test_eval_pinned_assertion_is_conditional_with_fixture():
-    data = json.loads(EVALS_JSON.read_text(encoding="utf-8"))
-    eval1 = next(e for e in data["evals"] if e["id"] == 1)
-    matched = [a for a in eval1["assertions"] if "置顶" in a]
-    assert matched
-    assert "N/A" in matched[0], "无置顶样本时断言必须按 N/A 计"
-    assert "fixture" in matched[0], "断言必须指向确定性离线 fixture"
-
-
-def test_eval10_forbids_hypothetical_reports():
-    data = json.loads(EVALS_JSON.read_text(encoding="utf-8"))
-    eval10 = next(e for e in data["evals"] if e["id"] == 10)
-    first = eval10["assertions"][0]
-    assert "假设稿" in first and "草稿" in first, (
-        "eval10 断言必须明确禁止无采集的假设型报告"
+    primary = next(
+        e for e in data["evals"] if e["id"] == "vague-bilibili-strategy"
     )
+    assert "直接给出可用判断" in primary["expected_output"]
+    assert "覆盖缺口" in primary["expected_output"]
+    assert all("固定顺序" not in item for item in primary["assertions"])
+
+
+def test_primary_evals_are_small_real_user_tasks_not_unit_contracts():
+    data = json.loads(EVALS_JSON.read_text(encoding="utf-8"))
+    assert 2 <= len(data["evals"]) <= 5
+    assert all(len(item["assertions"]) <= 5 for item in data["evals"])
+    assert all("不要联网或启动浏览器" not in item["prompt"] for item in data["evals"])
+
+
+def test_restricted_eval_forbids_fake_full_coverage():
+    data = json.loads(EVALS_JSON.read_text(encoding="utf-8"))
+    restricted = next(
+        e for e in data["evals"] if e["id"] == "restricted-partial-salvage"
+    )
+    assert any("前100" in item or "全量" in item for item in restricted["assertions"])

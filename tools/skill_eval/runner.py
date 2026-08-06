@@ -3,11 +3,11 @@
 
 解决 iteration-1 的两个协议缺陷：
 
-1. **物理隔离**：without_skill 基线在一个不含任何 Skill 文件/元数据的
+1. **物理隔离**：新建 Skill 时，without_skill 基线在一个不含任何 Skill 文件/元数据的
    全新临时工作区中运行，并叠加 ``--disable-slash-commands``（禁用全部
    Skill）与 ``--setting-sources project``（不加载用户级设置，杜绝
-   ``~/.claude/skills`` 泄漏）。with_skill 侧则把 Skill 复制进工作区的
-   ``.claude/skills/<name>``。两侧使用同一模型，保证可比。
+   ``~/.claude/skills`` 泄漏）。改进已有 Skill 时，``--baseline-skill-dir``
+   把旧快照安装到同一个基线配置。with_skill 侧安装候选版本；两侧使用同一模型。
 2. **标准目录结构与版本指纹**：产物固定写入
    ``<iteration>/eval-<name>/<config>/run-<n>/``，包含 run.json、
    response.md、timing.json（数值墙钟秒 + 可用时的 token 用量）与
@@ -24,7 +24,7 @@ usage 字段读取；不可用时写 null，绝不估算。
 用法::
 
     python tools/skill_eval/runner.py \
-        --evals skill/evals/evals.json --ids 1,7,10 \
+        --evals skill/evals/evals.json --ids vague-bilibili-strategy,user-data-no-recollection \
         --iteration workspace/skill-evals/claude-isolated/iteration-2 \
         --skill-dir skill --runs 3 [--model sonnet] [--timeout 900]
 """
@@ -49,11 +49,11 @@ def slugify(name: str) -> str:
     return "".join(c if c.isalnum() or c == "-" else "-" for c in name).strip("-")
 
 
-def load_evals(path: Path, ids: Optional[List[int]]) -> List[Dict[str, Any]]:
+def load_evals(path: Path, ids: Optional[List[str]]) -> List[Dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     evals = data.get("evals", [])
     if ids:
-        evals = [e for e in evals if e.get("id") in ids]
+        evals = [e for e in evals if str(e.get("id")) in ids]
     if not evals:
         raise SystemExit("error: no evals selected")
     return evals
@@ -82,10 +82,12 @@ def preflight(model: str) -> None:
         raise SystemExit(f"BLOCKED: claude preflight failed: {combined[:400]}")
 
 
-def build_workspace(run_dir: Path, config: str, skill_dir: Path) -> Path:
+def build_workspace(
+    run_dir: Path, config: str, skill_dir: Optional[Path],
+) -> Path:
     ws = run_dir / "workspace"
     ws.mkdir(parents=True)
-    if config == "with_skill":
+    if skill_dir is not None:
         target = ws / ".claude" / "skills" / SKILL_NAME
         target.parent.mkdir(parents=True)
         shutil.copytree(
@@ -95,7 +97,9 @@ def build_workspace(run_dir: Path, config: str, skill_dir: Path) -> Path:
     return ws
 
 
-def claude_command(config: str, prompt: str, model: str) -> List[str]:
+def claude_command(
+    config: str, prompt: str, model: str, *, has_skill: bool,
+) -> List[str]:
     cmd = [
         CLAUDE_BIN, "-p", prompt,
         "--model", model,
@@ -103,7 +107,7 @@ def claude_command(config: str, prompt: str, model: str) -> List[str]:
         "--setting-sources", "project",
         "--dangerously-skip-permissions",
     ]
-    if config == "without_skill":
+    if not has_skill:
         cmd.append("--disable-slash-commands")
     return cmd
 
@@ -127,11 +131,13 @@ def extract_usage(payload: Dict[str, Any]) -> Dict[str, Optional[int]]:
 
 def execute_run(
     eval_def: Dict[str, Any], config: str, run_dir: Path,
-    skill_dir: Path, model: str, timeout: int,
+    skill_dir: Optional[Path], model: str, timeout: int,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     ws = build_workspace(run_dir, config, skill_dir)
-    cmd = claude_command(config, eval_def["prompt"], model)
+    cmd = claude_command(
+        config, eval_def["prompt"], model, has_skill=skill_dir is not None
+    )
 
     started = time.monotonic()
     status = "completed"
@@ -184,8 +190,11 @@ def execute_run(
         "model": model,
         "isolation": {
             "kind": "physical",
-            "bare_workspace": config == "without_skill",
-            "skills_disabled_flag": config == "without_skill",
+            "bare_workspace": skill_dir is None,
+            "skills_disabled_flag": skill_dir is None,
+            "baseline_skill_installed": (
+                config == "without_skill" and skill_dir is not None
+            ),
             "setting_sources": "project",
         },
         "command_flags": cmd[3:],  # 不含 prompt 本体
@@ -221,6 +230,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="逗号分隔的 eval id 列表，缺省=全部")
     parser.add_argument("--iteration", required=True)
     parser.add_argument("--skill-dir", required=True)
+    parser.add_argument(
+        "--baseline-skill-dir",
+        default=None,
+        help="已有 Skill 的旧快照；省略时使用无 Skill 基线",
+    )
     parser.add_argument("--configs", default="with_skill,without_skill")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--model", default="sonnet")
@@ -228,11 +242,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--skip-preflight", action="store_true")
     args = parser.parse_args(argv)
 
-    ids = [int(x) for x in args.ids.split(",")] if args.ids else None
+    ids = (
+        [value.strip() for value in args.ids.split(",") if value.strip()]
+        if args.ids
+        else None
+    )
     evals = load_evals(Path(args.evals), ids)
     skill_dir = Path(args.skill_dir).resolve()
     if not (skill_dir / "SKILL.md").is_file():
         raise SystemExit(f"error: {skill_dir} is not a skill directory")
+    baseline_skill_dir = (
+        Path(args.baseline_skill_dir).resolve()
+        if args.baseline_skill_dir
+        else None
+    )
+    if (
+        baseline_skill_dir is not None
+        and not (baseline_skill_dir / "SKILL.md").is_file()
+    ):
+        raise SystemExit(
+            f"error: {baseline_skill_dir} is not a skill directory"
+        )
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
     if args.runs < 1:
         raise SystemExit("error: --runs must be >= 1")
@@ -252,14 +282,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     skill_contract_sha256 = hashlib.sha256(
         (skill_dir / "SKILL.md").read_bytes()
     ).hexdigest()
-    (iteration / "run-metadata.json").write_text(json.dumps({
+    baseline_kind = (
+        "previous_skill_snapshot"
+        if baseline_skill_dir is not None
+        else "physically_isolated_without_skill"
+    )
+    run_metadata = {
         "skill_name": SKILL_NAME,
         "skill_contract_sha256": skill_contract_sha256,
         "executor_model": args.model,
         "runs_per_configuration": args.runs,
         "configurations": configs,
-        "baseline_kind": "physically_isolated_without_skill",
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        "baseline_kind": baseline_kind,
+    }
+    if baseline_skill_dir is not None:
+        run_metadata["baseline_skill_contract_sha256"] = hashlib.sha256(
+            (baseline_skill_dir / "SKILL.md").read_bytes()
+        ).hexdigest()
+    (iteration / "run-metadata.json").write_text(
+        json.dumps(run_metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     for eval_def in evals:
         eval_dir = iteration / f"eval-{slugify(eval_def['name'])}"
         eval_dir.mkdir(parents=True, exist_ok=True)
@@ -268,7 +311,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "eval_name": eval_def.get("name"),
             "prompt": eval_def.get("prompt"),
             "model": args.model,
-            "baseline_kind": "physically_isolated_without_skill",
+            "baseline_kind": baseline_kind,
             "assertions": eval_def.get("assertions", []),
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         for config in configs:
@@ -278,8 +321,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"skip existing {run_dir}")
                     continue
                 print(f"run: eval={eval_def['name']} config={config} n={n}")
-                execute_run(eval_def, config, run_dir, skill_dir,
-                            args.model, args.timeout)
+                config_skill_dir = (
+                    skill_dir if config == "with_skill" else baseline_skill_dir
+                )
+                execute_run(
+                    eval_def, config, run_dir, config_skill_dir,
+                    args.model, args.timeout,
+                )
     print(f"done. next: fill grading.json per run, then aggregate with "
           f"tools/skill_eval/aggregate.py {iteration}")
     return 0

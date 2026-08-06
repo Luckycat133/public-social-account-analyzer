@@ -8,9 +8,8 @@
 - [无登录索引降级](#无登录-web-索引证据降级skillagent-层)
 - [平台测试样例](#平台特有测试样例)
 
-> 抖音（douyin.com）平台采集适配规范。本文件与 `data-schema.md`（字段字典）、
-> `exceptions.md`（状态机）配套使用，所有 `stop_reason` 取值严格取自
-> `exceptions.md` §9.2，不新增枚举。
+> 抖音字段从 [data-schema.md](../data-schema.md) 路由；停止语义以
+> [exceptions.md](../exceptions.md) 为准。
 >
 > 证据边界：匿名模式不把登录墙当作“账号无数据”；用户明确在对话中提供其合法会话 Cookie 时，
 > 可在隔离的临时浏览器中以该授权会话读取用户本来可见的页面。两种模式都不自动处理验证码、
@@ -21,7 +20,7 @@
 
 本文件主体描述匿名公开适配器和用户授权会话模式。账号本人提供同次 OAuth access token + `open_id` 时，可使用
 隔离的 `collect_douyin_authorized.py` 官方列表入口；其身份回证、末页、opaque share 与令牌
-边界见 [data-schema.md §3.2/§5](../data-schema.md) 和 [exceptions.md §2.1](../exceptions.md)。该入口
+边界见 [artifact-contract.md](../artifact-contract.md) §3.2、[collection-schema.md](../collection-schema.md) §5 和 [exceptions.md](../exceptions.md) §2.1。该入口
 不是匿名降级，也不能按第三方账号查询。
 
 ## 从账号名发现规范主页
@@ -40,8 +39,9 @@
 
 当云端匿名访问只得到登录墙，且用户愿意继续时，按 [cookie-guide.md](../cookie-guide.md) 直接引导其复制浏览器请求头并粘贴到对话。Agent 再以 `--douyin-cookie-file <PATH>` 传入其创建的临时文件；具体参数保持在本平台参考中。
 
-- Cookie 可由用户粘贴到当前对话，但 Agent 不得回显、转发、写入日志或版本库；命令行只传 Agent 创建的临时文件路径。
+- Cookie 可由用户粘贴到当前对话，但 Agent 不得回显、转发、写入产物或版本库；命令行只传 Agent 创建的临时文件路径。
 - 解析器限制文件大小、Cookie 数量和值长度，错误只返回固定说明，不回显秘密。Cookie 仅保存在采集进程内，临时 profile 随会话删除。
+- 持久化、自动加载与撤回只按 [cookie-guide.md](../cookie-guide.md) 执行。
 - 平台再次要求验证、限制访问或账号绑定冲突时，保留已有证据并按实际覆盖停止；Cookie 会过期，因此不把离线测试冒充在线成功。
 
 完整采集示例：
@@ -74,9 +74,8 @@ python3 scripts/collect_douyin_complete.py \
 - 搜索页：`.../search?keyword=...`。
 - 话题/音乐/直播/发现页：`/topic/`、`/music/`、`/challenge/`、`/live/`、`/discover/`。
 
-> 说明：抖音的 `sec_uid` 是用户唯一且稳定的公开标识，用作 `account_id` 的保底值；
-> 页面明确展示抖音号（`unique_id`）时优先作为 `account_id`，并同时记入
-> `platform_metrics.unique_id`。
+> 说明：公开 Web 资料优先使用页面明确展示的 `unique_id`/`short_id`，缺失时以主页
+> `sec_uid` 作为 `account_id`；OpenAPI 与索引导入固定使用已回证的 `sec_uid`。
 
 ## 账号主页与作品页区分
 
@@ -95,7 +94,7 @@ python3 scripts/collect_douyin_complete.py \
 
 ## 账号字段
 
-页面公开账号字段 → 统一 `Profile` 字段映射（`data-schema.md` §4）：
+页面公开账号字段 → 统一 `Profile` 字段映射（[collection-schema.md](../collection-schema.md) §4）：
 
 | 抖音原始字段 | 统一字段 | 说明 |
 |---|---|---|
@@ -117,14 +116,14 @@ python3 scripts/collect_douyin_complete.py \
   其他负数、非有限数、布尔类型码及没有认证证据的情况均记 `null`，不得把未知伪装成
   未认证，也不得把 `"false"` / `"未认证"` 当认证文案。
 - 获赞总量只进 `platform_metrics.total_likes`，统一层 `platform_metrics` 为必填对象。
-- 页面未展示的字段一律写 `null`（绝不用 `0` 代替未知，见 `data-schema.md` §7 / §8）。
+- 页面未展示的字段一律写 `null`（绝不用 `0` 代替未知，见 [collection-schema.md](../collection-schema.md) §8）。
 - `field_visibility` 必须覆盖 `account_id`、`verified` 与 `total_likes`：URL 中的
   `sec_uid` 回退为 `partial`，公开抖音号/明确认证证据/明确的获赞数（包括 0）为
   `visible`，无证据为 `hidden`。
 
 ## 内容字段
 
-单条作品 → 统一 `Post` 字段映射（`data-schema.md` §5）：
+单条作品 → 统一 `Post` 字段映射（[collection-schema.md](../collection-schema.md) §5）：
 
 | 抖音原始字段 | 统一字段 | 说明 |
 |---|---|---|
@@ -148,7 +147,7 @@ python3 scripts/collect_douyin_complete.py \
 
 ## 公开指标
 
-单条作品公开表现指标 → 统一 `Metrics` 字段（`data-schema.md` §6）：
+单条作品公开表现指标 → 统一 `Metrics` 字段（[collection-schema.md](../collection-schema.md) §6）：
 
 | 抖音原始字段 | 统一字段 | 说明 |
 |---|---|---|
@@ -160,14 +159,14 @@ python3 scripts/collect_douyin_complete.py \
 
 空值规则（强制）：
 - **播放数可能不公开**：抖音对部分账号/作品不展示播放量，解析不到时 `views = null`，
-  不得用互动数反推（见 `data-schema.md` §8）。
+  不得用互动数反推（见 [collection-schema.md](../collection-schema.md) §8）。
 - 任意指标**页面未展示** → `null`；**明确显示 0** 才记 `0`。
 - 抖音无 `coins`/`danmaku` 对应字段，统一层保持 `null`（不臆造）。
 
 ## 特殊处理
 
 - **置顶作品**：`is_top=true` 时 `is_pinned=true`。分析层默认排除置顶内容，但须在
-  `Post` 中保留标记（`data-schema.md` §5 约束）。
+  `Post` 中保留标记（[collection-schema.md](../collection-schema.md) §5 约束）。
 - **合集（mix/collection）**：作品若归属合集，`collection_name` 记入
   `platform_metrics.collection_name`；统一层 `series_name` 由模型分析阶段回填，
   采集层不臆造。
@@ -179,128 +178,46 @@ python3 scripts/collect_douyin_complete.py \
 
 ## 访问限制识别
 
-所有判定基于页面文本/结构特征，**不绕过任何保护**。对应 `stop_reason`（`exceptions.md` §9.2）：
+所有判定基于页面文本/结构特征，**不绕过任何保护**。对应 `stop_reason`：
 
 | 识别场景 | 页面特征（示例） | stop_reason |
 |---|---|---|
 | 登录提示 | "登录后查看"、"请先登录"、"登录抖音"、"需登录后访问" | `LOGIN_REQUIRED` |
 | 验证页 / 滑块 | "滑动验证"、"人机验证"、"请完成安全验证"、"Verify you are human" | `VERIFICATION_REQUIRED` |
-| 访问频控 | "访问过于频繁"、"操作过于频繁"、"请求频率过高"、"网络异常，请稍后再试" | `ACCESS_RESTRICTED` |
+| 访问频控 | "访问过于频繁"、"操作过于频繁"、"请求频率过高" | `RATE_LIMITED` |
+| 其他访问限制 | "网络异常，请稍后再试"、"访问受限" | `ACCESS_RESTRICTED` |
 | 账号不可用 | "账号不存在"、"用户不存在"、"该账号已被封禁"、"账号已注销" | `ACCOUNT_UNAVAILABLE` |
 | 解析失败 | 页面可访问（HTTP 200）但缺少 SSR 数据（抖音升级为 JS 虚拟机 `_$jsvmprt` 动态渲染，未嵌入静态 `RENDER_DATA` / `_SSR_DATA`） | `PARSER_FAILED` |
 | 无公开内容 | 账号存在但作品列表为空且非受限 | `NO_PUBLIC_CONTENT` |
 
 临时浏览器明确看到限制页时，覆盖账本只保存安全审计对：`restriction_source` 固定为
 `browser_visible_text`，`restriction_marker` 按停止原因固定映射为
-`LOGIN_WALL_VISIBLE`、`VERIFICATION_CHALLENGE_VISIBLE`、
+`LOGIN_WALL_VISIBLE`、`VERIFICATION_CHALLENGE_VISIBLE`、`RATE_LIMIT_VISIBLE`、
 `ACCESS_RESTRICTION_VISIBLE`、`ACCOUNT_UNAVAILABLE_VISIBLE` 或
 `NO_PUBLIC_CONTENT_VISIBLE`。页面原文、选择器、Cookie、请求头与带查询参数 URL 不得进入
 `task.json`、报告或其他产物；两个审计字段必须成对出现且与根级 `stop_reason` 一致。
 
 行为约束与解决决策树：
-- 命中上述任一**任务级**限制时，**立即停止**对应请求；`check_access` 返回
-  `{"accessible": False, "reason": <说明>, "stop_reason": <上表值>}`；
-  `collect_*` 抛 `DouyinError(stop_reason)` 由上层按 `exceptions.md` 决策表降级。
-- **抖音 JS 虚拟机/动态渲染与浏览器会话**：
-  1. 公开主页只有一条采集协议：先读取同一页面会话中的 SSR；SSR 缺失或作品列表结构无法识别（例如直连 HTTP 仅获取到 `_$jsvmprt` 打桩页）时，默认自动启动浏览器降级来读取该主页。真正识别到空作品列表时不启动浏览器，返回 `NO_PUBLIC_CONTENT`。`SOCIAL_BROWSER_FALLBACK=0` 可禁用浏览器会话；`--no-browser-fallback` 优先级最高，且仅控制抖音。用户 Cookie 只注入该会话，不引入另一条采集路径。
-  2. 浏览器会话只观察目标账号主页的被动 CDP 网络响应与可见 DOM 卡片；不再执行页内 `aweme/post` 请求来扩展列表。所有接纳的作品仍须通过 HTTP/API、owner、作品 ID、作者和分页审计。
-  3. 后端依次探测 `BROWSER_BIN` / `CHROME_BIN`、系统 Chrome/Chromium/Edge/Brave，以及已有的 Playwright Chromium 缓存（含 `PLAYWRIGHT_BROWSERS_PATH` 与平台默认缓存）。显式路径或环境覆盖是唯一候选；自动探测会在同一总启动时限内逐个尝试可用候选，前一个进程启动失败才尝试下一个。缓存探测不导入或启动 Playwright。全部未找到时内部诊断为 `BROWSER_UNAVAILABLE`，对外 `stop_reason` 仍为 `PARSER_FAILED`。
-  4. 浏览器运行不新增 pip、npm 或其他运行时依赖，Agent 不执行 `playwright install`、`npx puppeteer browsers install` 或一次性浏览器爬虫。每次启动均创建并删除临时用户目录，不附着本机浏览器 profile；只有显式 `--douyin-cookie-file` 才向临时会话注入用户授权 Cookie。无论哪种模式都不持久化 Cookie、请求头、带签名 URL、完整响应或媒体。
-     临时 profile 只在浏览器真正 `start()` 时创建；仅构造会话不会留下空目录。覆盖账本可选
-     记录浏览器 requested/launched、作品证据来源（无作品证据为 `none`）、页内请求是否启用与次数、滚动轮数和有界预算；这些字段经过三层白名单，不包含 profile 路径、页内请求 URL/query、请求头或原始响应。
-  5. 遇到登录、验证码、滑块、频控或其他限制立即停止；若时间预算尚存，只读取当前
-     精确账号路径下已可见的主页标题区（含认证徽章），不再滚动且不查询/接纳 DOM
-     作品卡片，原限制状态保持不变。已采集的公开作品可作为部分结果保留。后续
-     `run_pipeline.py` 仅在至少有 1 条有效可分析作品时提交独立分析工作区；0 条有效
-     数据会在输出预留前失败，不发布空分析。
-  6. API、SSR、网络响应和可见账号头只在 `sec_uid` 与规范化主页 URL 均不矛盾时合并；
-     任一显式账号绑定冲突都以 `PARSER_FAILED` 关闭，不用请求参数覆盖响应身份，也不以
-     旧缓存掩盖冲突。浏览器缓存按证据强度合并并重新净化，后到的档案片段不会清除已确认的抖音号、获赞数（包括 0）或更强认证证据。`followers`、`post_count` 或 `total_likes` 出现不同公开数值时保留先取得的值，同时在 `platform_metrics.profile_conflicts` 保存选中值与最多 16 个不同观测，并将对应 `field_visibility` 降为 `partial`；不得静默 first-wins 后称为确定事实。
-  7. 主页网络作品列表以规范主页路径中的 `sec_uid` 为预期账号。候选响应必须具有精确数值
-     HTTP 200；顶层 `status_code` / `error_code` 若存在，必须是整数 0。非空列表要求每一条原始项
-     都是可映射、数字 ID 且冻结路径 `author.sec_uid` 精确等于预期账号；所有非空
-     `aweme_id` / `aweme_id_str` 必须指向同一数字 ID，可解析的官方 `share_url` 直接作品路径
-     也必须绑定该 ID。稀疏、非对象、非法或冲突 ID/URL、缺作者、外账号或混合作者都会使整个候选丧失分页/末页证明，已验证作品仅可保留为
-     部分证据，不能过滤坏项后继续沿用同页的 `has_more` 或游标。账号分页响应 pathname 当前只接受冻结的
-     `/aweme/v1/web/aweme/post/`，JSON 只读取根对象或根 `data` 对象直接拥有的冻结作品列表
-     键；推荐、搜索、详情响应，以及 recommendation sibling 或任意深层同名键都不贡献
-     作品和分页事实。空列表必须由同一列表容器上的 `sec_uid` / `sec_user_id`，或该冻结
-     响应 URL 中唯一、严格解码且精确匹配的同名参数证明归属；缺失、空白、控制字符、重复、冲突、非法编码
-     和无关响应都不能证明空页。只有通过这些检查的观测才影响网络作品、页数、游标、
-     terminal 与 `is_exhaustive`。`has_more` 只接受 JSON 布尔值或类型精确且值为 `0/1` 的整数，并统一转为布尔；字符串、浮点或其他整数均使候选失去分页证明。即使较晚响应已给出可信末页，只要任一可能属于目标账号的
-     列表候选仍未读取、HTTP/API 状态失败、绑定重复/非法而有歧义、加载失败、JSON 解析失败，或合法 JSON 无法
-     通过列表结构与作者绑定校验形成分页观测，就只能保留末页已观察事实并将
-     `is_exhaustive` 置为 `false`。每个 frozen owner 内 `max_cursor` / `cursor` / `min_cursor`
-     只接受非负整数或非空有界字符串且必须一致；根/data 等多个有效 owner 先合并成一个
-     逻辑页，只向全局页数、游标和 terminal 原子提交一次。官方直接作品 URL 的可选尾斜杠
-     不得绕过作品 ID 一致性校验。owner 间分页事实冲突时，其中已
-     验证作品只作为部分证据。末页后停止滚动，但继续消费 CDP 事件直到一次静默轮询或预算
-     到期；DOM、正文或响应体 CDP 调用都会使旧静默证明失效，最终空轮询后不再调用 CDP。
-     响应
-     query 仅用于会话内判断，诊断仍只保留去 query 的安全路径及失败/未决候选计数。DOM 降级只读取可见 `[data-e2e="user-post-item"]` 根内的可见作品链接，且
-     同一次快照必须带有与规范请求精确匹配的 `profile.sec_uid`；旧 list-only 快照、缺失或
-     外账号 profile 均不接纳卡片，DOM 空卡片也不能证明 terminal / 穷尽。
-  8. `collect_post_detail` 对**已经由作品列表或调用方提供的规范作品 URL**支持独立匿名
-     浏览器降级。它先尝试原有 HTTP/SSR 详情；仅在详情不存在或结构无法解析并对应
-     `PARSER_FAILED` 时，最多启动一次临时浏览器会话。HTTP `401` / `403` / `429`、页面
-     登录/验证/频控提示及其他明确限制均保持原 `stop_reason` 并立即停止，不进入该降级。
-     `SOCIAL_BROWSER_FALLBACK=0` 与 `--no-browser-fallback` 同样禁用这条路径。
-  9. 已知作品详情降级不是发现接口，也不改变 `supports()` 只接受账号主页的规则。网络
-     响应只读取冻结的单条详情路径：顶层 `aweme_detail` / `awemeDetail`、`data` 下同名
-     字段、`aweme.detail`、`video.aweme`、`app.aweme.detail`；明确忽略 `aweme_list`、推荐
-     列表及任意递归命中的作品 ID。网络详情优先；没有可绑定网络详情时才读取一次当前
-     `/video/<id>` 或 `/note/<id>` 页面中的可见详情快照，不滚动、不点击。
-  10. 该路径要求请求 URL、原始 `aweme_id` / `aweme_id_str` / `share_url`（凡是响应明确
-     提供的字段）和归一化后的 `post_id` / `post_url` / `source_url` 全部一致。任一显式
-     冲突立即以 `PARSER_FAILED` 关闭，不能用另一候选覆盖，也不写入缓存。一次调用最多
-     返回一条绑定作品；多条或畸形载荷同样失败关闭。冻结路径和一致的 ID/地址只证明
-     路由身份，不单独构成详情：候选还须至少包含一个有效且可映射的公开字段，例如非空
-     `desc`、结构有效的 `text_extra`（明确的空数组也表示已知无话题）、有效发布时间、
-     非负互动数/时长、明确布尔标记、有效图文载荷或非空合集名。空 `desc` 单独不可信；
-     ID-only 候选在启用降级时继续一次浏览器详情采集，禁用时返回 `PARSER_FAILED`，但其
-     显式身份冲突仍优先立即失败。
-  11. 已知作品详情会话的默认/硬上限分别为：20/90 秒、8/32 个候选响应、
-      1,000,000/4,000,000 个响应正文字符。会话计时包含浏览器启动，不滚动、不点击、
-      不刷新、不重试响应正文、不生成签名；仍使用同一套零 Python 依赖的系统浏览器
-      CDP 传输和临时用户目录。达到边界只返回诚实的空详情/`PARSER_FAILED`，不扩大采集。
-- **绝不**刷新、重试破解、伪造签名或模拟浏览器绕过；`urllib` 直连或浏览器传输层拿到的风控页即如实认定。
-- 模糊范围的完整公开采集使用 `scripts/collect_douyin_complete.py`。每个浏览器进程一旦命中保护立即停止并密封；只有根级 `RATE_LIMITED/ACCESS_RESTRICTED` 才可在 30/60 秒后以相同身份和新目录重试，总尝试最多 3 次。`LOGIN_REQUIRED`、`VERIFICATION_REQUIRED`、`ACCOUNT_UNAVAILABLE`、`BROWSER_UNAVAILABLE` 和一般 `PARSER_FAILED` 不重试。没有成功 attempt 时选取 `collected_count` 最大、状态更强且更早的提交作为后续部分证据。
-- 单条内容级问题（`POST_UNAVAILABLE` / `COMMENTS_UNAVAILABLE`）只下钻到内容级，
-  **不**写入任务级 `stop_reason`（见 `exceptions.md` §1.1）。
+
+浏览器降级默认自动使用系统已有的 Chrome/Chromium/Edge/Brave 或已有 Playwright 浏览器缓存，使用隔离的临时用户目录，不新增 pip 包，也不接管本机 profile。`--no-browser-fallback` 仅控制抖音浏览器降级；找不到可用浏览器时以 `BROWSER_UNAVAILABLE` 安全诊断结束。
+
+1. 先读同一主页会话的 SSR；SSR 缺失或作品列表结构无法识别且未出现明确保护时，才默认自动启动浏览器降级。真正的空列表返回 `NO_PUBLIC_CONTENT`，`--no-browser-fallback` 可禁用浏览器。
+2. 浏览器只被动观察已发生的目标主页响应与可见 DOM，不执行页内 `aweme/post` 请求、不复制签名。当前 `page_context_fallback_used=false`、`page_context_request_count=0`。
+3. API、SSR、网络与可见账号头只在规范主页、`sec_uid` 和作者身份不冲突时合并。资料计数冲突进入 `platform_metrics.profile_conflicts` 并把可见性降为 `partial`。
+4. 作品候选必须绑定目标作者、数字作品 ID 与规范直接作品 URL；推荐、搜索、详情响应、坏项、混合作者或分页冲突不能提供末页证明。DOM 卡片只作为非穷尽降级证据。
+5. 详情浏览器只用于列表中已知且规范的作品 URL；HTTP 401/403/429 或可见保护状态立即停止。详情路径不能发现新作品。
+6. 全量浏览器预算默认 1,800 秒/2,000 次滚动；详情预算默认 20 秒、最多 8 个候选。达到边界保留 `PARTIAL`，不扩张采集。
+7. 登录、验证、频控或访问限制出现后立即停止当前进程；不刷新、切换身份、伪造签名或接管本机浏览器 profile。
+8. `collect_douyin_complete.py` 只对根级 `RATE_LIMITED` / `ACCESS_RESTRICTED` 以同一身份、新目录执行 30/60 秒有界重试，总计最多三次；其他原因不重试。单条内容问题仍按 [exceptions.md](../exceptions.md) §1.1 下钻。
 
 ## 无登录 Web 索引证据降级（Skill/Agent 层）
 
-当 HTTP/SSR 与临时浏览器路径已经以 `LOGIN_REQUIRED`、`VERIFICATION_REQUIRED`、
-`ACCESS_RESTRICTED` 或 `PARSER_FAILED` 停止时，若 Agent 环境有 Web 搜索/打开连接器，可
-继续取得公开索引证据。该能力不属于 `DouyinCollector` 网络适配器：Agent 通过连接器负责
-核验精确来源、作者和作品区边界，`scripts/import_index_snapshot.py` 只做离线结构、域名与
-字段一致性校验并导入，不能独立证明 JSON 中自报的作者归属。
+若环境有 Web 搜索/打开连接器，可把公开索引作为低成本发现路径，或在 HTTP/SSR/临时浏览器以
+`LOGIN_REQUIRED`、`VERIFICATION_REQUIRED`、`ACCESS_RESTRICTED` 或 `PARSER_FAILED` 停止后使用。
+Agent 先逐条核对精确账号主页、作者与作品区；`scripts/import_index_snapshot.py` 只做离线结构、域名和字段校验，不能证明 JSON 自报的归属。
 
-- A 级 `douyin_jingxuan`：官方精选页给出真实数字作品 ID、官方 URL、同作者标题等，可进入
-  统一流水线；未展示指标保持 `null`。
-- B 级 `douyin_search_index`：仅精确账号主页索引快照；没有作品 ID/详情 URL 时使用明确披露
-  的本地 `idx-*` 记录键和主页证据锚点，不能冒充平台作品。当前只接受卡片标题与明确显示的
-  点赞数，其余作品时间、时长和互动字段固定为 `null`。
-- 两级都要求 Agent 先逐条核对连接器页面中的目标主页/作者归属；脚本再检查将导入条目的
-  主页 ID、官方域名、`author_name`/账号名和作品 ID/URL 是否自洽。
-- 通用推荐区、热门区、页脚作品卡片、标题反搜命中和作者不一致内容必须在 Agent 取证阶段
-  排除，不能靠填写相同 `author_name` 送入导入器。
-- 两级始终为 `PARTIAL`、非穷尽、可能陈旧；无法确认页面区域或作者归属时不得导入。
-- 用户指定日期范围时，导入器先完整验证证据，再排除日期未知或范围外的条目，最后应用
-  limit；B 级搜索索引因日期固定未知，不能用于该时间窗排名。范围内没有可验证作品时不创建
-  工作区，分析层还会再次应用同一窗口。
-- 可选 `--profile-from-collection` 只从同账号、已密封且摘要核验通过的匿名公开采集提交读取较新
-  profile；非空公开字段覆盖索引账号快照，`null` 不擦除已有值，来源摘要和字段来源写入新任务。
-  本人授权 OpenAPI 提交不得作为 overlay 来源，避免混淆授权数据与匿名公开证据。
-  overlay 必须可证明晚于索引 `observed_at`；日期精度快照按当天结束保守比较，未严格晚于
-  该基线时拒绝覆盖。
-- 两级只能描述可见子集的日期分布，不计算账号周均、发布间隔、断更、季节性或排播建议。
-- 搜索索引的账号 `account_id` 使用主页路径 `sec_uid`，可见抖音号另存
-  `platform_metrics.douyin_id`；这与直连适配器从页面结构拿到 `unique_id` 时的优先规则不同。
-
-完整取证顺序、JSON 格式、命令和报告语义见
-[douyin-index-evidence.md](../douyin-index-evidence.md)。没有 Web 连接器且沙箱不能联网时不可用，
-不得声称完成新数据采集。
+索引证据始终为可能陈旧、非穷尽的 `PARTIAL`：作者或页面区域无法确认时不导入，缺失作品 ID/URL 时不伪造。取证等级、日期过滤、profile overlay、Evidence JSON、导入命令和报告限制见
+[douyin-index-evidence.md](../douyin-index-evidence.md)。没有连接器或合格公开证据时，不得声称采集成功。
 
 ## 平台特有测试样例
 

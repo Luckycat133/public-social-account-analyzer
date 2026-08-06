@@ -6,7 +6,7 @@
 
 - [Quickstart](https://agentskills.io/skill-creation/quickstart)：目录名与 `name` 一致，`SKILL.md` 是入口；模型先看到 name/description，触发后才加载正文。
 - [Best practices](https://agentskills.io/skill-creation/best-practices)：从真实任务和失败轨迹提炼规则；正文保持精简，详细材料按需放入 references；优先程序、模板、gotchas 和验证循环。
-- [Optimizing descriptions](https://agentskills.io/skill-creation/optimizing-descriptions)：description 用“何时使用”的用户意图表述；约 20 个真实正/近失负例，固定 60/40 train/validation，每题重复运行。
+- [Optimizing descriptions](https://agentskills.io/skill-creation/optimizing-descriptions)：description 用“何时使用”的用户意图表述；保持约 20–30 个真实正/近失负例，固定 train/validation 分组，每题重复运行。
 - [Evaluating skills](https://agentskills.io/skill-creation/evaluating-skills)：同题、同模型、干净上下文运行 with/without Skill；保存逐项证据、耗时和可用 token，汇总方差并人工查看实际输出。
 - [Using scripts](https://agentskills.io/skill-creation/using-scripts)：脚本非交互、`--help` 清晰、stdout 结构化、诊断走 stderr、退出码明确、默认安全且可重复运行。
 
@@ -33,8 +33,8 @@
 
 固定数据：
 
-- train：`skill/evals/description_train.json`，12 题（6 正、6 近失负例）；
-- validation：`skill/evals/description_validation.json`，8 题（4 正、4 近失负例）；
+- train：`skill/evals/description_train.json`，15 题（8 正、7 近失负例）；
+- validation：`skill/evals/description_validation.json`，12 题（6 正、6 近失负例）；
 - 每题运行 3 次，触发率阈值 0.5。
 
 只根据 train 的漏触发/误触发修改 description；validation 只用于比较候选版本。不得把某条失败 query 的精确关键词逐项追加进 description。
@@ -45,7 +45,7 @@ python3 tools/skill_eval/codex_trigger.py \
   --skill-path skill/SKILL.md \
   --project-root . \
   --out evals-workspace/iteration-N/description-train.json \
-  --model gpt-5.6-terra \
+  --model MODEL_UNDER_TEST \
   --reasoning-effort low \
   --runs 3 \
   --threshold 0.5
@@ -55,16 +55,17 @@ python3 tools/skill_eval/codex_trigger.py \
 
 ## 4. 行为基准
 
-仓库 runner 会物理隔离 no-Skill 基线：with 侧只安装候选 Skill；without 侧使用空工作区、project-only settings 与禁用 slash commands。默认每配置 3 次，并在 iteration 根记录声明协议。
+仓库 runner 会物理隔离候选与基线。改进已有 Skill 时用 `--baseline-skill-dir` 安装修改前快照；新建 Skill 时省略该参数，基线才是不安装任何 Skill 的空工作区。为兼容 viewer，两类基线目录都命名为 `without_skill`，真实类型与摘要记录在元数据中。默认每配置 3 次。
 
 ```bash
 python3 tools/skill_eval/runner.py \
   --evals skill/evals/evals.json \
-  --ids 14,15 \
+  --ids vague-bilibili-strategy,user-data-no-recollection \
   --iteration evals-workspace/iteration-N \
   --skill-dir skill \
+  --baseline-skill-dir ../public-social-account-analyzer-workspace/skill-snapshot \
   --runs 3 \
-  --model <MODEL>
+  --model MODEL_ID
 ```
 
 每个 run 必须保存：
@@ -105,7 +106,7 @@ skill-creator viewer schema 的 `review-benchmark.json`。
 生成静态审阅页：
 
 ```bash
-python3 /Users/jack/.agents/skills/skill-creator/eval-viewer/generate_review.py \
+python3 "${SKILL_CREATOR_DIR:?}/eval-viewer/generate_review.py" \
   evals-workspace/iteration-N \
   --skill-name public-social-account-analyzer \
   --benchmark evals-workspace/iteration-N/review-benchmark.json \
@@ -117,7 +118,10 @@ python3 /Users/jack/.agents/skills/skill-creator/eval-viewer/generate_review.py 
 ## 7. 发布门禁
 
 ```bash
-python3 /Users/jack/.agents/skills/skill-creator/scripts/quick_validate.py skill
+validation_root=$(mktemp -d)
+cp -R skill "$validation_root/public-social-account-analyzer"
+python3 "${SKILL_CREATOR_DIR:?}/scripts/quick_validate.py" \
+  "$validation_root/public-social-account-analyzer"
 python3 tools/skill_eval/split_dataset.py --verify
 python3 tools/skill_eval/split_dataset.py --dry-run --strict
 python3 -m pytest tests/ -q
@@ -131,3 +135,5 @@ git diff --check
 3. 候选在有/无 Skill 对照中有可解释的收益，且不存在高风险回归。
 4. README、USAGE、references、CHANGELOG 与脚本行为一致。
 5. 包中不含凭据、真实私有数据、评测 workspace 或生成的任务目录。
+
+仓库源目录名固定为 `skill/`，因此不得直接拿它做安装根目录或严格目录名校验；验证和打包都先复制为 `public-social-account-analyzer/`。

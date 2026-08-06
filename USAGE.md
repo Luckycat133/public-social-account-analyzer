@@ -15,6 +15,10 @@
 
 所有输出目录必须是尚不存在的新叶子目录。`.complete` 代表已提交，不能覆盖或修改。
 
+## 只有账号名时
+
+这是 Agent 层的四平台通用发现步骤，不是某个平台的特殊采集器。Agent 先用当前可用的第一方账号搜索、公开网页搜索或浏览工具取得候选，核对昵称/handle、认证主体、简介等身份信号；唯一强匹配时直接使用规范主页，多候选时只让用户做一次最小选择。搜索结果只负责发现账号，不补写作品数据；不得从昵称拼造 UID、`sec_uid` 或主页 URL。发现受阻时让用户补一条账号主页或账号分享链接，不要求逐条复制作品。
+
 ## 采集参数
 
 ```bash
@@ -72,7 +76,7 @@ python3 skill/scripts/collect_douyin_complete.py \
   --out-prefix workspace/douyin-collection
 ```
 
-只有昵称或抖音号时，先从第一方移动搜索核对身份并取得真实 `/user/<sec_uid>`，不要拼接 vanity ID。公开页受限时可降级为公开索引证据，但它始终是 `PARTIAL`。详见 [抖音规则](skill/references/platforms/douyin.md) 与 [索引证据](skill/references/douyin-index-evidence.md)。
+账号名发现遵循上面的通用步骤；抖音采集前必须取得真实 `/user/<sec_uid>`，不要拼接 vanity ID。公开页受限时可降级为公开索引证据，但它始终是 `PARTIAL`。详见 [抖音规则](skill/references/platforms/douyin.md) 与 [索引证据](skill/references/douyin-index-evidence.md)。
 
 ### 对话粘贴 Cookie：B站、抖音、微博、小红书
 
@@ -85,9 +89,21 @@ python3 skill/scripts/collect_douyin_complete.py \
 | 微博 | `--weibo-cookie-file <temporary-path>` |
 | 小红书 | `--xiaohongshu-cookie-file <temporary-path>` |
 
+加 `--persist-cookie` 可把本次 `--<platform>-cookie-file` 提供的 Cookie 落盘到 `workspace/<platform>-cookies.json`（权限 `0600`，默认根目录可由 `--cookie-store-path` 覆盖）。后续同平台任务在没有显式提供 Cookie 时会自动从该路径加载；不提供 Cookie 文件时不能单独使用 `--persist-cookie`。
+
+撤销缓存不需要主页 URL，也不会联网：
+
+```bash
+python3 skill/scripts/collect.py --clear-cached-cookie <bilibili|douyin|weibo|xiaohongshu>
+```
+
+自定义过 `--cookie-store-path` 时，清除命令必须传入相同路径。重复清除保持成功；它只删除目标平台缓存，不影响其他平台。
+
 不要把 Cookie 原文放进命令行。完整的浏览器步骤、JSON 备用路径、移动端替代方案和失败处理见 [Cookie 指引](skill/references/cookie-guide.md)。
 
 小红书 Cookie 不构成云端可访问保证：它只会触发一次同主页的隔离浏览器渲染，仍显示登录墙、验证码或访问限制时立即结束，不会继续尝试搜索或签名接口。
+
+小红书现代主页会一次解析页面已经嵌入的一批卡片。若匿名页面隐藏作品 ID，采集器仍保留标题、类型、置顶和可见点赞，但以 `xhs-card-*` 本地记录键、`post_url=null` 和 `PARTIAL` 明确标注；这支持主页样本观察，不等于单篇证据或全量。
 
 ### 抖音账号本人授权
 
@@ -131,8 +147,7 @@ macOS 的这两个目录是符号链接。请使用 `/private/tmp` 或 `/private
 ```bash
 python3 -m pytest tests/ -q
 python3 tools/skill_eval/split_dataset.py --verify
-python3 /Users/jack/.agents/skills/skill-creator/scripts/quick_validate.py skill
 git diff --check
 ```
 
-人工准确率、运营试用和实机验收不是离线 pytest 的替代；执行方式见 [验收计划](docs/guides/prd-v1.0-acceptance-test-plan.md)。
+Skill 结构和打包校验见 [部署清单](docs/guides/deployment-package-checklist.md)。人工准确率、运营试用和实机验收不能由离线 pytest 替代；执行方式见 [验收计划](docs/guides/prd-v1.0-acceptance-test-plan.md)。

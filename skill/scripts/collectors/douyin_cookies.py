@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ._cookie_storage import atomic_write_private_text
+
 
 _MAX_COOKIE_FILE_BYTES = 64 * 1024
 _MAX_COOKIE_COUNT = 128
@@ -117,3 +119,38 @@ def load_douyin_cookie_file(path: str | os.PathLike[str]) -> tuple[dict[str, Any
         names.add(record["name"])
         clean.append(record)
     return tuple(clean)
+
+
+def save_douyin_cookie_file(
+    records: tuple[dict[str, Any], ...],
+    path: str | os.PathLike[str],
+) -> None:
+    """Persist a sanitized Douyin Cookie record tuple to ``path`` with mode 0600.
+
+    Re-runs the same guards as the loader so a saved file round-trips back
+    through :func:`load_douyin_cookie_file`.
+    """
+    if not records:
+        raise DouyinCookieError("Cookie 记录为空")
+    if len(records) > _MAX_COOKIE_COUNT:
+        raise DouyinCookieError("Cookie 记录数量无效")
+    payload = [
+        _clean_record(
+            {
+                "name": record["name"],
+                "value": record["value"],
+                "domain": record.get("domain", ".douyin.com"),
+                "path": record.get("path", "/"),
+                "secure": record.get("secure", True),
+                "httpOnly": record.get("httpOnly", False),
+            }
+        )
+        for record in records
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+    atomic_write_private_text(
+        path,
+        encoded,
+        error_type=DouyinCookieError,
+        error_message="无法安全写入 Cookie 文件",
+    )

@@ -8,6 +8,7 @@ operations.  ``oauth/userinfo`` receives the documented form credentials;
 from __future__ import annotations
 
 import json
+import hmac
 import re
 import urllib.parse
 import urllib.request
@@ -97,6 +98,19 @@ def _safe_int(value: Any) -> int | None:
     if isinstance(value, int) and value >= 0:
         return value
     return None
+
+
+def _sanitize_public_asset_url(value: Any) -> str | None:
+    """Keep a public HTTPS asset location without signed query material."""
+    safe_url = sanitize_routing_url(value)
+    if safe_url is None:
+        return None
+    parsed = urllib.parse.urlsplit(safe_url)
+    if parsed.scheme != "https" or parsed.hostname is None:
+        return None
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, "", "")
+    )
 
 
 def _sanitize_share_url(
@@ -324,7 +338,16 @@ class DouyinOpenAPIClient:
             )
         self._access_token = access_token
         self._open_id = open_id
+        self._profile_identity_verified = False
         self._transport = transport or _urllib_transport
+
+    def is_profile_identity_verified(self, open_id: str) -> bool:
+        """Confirm the last profile response matched this in-memory OAuth ID."""
+        return bool(
+            self._profile_identity_verified
+            and type(open_id) is str
+            and hmac.compare_digest(open_id, self._open_id)
+        )
 
     @staticmethod
     def _is_fixed_endpoint(method: str, url: str) -> bool:
@@ -417,6 +440,7 @@ class DouyinOpenAPIClient:
             raise DouyinOpenAPIError(
                 "INVALID_RESPONSE", "Douyin OpenAPI profile identity did not match"
             )
+        self._profile_identity_verified = True
         account_name = data.get("nickname") or data.get("display_name")
         if not isinstance(account_name, str) or not account_name:
             raise DouyinOpenAPIError(
@@ -437,7 +461,7 @@ class DouyinOpenAPIClient:
             verified = None
         return {
             "platform": "douyin",
-            "account_id": open_id,
+            "account_id": sec_uid,
             "account_name": account_name,
             "profile_url": profile_url,
             "bio": data.get("description") if isinstance(data.get("description"), str) else None,
@@ -446,8 +470,7 @@ class DouyinOpenAPIClient:
             "post_count": post_count,
             "level": None,
             "platform_metrics": {
-                "union_id": data.get("union_id") if isinstance(data.get("union_id"), str) else None,
-                "avatar": data.get("avatar") if isinstance(data.get("avatar"), str) else None,
+                "avatar": _sanitize_public_asset_url(data.get("avatar")),
                 "authorization_source": "douyin_openapi_token_owner",
             },
             "collected_at": now_iso(),
