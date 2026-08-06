@@ -1,7 +1,7 @@
 {
   "schema": "public-social-account-analyzer/eval-dataset-manifest@3",
   "dataset_version": "0.4.0",
-  "generated_at": "2026-08-03T13:37:45+00:00",
+  "generated_at": "2026-08-06T12:06:22+00:00",
   "generated_by": "tools/skill_eval/split_dataset.py",
   "paths": {
     "source": "source",
@@ -37,18 +37,26 @@
     {
       "dataset": "behavior_cases",
       "stratify_field": "category",
-      "total": 26,
-      "validation_count": 18,
-      "test_count": 8,
+      "total": 33,
+      "validation_count": 23,
+      "test_count": 10,
       "max_distribution_deviation": 0.2,
       "strata": [
         {
           "stratum": "boundary",
-          "total": 7,
-          "test": 2,
-          "validation": 5,
-          "test_ratio_actual": 0.2857,
-          "deviation": 0.0143
+          "total": 10,
+          "test": 3,
+          "validation": 7,
+          "test_ratio_actual": 0.3,
+          "deviation": 0.0
+        },
+        {
+          "stratum": "comparison",
+          "total": 3,
+          "test": 1,
+          "validation": 2,
+          "test_ratio_actual": 0.3333,
+          "deviation": 0.0333
         },
         {
           "stratum": "compliance",
@@ -68,11 +76,11 @@
         },
         {
           "stratum": "happy_path",
-          "total": 7,
+          "total": 8,
           "test": 2,
-          "validation": 5,
-          "test_ratio_actual": 0.2857,
-          "deviation": 0.0143
+          "validation": 6,
+          "test_ratio_actual": 0.25,
+          "deviation": 0.05
         },
         {
           "stratum": "output_contract",
@@ -91,9 +99,9 @@
           "deviation": 0.2
         }
       ],
-      "validation_sha256": "44c1f141adfda3614bc3707f646892694c34df489a0467b484c0c4766804c4fb",
-      "test_sha256": "4a980aa82a0eeb5893756f63129bc275bb7bc53d5c9e92c0fee2cf42e1814390",
-      "source_sha256": "0a67cfcb3bb19116dfaf5025717a1c92f4510a5488cd7dbb684d557f41e2fcf3"
+      "validation_sha256": "d655a95fd4613ad04f66709f093dfcb30faea5daf38ddf8d50571d4d1b4f2eb7",
+      "test_sha256": "bb67e3c82c22885b4628a77ac612df53b7fc4cf47430cecff42c989b8921d6d4",
+      "source_sha256": "614137ce9e7a58e8931508cc203c1ac7e66bcf92f6dc4cc34f278916bd6129c9"
     },
     {
       "dataset": "p0_cases",
