@@ -1,6 +1,6 @@
 # 公开社交媒体账号内容分析器
 
-[![Version](https://img.shields.io/badge/version-0.8.4-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue.svg)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue.svg)](pyproject.toml)
 
 面向具体公开账号、创作者和品牌号的 Agent Skill。它把公开资料和内容采集为可审计的不可变产物，再生成指标、分类输入与报告；未知字段保持 `null`，受限任务保留已有证据并明确范围。
@@ -17,6 +17,20 @@
 平台保护、登录墙、验证码或频控出现时，当前任务立即停止，不把空结果当成功。只有观察到可信末页才能称为全量；其他结果均为明确标注的样本或 `PARTIAL`。P1 管线与用户授权会话仍需真实页面验收。
 
 用户只给账号名时，由 Agent 先在对应平台或公开搜索中查找候选，核对身份后把规范主页交给采集器；不会要求用户逐条提供作品链接，也不会根据昵称拼造账号 ID。
+
+## 安装
+
+作为 Agent Skill 安装（ClawHub）：
+
+```bash
+openclaw skills install @luckycat133/public-social-account-analyzer
+```
+
+或通过 skills.sh 生态：
+
+```bash
+npx skills add Luckycat133/public-social-account-analyzer
+```
 
 ## 快速开始
 
