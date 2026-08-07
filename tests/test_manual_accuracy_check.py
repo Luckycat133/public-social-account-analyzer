@@ -12,7 +12,7 @@ import pytest
 
 import immutable_workspace as workspace
 import manual_accuracy_check as acceptance
-import normalize
+from analysis import normalize
 
 
 COLLECTION_ARTIFACTS = frozenset(

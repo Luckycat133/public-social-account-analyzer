@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import copy
 
-import analyze
+from analysis import analyze
 import pytest
-import render_report
+from analysis import render_report
 
 
 def _row(index: int, views, **overrides) -> dict:

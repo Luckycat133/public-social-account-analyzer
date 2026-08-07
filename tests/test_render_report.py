@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-import analyze
-import render_report
+from analysis import analyze
+from analysis import render_report
 
 
 def test_safe_get_preserves_explicit_none_and_defaults_missing_paths():
@@ -34,7 +34,7 @@ import json
 import task_contract
 task_contract.PUBLIC_PAGE_DISCLAIMER = "PUBLIC-DISCLAIMER-SENTINEL"
 task_contract.AUTHORIZED_DISCLAIMER = "AUTHORIZED-DISCLAIMER-SENTINEL"
-import render_report
+from analysis import render_report
 print(json.dumps([
     render_report.PUBLIC_PAGE_DISCLAIMER,
     render_report.AUTHORIZED_DISCLAIMER,

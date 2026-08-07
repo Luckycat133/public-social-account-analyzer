@@ -7,8 +7,8 @@ import json
 
 import pytest
 
-import analyze
-import normalize
+from analysis import analyze
+from analysis import normalize
 
 
 COMMENT_FIELDS = {

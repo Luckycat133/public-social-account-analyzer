@@ -15,7 +15,7 @@ import os
 import subprocess
 import sys
 
-import analyze
+from analysis import analyze
 import pytest
 from collectors.bilibili import (
     BilibiliCollector,

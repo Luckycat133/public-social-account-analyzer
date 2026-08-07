@@ -1,6 +1,6 @@
 """Regression tests for standalone model-result validation contracts."""
 
-import analyze
+from analysis import analyze
 import task_contract as contract
 import validate_model_results as validator
 

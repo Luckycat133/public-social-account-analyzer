@@ -92,7 +92,7 @@ from task_contract import (  # noqa: E402
 from csv_contract import deserialize_csv_row, serialize_csv_row  # noqa: E402
 from execution_timing import ExecutionTimer  # noqa: E402
 from skill_metadata import skill_contract_sha256, skill_release  # noqa: E402
-from normalize import dedup_posts, to_bool_flag  # noqa: E402
+from analysis.normalize import dedup_posts, to_bool_flag  # noqa: E402
 
 # 北京时间为中国平台默认时区（见 references/artifact-contract.md §1）
 _BEIJING = timezone(timedelta(hours=8))

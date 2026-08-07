@@ -10,11 +10,11 @@ from pathlib import Path
 
 import pytest
 
-import analyze
+from analysis import analyze
 import immutable_workspace as workspace
 import manual_accuracy_check as acceptance
-import normalize
-import render_report
+from analysis import normalize
+from analysis import render_report
 
 
 COLLECTION_ARTIFACTS = frozenset(

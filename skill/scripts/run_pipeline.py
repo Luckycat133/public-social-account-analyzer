@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from analyze import (
+from analysis.analyze import (
     AnalysisResult,
     analyze_in_memory,
     build_business_context,
@@ -40,8 +40,8 @@ from immutable_workspace import (
     preflight_workspace_target,
     reject_workspace_overlap,
 )
-from normalize import NormalizationResult, normalize_in_memory
-from render_report import RenderResult, render_in_memory
+from analysis.normalize import NormalizationResult, normalize_in_memory
+from analysis.render_report import RenderResult, render_in_memory
 from task_contract import (
     ANALYZABLE_TASK_STATUSES,
     STOP_REASONS,

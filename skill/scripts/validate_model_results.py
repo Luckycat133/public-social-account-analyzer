@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-import analyze
+from analysis import analyze
 from task_contract import TAX_FORMAT, TAX_FUNNEL, TAX_HOOK
 
 

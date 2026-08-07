@@ -1,5 +1,5 @@
 """pytest 配置：把 skill/scripts/ 加入 sys.path，使离线测试可
-直接 import normalize / analyze / collectors.*。
+直接 import normalize / analyze / render_report / collectors.*。
 
 collectors 子包使用相对导入（from .base import ...），无需把 collectors/
 本身加入 sys.path。不在本文件里 import 被测模块（避免重复加载与 import 顺序

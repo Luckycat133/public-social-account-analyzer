@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-import analyze
+from analysis import analyze
 
 
 def _bilibili_parent_without_series_name(post_id: str = "BV_offline_probe") -> dict:

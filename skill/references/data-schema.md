@@ -11,4 +11,4 @@
 | 指标口径、样本与证据选择 | [analysis-rules.md](analysis-rules.md) |
 | 平台字段来源与能力差异 | 对应的 [platforms/](platforms/) 文件 |
 
-同一事实只保留一个权威来源：字段形状属于上述 schema，状态迁移属于 exceptions.md，平台识别和来源属于平台参考，命令参数属于脚本帮助与 [scripts/README.md](../scripts/README.md)。
+同一事实只保留一个权威来源：字段形状属于上述 schema，状态迁移属于 exceptions.md，平台识别和来源属于平台参考，命令参数属于各脚本 `python3 <script> --help`。

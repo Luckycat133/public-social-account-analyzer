@@ -15,8 +15,8 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-import analyze
-import normalize
+from analysis import analyze
+from analysis import normalize
 
 
 # ---------------------------------------------------------------------------

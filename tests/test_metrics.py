@@ -6,8 +6,8 @@
 import json
 from datetime import datetime
 
-import analyze
-import normalize
+from analysis import analyze
+from analysis import normalize
 import pytest
 
 

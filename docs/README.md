@@ -28,7 +28,7 @@
 
 - [`architecture/STRUCTURE.md`](architecture/STRUCTURE.md) — 目录结构、模块职责、依赖关系与边界。
 - [`guides/skill-development-workflow.md`](guides/skill-development-workflow.md) — 官方 Agent Skills 最佳实践在本仓库中的开发、对照评测与发布门禁。
-- [`guides/prd-v1.0-acceptance-test-plan.md`](guides/prd-v1.0-acceptance-test-plan.md) — PRD V1.0 / Skill 0.8.4 分层测试题、客观断言与发布判定。
+- [`guides/prd-v1.0-acceptance-test-plan.md`](guides/prd-v1.0-acceptance-test-plan.md) — PRD V1.0 / Skill 0.9.2 分层测试题、客观断言与发布判定。
 - [`acceptance/README.md`](acceptance/README.md) — 长期保留的验收记录、原始数据策略与敏感归档说明。
 - [`acceptance/skill-autonomy-0.7.1.md`](acceptance/skill-autonomy-0.7.1.md) — 有/无 Skill 自治能力对照、强制边界根因和高收益经验路径结果。
 - [`acceptance/skill-trigger-0.7.1.md`](acceptance/skill-trigger-0.7.1.md) — Terra/low 自然提示触发协议、20 题结果与复现命令。

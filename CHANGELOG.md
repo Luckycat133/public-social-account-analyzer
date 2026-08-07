@@ -6,6 +6,36 @@
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-07
+
+### Changed
+
+- `scripts/legacy/` 改名为 `scripts/analysis/`，并加 `__init__.py` 转为正式的运行时子包；`scripts/{analyze,normalize,render_report}.py` 三个 symlink 删除。`run_pipeline.py` / `collect.py` 改为 `from analysis.X import ...`，入口脚本不再通过顶层短名间接引用引擎。`scripts/analysis/` 现在反映真实职责（确定性分析 / 字段归一化 / 报告渲染），方便审核员与用户一眼看清边界。
+- 删除 `scripts/README.md`（与 SKILL.md 重复）。
+- SKILL.md 平台路由表第 33 行去掉「账号绑定 legacy/modern 双模式」中的 `legacy/` 路径描述，统一为「同时兼容 legacy/modern 主页状态」。
+- `docs/guides/deployment-package-checklist.md` 同步更新：`.skill` 制品清单改为 `scripts/analysis/` 子包显式标注；目录树参考升级到 v0.9.2；发布前门禁清单追加 `pytest tests/test_skill_package_manifest.py` 与 `tools/check_markdown_links.py`。
+
+### Added
+
+- `tests/test_skill_package_manifest.py`：6 个离线守护测试，禁止 `scripts/legacy/` 与 `scripts/README.md` 重新出现；要求 `scripts/analysis/` 子包存在并包含 `analyze.py` / `normalize.py` / `render_report.py` / `__init__.py`；要求 `run_pipeline.py` 与 `collect.py` 通过 `from analysis.X import ...` 引用引擎；禁止把 `evals/` / `tests/` / `docs/` / `tools/` / `workspace/` 写入 `.skill` 归档；归档文件数稳定在 50–70 之间。
+- SKILL.md 顶部新增 `## Security model` 段：明确三类高敏感资产（用户授权 Cookie、抖音 OAuth 凭据、B 站 WBI 签名）的触发条件、默认行为、落盘条件与安全边界清单；ClawHub 审核员与终端用户可直接对照。
+
+### Security
+
+- `.skill` 归档的运行时边界显式写入 SKILL.md 的 Security model 段落，禁止以「包含完整测试环境」为由把 `evals/` / `tests/` / `docs/` / `tools/` / `workspace/` 上传到 ClawHub。
+
+## [0.9.1] - 2026-08-07
+
+### Fixed
+
+- **修复抖音浏览器回退 DOM 选择器失效**：多重 fallback 选择器覆盖 profile、post list、detail 三层；`visibleText` 支持数组参数顺序尝试；新增 `data-e2e="user-post"`、`data-e2e="aweme-item"`、class 匹配、`[data-aid]`、`.verified-badge` 等兼容当前前端结构。对应测试同步更新（`tests/test_douyin.py::test_dom_expression_requests_only_visible_pin_and_metric_fields`）。
+- 修复 SKILL.md 中 `data-schema.md` / `analysis-rules.md` 的过期链接，全部指向模块化参考（`artifact-contract.md` / `collection-schema.md` / `metrics-and-sampling.md` / `model-insights.md` / `comment-insights.md`）。
+- 新增 `tools/check_markdown_links.py` 离线 Markdown 链接巡检；`pytest tests/test_markdown_links.py` 守护；`tools/skill_eval/split_dataset.py` 失败时直接阻断打包。
+
+### Security
+
+- 无新增攻击面；本补丁仅同步修复线上不一致与发布前自检。
+
 ## [0.9.0] - 2026-08-06
 
 ### Added

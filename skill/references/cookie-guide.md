@@ -13,7 +13,7 @@
 
 ## 交接规则
 
-Agent 接收完整 `Cookie: name=value; ...` 请求头或 JSON 后写到临时文件，命令行只传路径。解析器可接受 `Cookie:` 前缀、普通 `name=value; ...` 文本、JSON 数组与简单 JSON 对象；具体参数和平台域名校验以对应平台参考及 `scripts/README.md` 为准。
+Agent 接收完整 `Cookie: name=value; ...` 请求头或 JSON 后写到临时文件，命令行只传路径。解析器可接受 `Cookie:` 前缀、普通 `name=value; ...` 文本、JSON 数组与简单 JSON 对象；具体参数和平台域名校验以对应平台参考及 `python3 scripts/collect.py --help` 为准。
 
 Agent 不在回复、报告、产物文件或命令行中复述 Cookie 原文；解析后的 Cookie 值只在该任务进程内使用。
 

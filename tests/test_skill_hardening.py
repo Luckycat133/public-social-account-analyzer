@@ -43,7 +43,7 @@ def _classification(post: dict, topic: str) -> dict:
 
 
 def test_taxonomy_quality_rejects_one_topic_per_post_fragmentation():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     posts = [_post(index) for index in range(1, 16)]
     results = [
         _classification(post, f"主题{chr(0x4e00 + index)}")
@@ -55,7 +55,7 @@ def test_taxonomy_quality_rejects_one_topic_per_post_fragmentation():
 
 
 def test_comment_semantic_is_not_applicable_without_public_comments():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     result = analyze.analyze_comments_in_memory(
         [_post(1)],
         {"include_comments": False},
@@ -70,7 +70,7 @@ def test_comment_semantic_is_not_applicable_without_public_comments():
 
 
 def test_performance_axes_exclude_tiny_denominator_from_efficiency():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     posts = [_post(index, views=100 + index * 10) for index in range(1, 21)]
     posts[0].update(views=1, likes=1000, comments=1000, favorites=1000, shares=1000)
 
@@ -89,7 +89,7 @@ def test_performance_axes_exclude_tiny_denominator_from_efficiency():
 
 
 def test_dynamic_business_inventory_stays_within_evidence_driven_ranges():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     posts = [_post(index) for index in range(1, 16)]
     for index, post in enumerate(posts):
         post["topic"] = ("内容方法", "账号定位", "选题复盘")[index % 3]
@@ -103,7 +103,7 @@ def test_dynamic_business_inventory_stays_within_evidence_driven_ranges():
 
 
 def test_model_prompts_reference_compact_artifacts_instead_of_embedding_records():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     posts = [_post(index) for index in range(1, 31)]
 
     taxonomy = analyze.build_taxonomy_prompt(posts, 1000)
@@ -151,7 +151,7 @@ def test_collect_entry_resolves_bilibili_short_profile_only():
 
 
 def test_semantic_support_guard_rejects_broad_and_demographic_leaps():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     evidence = [{"post_id": "1", "excerpt": "创作者分享学习方法"}]
 
     with pytest.raises(ValueError, match="semantic support"):
@@ -220,7 +220,7 @@ def test_batch_business_validator_reports_source_group_lead_and_limitation_error
 
 
 def test_business_evidence_id_is_resolved_to_exact_catalog_excerpt():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     post = _post(1)
 
     resolved = analyze._validate_business_evidence(
@@ -233,7 +233,7 @@ def test_business_evidence_id_is_resolved_to_exact_catalog_excerpt():
 
 
 def test_business_template_uses_evidence_ids_and_context_exposes_group_options():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     posts = [_post(index) for index in range(1, 7)]
     high = [{"post_id": str(index)} for index in (1, 2, 3)]
     low = [{"post_id": str(index)} for index in (4, 5, 6)]
@@ -267,7 +267,7 @@ def test_business_template_uses_evidence_ids_and_context_exposes_group_options()
 
 
 def test_business_semantic_guard_rejects_creator_identity_and_causal_pattern():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
     evidence = [{"post_id": "1", "excerpt": "作为学生党，我分享动画制作过程"}]
 
     with pytest.raises(ValueError, match="creator identity"):
@@ -282,7 +282,7 @@ def test_business_semantic_guard_rejects_creator_identity_and_causal_pattern():
 
 
 def test_taxonomy_format_covers_animation_and_gameplay():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
 
     assert {"animation", "gameplay"} <= analyze._TAX_FORMAT
 

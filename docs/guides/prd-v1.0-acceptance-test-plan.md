@@ -1,10 +1,10 @@
-# PRD V1.0 / Skill 0.8.4 验收测试计划
+# PRD V1.0 / Skill 0.9.2 验收测试计划
 
 ## 1. 目标与判定基线
 
-本计划把 PRD V1.0 的 FR-001～FR-015、§15 七项非功能需求和 AC-01～AC-10 转成可执行测试。PRD 正本是需求来源；`docs/prd/需求实现状态与抖音能力边界.md` 是 0.8.4 的能力与剩余验收说明；二者冲突时必须在记录中显示合同演进，不能静默选一个数字。
+本计划把 PRD V1.0 的 FR-001～FR-015、§15 七项非功能需求和 AC-01～AC-10 转成可执行测试。PRD 正本是需求来源；`docs/prd/需求实现状态与抖音能力边界.md` 是 0.9.0 的能力与剩余验收说明（仓库当前 0.9.2 是 0.9.0 的发布侧补丁）；二者冲突时必须在记录中显示合同演进，不能静默选一个数字。
 
-0.8.4 延续既有账号隔离、当前脚本完整性、B站投稿列表语义和分位数顺序门禁，并包含默认启用的微博 P1 公开 AJAX 采集器、小红书 P1 新旧主页状态批量采集器，以及四个平台的用户授权 Cookie 入口。小红书匿名卡片缺真实作品 ID 时只以披露的本地键保留 `PARTIAL` 样本；账号名发现由 Agent 统一搜索候选并核验身份，不从昵称拼造 ID。匿名登录墙只表示匿名工具受阻，验证码和频控仍按实际覆盖结束。PRD 的“明确最近 30 条”和“正常公开条件下 10 分钟内完成”仍是正向验收门。
+0.9.2 延续既有账号隔离、当前脚本完整性、B站投稿列表语义和分位数顺序门禁，并包含默认启用的微博 P1 公开 AJAX 采集器、小红书现代 `window.__INITIAL_STATE__` 批量采集器、四个平台的用户授权 Cookie 入口，以及经过原子替换 + `fsync` + `0600` + 拒 symlink/UID 失配加固的 Cookie 持久化链路。B 站/抖音共享 `bounded_attempt_runner` 维护会话感知滚动；`task.json` 写入 `skill_release` 与 `skill_contract_sha256`；正文每组高/低仅展示 5 条代表作品、业务洞察每条最多 3 条去重证据，完整数据保留审计层。小红书匿名卡片缺真实 `noteId` 时只以披露的 `xhs-card-*` 本地键保留 `PARTIAL` 样本；账号名发现由 Agent 统一搜索候选并核验身份，不从昵称拼造 ID。匿名登录墙只表示匿名工具受阻，验证码和频控仍按实际覆盖结束。PRD 的「明确最近 30 条」和「正常公开条件下 10 分钟内完成」仍是正向验收门。0.9.2 把 `scripts/legacy/` 改名为 `scripts/analysis/` 子包（去掉误导性的「legacy」前缀,改为反映真实职责的命名），删除 `scripts/README.md` 与三个顶层 symlink，并在 SKILL.md 顶部新增 `## Security model` 段。
 
 ## 2. 四层测试方法
 
@@ -28,7 +28,7 @@ python3 tools/skill_eval/split_dataset.py --dry-run --strict
 git diff --check
 ```
 
-再按 [部署清单](deployment-package-checklist.md) 把 `skill/` 复制为 `public-social-account-analyzer/` 后执行 Skill 结构校验。通过条件：pytest 退出码 0；数据集输出 `"verify": "PASS"`；严格划分退出码 0；Skill 校验通过；diff check 无空白错误。用例数以当次日志为准，不写死历史数字。
+再按 [部署清单](deployment-package-checklist.md) 把 `skill/` 复制为 `public-social-account-analyzer/` 后执行 Skill 结构校验。通过条件：pytest 退出码 0；数据集输出 `"verify": "PASS"`；严格划分退出码 0；Skill 校验通过；diff check 无空白错误。0.9.2 当前离线下一次输出 `1689 passed`（含 0.9.2 新增的 `tests/test_skill_package_manifest.py` 4 个守护测试与 `tests/test_markdown_links.py` 7 个链接测试），`split_dataset.py --verify` 输出 `verify: PASS`，`tests/test_openapi_contract_repro.py`（6 条）+ `tests/test_series_name_public_evidence_repro.py`（2 条）离线可复现断言全绿，`tools/check_markdown_links.py` 与 `pytest tests/test_skill_package_manifest.py` 双门禁通过。用例数以当次日志为准，不写死历史数字。
 
 P0 机器可读题集位于 `skill/evals/datasets/source/p0_cases.jsonl`，需求注册表位于 `skill/evals/datasets/p0_requirements.json`，覆盖报告位于 `skill/evals/datasets/p0_coverage.json`。测试/验证划分只能由 `split_dataset.py` 从 source 生成，不得手改 derived 文件。
 
@@ -121,7 +121,7 @@ AC-10 使用 `docs/guides/operations-trial-template.md`。只有真实运营人�
 ## 8. 发布前结论模板
 
 ```text
-版本：0.8.4
+版本：0.9.2
 Skill contract SHA-256：
 离线自动化：PASS / FAIL（pytest 数量：）
 数据集完整性：PASS / FAIL

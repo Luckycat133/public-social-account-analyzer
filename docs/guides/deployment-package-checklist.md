@@ -6,12 +6,12 @@
 
 | 制品 | 包含内容 | 用途 |
 | --- | --- | --- |
-| `.skill` | `SKILL.md`、`VERSION`、`agents/`、`scripts/`、`scripts/legacy/`、`references/`、`assets/` | 安装到 Agent 运行时 |
+| `.skill` | `SKILL.md`、`VERSION`、`agents/`、`scripts/`、`references/`、`assets/` | 安装到 Agent 运行时 |
 | 仓库 ZIP | 上述内容加 `tests/`、`skill/evals/`、`docs/`、`tools/` | 回归、审计与维护 |
 
-标准 `.skill` 打包器会排除根级 `evals/`；因此不能把它当作“包含完整测试环境”的发布物。
+标准 `.skill` 打包器会排除根级 `evals/`；因此不能把它当作"包含完整测试环境"的发布物。`scripts/analysis/{analyze,normalize,render_report}.py` 是 `run_pipeline.py` 与 `collect.py` 在运行时实际 `from analysis.X import ...` 进来的分析引擎子包；0.9.2 由旧的 `scripts/legacy/` 改名而来，目录名现在反映真实职责。`scripts/README.md` 在 0.9.2 起已删除（与 SKILL.md 重复）。
 
-## 目录结构参考（v0.8.1+）
+## 目录结构参考（v0.9.2+）
 
 ```
 skill/
@@ -19,10 +19,10 @@ skill/
 ├── VERSION
 ├── agents/
 ├── assets/
-├── evals/
+├── evals/                 ← 不进 .skill
 ├── references/
-│   ├── data-schema.md
-│   ├── analysis-rules.md
+│   ├── data-schema.md          (路由)
+│   ├── analysis-rules.md       (路由)
 │   ├── exceptions.md
 │   ├── cookie-guide.md
 │   ├── workflow.md
@@ -32,47 +32,57 @@ skill/
 │   ├── model-insights.md
 │   ├── comment-insights.md
 │   ├── collection-schema.md
+│   ├── analysis-schema.md
 │   ├── artifact-contract.md
 │   └── platforms/
 │       ├── bilibili.md
 │       ├── douyin.md
 │       ├── weibo.md
 │       └── xiaohongshu.md
-├── scripts/
-│   ├── collect.py
-│   ├── run_pipeline.py
-│   ├── collect_douyin_authorized.py
-│   ├── import_index_snapshot.py
-│   ├── csv_contract.py
-│   ├── execution_timing.py
-│   ├── immutable_workspace.py
-│   ├── task_contract.py
-│   ├── validate_model_results.py
-│   ├── resolve_profile_url.py
-│   ├── sign_server.py
-│   ├── bounded_attempt_runner.py
-│   ├── field_coverage.py
-│   ├── skill_metadata.py
-│   ├── README.md
-│   ├── collectors/
-│   │   ├── base.py
-│   │   ├── bilibili.py
-│   │   ├── douyin.py
-│   │   ├── douyin_openapi.py
-│   │   ├── weibo.py
-│   │   ├── xiaohongshu.py
-│   │   ├── cookie_loader.py
-│   │   ├── _cookie_storage.py
-│   │   ├── browser_backend.py
-│   │   ├── url_policy.py
-│   │   ├── _constants.py
-│   │   ├── _douyin_browser_transport.py
-│   │   └── _douyin_detail_contract.py
-│   └── legacy/
-│       ├── analyze.py
-│       ├── normalize.py
-│       └── render_report.py
+└── scripts/
+    ├── collect.py
+    ├── collect_bilibili_complete.py
+    ├── collect_douyin_complete.py
+    ├── collect_douyin_authorized.py
+    ├── run_pipeline.py
+    ├── import_index_snapshot.py
+    ├── resolve_profile_url.py
+    ├── sign_server.py
+    ├── bounded_attempt_runner.py
+    ├── csv_contract.py
+    ├── execution_timing.py
+    ├── field_coverage.py
+    ├── immutable_workspace.py
+    ├── task_contract.py
+    ├── validate_model_results.py
+    ├── skill_metadata.py
+    ├── analysis/                ← 运行时分析引擎子包
+    │   ├── __init__.py
+    │   ├── analyze.py           ← 确定性分析、分类矩阵、高低表现
+    │   ├── normalize.py         ← 字段归一化
+    │   └── render_report.py     ← Markdown/HTML 报告渲染
+    └── collectors/
+        ├── __init__.py
+        ├── base.py
+        ├── bilibili.py
+        ├── douyin.py
+        ├── douyin_openapi.py
+        ├── douyin_cookies.py
+        ├── weibo.py
+        ├── xiaohongshu.py
+        ├── cookie_loader.py
+        ├── platform_cookies.py
+        ├── adapter_registry.py
+        ├── browser_backend.py
+        ├── url_policy.py
+        ├── _constants.py
+        ├── _utils.py
+        ├── _cookie_storage.py
+        ├── _douyin_browser_transport.py
+        └── _douyin_detail_contract.py
 ```
+
+包前门禁: `python3 tools/check_markdown_links.py` + `python3 -m pytest tests/test_skill_package_manifest.py -q` + `python3 -m pytest tests/ -q` + `python3 tools/skill_eval/split_dataset.py --verify` + `git diff --check`。任何一项失败即停止发布。
 
 ```
 docs/

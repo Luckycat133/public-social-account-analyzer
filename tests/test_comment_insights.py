@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import immutable_workspace as workspace
-import render_report
+from analysis import render_report
 
 
 COLLECTION_ARTIFACTS = frozenset(
@@ -160,7 +160,7 @@ def _minimal_template() -> str:
 
 
 def test_comment_insight_draft_requires_usable_comment_text():
-    analyze = importlib.import_module("analyze")
+    analyze = importlib.import_module("analysis.analyze")
 
     with pytest.raises(
         ValueError, match="at least one usable comment text"

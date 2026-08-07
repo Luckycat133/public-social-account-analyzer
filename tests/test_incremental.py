@@ -22,7 +22,7 @@ for _d in (os.path.join(_REPO_ROOT, "skill", "scripts"), os.path.join(_REPO_ROOT
         sys.path.insert(0, _d)
 
 import collect  # noqa: E402
-import analyze  # noqa: E402
+from analysis import analyze  # noqa: E402
 from collectors.base import BaseCollector  # noqa: E402
 
 

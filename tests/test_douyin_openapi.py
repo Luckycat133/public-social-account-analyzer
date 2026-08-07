@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import collect_douyin_authorized as authorized
-import analyze
+from analysis import analyze
 import immutable_workspace as immutable
 import run_pipeline as pipeline
 import collectors.douyin_openapi as openapi

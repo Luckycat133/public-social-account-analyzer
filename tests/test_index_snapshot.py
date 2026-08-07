@@ -12,11 +12,11 @@ from pathlib import Path
 
 import pytest
 
-import analyze
+from analysis import analyze
 import import_index_snapshot as importer
 import immutable_workspace as immutable
-import normalize
-import render_report
+from analysis import normalize
+from analysis import render_report
 import run_pipeline
 
 

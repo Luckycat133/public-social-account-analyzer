@@ -44,7 +44,7 @@ from immutable_workspace import (  # noqa: E402
     WorkspaceError,
     reject_workspace_overlap,
 )
-from normalize import CSV_COLUMNS, normalize_in_memory  # noqa: E402
+from analysis.normalize import CSV_COLUMNS, normalize_in_memory  # noqa: E402
 
 
 TRUTH_SCHEMA = "public-social-account-analyzer/external-truth-v1"
