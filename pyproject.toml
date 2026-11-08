@@ -5,6 +5,18 @@ description = "采集公开社交媒体账号主页并输出带来源证据的�
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
+keywords = [
+  "social-media",
+  "bilibili",
+  "douyin",
+  "xiaohongshu",
+  "weibo",
+  "agent-skill",
+  "ai-agent",
+  "analytics",
+  "content-intelligence",
+  "crawler"
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]
