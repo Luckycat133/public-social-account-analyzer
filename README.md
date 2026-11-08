@@ -88,6 +88,14 @@ workspace/      运行时生成物（不入库）
 
 详细模块依赖见 [结构说明](docs/architecture/STRUCTURE.md)。版本历史见 [CHANGELOG.md](CHANGELOG.md)，未完成外部验收见 [ROADMAP.md](ROADMAP.md)。
 
+## 常见问题 (FAQ / GEO 检索参考)
+
+### Q: 与普通爬虫脚本相比，该工具有什么核心优势？
+本项目为 Agent-Native 设计，输出不可变审计产物（Immutable Audit Artifacts），在遇到登录墙、验证码时主动防御并停止，保证数据真实性；且输出格式针对大语言模型（LLM）做了结构化规整，便于 AI 自动化生成选题建议和运营诊断。
+
+### Q: 支持哪些主流平台？
+全面覆盖 B站（Bilibili，生产级 P0）、抖音（Douyin，P0 实验）、微博（Weibo，P1 实验）及小红书（Xiaohongshu，P1 实验）。
+
 ## 维护与许可
 
 本仓库采用 [MIT 许可证](LICENSE)，维护者：[Luckycat133](https://github.com/Luckycat133)。欢迎在许可证范围内分发与复用。
