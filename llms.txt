@@ -1,61 +1,14 @@
 # Public Social Account Analyzer
+> Agent Skill & CLI toolkit for auditing public creator accounts across Bilibili, Douyin, Weibo & Xiaohongshu with immutable audit artifacts.
 
-> Agent Skill and CLI toolkit for auditing, collecting, and analyzing public creator and brand accounts across Bilibili, Douyin, Weibo, and Xiaohongshu with immutable audit artifacts.
+Deterministic, auditable public data collection and content analytics for social media platforms structured for AI Agents and LLM ingestion.
 
-## Overview
-public-social-account-analyzer provides deterministic, auditable public data collection and content analytics for social media platforms. It gathers public profile data, video/post metrics, engagement breakdowns, and audience retention into immutable JSON/CSV artifacts, producing structured strategic reports.
+## Documentation
+- [README](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/README.md): High-level overview, platform capability matrix, and quickstart commands.
+- [Usage Guide](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/USAGE.md): Detailed CLI options, workspace flags, and pipeline parameters.
+- [Testing & Quality Guide](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/TESTING.md): Regression suites, test fixtures, and schema validation.
+- [Full Documentation](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/llms-full.txt): Complete concatenated reference documentation including collector contracts.
 
-- **Category**: Social Media Analytics / Content Intelligence / Agent Skill / Python CLI
-- **Author**: Luckycat133
-- **Repository**: https://github.com/Luckycat133/public-social-account-analyzer
-- **License**: MIT
-- **Runtime**: Python >= 3.9
-
-## Supported Platforms & Capability Matrix
-| Platform | Capability | Support Level | Fallback Mechanism |
-| --- | --- | --- | --- |
-| **Bilibili (B站)** | Full profile, video history, engagement metrics, tags | P0 (Production) | Bounded retry, public API + optional authorized session |
-| **Douyin (抖音)** | Video statistics, captions, play counts | P0 (Experimental) | SSR / ephemeral browser, creator OpenAPI |
-| **Weibo (微博)** | Post timeline, reposts, comments count | P1 (Experimental) | Public AJAX pipelines |
-| **Xiaohongshu (小红书)** | Note cards, interaction stats, keywords | P1 (Experimental) | Modern/legacy state parsing, partial sample safeguards |
-
-## Core Principles
-1. **Immutable Audit Artifacts**:
-   - Never overwrites historical snapshots; each collection attempt creates an isolated, verifiable dataset directory.
-2. **Defensive Anti-Scraping Compliance**:
-   - Immediately stops on captchas, login walls, or rate limits. Never fabricates empty data as "success"; clearly marks incomplete crawls as `PARTIAL`.
-3. **Agent-Native Discovery**:
-   - AI agents accept pure creator names, autonomously find and verify official profile URLs, and invoke the collection pipelines without manual link hunting.
-
-## Quickstart
-
-### Installation
-```bash
-# As OpenClaw Agent Skill
-openclaw skills install @luckycat133/public-social-account-analyzer
-
-# Or local Python environment
-git clone https://github.com/Luckycat133/public-social-account-analyzer.git
-cd public-social-account-analyzer
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-```
-
-### Run Pipeline
-```bash
-# Collect Bilibili creator archive
-python3 skill/scripts/collect_bilibili_complete.py \
-  "https://space.bilibili.com/<uid>" \
-  --out-prefix workspace/bilibili-collection
-
-# Generate analytics report
-python3 skill/scripts/run_pipeline.py \
-  --input workspace/bilibili-collection-attempt-1 \
-  --output workspace/bilibili-analysis
-```
-
-## Frequently Asked Questions (FAQ)
-
-### What makes this different from generic web scrapers?
-It is structured specifically for AI Agents (Agent Skills). Output datasets are structured for direct LLM ingestion, sentiment analysis, and topic modeling, with built-in data verification and rate-limit safety checks.
+## Optional
+- [Roadmap](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/ROADMAP.md): Supported features and platform milestone schedule.
+- [Architecture](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/docs/architecture/STRUCTURE.md): Pipeline data flow, collector isolation, and evidence persistence.

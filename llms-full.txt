@@ -1,0 +1,51 @@
+# Public Social Account Analyzer Full Documentation
+
+> Agent Skill & CLI toolkit for auditing public creator accounts across Bilibili, Douyin, Weibo & Xiaohongshu with immutable audit artifacts.
+
+- **Repository**: https://github.com/Luckycat133/public-social-account-analyzer
+- **Author**: Luckycat133
+- **License**: MIT
+- **Runtime**: Python >= 3.9
+
+---
+
+## 1. Supported Platform Matrix
+
+| Platform | Capability | Support Tier | Primary Extraction Pipeline |
+| :--- | :--- | :--- | :--- |
+| **Bilibili (B站)** | Full public profile, video history, tags, engagement | P0 (Production) | Bounded retry, public API + optional session |
+| **Douyin (抖音)** | Video statistics, captions, play counts | P0 (Experimental) | SSR / ephemeral browser, creator OpenAPI |
+| **Weibo (微博)** | Post timeline, reposts, comments count | P1 (Experimental) | Public AJAX pipelines |
+| **Xiaohongshu (小红书)** | Note cards, interaction stats, keywords | P1 (Experimental) | Modern/legacy state parsing, partial sample safeguards |
+
+---
+
+## 2. Core Architectural Guarantees
+
+1. **Immutable Audit Artifacts**: Each collection attempt writes to a segregated, timestamped directory. Historical evidence is never mutated.
+2. **Defensive Rate-Limit & Login-Wall Handling**: The collector immediately halts on captchas, login walls, or throttling. It never fabricates empty records as "success".
+3. **Agent-Native Discovery**: Agents take raw creator names, discover canonical profile URLs via search, and drive collection without manual link provision.
+
+---
+
+## 3. Quickstart
+
+```bash
+# As OpenClaw Agent Skill
+openclaw skills install @luckycat133/public-social-account-analyzer
+
+# Local setup
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+# Collect Bilibili creator profile
+python3 skill/scripts/collect_bilibili_complete.py \
+  "https://space.bilibili.com/<uid>" \
+  --out-prefix workspace/bilibili-collection
+
+# Generate analytics report
+python3 skill/scripts/run_pipeline.py \
+  --input workspace/bilibili-collection-attempt-1 \
+  --output workspace/bilibili-analysis
+```
