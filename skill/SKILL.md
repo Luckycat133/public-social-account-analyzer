@@ -1,11 +1,10 @@
 ---
 name: public-social-account-analyzer
-description: >-
-  Analyze specific public creator, brand, or institutional accounts on B站/哔哩哔哩、抖音、微博、小红书. Use for 内容策略、选题栏目、发布节奏、公开互动效率、高低表现共同点、评论区需求、最近N条/日期窗口内容审计. Accept a verified homepage or a nickname/handle that the agent first resolves and verifies; user-provided CSV/JSON can supply external evidence but is not automatically a sealed CLI collection. Do not use for unsupported-platform collectors (including 公众号、YouTube、Instagram、TikTok), private messages, backend analytics, inferred private audience profiles, media downloading, posting, or account-control automation.
+description: Analyze specific public creator, brand, or institutional accounts on B站/哔哩哔哩、抖音、微博、小红书. Use for 内容策略、选题栏目、发布节奏、公开互动效率、高低表现共同点、评论区需求、最近N条/日期窗口内容审计. Accept a verified homepage or a nickname/handle that the agent first resolves and verifies; user-provided CSV/JSON can supply external evidence but is not automatically a sealed CLI collection. Do not use for unsupported-platform collectors (including 公众号、YouTube、Instagram、TikTok), private messages, backend analytics, inferred private audience profiles, media downloading, posting, or account-control automation.
 ---
 # 公开社交账号分析
 
-先回答用户的实际问题，再说明证据范围；不要把采集数量、模型输出数量或报告生成成功当作分析质量。
+直接回答用户的实际问题，并交代支撑结论的证据范围和不确定性。段落顺序和篇幅由用户目标决定，不设固定模板。不要把采集数量、模型输出数量或报告生成成功当作分析质量。
 
 ## 当前交付边界
 
