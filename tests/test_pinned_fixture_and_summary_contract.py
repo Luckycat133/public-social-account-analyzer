@@ -96,9 +96,9 @@ def test_pinned_metrics_do_not_skew_valid_medians(pipeline_analysis):
 
 def test_skill_md_keeps_scope_disclosure_without_forced_order():
     text = SKILL_MD.read_text(encoding="utf-8")
-    assert "先给用户能直接使用的判断" in text
-    assert "最关键的证据范围和不确定性" in text
-    assert "实际顺序和篇幅由用户目标决定" in text
+    assert "直接回答用户的实际问题" in text
+    assert "证据范围和不确定性" in text
+    assert "段落顺序和篇幅由用户目标决定" in text
     assert "最终答复先摘要后结论" not in text
     assert "最终答复在分析结论前先展示数据质量摘要" not in text
 

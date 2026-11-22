@@ -246,7 +246,11 @@ def test_docs_describe_zero_python_dependency_browser_fallback():
     assert "不新增 pip" in platform
     assert "临时用户目录" in platform
     assert "platforms/douyin.md" in skill
-    assert "仓库脚本擅长 B站和抖音" in skill
+    bilibili = next(line for line in skill.splitlines() if line.startswith("| B站 |"))
+    douyin = next(line for line in skill.splitlines() if line.startswith("| 抖音 |"))
+    assert all(mode in bilibili for mode in ("公共采集", "有界完整采集", "可选授权会话"))
+    assert all(mode in douyin for mode in ("公开 HTTP/SSR/临时浏览器", "本人 OpenAPI", "公开索引"))
+    assert "条件支持" in douyin and "不得互相冒充" in douyin
     assert "SSR 缺失或作品列表结构无法识别" in platform
     assert "默认自动启动浏览器降级" in platform
     assert "--no-browser-fallback" in platform
