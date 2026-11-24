@@ -12,9 +12,8 @@ This table records the Skills added for public-social-account-analyzer. Load onl
 | `social-media-analysis` | Platform adapters (Bilibili/Douyin/Weibo/Xiaohongshu), content classification, business insights, taxonomy drafts, immutable analysis workspaces |
 | `web-scraping` | Public web scraping, collection adapters, Cookie handling, URL allowlist/canonicalization, browser fallback, rate limiting, retry strategies |
 | `python-pypi-package-builder` | End-to-end PyPI packaging, PEP 440/SemVer versioning, and OIDC Trusted Publishing |
-| `directory-submissions` | Skill marketplaces (`skills.sh`, ClawHub, plugin manifests) and directory submissions |
-| `clawhub` | ClawHub skill publishing, syncing, and verification workflows |
 | `github-release` | GitHub Releases, SemVer tagging, and Keep a Changelog release workflows |
+| `distribution-publisher` (Claude Agent) | Dedicated agent (`~/.claude/agents/distribution-publisher.md`) for MCP/Skill registries, ClawHub, `skills.sh`, GEO/`llms.txt`, and launch copy |
 
 ## Maintenance rules
 
