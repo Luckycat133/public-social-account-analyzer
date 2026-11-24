@@ -57,6 +57,8 @@ python3 skill/scripts/run_pipeline.py \
 
 需要最近 N 条时，使用 `collect.py <profile-url> --limit N --out <new-directory>`。B站/抖音省略 `--limit` 默认走有界完整模式，不是默认最近 30 条。完整参数、抖音流程、Cookie 会话与故障处理见 [USAGE.md](USAGE.md)；遇旧说明冲突，以实际 `--help` 与 [当前 skill](skill/SKILL.md) 的已知边界为准。
 
+Agent 查看已生成结果时，先读 `delivery-summary.json` 与 `final-response.md`，再按问题读取报告章节或对应作品证据。无需把 `analysis.json`、原始数据与 HTML 报告同时加载进上下文；模型阶段使用生成的紧凑输入与模板，完整覆盖和交付门仍按原合同验证。
+
 ## 文档入口
 
 | 目的 | 文档 |
@@ -70,11 +72,14 @@ python3 skill/scripts/run_pipeline.py \
 | 数据字段与状态枚举 | [collection-schema.md](skill/references/collection-schema.md)、[analysis-schema.md](skill/references/analysis-schema.md)、[exceptions.md](skill/references/exceptions.md) |
 | 当前源码审查与历史验收 | [2026-11-15 审查](docs/acceptance/repository-audit-2026-11-15.md)、[历史需求映射](docs/prd/需求实现状态与抖音能力边界.md)、[验收计划](docs/guides/prd-v1.0-acceptance-test-plan.md) |
 | 架构、发布与历史验收 | [docs/README.md](docs/README.md) |
+| AI / LLM 规范索引 | [llms.txt](llms.txt)、[llms-full.txt](llms-full.txt) |
+| 版本历史与变更记录 | [CHANGELOG.md](CHANGELOG.md) |
 
 ## 开发与验证
 
 ```bash
 python3 -m pytest tests/ -q
+python3 tools/check_markdown_links.py
 python3 tools/skill_eval/split_dataset.py --verify
 python3 -m compileall -q skill/scripts
 python3 tools/check_markdown_links.py
