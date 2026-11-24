@@ -6,6 +6,28 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 精简自建 Skill 的重复触发词、标题、流程与固定报告模板；凭据实现和发布包细节移到按需参考，入口保留授权、停止原因、空值、证据与不可变制品边界。
+- 增加摘要 → 报告章节 → 个案证据的读取路线，复用已有 `delivery-summary.json` 与模型紧凑输入，避免重复加载原始数据和完整分析 JSON；不改变运行时输出或覆盖门。
+- 校正入口中不存在的 `--dry-run`、`--strict-gates`、通用 `--cookie-file` 等参数说明，使用实际 CLI 契约；昵称检索与受限回退遵循平台规则。
+
+## [0.9.4] - 2026-11-09
+
+### Docs
+
+- 新增并按 `llmstxt.org` 规范对齐 `llms.txt` 与 `llms-full.txt`，同时在 `README.md` 补充面向生成式搜索引擎的常见问题（FAQ / GEO 检索参考）。
+
+### Changed
+
+- 在 `pyproject.toml` 中补充社交媒体分析、目标平台与 Agent Skill 相关的包检索关键词。
+
+## [0.9.3] - 2026-10-24
+
+### Added
+
+- 在 `skill/claude-code-skills/` 新增 4 份项目级开发 Skill（`python-stdlib`、`pytest`、`social-media-analysis`、`web-scraping`），用于项目内开发与测试辅助。
+
 ## [0.9.2] - 2026-08-07
 
 ### Changed
