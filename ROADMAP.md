@@ -1,8 +1,8 @@
 # Roadmap
 
-> 更新：2026-11-15；代码审查基线：`69efd2be4064b9b144b5231b3f5ef86add9d4ba5`（2026-11-09 提交）；`skill/VERSION` 与 `pyproject.toml` 均为 `0.9.2`。本次是文档与验收事实修订，不是新发行版，不代表已发布新 `.skill`。
+> 更新：2026-11-27；本轮离线验收固定在 `v0.9.5`（`b22354649c83105e4d201a9ac9e736f7d0b98f76`）。`skill/VERSION` 与 `pyproject.toml` 均为 `0.9.5`。[正式 GitHub Release](https://github.com/Luckycat133/public-social-account-analyzer/releases/tag/v0.9.5) 提供离线 `.skill` 和 SHA-256 文件，不代表在线功能验收。
 >
-> 当前审查记录：[repository-audit-2026-11-15.md](docs/acceptance/repository-audit-2026-11-15.md)。历史 [PRD 实现映射](docs/prd/需求实现状态与抖音能力边界.md) 保留为历史证据，不将其中“已完成”直接升级为本提交重新验收通过。
+> [2026-11-15 历史源码审查](docs/acceptance/repository-audit-2026-11-15.md)及[历史 PRD 实现映射](docs/prd/需求实现状态与抖音能力边界.md)各自保留原基线；不能将历史“已完成”当成当前在线验收证据。
 
 ## 状态判定
 
@@ -11,7 +11,7 @@
 - **本轮实际验证**：必须记录命令/方法、运行环境、结果和局限。
 - **待修复/待验收**：未满足可复现门禁，不能因文档改写、跳过测试或进程退出 0 而勾选完成。
 
-本轮没有重新运行全量 pytest、dataset split、归档打包、平台在线采集、OAuth 或人工准确率验收。GitHub Actions 对基线 SHA 的查询返回 0 次运行。已执行的离线实验是 CPython 3.13.5 默认重定向请求构造：10/10 个测试组合都保留了 Cookie，**这是缺陷复现，不是安全通过**。
+本轮只执行离线测试、归档及公开附件下载，不访问实际账号、平台采集、Cookie、OAuth 或模型 API，也没有执行人工准确率/运营试用。历史 Cookie 重定向实验是缺陷复现而非安全通过。
 
 ## 已有工程能力
 
@@ -25,14 +25,14 @@
 | Cookie 生命周期 | 四平台显式文件输入、可选私有持久缓存、自动加载/清除 | 全链路只在内存；所有传输路径的凭据隔离均已闭环 |
 | 公开索引降级 | 抖音结构化索引导入、来源追踪和 `PARTIAL` 快照 | 实时、全量、日期未知记录的近期排名 |
 
-## 本次已完成的文档修订
+## 历史文档修订（2026-11-15）
 
 - [x] 以实际 argparse 接口纠正 skill 中不存在的参数，区分增量续采、checkpoint 和多 attempt。
 - [x] 明确 `.complete`、`COMPLETED`、`delivery_ready`、`is_exhaustive` 的不同含义。
 - [x] 修正微博默认启用、四平台正式入口、公众号不支持、P0 不等于生产验收的表述。
-- [x] 将本次新发现的运行时缺口与未执行验收显式列出；同步 README 与模型发现摘要，避免继续传播无证据的 Production 标签。
+- [x] 将当时发现的运行时缺口与未执行验收显式列出；同步 README 与模型发现摘要，避免继续传播无证据的 Production 标签。
 
-以上勾选只表示文档工作完成；下面的代码修复和发布门仍未关闭。
+以上是历史文档工作。凭据和执行策略缺口在 v0.9.5 仍未关闭；离线发布进展见 P0-3。
 
 ## 下一轮 P0：先关闭执行与凭据边界
 
@@ -54,30 +54,13 @@
 - [ ] 同时验证小红书和 B站的策略传播；不只修单个抖音布尔值。
 - [ ] 冲突组合要么按无浏览器路径安全执行，要么在联网/启动前给出稳定错误，不静默忽略用户限制。
 
-### P0-3：可复现的仓库与发布门（待实现/待运行）
+### P0-3：可复现离线发布（v0.9.5 已验，持续覆盖待补）
 
-- [ ] 将打包工具变成仓库可定位工具或显式依赖；移除归档测试对 `/Users/jack/.agents/...` 的硬编码依赖。发布必需测试不能通过 `skip` 冒充通过。
-- [ ] 在干净环境记录当前提交的 pytest 结果和 skip/xfail 明细；建立支持版本/系统矩阵，至少覆盖 Python 声明下限及主开发环境，不用单个环境替代全部支持范围。
-- [ ] 运行数据集切分、递归 Python 编译、Markdown 链接、关键 CLI help 和 diff 检查。递归编译必须包含 `scripts/analysis/`，不能只编译顶层 glob。
-- [ ] 实际生成并解包 `.skill`，检查归档成员而非 grep 文档正文；必须包含 `scripts/analysis/`，排除 evals/tests/docs/tools/workspace、凭据、临时文件和链接逃逸。
-- [ ] 在独立解包环境运行入口与离线 fixture；记录 Git SHA、Skill 版本、SKILL.md SHA-256、Python/OS、命令、退出码和日志位置。
-- [ ] skill description 已变更，重新执行干净上下文的 train/validation 触发与行为评测；不沿用旧描述的成绩。
-
-建议执行基线（这是待执行清单，不是本轮测试结果）：
-
-```bash
-python3 -m pytest tests/ -q
-python3 tools/skill_eval/split_dataset.py --verify
-python3 -m compileall -q skill/scripts
-python3 tools/check_markdown_links.py
-python3 skill/scripts/collect.py --help
-python3 skill/scripts/run_pipeline.py --help
-python3 skill/scripts/collect_bilibili_complete.py --help
-python3 skill/scripts/collect_douyin_complete.py --help
-python3 skill/scripts/collect_douyin_authorized.py --help
-python3 skill/scripts/import_index_snapshot.py --help
-git diff --check
-```
+- [x] 仓库自带 `tools/package_skill.py`，归档合同测试不依赖开发机绝对路径且未跳过。固定 Git 树的两次隔离构建逐字节相同；[发布流水线](https://github.com/Luckycat133/public-social-account-analyzer/actions/runs/45988349982)复验 SHA-256 后发布。
+- [x] Linux x86_64 的 Python 3.9、3.12 分别执行 `python -m pytest tests/ -q -rs`：各 1698 通过、0 跳过/失败。[主干 CI](https://github.com/Luckycat133/public-social-account-analyzer/actions/runs/45963134590) Python 3.12 通过；持久多版本/多系统 CI 矩阵仍待补。
+- [x] 对固定树执行 dataset split 与 Markdown 链接检查；对独立解包内容递归编译 `scripts/`（含 `analysis/`）、运行六个入口的 `--help`，并用合成数据验证离线去重、零值与缺失值。
+- [x] 校验公开下载的 `.skill` 字节、校验文件及实际归档成员；归档包含分析脚本，不包含仓库测试、文档、评测、工作区、缓存或符号链接。归档 SHA-256：`b3b0502a550d190d012cca17ca54872092a949ee9e7c455a729ecb8e3e355f68`；`SKILL.md` SHA-256：`e155b641606621e6e2c45931602ca169b9b60f126049c0bc4527e90e45366137`。
+- [ ] 补齐持久 Python/操作系统 CI 矩阵，并在干净上下文重跑当前 Skill 描述的训练/验证触发及行为评测；不得沿用旧描述成绩。
 
 ## 外部发布验收：继续保持未完成
 
