@@ -11,6 +11,10 @@
 - 在不可变封存前核验结构化交付摘要类型、样本计数与状态。
 - 添加无本地依赖的确定性 Skill 打包检查。
 
+### Distribution
+
+- [正式 GitHub Release v0.9.5](https://github.com/Luckycat133/public-social-account-analyzer/releases/tag/v0.9.5) 在原 tag（`b2235464`）附上确定性离线 `.skill` 和 SHA-256 文件；公开下载复验通过。未改动标签或使用真实账号、Cookie/OAuth 凭据。在线与人工验收仍见 [Roadmap](ROADMAP.md)。
+
 ### Changed
 
 - 精简自建 Skill 的重复触发词、标题、流程与固定报告模板；凭据实现和发布包细节移到按需参考，入口保留授权、停止原因、空值、证据与不可变制品边界。
