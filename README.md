@@ -115,3 +115,5 @@ workspace/      运行时生成物（不入库）
 ## 维护与许可
 
 本仓库采用 [MIT 许可证](LICENSE)，维护者：[Luckycat133](https://github.com/Luckycat133)。欢迎在许可证范围内分发与复用。
+
+同平台公开样本横向对比和周期环比见 [结构化对比合同](skill/references/comparison-schema.md)，仅基于密封工作区离线执行。
