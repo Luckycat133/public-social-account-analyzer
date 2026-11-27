@@ -1131,6 +1131,25 @@ def analyze_comments_in_memory(
     else:
         status = "unavailable"
 
+    counts = _comment_field_coverage(records)
+    eligible_count = len(eligible_parents)
+    if status == "not_requested":
+        sampling_state = "not_requested"
+    elif status == "empty":
+        sampling_state = "confirmed_empty"
+    elif status == "unavailable":
+        sampling_state = "unavailable"
+    elif (
+        ledger["stop_reason"] is not None
+        or ledger["failures"] > 0
+        or ledger["attempted_posts"] != eligible_count
+        or covered_count + ledger["empty_results"] != eligible_count
+        or counts["text"]["present"] != len(records)
+    ):
+        sampling_state = "partial"
+    else:
+        sampling_state = "sampled"
+
     limitations = [
         "评论仅为公开页面采样，不代表全部评论或账号受众总体观点。",
         "确定性阶段不生成评论语义结论。",
@@ -1145,6 +1164,9 @@ def analyze_comments_in_memory(
         limitations.insert(
             0, "代表评论按可见点赞数与源文件行号选择，不代表语义重要性。"
         )
+
+    if sampling_state == "partial":
+        limitations.insert(0, "评论采样仅获得部分证据；已核验行保留，未覆盖或缺文不能按零处理。")
 
     comment_insight_required = (
         with_comment_insights or comment_insight_results is not None
@@ -1175,10 +1197,10 @@ def analyze_comments_in_memory(
     if status == "collected_pending_model" and semantic.get("status") == "completed":
         status = "collected_analyzed"
 
-    eligible_count = len(eligible_parents)
     return {
         "schema_version": 1,
         "status": status,
+        "sampling_state": sampling_state,
         "requested": requested,
         "sampled_comment_count": len(records),
         "eligible_parent_posts": eligible_count,
@@ -1187,7 +1209,7 @@ def analyze_comments_in_memory(
             rnd(covered_count / eligible_count, 4) if eligible_count else None
         ),
         "collection_ledger": copy.deepcopy(ledger),
-        "field_coverage": _comment_field_coverage(records),
+        "field_coverage": counts,
         "representative_selection": {
             "max_parent_posts": COMMENT_REPRESENTATIVE_PARENT_LIMIT,
             "max_per_parent": 1,

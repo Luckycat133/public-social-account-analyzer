@@ -458,8 +458,10 @@ def _analysis_status(result: AnalysisResult) -> str:
         not comment_required
         or result.analysis.get("comment_insight_status") == "completed"
     )
+    comment_sampling = (result.analysis.get("comment_analysis") or {}).get("sampling_state")
     complete = (
-        classification_status == "completed"
+        comment_sampling not in {"partial", "unavailable"}
+        and classification_status == "completed"
         and evidence_status == "COMPLETE"
         and business_complete
         and comment_complete
@@ -497,6 +499,12 @@ def _analysis_partial_reasons(analysis: dict[str, Any]) -> list[str]:
             reasons.append("PARTIAL_COMMENT_INSIGHTS")
         elif comment_status != "completed":
             needs_generic_reason = True
+
+    sampling = (analysis.get("comment_analysis") or {}).get("sampling_state")
+    if sampling == "partial":
+        reasons.append("COMMENT_SAMPLE_PARTIAL")
+    elif sampling == "unavailable":
+        reasons.append("COMMENT_SAMPLE_UNAVAILABLE")
 
     evidence_status = (analysis.get("evidence_coverage") or {}).get("status")
     if evidence_status == "PARTIAL_EVIDENCE":

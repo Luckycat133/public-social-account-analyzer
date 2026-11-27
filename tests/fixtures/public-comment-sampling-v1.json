@@ -1,0 +1,23 @@
+{
+  "rate_limited": {
+    "responses": ["rate", "unused", "unused"],
+    "called": 1, "state": "unavailable", "count": 0, "failures": 1, "stop": "RATE_LIMITED"
+  },
+  "rate_after_one": {
+    "responses": [[{"comment_id": "sample_1", "text": "公开样本预期字句", "likes": 0}], "rate", "unused"],
+    "called": 2, "state": "partial", "count": 1, "failures": 1, "stop": "RATE_LIMITED"
+  },
+  "half_rows": {
+    "responses": [[{"comment_id": "half_1", "text": null, "likes": 0},
+                   {"comment_id": "bad_1", "parent_post_id": "999", "text": "nonmatching parent sentinel"}], [], []],
+    "called": 3, "state": "partial", "count": 1, "failures": 1, "stop": null
+  },
+  "known_empty": {
+    "responses": [[], [], []],
+    "called": 3, "state": "confirmed_empty", "count": 0, "failures": 0, "stop": null
+  },
+  "sampled": {
+    "responses": [[{"comment_id": "sample_1", "text": "公开样本预期字句", "likes": 0}], [], []],
+    "called": 3, "state": "sampled", "count": 1, "failures": 0, "stop": null
+  }
+}
