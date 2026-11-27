@@ -182,6 +182,14 @@ def _parse_weibo_time(s: Any) -> str | None:
     if not s or not isinstance(s, str):
         return None
     s = s.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?", s):
+        try:
+            exact = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if exact.tzinfo is None:
+                exact = exact.replace(tzinfo=BEIJING_TZ)
+            return exact.astimezone(BEIJING_TZ).isoformat()
+        except (ValueError, OverflowError):
+            return None
     now = datetime.now(BEIJING_TZ)
     m = re.match(r"^(\d+)\s*分钟前$", s)
     if m:
@@ -220,6 +228,20 @@ def _parse_weibo_time(s: Any) -> str | None:
         ).astimezone(BEIJING_TZ).isoformat()
     except ValueError:
         return None
+
+
+def _published_precision(value: Any, parsed: str | None) -> str:
+    """Do not promote a relative, date-only or yearless display to a timestamp."""
+    if not parsed or not isinstance(value, str):
+        return "unknown"
+    value = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return "date"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?", value):
+        return "datetime"
+    if re.fullmatch(r"[A-Za-z]{3} [A-Za-z]{3} [0-9]{1,2} \d{2}:\d{2}:\d{2} [+-]\d{4} \d{4}", value):
+        return "datetime"  # explicit platform API weekday/month datetime
+    return "unknown"
 
 
 def _extract_uid_candidates(page: str, name: str) -> list[str]:
@@ -332,11 +354,13 @@ def _build_post_raw(it: dict, uid: str) -> dict:
         content_type = "image_text"
     else:
         content_type = "repost" if is_repost else "text"
+    raw_time = it.get("created_at")
+    published_at = _parse_weibo_time(raw_time)
     return {
         "platform": PLATFORM,
         "post_id": bid,
         "post_url": f"https://weibo.com/{uid}/{bid}",
-        "published_at": _parse_weibo_time(it.get("created_at")),
+        "published_at": published_at,
         "content_type": content_type,
         "title": (text.split("\n")[0][:50] if text else None),
         "text": text or None,
@@ -355,6 +379,7 @@ def _build_post_raw(it: dict, uid: str) -> dict:
         "collected_at": _now_iso(),
         "source_url": f"https://weibo.com/{uid}/{bid}",
         "platform_metrics": {
+            "published_at_precision": _published_precision(raw_time, published_at),
             "repost_source": (
                 (rto.get("user") or {}).get("screen_name")
                 if is_repost is True

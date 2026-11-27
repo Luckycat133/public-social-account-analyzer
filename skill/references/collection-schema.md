@@ -84,6 +84,7 @@
 - `is_pinned` / `is_repost` / `is_promoted` 仅保留明确公开的 `true` / `false`；未知时为 `null`，不得把缺失证据断言为 `false` 或 `true`。
 - `collection_status` 缺失或非法时必须归一为 `PARTIAL`，并分别标记 `inferred_missing` / `inferred_invalid`；禁止默认为 `SUCCESS`。归一化覆盖率须记录 `COLLECTION_STATUS_INFERRED` warning，流水线因此降为 `PARTIAL`。
 - `normalized-posts.csv` 使用紧凑、排序键的 JSON 序列化 `hashtags`、`platform_metrics` 与 `field_visibility`；布尔值统一写小写 `true` / `false`，`null` 写为空单元格。读取端仍兼容旧 CSV 中用 `|` / `,` / `;` 分隔的话题串，以及旧采集器写出的 Python `list` / `tuple` / `dict` 字面量；后者只在严格单元格大小、AST 复杂度、目标类型及 JSON 兼容性校验后读取，绝不执行表达式，也不再以旧格式写出。
+- 微博和小红书的 `platform_metrics.published_at_precision` 为 `datetime` / `date` / `unknown`；即使兼容显示的时间字符串补足至午夜，离线精确窗口仍排除日期级、推断及历史未标明精度的记录。
 - 默认分析排除置顶、转载、投放内容（见 [model-insights.md](model-insights.md) §6.4），但须在数据中保留标记。
 - B站所有构建路径的 `platform_metrics` 固定包含
   `collection_evidence_status/is_in_collection/series_name/season_id`：只有公开
