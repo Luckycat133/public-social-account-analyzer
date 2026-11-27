@@ -324,6 +324,7 @@ def test_xiaohongshu_modern_anonymous_cards_remain_disclosed_partial_evidence(
     assert first[0]["likes"] == 88
     assert first[0]["platform_metrics"] == {
         "note_type": "video",
+        "published_at_precision": "unknown",
         "collection_source": "xiaohongshu_profile_cards",
         "platform_post_id_known": False,
         "local_record_key": True,

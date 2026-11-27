@@ -8,6 +8,8 @@ import pytest
 
 from analysis.compare import ARTIFACT, ComparisonError, run
 from collectors.bilibili import _build_post_raw_from_medialist
+from collectors.weibo import _build_post_raw as weibo_post
+from collectors.xiaohongshu import _raw_note as xhs_post
 from immutable_workspace import ImmutableWorkspace, WorkspaceError
 from run_pipeline import COLLECTION_ARTIFACTS
 
@@ -26,8 +28,10 @@ def _seal(directory, allowed, files):
 
 def _collection(directory, spec, platform="bilibili", *, count=None):
     account, capture = spec["account"], spec["capture"]
-    url = (f"https://space.bilibili.com/{account}" if platform == "bilibili" else
-           f"https://weibo.com/u/{account}")
+    urls = {"bilibili": f"https://space.bilibili.com/{account}",
+            "weibo": f"https://weibo.com/u/{account}",
+            "xiaohongshu": f"https://www.xiaohongshu.com/user/profile/{account}"}
+    url = urls[platform]
     rows = [
         {"platform": platform, "post_id": pid, "published_at": stamp,
          "likes": likes, "comments": comment, "shares": 0,
@@ -213,3 +217,33 @@ def test_incremental_collection_reused_observation_is_not_an_observed_zero_delta
     for post in changes:
         assert post["previous_observed_at"] == post["current_observed_at"]
         assert post["metric_deltas"] == {"likes": None, "comments": None, "shares": None}
+
+@pytest.mark.parametrize("platform", ["weibo", "xiaohongshu"])
+def test_coarse_and_unmarked_legacy_adapter_dates_never_enter_exact_window(tmp_path, platform):
+    def raw(key, value):
+        if platform == "weibo":
+            return weibo_post({"id": key, "created_at": value, "attitudes_count": 0}, "100")
+        return xhs_post({"noteId": key, "time": value, "likedCount": 0})
+
+    coarse = raw("a" * 24, "2026-10-03")
+    exact = raw("b" * 24, "2026-10-03T00:30:00Z")
+    assert coarse["platform_metrics"]["published_at_precision"] == "date"
+    assert exact["platform_metrics"]["published_at_precision"] == "datetime"
+    assert exact["published_at"] == "2026-10-03T08:30:00+08:00"
+    old = dict(coarse, post_id="c" * 24, platform_metrics={})
+    data = [coarse, exact, old]
+    if platform == "weibo":
+        incomplete = raw("d" * 24, "10-03")
+        approx = raw("e" * 24, "3小时前")
+        assert incomplete["platform_metrics"]["published_at_precision"] == "unknown"
+        assert approx["platform_metrics"]["published_at_precision"] == "unknown"
+        data.extend([incomplete, approx])
+    left, right, out = [tmp_path / name for name in ("left", "right", "out")]
+    capture = "2026-10-05T02:00:00Z"
+    a, b = ("100", "101") if platform == "weibo" else ("1" * 24, "2" * 24)
+    _collection(left, {"account": a, "capture": capture, "sample": [], "extra": data}, platform)
+    _collection(right, {"account": b, "capture": capture, "sample": []}, platform)
+    run("accounts", ["2026-10-02T15:00:00Z", "2026-10-04T00:00:00Z"], [str(left), str(right)], str(out))
+    row = _read(out)["accounts"][0]
+    assert row["sample_post_count"] == 1
+    assert row["coverage"]["unknown_publication_time"] == len(data) - 1

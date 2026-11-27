@@ -72,8 +72,13 @@ def _published(row: dict) -> datetime | None:
     # The source must supply a year (no wall clock/year-inferred dates), and
     # date-only observations cannot be assigned to an exact UTC interval.
     value = row.get("published_at")
-    precision = row.get("platform_metrics")
-    if isinstance(precision, dict) and precision.get("published_at_precision") in ("unknown", "date"):
+    metadata = row.get("platform_metrics")
+    precision = metadata.get("published_at_precision") if isinstance(metadata, dict) else None
+    if precision in ("unknown", "date"):
+        return None
+    # Legacy Weibo/XHS adapters expanded coarse dates into plausible ISO strings
+    # before sealing. An unmarked old row cannot establish exact timing.
+    if row.get("platform") in {"weibo", "xiaohongshu"} and precision != "datetime":
         return None
     if not isinstance(value, str) or len(value) < 16:
         return None

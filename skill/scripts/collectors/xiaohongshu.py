@@ -436,6 +436,20 @@ def _published_at(value: Any) -> str | None:
     return parsed.astimezone(BEIJING_TZ).isoformat()
 
 
+def _published_precision(value: Any, parsed: str | None) -> str:
+    if not parsed:
+        return "unknown"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "datetime"
+    if isinstance(value, str):
+        raw = value.strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            return "date"
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})", raw):
+            return "datetime"
+    return "unknown"
+
+
 def _optional_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -476,11 +490,14 @@ def _raw_note(note: dict[str, Any]) -> dict[str, Any] | None:
     favorites = parse_int(note.get("collectedCount", note.get("collectCount")))
     comments = parse_int(note.get("commentCount"))
     shares = parse_int(note.get("shareCount"))
+    raw_time = note.get("time", note.get("publishTime"))
+    published_at = _published_at(raw_time)
+    precision = _published_precision(raw_time, published_at)
     return {
         "platform": PLATFORM,
         "post_id": note_id,
         "post_url": note_url,
-        "published_at": _published_at(note.get("time", note.get("publishTime"))),
+        "published_at": published_at,
         "content_type": content_type,
         "title": title,
         "text": text,
@@ -509,6 +526,7 @@ def _raw_note(note: dict[str, Any]) -> dict[str, Any] | None:
         "platform_metrics": (
             {
                 "note_type": note_type,
+                "published_at_precision": precision,
                 "collection_source": "xiaohongshu_profile_cards",
                 "platform_post_id_known": False,
                 "local_record_key": True,
@@ -516,7 +534,7 @@ def _raw_note(note: dict[str, Any]) -> dict[str, Any] | None:
                 "source_rank": note.get("_sourceRank"),
             }
             if local_record_key
-            else {"note_type": note_type}
+            else {"note_type": note_type, "published_at_precision": precision}
         ),
     }
 
