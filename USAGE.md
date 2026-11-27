@@ -55,6 +55,12 @@ python3 skill/scripts/run_pipeline.py \
 
 脚本不调用模型：它生成模板、校验外部结果，并绑定 collection 与证据。没有完整分类或业务结果时，可生成明确标记为 `PARTIAL` 的数据概览；只有 `delivery-summary.json.delivery_ready=true` 才是正式交付。逐步模型协作见 [workflow.md](skill/references/workflow.md)。
 
+### 按需读取结果
+
+先读 `delivery-summary.json` 的范围、字段覆盖、停止原因及就绪门，以及 `final-response.md` 的交付说明；回答具体问题时再读取 `account-analysis-report.md` 相应章节和作品 ID/URL 证据。不要默认把完整 `analysis.json`、原始 posts/comments 与 `dashboard.html` 一起加载。
+
+分类阶段使用 `taxonomy-prompt.md`、`taxonomy-input.jsonl` 和 `taxonomy-result-template.json`；业务阶段使用 `business-insights-prompt.md`、`business-context.json`、`business-evidence-catalog.jsonl` 和对应模板。仅在需要该阶段时读取这些文件；大输入可以分批读取，但最终结果必须覆盖全部要求的有效作品。文件由相应模型阶段开关生成，不能假定每个 workspace 都存在。摘要只帮助导航，不能替代原始证据或验证合同。
+
 ## 常用流程
 
 ### B站

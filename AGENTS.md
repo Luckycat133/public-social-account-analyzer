@@ -1,33 +1,37 @@
-# 仓库指导规范
+# AGENTS.md — Public Social Account Analyzer
 
-## 项目结构与模块组织
+## Project Shape & Runtime Boundary
 
-Agent Skill 保存在 `skill/` 目录中。其接口契约由 `skill/SKILL.md` 定义；Python 入口脚本位于 `skill/scripts/`，平台适配器位于 `skill/scripts/collectors/`，领域契约位于 `skill/references/`，数据看板模板位于 `skill/assets/`。离线评估测试集保留在 `skill/evals/datasets/` 下。Pytest 测试套件位于 `tests/`，架构说明、计划和验收记录属于 `docs/`。`workspace/` 任务目录为自动生成的运行产物，不属于源码。
+Two-tier layout: repo root (`README.md`, `USAGE.md`, `tests/`, `docs/`, `workspace/` runtime output) + Agent-Skills deliverable under `skill/` (`SKILL.md`, `scripts/`, `references/`, `assets/`, `evals/`).
+- **Zero external runtime dependencies**: production code uses **Python 3.9+ stdlib only** (`pytest` is dev-only). Production scripts never call an LLM; classification/business-insight JSON is supplied externally and sealed by digest.
 
-## 构建、测试与开发命令
-
-本项目无编译步骤，生产代码仅依赖 Python 标准库。
+## Verification & Smoke Commands
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-python3 -m pip install -e ".[dev]"       # 安装 Python 3.9+ 项目与 pytest 开发依赖
-python3 -m pytest tests/ -q              # 运行全量回归测试套件
-python3 -m pytest tests/test_douyin.py -q # 运行单个模块测试
-python3 tools/skill_eval/split_dataset.py --verify # 验证评估数据集切分契约
+python3 -m pytest tests/ -q                          # full regression (must be 100% green before commit)
+python3 -m pytest tests/test_douyin.py -q            # focused module test
+python3 tools/skill_eval/split_dataset.py --verify   # eval dataset split contract
+git diff --check
+# real-network public smoke only (normalize/analyze/render stay 100% offline & deterministic):
+python3 skill/scripts/collect.py "https://space.bilibili.com/123456" --limit 5 --out workspace/smoke
 ```
 
-执行本地冒烟测试命令为 `python3 skill/scripts/collect.py <public-profile-url> --limit 5 --out workspace/smoke`。采集过程可访问公开网页；归一化、分析与渲染阶段必须保持确定性与完全离线运行。
+## Hard Invariants (Why + Counterfactual)
 
-## 代码风格与命名规范
+- **Single source of truth for task constants**: Always import `TASK_STATUSES`, `STOP_REASONS`, `LABEL_MISSING`, `LABEL_UNKNOWN`, `ANALYZABLE_TASK_STATUSES`, `safe_*_label`, `validate_analysis_goal`, `new_task_id` from `skill/scripts/task_contract.py`—redeclaring them causes silent status/stop-reason drift across adapters and reports.
+- **Create-only immutable workspaces**: Collection (`collect.py`) and analysis (`run_pipeline.py`) are independent create-only commits (`--input` must be a sealed workspace; `--output` must not exist) so failed runs never overwrite or corrupt prior evidence. Legacy `normalize.py`/`analyze.py`/`render_report.py` intentionally reject sealed workspaces—use `run_pipeline.py`.
+- **Two-phase model workflow**: `--with-llm-tax` → write `taxonomy-results.json` outside workspace → `--classification-results` (digest-verified & sealed) → `--with-business-insights` → write `business-insight-results.json` → `--business-insight-results`. Resume (`--resume --out`) requires matching platform + canonical URL passing `verify_committed_workspace`.
+- **No fabricated success & strict credential isolation**: Missing/invalid `collection_status` degrades to `PARTIAL`; unit tests must mock network transport (never depend on live network). Never log or leak `DOUYIN_OPENAPI_ACCESS_TOKEN`, cookies, signed URLs, private raw data, or generated `workspace/` payloads; `browser_backend.py` is fallback-only and never persists cookies/headers/bodies.
+- **New artifact registration**: Any new collected artifact path must be added to both `ANALYSIS_REQUIRED_ARTIFACTS`/`ANALYSIS_OPTIONAL_ARTIFACTS` in `skill/scripts/immutable_workspace.py` and `docs/guides/deployment-package-checklist.md` §1, otherwise strict delivery validation will reject it.
 
-使用 4 空格缩进，优先导入标准库，为公共接口添加类型提示（Type Hints），并使用简短 docstring 阐明行为契约。模块、函数与变量统一使用 `snake_case`；类使用 `PascalCase`；常量使用 `UPPER_SNAKE_CASE`；私有 Helper 函数使用前导下划线 `_`。保持从入口脚本到适配器、再到共享 Helper 的单向依赖流。项目中未配置 Linter，提交前请与周围已有代码风格保持一致并运行 `git diff --check`。
+## Coding, Acceptance & Deployment Drift
 
-## 测试指导规范
+- **Dependency direction**: `entry scripts → collectors/* → shared helpers (base.py, _constants.py, _utils.py)`; 4-space indent, type hints on public interfaces, Conventional Commits (`feat(scope): ...`).
+- **PRD AC-01…AC-10 evidence**: AC-01/AC-02 require real sealed `workspace/<platform>-<id>-<date>/` (`.complete` + `manifest.json`); AC-03/AC-06 require `tests/manual_accuracy_check.py prepare|verify` bound to two immutable commits (source↔CSV self-consistency is NOT human truth); AC-10 uses `docs/guides/operations-trial-template.md`. Never mark AC PASS with placeholders.
+- **Pre-release drift check**: Run [docs/guides/deployment-package-checklist.md](docs/guides/deployment-package-checklist.md) verifying symlink/snapshot surfaces (`~/.agents/skills/`, `~/.claude/skills/`, `~/.workbuddy/skills/`), CLI flag parity, and full `pytest`.
 
-Pytest 测试文件命名为 `tests/test_<area>.py`，测试函数命名为 `test_<behavior>()`。为每个行为变更添加针对性的回归测试，尤其是 URL 校验、可空证据字段、`stop_reason` 语义、不可变工作区边界以及报告转义。自动化测试中应 Mock 平台网络传输，切勿将真实网络请求成功作为单元测试的通过前提。测试套件在代码提交前必须 100% 绿色通过。
+## 1-Hop Pointers
 
-## Commit 与 Pull Request 规范
-
-提交历史遵循 Conventional Commits 格式，例如 `feat(analysis): compare classified content patterns`、`fix(douyin): harden public evidence analysis` 以及 `docs: publish Douyin capability boundaries`。保持提交粒度聚焦，使用 `feat`、`fix`、`test`、`docs`、`refactor` 或 `chore` 并可带 scope。
-
-Pull Request 应说明用户可见的变更、证据/安全影响以及验证命令；链接相关的 Issue 或设计文档。当 `dashboard.html` 输出发生变化时请提供截图。当行为或配置发生变更时，同步更新 `README.md`、`USAGE.md`、契约规范与 `CHANGELOG.md`。严禁提交 OAuth Token、签名 URL、私有原始数据或生成的临时 workspace。
+- Architecture & full module map: [docs/architecture/STRUCTURE.md](docs/architecture/STRUCTURE.md)
+- Agent Skill contract & per-platform rules: [skill/SKILL.md](skill/SKILL.md), `skill/references/` (`data-schema.md`, `analysis-rules.md`, `exceptions.md`, `platforms/`, `douyin-index-evidence.md`)
+- Operations & acceptance plans: [USAGE.md](USAGE.md), [docs/prd/需求实现状态与抖音能力边界.md](docs/prd/需求实现状态与抖音能力边界.md), [docs/guides/prd-v1.0-acceptance-test-plan.md](docs/guides/prd-v1.0-acceptance-test-plan.md)

@@ -2,6 +2,14 @@
 
 只在生成或校验 taxonomy、business、comment、确定性聚合及高低表现结构时读取。指标和证据选择规则见 [analysis-rules.md](analysis-rules.md)。
 
+## 制品读取顺序
+
+`delivery-summary.json` 与 `final-response.md` 是交付范围/状态的轻量入口；
+`account-analysis-report.md` 提供按主题组织的结论。只有需要核查具体字段或作品时，
+才读取 `analysis.json` 或原始记录的相关部分。摘要不包含全部证据，不能用作
+完整性校验的替代输入。模型阶段优先读取该阶段生成的 prompt、紧凑输入与模板；
+分批读取不改变全量覆盖、父作品关联、字段空值或不可变制品合同。
+
 ## 7. Analysis 数据结构
 
 模型输出，分层保存，不覆盖原始字段。
