@@ -614,7 +614,7 @@ def _validate_output_payloads(
     sample = analysis["sample_boundary"]
     _validate_delivery_summary(
         summary, task, expected_valid=valid,
-        expected_collected=_jsonl_record_count(artifacts["source/posts.jsonl"], "source/posts.jsonl"),
+        expected_collected=len(csv_rows),
         expected_requested=sample.get("requested"),
     )
     expected_summary = _delivery_summary(analysis, task_status=task["task_status"])
