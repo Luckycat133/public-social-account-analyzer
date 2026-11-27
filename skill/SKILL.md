@@ -23,8 +23,8 @@ collection 与 analysis 输出目录都是 create-only；不覆盖、清空或�
 
 | 平台 | 参考与边界 |
 | --- | --- |
-| B站 | [bilibili.md](references/platforms/bilibili.md)：medialist / WBI arc-search，平台保护停止语义。 |
-| 抖音 | [douyin.md](references/platforms/douyin.md)：公开主页与有界浏览器回退；本人 OpenAPI 需要独立授权。 |
+| B站 | [bilibili.md](references/platforms/bilibili.md)：公共采集、 有界完整采集、可选授权会话；medialist / WBI arc-search，平台保护即停止。 |
+| 抖音 | [douyin.md](references/platforms/douyin.md)：公开 HTTP/SSR/临时浏览器、本人 OpenAPI 和公开索引为独立的条件支持路径，不得互相冒充；OpenAPI 需要独立授权。 |
 | 微博 | [weibo.md](references/platforms/weibo.md)：`WEIBO_COLLECTOR_ENABLED=1` 显式启用。 |
 | 小红书 | [xiaohongshu.md](references/platforms/xiaohongshu.md)：公开卡片可能缺 views 或作品 URL，不能补造。 |
 | 公众号等无专用采集器 | 使用已核验公开主页、作品或用户导出；手工保留来源和覆盖，不冒称脚本采集成功。 |
@@ -46,4 +46,4 @@ collection 与 analysis 输出目录都是 create-only；不覆盖、清空或�
 - 模型结果先用 `run_pipeline.py --validate-only` 校验；正式 final 使用 `--require-delivery-ready`，并检查 `delivery-summary.json` 的实际门状态。生成文件、校验通过与策略交付各有不同含义。
 - 只研究节奏/指标时读 [指标与抽样](references/metrics-and-sampling.md)；需要 taxonomy、高低表现、业务洞察才读模型规则；需要评论才读评论规则。先搜参考标题与任务关键词，再读命中章节，不全文加载整套契约。
 
-报告按用户目标选取定位/栏目、节奏、互动效率、高低表现、评论需求等相关部分，保留证据范围与不确定性；不强制所有请求套用完整六段模板。正式制品仍遵守工作流的分类、证据覆盖和交付门。
+直接回答用户的实际问题；段落顺序和篇幅由用户目标决定。报告可选取定位/栏目、节奏、互动效率、高低表现、评论需求等相关部分，保留证据范围和不确定性；不强制所有请求套用完整六段模板。正式制品仍遵守工作流的分类、证据覆盖和交付门。

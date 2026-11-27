@@ -261,3 +261,24 @@ def test_evidence_only_cli_delivers_a_sealed_zero_post_result(tmp_path):
     assert "未生成账号内容策略结论" in response
     assert "公开页面快照，不代表账号后台真实曝光和转化" in response
     assert (output / ".complete").is_file()
+
+
+@pytest.mark.parametrize("field,invalid", [
+    ("schema_version", True), ("delivery_kind", "strategy"),
+    ("delivery_ready", 1), ("strategy_ready", 0), ("task_status", "COMPLETED"),
+    ("sample", {"valid": False, "collected": 0, "requested": None}),
+])
+def test_delivery_schema_rejects_mistyped_or_inconsistent_evidence(field, invalid):
+    task = {"task_status": "PARTIAL", "collection_commit_sha256": "a" * 64}
+    summary = {
+        "schema_version": 1, "delivery_kind": "evidence_only",
+        "delivery_ready": True, "strategy_ready": False, "task_status": "PARTIAL",
+        "sample": {"valid": 0, "collected": 0, "requested": None},
+        "collection_commit_sha256": "a" * 64,
+    }
+    kwargs = dict(expected_valid=0, expected_collected=0, expected_requested=None,
+                  evidence_only=True)
+    pipeline._validate_delivery_summary(summary, task, **kwargs)
+    summary[field] = invalid
+    with pytest.raises(pipeline.PipelineError, match="delivery-summary.json"):
+        pipeline._validate_delivery_summary(summary, task, **kwargs)

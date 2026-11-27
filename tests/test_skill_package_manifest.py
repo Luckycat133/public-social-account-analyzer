@@ -20,8 +20,6 @@ import sys
 import zipfile
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_ROOT = REPO_ROOT / "skill"
 
@@ -119,62 +117,47 @@ def test_collect_entry_points_reject_legacy_path_imports() -> None:
             )
 
 
-@pytest.mark.skipif(
-    not (Path("/Users/jack/.agents/skills/skill-creator/scripts/package_skill.py").exists()),
-    reason="skill-creator's package_skill.py is not available in this environment",
-)
-def test_packaged_archive_excludes_repo_only_paths() -> None:
-    """Run the actual packager and assert the archive layout is minimal."""
-    packager = Path("/Users/jack/.agents/skills/skill-creator/scripts/package_skill.py")
+def test_packaged_archive_excludes_repo_only_paths(tmp_path) -> None:
+    """Run the repository packager with no developer-local fixtures."""
     import subprocess
-    import tempfile
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        archive_path = Path(tmpdir) / "skill.skill"
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(packager),
-                str(SKILL_ROOT),
-                str(tmpdir),
-            ],
-            cwd=str(packager.parent.parent),
-            env={**__import__("os").environ, "PYTHONPATH": str(packager.parent.parent)},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert completed.returncode == 0, completed.stderr
+    packager = REPO_ROOT / "tools" / "package_skill.py"
+    archive_path = tmp_path / "skill.skill"
+    completed = subprocess.run(
+        [sys.executable, str(packager), str(archive_path)],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
-        with zipfile.ZipFile(archive_path) as archive:
-            names = archive.namelist()
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
 
-        # Forbid repo-only fragments.
-        for fragment in FORBIDDEN_ARCHIVE_FRAGMENTS:
-            offenders = [name for name in names if fragment in name]
-            assert not offenders, (
-                f"Archive contains forbidden fragment {fragment!r}: {offenders}"
-            )
-
-        # 0.9.2 archive: 2 (SKILL.md, VERSION) + 1 agents + 1 assets
-        # + 17 references + 16 top-level scripts + 1 analysis/__init__.py
-        # + 3 analysis modules + 18 collectors = 59 files.
-        # We cap at 70 to leave headroom for hotfixes without allowing
-        # silent regressions back to the historical 80+ file range.
-        assert 50 <= len(names) <= 70, (
-            f"Archive has {len(names)} files; expected 50–70 after 0.9.2 trims"
+    # Forbid repo-only fragments.
+    for fragment in FORBIDDEN_ARCHIVE_FRAGMENTS:
+        offenders = [name for name in names if fragment in name]
+        assert not offenders, (
+            f"Archive contains forbidden fragment {fragment!r}: {offenders}"
         )
 
-        # Spot-check that the entry-point files are present.
-        required = (
-            "skill/SKILL.md",
-            "skill/VERSION",
-            "skill/scripts/collect.py",
-            "skill/scripts/run_pipeline.py",
-            "skill/scripts/analysis/__init__.py",
-            "skill/scripts/analysis/analyze.py",
-            "skill/scripts/collectors/__init__.py",
-            "skill/assets/report-template.html",
-        )
-        for entry in required:
-            assert entry in names, f"Archive missing required entry: {entry}"
+    # 0.9.2 archive: 2 (SKILL.md, VERSION) + 1 agents + 1 assets
+    # + 17 references + 16 top-level scripts + 1 analysis/__init__.py
+    # + 3 analysis modules + 18 collectors = 59 files.
+    # We cap at 70 to leave headroom for hotfixes without allowing
+    # silent regressions back to the historical 80+ file range.
+    assert 50 <= len(names) <= 70, (
+        f"Archive has {len(names)} files; expected 50–70 after 0.9.2 trims"
+    )
+
+    # Spot-check that the entry-point files are present.
+    required = (
+        "skill/SKILL.md",
+        "skill/VERSION",
+        "skill/scripts/collect.py",
+        "skill/scripts/run_pipeline.py",
+        "skill/scripts/analysis/__init__.py",
+        "skill/scripts/analysis/analyze.py",
+        "skill/scripts/collectors/__init__.py",
+        "skill/assets/report-template.html",
+    )
+    for entry in required:
+        assert entry in names, f"Archive missing required entry: {entry}"
