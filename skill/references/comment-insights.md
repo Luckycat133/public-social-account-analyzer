@@ -43,3 +43,12 @@ U+2028 / U+2029 是内容而非分隔符，仅用二者连接两个对象必须�
 `partial-model`，完整结果为 `completed`。只有用户请求评论语义时，该阶段才进入全局完成门；
 `pending-model` 或 `partial-model` 会令正式分析保持 `PARTIAL`。结构与枚举以
 [analysis-schema.md](analysis-schema.md) §7.2 为唯一来源。
+
+`sampling_state` 与已有语义处理状态独立：`not_requested` / `confirmed_empty` /
+`unavailable` 区分未请求、全体父作品确认空和零可用证据；有有效行但发生保护性停止、
+失败、尚有父作品未处置或文本缺失时为 `partial`。只有父作品均已处置且文本可用才是
+`sampled`，仍只代表每作品最多 20 条的公开样本，不是完整评论。采样状态随账本显示在
+Markdown 和 HTML；语义模型完成不会把 `partial` 升格。
+
+派生工作区会标记 `PARTIAL`（`COMMENT_SAMPLE_PARTIAL` / `COMMENT_SAMPLE_UNAVAILABLE`），
+但已核验的作品与评论证据仍可单独读取；确认空不触发这两个降级原因。

@@ -118,6 +118,7 @@ def test_comment_analysis_not_requested_has_stable_complete_contract():
     assert set(result) == {
         "schema_version",
         "status",
+        "sampling_state",
         "requested",
         "sampled_comment_count",
         "eligible_parent_posts",
@@ -134,6 +135,7 @@ def test_comment_analysis_not_requested_has_stable_complete_contract():
         **result,
         "schema_version": 1,
         "status": "not_requested",
+        "sampling_state": "not_requested",
         "requested": False,
         "sampled_comment_count": 0,
         "eligible_parent_posts": 1,

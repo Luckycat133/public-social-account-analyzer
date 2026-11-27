@@ -2429,6 +2429,7 @@ def _comment_evidence_block(analysis: dict) -> tuple[str, str]:
     summary_rows = [
         ["schema_version", _comment_scalar(comments.get("schema_version"))],
         ["status", _comment_scalar(comments.get("status"))],
+        ["sampling_state", _comment_scalar(comments.get("sampling_state"))],
         ["requested", _comment_scalar(comments.get("requested"))],
         [
             "sampled_comment_count",

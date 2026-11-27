@@ -132,6 +132,7 @@ Markdown/HTML 不复制完整审计数组：高表现只展示排序最前 5 条
 {
   "schema_version": 1,
   "status": "not_requested | empty | unavailable | collected_pending_model | collected_analyzed",
+  "sampling_state": "not_requested | confirmed_empty | unavailable | partial | sampled",
   "requested": false,
   "sampled_comment_count": 0,
   "eligible_parent_posts": 0,
