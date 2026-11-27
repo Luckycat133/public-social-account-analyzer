@@ -1,0 +1,97 @@
+name: Publish public-social-account-analyzer v0.9.5 once
+on:
+  push:
+    branches: ['dots/release-v0.9.5-once']
+    paths: ['.github/workflows/publish-v0.9.5-once.yml']
+permissions: {}
+env:
+  TAG: v0.9.5
+  TARGET: b22354649c83105e4d201a9ac9e736f7d0b98f76
+  TREE: a514ddf575311744666ca65a36ac7024959328c8
+  DIGEST: b3b0502a550d190d012cca17ca54872092a949ee9e7c455a729ecb8e3e355f68
+  NAME: public-social-account-analyzer-v0.9.5.skill
+jobs:
+  verify:
+    if: github.repository == 'Luckycat133/public-social-account-analyzer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.TARGET }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Compare isolated builds and validate distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^{tree})" = "$TREE"
+          test "$(git ls-remote --exit-code origin "refs/tags/$TAG" | cut -f1)" = "$TARGET"
+          a="$(mktemp -d)"; b="$(mktemp -d)"; unpack="$(mktemp -d)"
+          for d in "$a" "$b"; do
+            git archive "$TARGET" | tar -xf - -C "$d"
+            test "v$(cat "$d/skill/VERSION")" = "$TAG"
+            python "$d/tools/package_skill.py" "$d/$NAME"
+          done
+          cmp "$a/$NAME" "$b/$NAME"
+          mkdir "$RUNNER_TEMP/dist"
+          cp "$a/$NAME" "$RUNNER_TEMP/dist/"
+          cd "$RUNNER_TEMP/dist"
+          printf '%s  %s\n' "$DIGEST" "$NAME" > "$NAME.sha256"
+          sha256sum -c "$NAME.sha256"
+          python - "$NAME" "$unpack" <<'PY'
+          import stat, sys, zipfile
+          from pathlib import PurePosixPath
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              members = archive.infolist()
+              names = {m.filename for m in members}
+              assert len(members) == len(names)
+              assert {"skill/SKILL.md", "skill/VERSION", "skill/scripts/run_pipeline.py", "skill/scripts/analysis/analyze.py"} <= names
+              for member in members:
+                  p = PurePosixPath(member.filename)
+                  assert p.parts[0] == "skill" and ".." not in p.parts
+                  assert not any(x.startswith(".") or x in {"docs", "evals", "tests", "tools", "workspace", "__pycache__"} for x in p.parts)
+                  assert stat.S_ISREG(member.external_attr >> 16)
+              assert archive.testzip() is None
+              archive.extractall(sys.argv[2])
+          PY
+          for entry in collect run_pipeline collect_bilibili_complete collect_douyin_complete collect_douyin_authorized import_index_snapshot; do
+            python "$unpack/skill/scripts/$entry.py" --help > /dev/null
+          done
+          python -m compileall -q "$unpack/skill/scripts"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: verified-distribution
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: verified-distribution
+          path: dist
+      - name: Publish assets to the pre-existing tag only
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Luckycat133/public-social-account-analyzer"
+          test "$GITHUB_REF" = "refs/heads/dots/release-v0.9.5-once"
+          test "$TAG" = "v0.9.5"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)" = "$TARGET"
+          (cd dist && sha256sum -c "$NAME.sha256")
+          test "$(sha256sum "dist/$NAME" | cut -d ' ' -f1)" = "$DIGEST"
+          gh release create "$TAG" "dist/$NAME" "dist/$NAME.sha256" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Public Social Account Analyzer $TAG" \
+            --notes '确定性离线 Agent Skill。两个隔离构建逐字节相同；请用配套 SHA-256 校验文件验证下载。此包不代表平台在线采集、真实 OAuth、授权会话或人工准确率验收。微博凭据重定向与浏览器禁用策略的已知待办见 ROADMAP；未关闭前请勿用真实微博 Cookie 验证。'
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets,isDraft --jq '.isDraft == false and (.assets | length) == 2')" = true
