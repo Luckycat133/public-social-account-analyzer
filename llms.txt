@@ -1,14 +1,16 @@
 # Public Social Account Analyzer
 > Agent Skill & CLI toolkit for auditing public creator accounts across Bilibili, Douyin, Weibo & Xiaohongshu with immutable audit artifacts.
 
-Deterministic, auditable public data collection and content analytics for social media platforms structured for AI Agents and LLM ingestion.
+Auditable public collection and deterministic offline analysis for AI Agents. Source availability and release acceptance are separate; P0/P1 are priorities, not production certifications.
 
 ## Documentation
-- [README](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/README.md): High-level overview, platform capability matrix, and quickstart commands.
-- [Usage Guide](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/USAGE.md): Detailed CLI options, workspace flags, and pipeline parameters.
-- [Testing & Quality Guide](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/TESTING.md): Regression suites, test fixtures, and schema validation.
-- [Full Documentation](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/llms-full.txt): Complete concatenated reference documentation including collector contracts.
+- [README](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/README.md): Platform capability matrix, current limitations, and quickstart commands.
+- [Agent Skill](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/skill/SKILL.md): Actual CLI routing, evidence rules, and known execution/security boundaries.
+- [Usage Guide](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/USAGE.md): Detailed CLI options; check current script help and Skill boundaries when older prose conflicts.
+- [Testing & Quality Guide](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/TESTING.md): Test procedures and fixtures, not proof that a particular revision passed.
+- [Implementation and Acceptance Summary](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/llms-full.txt): Summary of implemented contracts and unclosed gates; not a concatenation of all reference documents.
+- [Roadmap](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/ROADMAP.md): Runtime fixes, reproducible verification, and external acceptance gates.
+- [2026-11-15 Repository Audit](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/docs/acceptance/repository-audit-2026-11-15.md): Fixed-baseline findings, offline reproduction, and checks not executed.
 
 ## Optional
-- [Roadmap](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/ROADMAP.md): Supported features and platform milestone schedule.
 - [Architecture](https://raw.githubusercontent.com/Luckycat133/public-social-account-analyzer/main/docs/architecture/STRUCTURE.md): Pipeline data flow, collector isolation, and evidence persistence.

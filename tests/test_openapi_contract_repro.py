@@ -133,23 +133,13 @@ def test_offline_acceptance_documents_openapi_protocol_2():
     )
 
 
-def test_skill_md_frontmatter_is_well_formed_and_unchanged():
-    """frontmatter 是 Claude 决定 skill 触发的唯一字段。本测试守护它,
-    防止重构时把它改坏或破坏 YAML 结构。"""
-    text = SKILL_MD.read_text(encoding="utf-8")
-    # 第一行 ---,之后是 name: ..., description: ..., 之后 --- 关闭 frontmatter
-    lines = text.splitlines()
+def test_skill_md_frontmatter_has_name_and_nonempty_description():
+    """Validate the Skill's simple scalar header without a YAML dependency."""
+    lines = SKILL_MD.read_text(encoding="utf-8").splitlines()
     assert lines and lines[0] == "---", "SKILL.md 首行必须是 ---"
-    name_line = next((l for l in lines[1:] if l.startswith("name:")), None)
-    desc_line = next((l for l in lines[1:] if l.startswith("description:")), None)
-    close_line = lines[3] if len(lines) > 3 else None  # close marker
-    assert name_line == "name: public-social-account-analyzer", (
-        f"SKILL.md frontmatter name 必须保留 'public-social-account-analyzer',"
-        f"当前: {name_line!r}"
-    )
-    assert desc_line and len(desc_line) <= 1024, (
-        "SKILL.md description 长度必须 ≤ 1024 字符(Claude spec 限制)"
-    )
-    assert close_line == "---", (
-        "SKILL.md frontmatter 必须以 --- 在第 4 行关闭"
-    )
+    closing = lines.index("---", 1)
+    items = [line.split(": ", 1) for line in lines[1:closing] if line.strip()]
+    fields = dict(items)
+    assert len(fields) == len(items)
+    assert fields["name"] == "public-social-account-analyzer"
+    assert 0 < len(fields["description"].strip()) <= 1024

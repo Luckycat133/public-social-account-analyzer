@@ -1,51 +1,44 @@
-# Public Social Account Analyzer Full Documentation
+# Public Social Account Analyzer — Implementation and Acceptance Summary
 
-> Agent Skill & CLI toolkit for auditing public creator accounts across Bilibili, Douyin, Weibo & Xiaohongshu with immutable audit artifacts.
+> Agent Skill and CLI toolkit for auditing public creator accounts on Bilibili, Douyin, Weibo and Xiaohongshu using separately sealed collection and analysis artifacts.
 
-- **Repository**: https://github.com/Luckycat133/public-social-account-analyzer
-- **Author**: Luckycat133
-- **License**: MIT
-- **Runtime**: Python >= 3.9
+This is a summary, not the complete contract documentation. Read skill/SKILL.md and its focused references for execution. Review date: 2026-11-15. Source baseline: 69efd2be4064b9b144b5231b3f5ef86add9d4ba5. Repository version: 0.9.2. This documentation update is not a new package release or a fresh full-suite acceptance result.
 
----
+## Supported surface
 
-## 1. Supported Platform Matrix
+| Platform | Implemented surface | Acceptance boundary |
+| --- | --- | --- |
+| Bilibili | Public profiles, limited/bounded complete collection, metrics, independent attempts | P0 priority; real-account, accuracy and performance release gates remain open |
+| Douyin | Public SSR/temporary browser, separate owner-authorized OpenAPI, public-index import | Conditional support; sources are distinct; real OAuth acceptance remains open |
+| Weibo | Public AJAX, adapter enabled by default | P1 experimental; Cookie redirect isolation requires a runtime fix |
+| Xiaohongshu | Modern/legacy profile-state parsing and visible cards | P1 experimental; cards without real note IDs remain partial and have no canonical post URL |
 
-| Platform | Capability | Support Tier | Primary Extraction Pipeline |
-| :--- | :--- | :--- | :--- |
-| **Bilibili (B站)** | Full public profile, video history, tags, engagement | P0 (Production) | Bounded retry, public API + optional session |
-| **Douyin (抖音)** | Video statistics, captions, play counts | P0 (Experimental) | SSR / ephemeral browser, creator OpenAPI |
-| **Weibo (微博)** | Post timeline, reposts, comments count | P1 (Experimental) | Public AJAX pipelines |
-| **Xiaohongshu (小红书)** | Note cards, interaction stats, keywords | P1 (Experimental) | Modern/legacy state parsing, partial sample safeguards |
+P0/P1 are priorities, not production certifications. There is no dedicated WeChat public-account or other-platform collector. Missing public fields remain null; public views are not verified private impressions, unique reach, retention or conversion.
 
----
+## Runtime contracts
 
-## 2. Core Architectural Guarantees
+- collect.py takes a positional profile URL. --limit N requests 1–100 recent items. Omitting --limit defaults to bounded complete collection for Bilibili/Douyin and 30 items for Weibo/Xiaohongshu. --all is limited to Bilibili/Douyin.
+- Agent-side nickname discovery must verify identity before passing a URL; the CLI does not implement a nickname search service.
+- A sealed collection is the input to run_pipeline.py; an arbitrary CSV/JSON file is not automatically a valid collection.
+- Analysis is offline and deterministic for fixed evidence and model-result inputs. Model flags generate prompts and validate externally supplied results; the CLI does not call an LLM.
+- Every collection/analysis/checkpoint uses its own new output directory. Manifest verification, .complete, task status, delivery_ready and is_exhaustive have different meanings. Exit code 0 alone proves neither complete coverage nor a final strategy report.
+- Read the actual selected_workspace from complete-collector output; do not hard-code attempt-1.
+- --require-delivery-ready is the real pipeline delivery gate. There is no --strict-gates. collect.py has no --dry-run, --platform, --url or generic --cookie-file.
 
-1. **Immutable Audit Artifacts**: Each collection attempt writes to a segregated, timestamped directory. Historical evidence is never mutated.
-2. **Defensive Rate-Limit & Login-Wall Handling**: The collector immediately halts on captchas, login walls, or throttling. It never fabricates empty records as "success".
-3. **Agent-Native Discovery**: Agents take raw creator names, discover canonical profile URLs via search, and drive collection without manual link provision.
+## Known unclosed boundaries
 
----
+The Cookie-enabled adapter branch can force Douyin browser fallback on despite an explicit disable policy. The Weibo HTTP path uses default redirects with a normal Cookie header; an offline stdlib probe confirms header forwarding into cross-origin/HTTP target requests, not an observed real-platform incident. Neither defect was fixed by this documentation update. Do not claim these execution/security boundaries have passed acceptance.
 
-## 3. Quickstart
+Cookie persistence is opt-in for new cache writes, but existing per-platform caches auto-load. Input files and isolated browser temporary storage mean that “all credentials always stay only in memory” is not an accurate guarantee. The separate Douyin OpenAPI transport already rejects redirects.
 
-```bash
-# As OpenClaw Agent Skill
-openclaw skills install @luckycat133/public-social-account-analyzer
+The archive test depends on a developer-local packager path and may skip elsewhere. No current-SHA Actions run or fresh full pytest/package/live acceptance result was obtained in this review.
 
-# Local setup
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+## Canonical documentation
 
-# Collect Bilibili creator profile
-python3 skill/scripts/collect_bilibili_complete.py \
-  "https://space.bilibili.com/<uid>" \
-  --out-prefix workspace/bilibili-collection
-
-# Generate analytics report
-python3 skill/scripts/run_pipeline.py \
-  --input workspace/bilibili-collection-attempt-1 \
-  --output workspace/bilibili-analysis
-```
+- skill/SKILL.md: actual routing, CLI contracts, evidence limits and known defects.
+- ROADMAP.md: implemented surfaces, P0 runtime fixes, repeatable verification and external acceptance gates.
+- docs/acceptance/repository-audit-2026-11-15.md: fixed-baseline findings, offline reproduction and explicit unexecuted checks.
+- skill/references/artifact-contract.md: sealed workspaces, task status and provenance.
+- skill/references/collection-schema.md and analysis-schema.md: field contracts.
+- skill/references/metrics-and-sampling.md: valid samples, denominators and coverage.
+- TESTING.md: repository test procedures; a procedure is not evidence that it was run.
