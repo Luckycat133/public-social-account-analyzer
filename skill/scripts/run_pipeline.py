@@ -394,6 +394,11 @@ def run_evidence_delivery(collection_dir: str, output_dir: str) -> PipelineResul
             "delivery-summary.json": _json_bytes(summary),
             "final-response.md": _evidence_only_response(summary).encode("utf-8"),
         }
+        _validate_delivery_summary(
+            _json_object(artifacts["delivery-summary.json"], "delivery-summary.json"),
+            derived_task, expected_valid=0, expected_collected=record_count,
+            expected_requested=source_task.get("requested_limit"), evidence_only=True,
+        )
         reader.verify_unchanged()
         reservation = ImmutableWorkspace.reserve(
             output, allowed_artifacts=EVIDENCE_DELIVERY_ARTIFACTS
@@ -504,6 +509,49 @@ def _analysis_partial_reasons(analysis: dict[str, Any]) -> list[str]:
     return reasons
 
 
+def _validate_delivery_summary(
+    summary: dict[str, Any], task: dict[str, Any], *, expected_valid: int,
+    expected_collected: int, expected_requested: Any, evidence_only: bool = False,
+) -> None:
+    """Check the public summary's typed envelope against independently known counts."""
+    kind = summary.get("delivery_kind")
+    ready = summary.get("delivery_ready")
+    strategy = summary.get("strategy_ready")
+    sample = summary.get("sample")
+    valid_kinds = {"evidence_only"} if evidence_only else {"light", "strategy"}
+    if (
+        type(summary.get("schema_version")) is not int
+        or summary["schema_version"] != 1
+        or not isinstance(kind, str)
+        or kind not in valid_kinds
+        or type(ready) is not bool
+        or type(strategy) is not bool
+        or strategy != (kind == "strategy")
+        or (kind in {"strategy", "evidence_only"} and not ready)
+        or summary.get("task_status") != task.get("task_status")
+        or summary.get("task_status") not in ("COMPLETED", "PARTIAL", "FAILED")
+        or not isinstance(sample, dict)
+    ):
+        raise PipelineError("delivery-summary.json envelope is invalid")
+    for key, expected in (
+        ("valid", expected_valid), ("collected", expected_collected),
+        ("requested", expected_requested),
+    ):
+        value = sample.get(key)
+        if key not in sample or type(value) is not type(expected) or value != expected:
+            raise PipelineError(f"delivery-summary.json sample.{key} is invalid")
+        if value is None and key == "requested":
+            continue
+        if type(value) is not int or value < 0:
+            raise PipelineError(f"delivery-summary.json sample.{key} is invalid")
+    if expected_valid > expected_collected:
+        raise PipelineError("delivery-summary.json valid count exceeds collected count")
+    if evidence_only and summary.get("collection_commit_sha256") != task.get(
+        "collection_commit_sha256"
+    ):
+        raise PipelineError("delivery-summary.json collection provenance is invalid")
+
+
 def _validate_output_payloads(
     artifacts: dict[str, bytes], *, expected_artifacts: frozenset[str]
 ) -> None:
@@ -559,8 +607,19 @@ def _validate_output_payloads(
         raise PipelineError("normalized-posts.csv is invalid") from exc
     analysis = _json_object(artifacts["analysis.json"], "analysis.json")
     valid = (analysis.get("sample_boundary") or {}).get("valid")
-    if not csv_rows or not isinstance(valid, int) or valid < 1:
+    if not csv_rows or type(valid) is not int or valid < 1:
         raise PipelineError("analysis has no analyzable rows")
+    summary = _json_object(artifacts["delivery-summary.json"], "delivery-summary.json")
+    task = _json_object(artifacts["task.json"], "task.json")
+    sample = analysis["sample_boundary"]
+    _validate_delivery_summary(
+        summary, task, expected_valid=valid,
+        expected_collected=len(csv_rows),
+        expected_requested=sample.get("requested"),
+    )
+    expected_summary = _delivery_summary(analysis, task_status=task["task_status"])
+    if artifacts["delivery-summary.json"] != _json_bytes(expected_summary):
+        raise PipelineError("delivery-summary.json disagrees with analysis")
     for relative in (
         "account-analysis-report.md",
         "dashboard.html",

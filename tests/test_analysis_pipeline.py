@@ -3004,3 +3004,19 @@ def test_legacy_renderer_bad_link_is_fatal_and_diagnostics_reset(tmp_path):
     assert good_code == 0
     assert (good_output / "dashboard.html").is_file()
     assert render_report.WARNINGS == []
+
+
+def test_delivery_summary_accepts_normalized_duplicate_counts(tmp_path):
+    pipeline = _pipeline_module()
+    post = _sample_post()
+    collection, _ = _collection(
+        tmp_path, task_status="COMPLETED", posts=[post, dict(post)]
+    )
+    output = tmp_path / "analysis"
+    result = pipeline.run_pipeline(str(collection), str(output),
+                                   template_text=_minimal_template())
+    task = json.loads((output / "task.json").read_text(encoding="utf-8"))
+    report = json.loads((output / "delivery-summary.json").read_text(encoding="utf-8"))
+    assert result.task_status == "PARTIAL"
+    assert "NORMALIZATION_PARTIAL" in task["partial_reasons"]
+    assert report["sample"]["collected"] == report["sample"]["valid"] == 1
