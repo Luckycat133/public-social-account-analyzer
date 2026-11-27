@@ -105,12 +105,16 @@ def _read(reader: VerifiedWorkspaceReader) -> dict:
             or url is None or url != canonical_profile_url(profile_platform, task.get("profile_url"))
             or not isinstance(status, str) or status not in ANALYZABLE_TASK_STATUSES):
         raise ComparisonError("verified account identity or analyzable collection is missing")
-    capture = _utc(task.get("collected_at"))
+    start_capture = _utc(task.get("collected_at"))
+    end_capture = _utc(task["ended_at"]) if task.get("ended_at") is not None else start_capture
+    if end_capture < start_capture:
+        raise ComparisonError("collection timing is out of order")
     raw = [_object(line) for line in reader.read("source/posts.jsonl").payload.splitlines() if line.strip()]
     count = task.get("collected_count")
     if type(count) is not int or count != len(raw):
         raise ComparisonError("collection count does not match the sealed posts")
     known = {}
+    observation_times = {}
     candidates = []
     unknown_identity = 0
     for row in raw:
@@ -122,6 +126,7 @@ def _read(reader: VerifiedWorkspaceReader) -> dict:
         if key in known:
             raise ComparisonError("duplicate post in sealed collection")
         known[key] = _published(row)
+        observation_times[key] = _observed(row)
         extra = row.get("platform_metrics")
         if isinstance(extra, dict) and (extra.get("platform_post_id_known") is False or extra.get("local_record_key") is True):
             unknown_identity += 1
@@ -140,7 +145,7 @@ def _read(reader: VerifiedWorkspaceReader) -> dict:
         for row in valid
         if not any(row.get(flag) is True for flag in ("is_pinned", "is_repost", "is_promoted"))
     }
-    if any(stamp is not None and stamp > capture for stamp, _ in eligible.values()):
+    if any(stamp is not None and stamp > end_capture for stamp, _ in eligible.values()):
         raise ComparisonError("post publication is later than the collection snapshot")
     coverage = {
         "task_status": status,
@@ -151,8 +156,8 @@ def _read(reader: VerifiedWorkspaceReader) -> dict:
         "unavailable_posts": len(candidates) - len(valid),
         "unknown_publication_time": sum(stamp is None for stamp, _ in eligible.values()),
     }
-    return {"platform": profile_platform, "account_id": identity, "profile_url": url, "capture": capture,
-            "commit_sha256": reader.source_digest, "coverage": coverage, "eligible": eligible}
+    return {"platform": profile_platform, "account_id": identity, "profile_url": url, "capture": start_capture, "capture_end": end_capture,
+            "commit_sha256": reader.source_digest, "coverage": coverage, "eligible": eligible, "observation_times": observation_times}
 
 
 def _slice(source: dict, start: datetime, end: datetime) -> dict:
@@ -174,6 +179,13 @@ def _summarize(source: dict, sample: dict) -> dict:
         "snapshot_at": source["capture"].isoformat(), "coverage": source["coverage"],
         "sample_post_count": len(sample), "metrics": values,
     }
+
+
+def _observed(row: dict) -> datetime | None:
+    try:
+        return _utc(row.get("collected_at"))
+    except ComparisonError:
+        return None
 
 
 def _window(start: datetime, end: datetime) -> dict:
@@ -228,11 +240,26 @@ def _build(readers, mode: str, boundaries: list[str]) -> dict:
             new_time, new_row = current["eligible"][pid]
             if old_time is not None and new_time is not None and old_time != new_time:
                 raise ComparisonError("shared post publication differs between snapshots")
+            previous_observed = previous["observation_times"][pid]
+            current_observed = current["observation_times"][pid]
+            # Incremental collections may carry the same observation forward.
+            # A later seal does not in itself prove a fresh post observation.
+            distinct = (
+                previous_observed is not None and current_observed is not None
+                and previous_observed < current_observed
+                and previous_observed <= previous["capture_end"]
+                and current_observed <= current["capture_end"]
+                and (old_time is None or old_time <= previous_observed)
+                and (new_time is None or new_time <= current_observed)
+            )
             delta = {}
             for metric in METRICS:
                 before, after = _number(old_row, metric), _number(new_row, metric)
-                delta[metric] = after - before if before is not None and after is not None else None
-            changes.append({"post_id": pid, "metric_deltas": delta})
+                delta[metric] = after - before if distinct and before is not None and after is not None else None
+            changes.append({"post_id": pid,
+                            "previous_observed_at": previous_observed.isoformat() if previous_observed else None,
+                            "current_observed_at": current_observed.isoformat() if current_observed else None,
+                            "metric_deltas": delta})
         prior = _summarize(previous, old)
         latest = _summarize(current, new)
         result.update(previous={"window": _window(start, middle), **prior},

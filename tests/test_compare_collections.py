@@ -31,7 +31,7 @@ def _collection(directory, spec, platform="bilibili", *, count=None):
     rows = [
         {"platform": platform, "post_id": pid, "published_at": stamp,
          "likes": likes, "comments": comment, "shares": 0,
-         "field_visibility": {"likes": visibility},
+         "field_visibility": {"likes": visibility}, "collected_at": capture,
          "collection_status": "SUCCESS"}
         for pid, stamp, likes, comment, visibility in spec["sample"]
     ]
@@ -98,8 +98,10 @@ def test_period_cohorts_separate_from_shared_post_metrics(collections, tmp_path)
     assert report["sample_count_delta"] == -1
     assert report["sample_total_deltas"] == {"likes": 1, "comments": None, "shares": 0}
     assert report["shared_post_metric_changes"] == [
-        {"post_id": "BVprior1", "metric_deltas": {"likes": 5, "comments": -1, "shares": 0}},
-        {"post_id": "BVprior2", "metric_deltas": {"likes": None, "comments": None, "shares": 0}},
+        {"post_id": "BVprior1", "previous_observed_at": "2026-10-03T01:00:00+00:00",
+         "current_observed_at": "2026-10-05T02:00:00+00:00", "metric_deltas": {"likes": 5, "comments": -1, "shares": 0}},
+        {"post_id": "BVprior2", "previous_observed_at": "2026-10-03T01:00:00+00:00",
+         "current_observed_at": "2026-10-05T02:00:00+00:00", "metric_deltas": {"likes": None, "comments": None, "shares": 0}},
     ]
 
 
@@ -198,3 +200,16 @@ def test_duplicate_post_id_across_distinct_accounts_is_not_ranked(collections, t
     _collection(source, dict(fixture["a_now"], account="103"))
     with pytest.raises(ComparisonError, match="multiple accounts"):
         run("accounts", DATES[1:], [str(source), dirs["a_now"]], str(tmp_path / "out"))
+
+def test_incremental_collection_reused_observation_is_not_an_observed_zero_delta(collections, tmp_path):
+    fixture, dirs, _ = collections
+    old_raw = [json.loads(line) for line in Path(dirs["a_prior"], "source/posts.jsonl").read_text().splitlines()]
+    current = tmp_path / "incremental"
+    _collection(current, dict(fixture["a_now"], sample=fixture["a_now"]["sample"][2:], extra=old_raw[:2]))
+    out = tmp_path / "out"
+    run("periods", DATES, [dirs["a_prior"], str(current)], str(out))
+    changes = _read(out)["shared_post_metric_changes"]
+    assert len(changes) == 2
+    for post in changes:
+        assert post["previous_observed_at"] == post["current_observed_at"]
+        assert post["metric_deltas"] == {"likes": None, "comments": None, "shares": None}
