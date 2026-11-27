@@ -1,0 +1,28 @@
+name: Create public-social-account-analyzer v0.9.5 milestone tags once
+on:
+  push:
+    branches: ['dots/tag-v0.9.5-once']
+    paths: ['.github/workflows/tag-v0.9.5-once.yml']
+permissions: {}
+jobs:
+  exact-tags:
+    if: github.repository == 'Luckycat133/public-social-account-analyzer'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Validate source and create only the fixed milestone refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Luckycat133/public-social-account-analyzer"
+          test "$GITHUB_REF" = "refs/heads/dots/tag-v0.9.5-once"
+          main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          test "$main" = "b22354649c83105e4d201a9ac9e736f7d0b98f76"
+          gh api "repos/$GITHUB_REPOSITORY/contents/pyproject.toml?ref=$main" --jq .content | base64 --decode > "$RUNNER_TEMP/tag-version.txt"
+          grep -Fx 'version = "0.9.5"' "$RUNNER_TEMP/tag-version.txt" >/dev/null
+          test -z "$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v0.9.5" --jq ' .[] | select(.ref == "refs/tags/v0.9.5") | .ref ')"; gh api "repos/$GITHUB_REPOSITORY/git/commits/b22354649c83105e4d201a9ac9e736f7d0b98f76" --jq .sha | grep -Fx "b22354649c83105e4d201a9ac9e736f7d0b98f76" >/dev/null
+          test "$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/v0.9.5" -f "sha=b22354649c83105e4d201a9ac9e736f7d0b98f76" --jq .object.sha)" = "b22354649c83105e4d201a9ac9e736f7d0b98f76"
